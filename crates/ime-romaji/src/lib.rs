@@ -88,6 +88,18 @@ impl RomajiComposer {
                 break;
             }
 
+            // `tch` is the one common sokuon spelling that is not expressed by
+            // a doubled consonant (for example, `matcha` -> `まっちゃ`). Keep
+            // `tc` pending until the `h` arrives, then consume only the `t`.
+            if self.pending == "tc" {
+                break;
+            }
+            if self.pending.starts_with("tch") {
+                output.push('っ');
+                self.pending.remove(0);
+                continue;
+            }
+
             let bytes = self.pending.as_bytes();
             if bytes.len() >= 2 {
                 let first = bytes[0];
@@ -180,6 +192,9 @@ fn matching_entries(input: &str) -> &'static [(&'static str, &'static str)] {
     &table[start..start + matching_length]
 }
 
+// Kana mappings follow Mozc's default romaji table. Stateful `n`/sokuon rules
+// are handled above, while punctuation and Mozc's `z` shortcuts are not kana
+// composition and therefore stay outside this table.
 const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("a", "あ"),
     ("i", "い"),
@@ -192,7 +207,9 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("ke", "け"),
     ("ko", "こ"),
     ("kya", "きゃ"),
+    ("kyi", "きぃ"),
     ("kyu", "きゅ"),
+    ("kye", "きぇ"),
     ("kyo", "きょ"),
     ("ga", "が"),
     ("gi", "ぎ"),
@@ -200,7 +217,9 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("ge", "げ"),
     ("go", "ご"),
     ("gya", "ぎゃ"),
+    ("gyi", "ぎぃ"),
     ("gyu", "ぎゅ"),
+    ("gye", "ぎぇ"),
     ("gyo", "ぎょ"),
     ("sa", "さ"),
     ("si", "し"),
@@ -209,10 +228,13 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("se", "せ"),
     ("so", "そ"),
     ("sya", "しゃ"),
+    ("syi", "しぃ"),
     ("syu", "しゅ"),
+    ("sye", "しぇ"),
     ("syo", "しょ"),
     ("sha", "しゃ"),
     ("shu", "しゅ"),
+    ("she", "しぇ"),
     ("sho", "しょ"),
     ("za", "ざ"),
     ("zi", "じ"),
@@ -221,11 +243,19 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("ze", "ぜ"),
     ("zo", "ぞ"),
     ("zya", "じゃ"),
+    ("zyi", "じぃ"),
     ("zyu", "じゅ"),
+    ("zye", "じぇ"),
     ("zyo", "じょ"),
     ("ja", "じゃ"),
+    ("jya", "じゃ"),
+    ("jyi", "じぃ"),
     ("ju", "じゅ"),
+    ("jyu", "じゅ"),
+    ("je", "じぇ"),
+    ("jye", "じぇ"),
     ("jo", "じょ"),
+    ("jyo", "じょ"),
     ("ta", "た"),
     ("ti", "ち"),
     ("chi", "ち"),
@@ -234,28 +264,71 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("te", "て"),
     ("to", "と"),
     ("tya", "ちゃ"),
+    ("tyi", "ちぃ"),
     ("tyu", "ちゅ"),
+    ("tye", "ちぇ"),
     ("tyo", "ちょ"),
     ("cha", "ちゃ"),
     ("chu", "ちゅ"),
+    ("che", "ちぇ"),
     ("cho", "ちょ"),
+    ("cya", "ちゃ"),
+    ("cyi", "ちぃ"),
+    ("cyu", "ちゅ"),
+    ("cye", "ちぇ"),
+    ("cyo", "ちょ"),
+    ("tsa", "つぁ"),
+    ("tsi", "つぃ"),
+    ("tse", "つぇ"),
+    ("tso", "つぉ"),
+    ("tha", "てゃ"),
+    ("thi", "てぃ"),
+    ("t'i", "てぃ"),
+    ("thu", "てゅ"),
+    ("the", "てぇ"),
+    ("tho", "てょ"),
+    ("t'yu", "てゅ"),
+    ("twa", "とぁ"),
+    ("twi", "とぃ"),
+    ("twu", "とぅ"),
+    ("twe", "とぇ"),
+    ("two", "とぉ"),
+    ("t'u", "とぅ"),
     ("da", "だ"),
     ("di", "ぢ"),
     ("du", "づ"),
     ("de", "で"),
     ("do", "ど"),
     ("dya", "ぢゃ"),
+    ("dyi", "ぢぃ"),
     ("dyu", "ぢゅ"),
+    ("dye", "ぢぇ"),
     ("dyo", "ぢょ"),
+    ("dha", "でゃ"),
+    ("dhi", "でぃ"),
+    ("d'i", "でぃ"),
+    ("dhu", "でゅ"),
+    ("dhe", "でぇ"),
+    ("dho", "でょ"),
+    ("d'yu", "でゅ"),
+    ("dwa", "どぁ"),
+    ("dwi", "どぃ"),
+    ("dwu", "どぅ"),
+    ("dwe", "どぇ"),
+    ("dwo", "どぉ"),
+    ("d'u", "どぅ"),
     ("na", "な"),
     ("ni", "に"),
     ("nu", "ぬ"),
     ("ne", "ね"),
     ("no", "の"),
     ("nya", "にゃ"),
+    ("nyi", "にぃ"),
     ("nyu", "にゅ"),
+    ("nye", "にぇ"),
     ("nyo", "にょ"),
     ("n", "ん"),
+    ("xn", "ん"),
     ("ha", "は"),
     ("hi", "ひ"),
     ("hu", "ふ"),
@@ -263,15 +336,31 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("he", "へ"),
     ("ho", "ほ"),
     ("hya", "ひゃ"),
+    ("hyi", "ひぃ"),
     ("hyu", "ひゅ"),
+    ("hye", "ひぇ"),
     ("hyo", "ひょ"),
+    ("fa", "ふぁ"),
+    ("fi", "ふぃ"),
+    ("fe", "ふぇ"),
+    ("fo", "ふぉ"),
+    ("fya", "ふゃ"),
+    ("fyu", "ふゅ"),
+    ("fyo", "ふょ"),
+    ("hwa", "ふぁ"),
+    ("hwi", "ふぃ"),
+    ("hwe", "ふぇ"),
+    ("hwo", "ふぉ"),
+    ("hwyu", "ふゅ"),
     ("ba", "ば"),
     ("bi", "び"),
     ("bu", "ぶ"),
     ("be", "べ"),
     ("bo", "ぼ"),
     ("bya", "びゃ"),
+    ("byi", "びぃ"),
     ("byu", "びゅ"),
+    ("bye", "びぇ"),
     ("byo", "びょ"),
     ("pa", "ぱ"),
     ("pi", "ぴ"),
@@ -279,7 +368,9 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("pe", "ぺ"),
     ("po", "ぽ"),
     ("pya", "ぴゃ"),
+    ("pyi", "ぴぃ"),
     ("pyu", "ぴゅ"),
+    ("pye", "ぴぇ"),
     ("pyo", "ぴょ"),
     ("ma", "ま"),
     ("mi", "み"),
@@ -287,7 +378,9 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("me", "め"),
     ("mo", "も"),
     ("mya", "みゃ"),
+    ("myi", "みぃ"),
     ("myu", "みゅ"),
+    ("mye", "みぇ"),
     ("myo", "みょ"),
     ("ya", "や"),
     ("yu", "ゆ"),
@@ -298,18 +391,48 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("re", "れ"),
     ("ro", "ろ"),
     ("rya", "りゃ"),
+    ("ryi", "りぃ"),
     ("ryu", "りゅ"),
+    ("rye", "りぇ"),
     ("ryo", "りょ"),
     ("wa", "わ"),
+    ("wi", "うぃ"),
+    ("we", "うぇ"),
     ("wo", "を"),
+    ("wha", "うぁ"),
+    ("whi", "うぃ"),
+    ("whu", "う"),
+    ("whe", "うぇ"),
+    ("who", "うぉ"),
+    ("wyi", "ゐ"),
+    ("wye", "ゑ"),
+    ("wu", "う"),
+    ("va", "ゔぁ"),
+    ("vi", "ゔぃ"),
+    ("vu", "ゔ"),
+    ("ve", "ゔぇ"),
+    ("vo", "ゔぉ"),
+    ("vya", "ゔゃ"),
+    ("vyi", "ゔぃ"),
+    ("vyu", "ゔゅ"),
+    ("vye", "ゔぇ"),
+    ("vyo", "ゔょ"),
     ("xya", "ゃ"),
     ("xyu", "ゅ"),
     ("xyo", "ょ"),
+    ("xyi", "ぃ"),
+    ("xye", "ぇ"),
+    ("xwa", "ゎ"),
     ("lya", "ゃ"),
     ("lyu", "ゅ"),
     ("lyo", "ょ"),
+    ("lyi", "ぃ"),
+    ("lye", "ぇ"),
+    ("lwa", "ゎ"),
     ("xtu", "っ"),
+    ("xtsu", "っ"),
     ("ltu", "っ"),
+    ("ltsu", "っ"),
     ("xa", "ぁ"),
     ("xi", "ぃ"),
     ("xu", "ぅ"),
@@ -320,6 +443,41 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("lu", "ぅ"),
     ("le", "ぇ"),
     ("lo", "ぉ"),
+    ("xka", "ヵ"),
+    ("xke", "ヶ"),
+    ("lka", "ヵ"),
+    ("lke", "ヶ"),
+    ("ye", "いぇ"),
+    ("ca", "か"),
+    ("ci", "し"),
+    ("cu", "く"),
+    ("ce", "せ"),
+    ("co", "こ"),
+    ("qa", "くぁ"),
+    ("qi", "くぃ"),
+    ("qu", "く"),
+    ("qe", "くぇ"),
+    ("qo", "くぉ"),
+    ("kwa", "くぁ"),
+    ("kwi", "くぃ"),
+    ("kwu", "くぅ"),
+    ("kwe", "くぇ"),
+    ("kwo", "くぉ"),
+    ("gwa", "ぐぁ"),
+    ("gwi", "ぐぃ"),
+    ("gwu", "ぐぅ"),
+    ("gwe", "ぐぇ"),
+    ("gwo", "ぐぉ"),
+    ("swa", "すぁ"),
+    ("swi", "すぃ"),
+    ("swu", "すぅ"),
+    ("swe", "すぇ"),
+    ("swo", "すぉ"),
+    ("zwa", "ずぁ"),
+    ("zwi", "ずぃ"),
+    ("zwu", "ずぅ"),
+    ("zwe", "ずぇ"),
+    ("zwo", "ずぉ"),
 ];
 
 #[cfg(test)]
@@ -352,6 +510,27 @@ mod tests {
     fn converts_double_consonant() {
         assert_eq!(compose("kitte"), "きって");
         assert_eq!(compose("gakkou"), "がっこう");
+        assert_eq!(compose("matcha"), "まっちゃ");
+    }
+
+    #[test]
+    fn converts_foreign_sounds() {
+        assert_eq!(compose("pafo"), "ぱふぉ");
+        assert_eq!(compose("vaio"), "ゔぁいお");
+        assert_eq!(compose("thi"), "てぃ");
+        assert_eq!(compose("dhu"), "でゅ");
+        assert_eq!(compose("tsa"), "つぁ");
+        assert_eq!(compose("kwa"), "くぁ");
+        assert_eq!(compose("she"), "しぇ");
+    }
+
+    #[test]
+    fn converts_alternative_spellings_and_small_kana() {
+        assert_eq!(compose("jye"), "じぇ");
+        assert_eq!(compose("t'i"), "てぃ");
+        assert_eq!(compose("xtsu"), "っ");
+        assert_eq!(compose("xka"), "ヵ");
+        assert_eq!(compose("wye"), "ゑ");
     }
 
     #[test]

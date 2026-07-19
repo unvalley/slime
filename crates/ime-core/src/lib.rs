@@ -109,7 +109,9 @@ impl ImeEngine {
             actions.push(ImeAction::HideCandidates);
         }
 
-        if character.is_ascii_alphabetic() || (character == '\'' && self.romaji.pending() == "n") {
+        if character.is_ascii_alphabetic()
+            || (character == '\'' && matches!(self.romaji.pending(), "n" | "t" | "d"))
+        {
             let kana = self
                 .romaji
                 .push(character)
@@ -264,8 +266,12 @@ impl ImeEngine {
 
 fn normalize_ascii_character(character: char) -> char {
     match character {
+        '-' => 'ー',
+        '~' => '〜',
         ',' => '、',
         '.' => '。',
+        '[' => '「',
+        ']' => '」',
         character @ '!'..='~' => char::from_u32(u32::from(character) + 0xFEE0)
             .expect("ASCII graphic characters have full-width forms"),
         character => character,
@@ -322,12 +328,31 @@ mod tests {
     #[test]
     fn ascii_numbers_and_symbols_are_normalized_for_japanese_input() {
         let mut engine = ImeEngine::bundled();
-        type_text(&mut engine, "123,.!?()[]+-/@#'");
+        type_text(&mut engine, "123,.!?()[]+-~/@#'");
 
         assert_eq!(
             engine.snapshot().preedit,
-            "１２３、。！？（）［］＋－／＠＃＇"
+            "１２３、。！？（）「」＋ー〜／＠＃＇"
         );
+    }
+
+    #[test]
+    fn foreign_word_with_long_vowel_converts_to_dictionary_candidate() {
+        let mut engine = ImeEngine::bundled();
+        type_text(&mut engine, "pafo-mansu");
+
+        assert_eq!(engine.snapshot().preedit, "ぱふぉーまんす");
+
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "パフォーマンス");
+    }
+
+    #[test]
+    fn apostrophe_spellings_for_foreign_sounds_remain_composable() {
+        let mut engine = ImeEngine::bundled();
+        type_text(&mut engine, "t'id'yu");
+
+        assert_eq!(engine.snapshot().preedit, "てぃでゅ");
     }
 
     #[test]

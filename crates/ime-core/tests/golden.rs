@@ -23,7 +23,17 @@ fn core_conversion_golden_cases() {
         ("kyou", "今日"),
         ("watashi", "私"),
         ("watashihanihon", "私は日本"),
-        ("neko", "ねこ"),
+        ("neko", "猫"),
+        ("henkan", "変換"),
+        ("nyuuryoku", "入力"),
+        ("dousa", "動作"),
+        ("komaru", "困る"),
+        ("kanjihenohenkan", "漢字への変換"),
+        (
+            "seidowotakamerukufuuwoshiteikimashou",
+            "精度を高める工夫をしていきましょう",
+        ),
+        ("jishowokakujuusasemashou", "辞書を拡充させましょう"),
     ];
 
     for (input, expected) in cases {

@@ -71,6 +71,10 @@ ci: check bench-build
 test-macos:
     scripts/test-macos-adapter.sh
 
+# macOS Swiftアダプターのmicro benchmarkを実行する
+bench-macos:
+    bash scripts/benchmark-macos-adapter.sh
+
 # macOS入力メソッドbundleをビルドする
 build-macos:
     scripts/build-macos.sh

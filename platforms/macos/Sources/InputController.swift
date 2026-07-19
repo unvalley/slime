@@ -1,7 +1,13 @@
 import AppKit
 import InputMethodKit
+import os
 
 final class UnvalleyController: IMKInputController {
+    private static let performanceLog = OSLog(
+        subsystem: "com.unvalley.inputmethod.Unvalley",
+        category: .pointsOfInterest
+    )
+
     private let engine: RustEngine
     private var hasComposition = false
 
@@ -16,9 +22,43 @@ final class UnvalleyController: IMKInputController {
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event, event.type == .keyDown else { return false }
 
+        let deleteSignpostID: OSSignpostID? = if event.keyCode == 51 || event.keyCode == 117 {
+            OSSignpostID(log: Self.performanceLog)
+        } else {
+            nil
+        }
+        if let deleteSignpostID {
+            os_signpost(
+                .begin,
+                log: Self.performanceLog,
+                name: "HandleDelete",
+                signpostID: deleteSignpostID,
+                "composition=%{public}d keyCode=%{public}d",
+                hasComposition,
+                event.keyCode
+            )
+        }
+        defer {
+            if let deleteSignpostID {
+                os_signpost(
+                    .end,
+                    log: Self.performanceLog,
+                    name: "HandleDelete",
+                    signpostID: deleteSignpostID
+                )
+            }
+        }
+
         let commandModifiers = event.modifierFlags.intersection([.command, .control, .option])
         if !commandModifiers.isEmpty {
             commitIfNeeded(client: sender)
+            return false
+        }
+
+        if shouldForwardBackspaceDirectly(
+            keyCode: event.keyCode,
+            hasComposition: hasComposition
+        ) {
             return false
         }
 
@@ -54,19 +94,7 @@ final class UnvalleyController: IMKInputController {
     }
 
     private func characterEvent(from event: NSEvent) -> RustEngine.Event? {
-        guard let characters = event.charactersIgnoringModifiers,
-              characters.unicodeScalars.count == 1,
-              let scalar = characters.unicodeScalars.first
-        else {
-            return nil
-        }
-
-        let value = scalar.value
-        let isASCIIAlphabet = (65 ... 90).contains(value) || (97 ... 122).contains(value)
-        guard isASCIIAlphabet || scalar == "'" else { return nil }
-
-        let normalized = Unicode.Scalar(String(scalar).lowercased()) ?? scalar
-        return .character(normalized)
+        printableInputScalar(from: event).map(RustEngine.Event.character)
     }
 
     @discardableResult

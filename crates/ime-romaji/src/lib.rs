@@ -1,6 +1,7 @@
 //! Incremental romaji-to-hiragana composition.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RomajiComposer {
@@ -48,6 +49,20 @@ impl RomajiComposer {
         &self.pending
     }
 
+    /// Returns the text that should be shown while the romaji is ambiguous.
+    ///
+    /// A single `n` remains literal because it can still become `な` through
+    /// `の`. Two `n`s represent one `ん`, while remaining editable as two key
+    /// strokes until the following input resolves the ambiguity.
+    #[must_use]
+    pub fn preview(&self) -> &str {
+        if self.pending == "nn" {
+            "ん"
+        } else {
+            &self.pending
+        }
+    }
+
     /// Removes one uncommitted romaji character.
     pub fn backspace(&mut self) -> bool {
         self.pending.pop().is_some()
@@ -90,7 +105,25 @@ impl RomajiComposer {
                         self.pending.drain(..2);
                         continue;
                     }
-                    if second == b'n' || (!is_vowel(second) && second != b'y') {
+                    if second == b'n' {
+                        if bytes.len() == 2 {
+                            if flush {
+                                output.push('ん');
+                                self.pending.clear();
+                            }
+                            break;
+                        }
+
+                        output.push('ん');
+                        let third = bytes[2];
+                        if is_vowel(third) || third == b'y' {
+                            self.pending.remove(0);
+                        } else {
+                            self.pending.drain(..2);
+                        }
+                        continue;
+                    }
+                    if !is_vowel(second) && second != b'y' {
                         output.push('ん');
                         self.pending.remove(0);
                         continue;
@@ -98,15 +131,21 @@ impl RomajiComposer {
                 }
             }
 
-            if let Some(kana) = exact_match(&self.pending)
-                && (flush || !has_longer_match(&self.pending))
+            let matching_entries = matching_entries(&self.pending);
+            if let Some((_, kana)) = matching_entries
+                .iter()
+                .find(|(romaji, _)| *romaji == self.pending)
+                && (flush
+                    || !matching_entries
+                        .iter()
+                        .any(|(romaji, _)| romaji.len() > self.pending.len()))
             {
                 output.push_str(kana);
                 self.pending.clear();
                 continue;
             }
 
-            if has_prefix(&self.pending) || self.pending.len() == 1 {
+            if !matching_entries.is_empty() || self.pending.len() == 1 {
                 break;
             }
 
@@ -126,22 +165,19 @@ const fn is_consonant(byte: u8) -> bool {
     byte.is_ascii_alphabetic() && !is_vowel(byte)
 }
 
-fn exact_match(input: &str) -> Option<&'static str> {
-    ROMAJI_TABLE
+fn matching_entries(input: &str) -> &'static [(&'static str, &'static str)] {
+    static SORTED_TABLE: OnceLock<Box<[(&str, &str)]>> = OnceLock::new();
+    let table = SORTED_TABLE.get_or_init(|| {
+        let mut table = ROMAJI_TABLE.to_vec();
+        table.sort_unstable_by_key(|(romaji, _)| *romaji);
+        table.into_boxed_slice()
+    });
+    let start = table.partition_point(|(romaji, _)| *romaji < input);
+    let matching_length = table[start..]
         .iter()
-        .find_map(|(romaji, kana)| (*romaji == input).then_some(*kana))
-}
-
-fn has_prefix(input: &str) -> bool {
-    ROMAJI_TABLE
-        .iter()
-        .any(|(romaji, _)| romaji.starts_with(input))
-}
-
-fn has_longer_match(input: &str) -> bool {
-    ROMAJI_TABLE
-        .iter()
-        .any(|(romaji, _)| romaji.len() > input.len() && romaji.starts_with(input))
+        .take_while(|(romaji, _)| romaji.starts_with(input))
+        .count();
+    &table[start..start + matching_length]
 }
 
 const ROMAJI_TABLE: &[(&str, &str)] = &[
@@ -288,7 +324,7 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::RomajiComposer;
+    use super::{ROMAJI_TABLE, RomajiComposer};
 
     fn compose(input: &str) -> String {
         let mut composer = RomajiComposer::new();
@@ -324,6 +360,21 @@ mod tests {
         assert_eq!(compose("kanpai"), "かんぱい");
         assert_eq!(compose("kin'youbi"), "きんようび");
         assert_eq!(compose("hon"), "ほん");
+        assert_eq!(compose("honn"), "ほん");
+        assert_eq!(compose("annai"), "あんない");
+    }
+
+    #[test]
+    fn previews_ambiguous_n_without_committing_it() {
+        let mut composer = RomajiComposer::new();
+
+        assert_eq!(composer.push('n').unwrap(), "");
+        assert_eq!(composer.preview(), "n");
+        assert_eq!(composer.push('n').unwrap(), "");
+        assert_eq!(composer.preview(), "ん");
+
+        assert!(composer.backspace());
+        assert_eq!(composer.preview(), "n");
     }
 
     #[test]
@@ -350,5 +401,12 @@ mod tests {
         let mut composer = RomajiComposer::new();
         assert!(composer.push('1').is_err());
         assert_eq!(composer.pending(), "");
+    }
+
+    #[test]
+    fn every_table_entry_converts() {
+        for (romaji, kana) in ROMAJI_TABLE {
+            assert_eq!(compose(romaji), *kana, "failed to convert {romaji}");
+        }
     }
 }

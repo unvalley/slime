@@ -107,7 +107,7 @@ impl ImeEngine {
             actions.push(ImeAction::HideCandidates);
         }
 
-        if character.is_ascii_alphabetic() || character == '\'' {
+        if character.is_ascii_alphabetic() || (character == '\'' && self.romaji.pending() == "n") {
             let kana = self
                 .romaji
                 .push(character)
@@ -115,7 +115,7 @@ impl ImeEngine {
             self.reading.push_str(&kana);
         } else {
             self.reading.push_str(&self.romaji.flush());
-            self.reading.push(character);
+            self.reading.push(normalize_ascii_character(character));
         }
 
         actions.push(ImeAction::UpdatePreedit(self.preedit()));
@@ -232,8 +232,7 @@ impl ImeEngine {
         }
 
         let mut preedit = self.reading.clone();
-        let mut preview = self.romaji.clone();
-        preedit.push_str(&preview.flush());
+        preedit.push_str(self.romaji.preview());
         preedit
     }
 
@@ -246,6 +245,16 @@ impl ImeEngine {
         self.reading.clear();
         self.candidates.clear();
         self.selected = 0;
+    }
+}
+
+fn normalize_ascii_character(character: char) -> char {
+    match character {
+        ',' => '、',
+        '.' => '。',
+        character @ '!'..='~' => char::from_u32(u32::from(character) + 0xFEE0)
+            .expect("ASCII graphic characters have full-width forms"),
+        character => character,
     }
 }
 
@@ -266,12 +275,53 @@ mod tests {
     }
 
     #[test]
-    fn romaji_is_exposed_as_hiragana_preedit() {
+    fn ambiguous_trailing_n_remains_literal_in_preedit() {
         let mut engine = ImeEngine::bundled();
         type_text(&mut engine, "nihon");
 
-        assert_eq!(engine.snapshot().preedit, "にほん");
+        assert_eq!(engine.snapshot().preedit, "にほn");
         assert_eq!(engine.snapshot().phase, Phase::Composing);
+    }
+
+    #[test]
+    fn ambiguous_n_stays_editable_and_double_n_is_one_syllabic_n() {
+        let mut engine = ImeEngine::bundled();
+
+        type_text(&mut engine, "n");
+        assert_eq!(engine.snapshot().preedit, "n");
+
+        type_text(&mut engine, "n");
+        assert_eq!(engine.snapshot().preedit, "ん");
+
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&ImeAction::Commit("ん".to_owned())));
+    }
+
+    #[test]
+    fn double_n_can_still_begin_the_following_na_row_syllable() {
+        let mut engine = ImeEngine::bundled();
+        type_text(&mut engine, "annai");
+
+        assert_eq!(engine.snapshot().preedit, "あんない");
+    }
+
+    #[test]
+    fn ascii_numbers_and_symbols_are_normalized_for_japanese_input() {
+        let mut engine = ImeEngine::bundled();
+        type_text(&mut engine, "123,.!?()[]+-/@#'");
+
+        assert_eq!(
+            engine.snapshot().preedit,
+            "１２３、。！？（）［］＋－／＠＃＇"
+        );
+    }
+
+    #[test]
+    fn punctuation_resolves_a_trailing_n_before_it_is_inserted() {
+        let mut engine = ImeEngine::bundled();
+        type_text(&mut engine, "hon,");
+
+        assert_eq!(engine.snapshot().preedit, "ほん、");
     }
 
     #[test]
@@ -284,7 +334,7 @@ mod tests {
         assert_eq!(engine.snapshot().phase, Phase::Converting);
 
         engine.handle(InputEvent::Space);
-        assert_eq!(engine.snapshot().preedit, "二本");
+        assert_eq!(engine.snapshot().preedit, "ニホン");
     }
 
     #[test]

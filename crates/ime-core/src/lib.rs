@@ -253,6 +253,9 @@ impl ImeEngine {
             .into_iter()
             .map(|candidate| candidate.surface)
         {
+            if surface == self.reading && !candidates.is_empty() {
+                continue;
+            }
             push_unique(&mut candidates, surface);
         }
         insert_visible_katakana_candidate(&mut candidates, &self.reading);
@@ -1225,7 +1228,11 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(engine.snapshot().candidates[1], "ホゲホゲ");
+        assert!(
+            engine.snapshot().candidates[..2].contains(&"ホゲホゲ".to_owned()),
+            "katakana candidate stays on the first page: {:?}",
+            &engine.snapshot().candidates[..2]
+        );
     }
 
     #[test]

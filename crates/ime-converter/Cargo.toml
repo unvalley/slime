@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+fst = "0.4"
+
+[build-dependencies]
+fst = "0.4"
+
 [lints]
 workspace = true
 

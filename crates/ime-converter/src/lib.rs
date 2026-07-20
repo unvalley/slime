@@ -1,6 +1,9 @@
 //! A small, deterministic kana-kanji conversion baseline backed by a reduced
 //! Mozc OSS dictionary.
 
+mod compact;
+
+use compact::CompactDictionary;
 use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,67 +127,24 @@ impl DictionaryLayer {
     pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
-
-    fn from_sorted(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        entries: Arc<[DictionaryEntry]>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            name: name.into(),
-            max_reading_bytes: entries
-                .iter()
-                .map(|entry| entry.reading.len())
-                .max()
-                .unwrap_or(0),
-            entries,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Dictionary {
+    bundled: Option<&'static CompactDictionary>,
     layers: Arc<[DictionaryLayer]>,
     uses_connection_costs: bool,
-    max_reading_bytes: usize,
 }
 
-macro_rules! for_each_exact_entry {
-    ($dictionary:expr, $reading:expr, $entry:ident, $body:block) => {{
-        if $dictionary.layers.len() == 1 {
-            for $entry in exact_entries_in_layer(&$dictionary.layers[0], $reading) $body
-        } else {
-            for layer in $dictionary.layers.iter() {
-                for $entry in exact_entries_in_layer(layer, $reading) $body
-            }
-        }
-    }};
-}
-
-macro_rules! for_each_prefix_end {
-    ($suffix:expr, $maximum:expr, $end:ident, $body:block) => {{
-        if $suffix.len() <= $maximum {
-            for $end in $suffix
-                .char_indices()
-                .skip(1)
-                .map(|(index, _)| index)
-                .chain(std::iter::once($suffix.len()))
-            $body
-        } else {
-            for $end in $suffix
-                .char_indices()
-                .skip(1)
-                .map(|(index, _)| index)
-                .chain(std::iter::once($suffix.len()))
-            {
-                if $end > $maximum {
-                    break;
-                }
-                $body
-            }
-        }
-    }};
+/// A borrowed view of one dictionary entry during lattice construction. The
+/// entry's reading is always the query string itself, so only the surface and
+/// costs are carried.
+#[derive(Clone, Copy, Debug)]
+struct EntryView<'a> {
+    surface: &'a str,
+    left_id: u16,
+    right_id: u16,
+    word_cost: i32,
 }
 
 impl Dictionary {
@@ -192,7 +152,7 @@ impl Dictionary {
     pub fn new(entries: Vec<DictionaryEntry>) -> Self {
         let layer = DictionaryLayer::new("default", "Default", entries);
         Self {
-            max_reading_bytes: layer.max_reading_bytes,
+            bundled: None,
             layers: vec![layer].into(),
             uses_connection_costs: false,
         }
@@ -200,51 +160,111 @@ impl Dictionary {
 
     #[must_use]
     pub fn bundled() -> Self {
-        static LAYERS: OnceLock<Arc<[DictionaryLayer]>> = OnceLock::new();
-        let layers = Arc::clone(LAYERS.get_or_init(|| {
-            vec![DictionaryLayer::from_sorted(
-                "basic",
-                "基本辞書",
-                parse_bundled_entries().into(),
-            )]
-            .into()
-        }));
         Self {
-            max_reading_bytes: layers[0].max_reading_bytes,
-            layers,
+            bundled: Some(CompactDictionary::bundled()),
+            layers: Vec::new().into(),
             uses_connection_costs: true,
         }
     }
 
     #[must_use]
     pub fn bundled_with_layers(additional_layers: Vec<DictionaryLayer>) -> Self {
-        let bundled = Self::bundled();
-        if additional_layers.is_empty() {
-            return bundled;
-        }
-        let mut layers = Vec::with_capacity(1 + additional_layers.len());
-        layers.extend(bundled.layers.iter().cloned());
-        layers.extend(additional_layers);
-        let max_reading_bytes = layers
-            .iter()
-            .map(|layer| layer.max_reading_bytes)
-            .max()
-            .unwrap_or(0);
         Self {
-            layers: layers.into(),
+            bundled: Some(CompactDictionary::bundled()),
+            layers: additional_layers.into(),
             uses_connection_costs: true,
-            max_reading_bytes,
         }
     }
 
     #[must_use]
     pub fn entry_count(&self) -> usize {
-        self.layers.iter().map(DictionaryLayer::entry_count).sum()
+        self.bundled.map_or(0, CompactDictionary::entry_count)
+            + self
+                .layers
+                .iter()
+                .map(DictionaryLayer::entry_count)
+                .sum::<usize>()
     }
 
     #[must_use]
     pub fn layer_count(&self) -> usize {
-        self.layers.len()
+        usize::from(self.bundled.is_some()) + self.layers.len()
+    }
+
+    /// Calls `callback` for every entry whose reading equals `reading`.
+    fn for_each_exact<'s>(&'s self, reading: &str, mut callback: impl FnMut(EntryView<'s>)) {
+        if let Some(compact) = self.bundled {
+            compact.for_each_exact(reading, |entry| {
+                callback(EntryView {
+                    surface: entry.surface,
+                    left_id: entry.left_id,
+                    right_id: entry.right_id,
+                    word_cost: entry.word_cost,
+                });
+            });
+        }
+        for layer in self.layers.iter() {
+            for entry in exact_entries_in_layer(layer, reading) {
+                callback(EntryView {
+                    surface: &entry.surface,
+                    left_id: entry.left_id,
+                    right_id: entry.right_id,
+                    word_cost: entry.word_cost,
+                });
+            }
+        }
+    }
+
+    /// Calls `callback(prefix_bytes, entry)` for every entry whose reading is
+    /// a prefix of `suffix`.
+    fn for_each_prefix<'s>(&'s self, suffix: &str, mut callback: impl FnMut(usize, EntryView<'s>)) {
+        if let Some(compact) = self.bundled {
+            compact.for_each_prefix(suffix, |prefix_bytes, entry| {
+                callback(
+                    prefix_bytes,
+                    EntryView {
+                        surface: entry.surface,
+                        left_id: entry.left_id,
+                        right_id: entry.right_id,
+                        word_cost: entry.word_cost,
+                    },
+                );
+            });
+        }
+
+        if self.layers.is_empty() {
+            return;
+        }
+        let maximum = self
+            .layers
+            .iter()
+            .map(|layer| layer.max_reading_bytes)
+            .max()
+            .unwrap_or(0);
+        for prefix_bytes in suffix
+            .char_indices()
+            .skip(1)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(suffix.len()))
+        {
+            if prefix_bytes > maximum {
+                break;
+            }
+            let prefix = &suffix[..prefix_bytes];
+            for layer in self.layers.iter() {
+                for entry in exact_entries_in_layer(layer, prefix) {
+                    callback(
+                        prefix_bytes,
+                        EntryView {
+                            surface: &entry.surface,
+                            left_id: entry.left_id,
+                            right_id: entry.right_id,
+                            word_cost: entry.word_cost,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -261,23 +281,31 @@ impl Dictionary {
     ) -> Vec<Candidate> {
         let mut candidates = Vec::<Candidate>::new();
         let mut conversions = Vec::new();
-        for_each_exact_entry!(self, reading, entry, {
-            let cost = if entry.surface == entry.reading {
+        self.for_each_exact(reading, |entry| {
+            let cost = if entry.surface == reading {
                 LITERAL_CANDIDATE_COST
             } else {
                 entry.word_cost
             };
             conversions.push(Conversion {
-                surface: entry.surface.clone(),
+                surface: entry.surface.to_owned(),
                 segments: vec![Segment {
-                    reading: entry.reading.clone(),
-                    surface: entry.surface.clone(),
+                    reading: reading.to_owned(),
+                    surface: entry.surface.to_owned(),
                     cost,
                 }],
                 cost,
             });
         });
-        conversions.extend(self.convert_n_best(reading, limit));
+        let n_best = self.convert_n_best(reading, limit);
+        if let Some(best_cost) = n_best.first().map(|conversion| conversion.cost) {
+            let maximum_cost = best_cost.saturating_add(candidate_cost_window(reading));
+            conversions.extend(
+                n_best
+                    .into_iter()
+                    .filter(|conversion| conversion.cost <= maximum_cost),
+            );
+        }
 
         for conversion in conversions {
             let cost = if conversion.surface == reading {
@@ -358,28 +386,26 @@ impl Dictionary {
             }
 
             let suffix = &reading[start..];
-            for_each_prefix_end!(suffix, self.max_reading_bytes(), relative_end, {
+            self.for_each_prefix(suffix, |relative_end, entry| {
                 let prefix = &suffix[..relative_end];
-                for_each_exact_entry!(self, prefix, entry, {
-                    let is_literal = entry.surface == entry.reading;
-                    if is_literal && !is_grammar_literal(prefix) {
-                        continue;
-                    }
+                let is_literal = entry.surface == prefix;
+                if is_literal && !is_grammar_literal(prefix) {
+                    return;
+                }
 
-                    let end = start + relative_end;
-                    let word_cost = if is_literal { 0 } else { entry.word_cost };
-                    let segment_cost = word_cost.saturating_add(SEGMENT_PENALTY);
-                    update_path(
-                        &mut best_cost,
-                        &mut previous,
-                        start,
-                        end,
-                        path_cost.saturating_add(segment_cost),
-                        &entry.reading,
-                        &entry.surface,
-                        segment_cost,
-                    );
-                });
+                let end = start + relative_end;
+                let word_cost = if is_literal { 0 } else { entry.word_cost };
+                let segment_cost = word_cost.saturating_add(SEGMENT_PENALTY);
+                update_path(
+                    &mut best_cost,
+                    &mut previous,
+                    start,
+                    end,
+                    path_cost.saturating_add(segment_cost),
+                    prefix,
+                    entry.surface,
+                    segment_cost,
+                );
             });
 
             let Some(character) = suffix.chars().next() else {
@@ -436,6 +462,7 @@ impl Dictionary {
         }
 
         let connection = ConnectionMatrix::bundled();
+        let synthetic_by_start = synthetic_entries_by_start(reading);
         let mut lattice: Vec<Vec<LatticeNode<'_>>> =
             (0..=reading.len()).map(|_| Vec::new()).collect();
         let mut predecessor_cache = Vec::new();
@@ -451,33 +478,55 @@ impl Dictionary {
             predecessor_cache.clear();
 
             let suffix = &reading[start..];
-            for_each_prefix_end!(suffix, self.max_reading_bytes(), relative_end, {
-                let prefix = &suffix[..relative_end];
-                for_each_exact_entry!(self, prefix, entry, {
-                    let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
-                        &lattice,
+            self.for_each_prefix(suffix, |relative_end, entry| {
+                let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
+                    &lattice,
+                    start,
+                    entry.left_id,
+                    connection,
+                    &mut predecessor_cache,
+                ) else {
+                    return;
+                };
+                let total_cost = predecessor_cost.saturating_add(entry.word_cost);
+                insert_lattice_node(
+                    &mut lattice[start + relative_end],
+                    LatticeNode {
                         start,
-                        entry.left_id,
-                        connection,
-                        &mut predecessor_cache,
-                    ) else {
-                        continue;
-                    };
-                    let total_cost = predecessor_cost.saturating_add(entry.word_cost);
-                    insert_lattice_node(
-                        &mut lattice[start + relative_end],
-                        LatticeNode {
-                            start,
-                            predecessor,
-                            reading: &entry.reading,
-                            surface: &entry.surface,
-                            segment_cost: entry.word_cost,
-                            right_id: entry.right_id,
-                            total_cost,
-                        },
-                    );
-                });
+                        predecessor,
+                        reading: &suffix[..relative_end],
+                        surface: entry.surface,
+                        segment_cost: entry.word_cost,
+                        right_id: entry.right_id,
+                        total_cost,
+                    },
+                );
             });
+
+            for synthetic in &synthetic_by_start[start] {
+                let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
+                    &lattice,
+                    start,
+                    synthetic.left_id,
+                    connection,
+                    &mut predecessor_cache,
+                ) else {
+                    continue;
+                };
+                let total_cost = predecessor_cost.saturating_add(synthetic.cost);
+                insert_lattice_node(
+                    &mut lattice[synthetic.end],
+                    LatticeNode {
+                        start,
+                        predecessor,
+                        reading: &reading[start..synthetic.end],
+                        surface: &synthetic.surface,
+                        segment_cost: synthetic.cost,
+                        right_id: synthetic.right_id,
+                        total_cost,
+                    },
+                );
+            }
 
             let character = suffix.chars().next()?;
             let end = start + character.len_utf8();
@@ -510,6 +559,7 @@ impl Dictionary {
 
     fn convert_n_best_connected(&self, reading: &str, limit: usize) -> Vec<Conversion> {
         let connection = ConnectionMatrix::bundled();
+        let synthetic_by_start = synthetic_entries_by_start(reading);
         let mut arena = Vec::<NBestNode<'_>>::new();
         let mut lattice: Vec<Vec<usize>> = (0..=reading.len()).map(|_| Vec::new()).collect();
 
@@ -524,52 +574,35 @@ impl Dictionary {
             let predecessors = lattice[start].clone();
             let suffix = &reading[start..];
 
-            for_each_prefix_end!(suffix, self.max_reading_bytes(), relative_end, {
-                let prefix = &suffix[..relative_end];
-                for_each_exact_entry!(self, prefix, entry, {
-                    if start == 0 {
-                        let total_cost = connection
-                            .cost(BOS_EOS_POS_ID, entry.left_id)
-                            .saturating_add(entry.word_cost);
-                        insert_n_best_node(
-                            &mut arena,
-                            &mut lattice[start + relative_end],
-                            NBestNode {
-                                start,
-                                predecessor: None,
-                                reading: &entry.reading,
-                                surface: &entry.surface,
-                                segment_cost: entry.word_cost,
-                                right_id: entry.right_id,
-                                total_cost,
-                            },
-                            limit,
-                        );
-                    } else {
-                        for &predecessor in &predecessors {
-                            let previous = &arena[predecessor];
-                            let total_cost = previous
-                                .total_cost
-                                .saturating_add(connection.cost(previous.right_id, entry.left_id))
-                                .saturating_add(entry.word_cost);
-                            insert_n_best_node(
-                                &mut arena,
-                                &mut lattice[start + relative_end],
-                                NBestNode {
-                                    start,
-                                    predecessor: Some(predecessor),
-                                    reading: &entry.reading,
-                                    surface: &entry.surface,
-                                    segment_cost: entry.word_cost,
-                                    right_id: entry.right_id,
-                                    total_cost,
-                                },
-                                limit,
-                            );
-                        }
-                    }
-                });
+            self.for_each_prefix(suffix, |relative_end, entry| {
+                insert_connected_word(
+                    &mut arena,
+                    &mut lattice[start + relative_end],
+                    &predecessors,
+                    connection,
+                    start,
+                    &suffix[..relative_end],
+                    entry.surface,
+                    (entry.left_id, entry.right_id),
+                    entry.word_cost,
+                    limit,
+                );
             });
+
+            for synthetic in &synthetic_by_start[start] {
+                insert_connected_word(
+                    &mut arena,
+                    &mut lattice[synthetic.end],
+                    &predecessors,
+                    connection,
+                    start,
+                    &reading[start..synthetic.end],
+                    &synthetic.surface,
+                    (synthetic.left_id, synthetic.right_id),
+                    synthetic.cost,
+                    limit,
+                );
+            }
 
             insert_connected_unknown(
                 reading,
@@ -612,51 +645,48 @@ impl Dictionary {
             let predecessors = lattice[start].clone();
             let suffix = &reading[start..];
 
-            for_each_prefix_end!(suffix, self.max_reading_bytes(), relative_end, {
+            self.for_each_prefix(suffix, |relative_end, entry| {
                 let prefix = &suffix[..relative_end];
-                for_each_exact_entry!(self, prefix, entry, {
-                    let is_literal = entry.surface == entry.reading;
-                    if is_literal && !is_grammar_literal(prefix) {
-                        continue;
-                    }
-                    let segment_cost = if is_literal { 0 } else { entry.word_cost }
-                        .saturating_add(SEGMENT_PENALTY);
-                    if start == 0 {
+                let is_literal = entry.surface == prefix;
+                if is_literal && !is_grammar_literal(prefix) {
+                    return;
+                }
+                let segment_cost =
+                    if is_literal { 0 } else { entry.word_cost }.saturating_add(SEGMENT_PENALTY);
+                if start == 0 {
+                    insert_n_best_node(
+                        &mut arena,
+                        &mut lattice[start + relative_end],
+                        NBestNode {
+                            start,
+                            predecessor: None,
+                            reading: prefix,
+                            surface: entry.surface,
+                            segment_cost,
+                            right_id: 0,
+                            total_cost: segment_cost,
+                        },
+                        limit,
+                    );
+                } else {
+                    for &predecessor in &predecessors {
+                        let total_cost = arena[predecessor].total_cost.saturating_add(segment_cost);
                         insert_n_best_node(
                             &mut arena,
                             &mut lattice[start + relative_end],
                             NBestNode {
                                 start,
-                                predecessor: None,
-                                reading: &entry.reading,
-                                surface: &entry.surface,
+                                predecessor: Some(predecessor),
+                                reading: prefix,
+                                surface: entry.surface,
                                 segment_cost,
                                 right_id: 0,
-                                total_cost: segment_cost,
+                                total_cost,
                             },
                             limit,
                         );
-                    } else {
-                        for &predecessor in &predecessors {
-                            let total_cost =
-                                arena[predecessor].total_cost.saturating_add(segment_cost);
-                            insert_n_best_node(
-                                &mut arena,
-                                &mut lattice[start + relative_end],
-                                NBestNode {
-                                    start,
-                                    predecessor: Some(predecessor),
-                                    reading: &entry.reading,
-                                    surface: &entry.surface,
-                                    segment_cost,
-                                    right_id: 0,
-                                    total_cost,
-                                },
-                                limit,
-                            );
-                        }
                     }
-                });
+                }
             });
 
             insert_heuristic_unknown(
@@ -675,10 +705,6 @@ impl Dictionary {
             .collect();
         completed.sort_unstable_by_key(|(_, cost)| *cost);
         reconstruct_n_best_conversions(&arena, &completed, limit)
-    }
-
-    fn max_reading_bytes(&self) -> usize {
-        self.max_reading_bytes
     }
 }
 
@@ -906,6 +932,65 @@ fn insert_heuristic_unknown<'a>(
     }
 }
 
+/// Inserts one word (dictionary or synthetic) into the n-best lattice,
+/// fanning out over every predecessor state at `start`.
+#[allow(clippy::too_many_arguments)]
+fn insert_connected_word<'a>(
+    arena: &mut Vec<NBestNode<'a>>,
+    states: &mut Vec<usize>,
+    predecessors: &[usize],
+    connection: ConnectionMatrix,
+    start: usize,
+    word_reading: &'a str,
+    surface: &'a str,
+    (left_id, right_id): (u16, u16),
+    word_cost: i32,
+    limit: usize,
+) {
+    if start == 0 {
+        let total_cost = connection
+            .cost(BOS_EOS_POS_ID, left_id)
+            .saturating_add(word_cost);
+        insert_n_best_node(
+            arena,
+            states,
+            NBestNode {
+                start,
+                predecessor: None,
+                reading: word_reading,
+                surface,
+                segment_cost: word_cost,
+                right_id,
+                total_cost,
+            },
+            limit,
+        );
+        return;
+    }
+
+    for &predecessor in predecessors {
+        let previous = &arena[predecessor];
+        let total_cost = previous
+            .total_cost
+            .saturating_add(connection.cost(previous.right_id, left_id))
+            .saturating_add(word_cost);
+        insert_n_best_node(
+            arena,
+            states,
+            NBestNode {
+                start,
+                predecessor: Some(predecessor),
+                reading: word_reading,
+                surface,
+                segment_cost: word_cost,
+                right_id,
+                total_cost,
+            },
+            limit,
+        );
+    }
+}
+
 fn insert_n_best_node<'a>(
     arena: &mut Vec<NBestNode<'a>>,
     states: &mut Vec<usize>,
@@ -1077,11 +1162,11 @@ struct ConnectionMatrix {
 impl ConnectionMatrix {
     fn bundled() -> Self {
         let bytes = include_bytes!("../data/mozc-connection.bin").as_slice();
-        assert_eq!(&bytes[..4], b"UCN1", "connection matrix magic");
+        assert_eq!(&bytes[..4], b"UCN2", "connection matrix magic");
         let size = usize::from(u16::from_le_bytes([bytes[4], bytes[5]]));
         let offsets_start = 8;
         let modes_start = offsets_start + (size + 1) * 4;
-        let entries_start = modes_start + size;
+        let entries_start = modes_start + size * 2;
         Self {
             bytes,
             size,
@@ -1102,7 +1187,7 @@ impl ConnectionMatrix {
         let mut high = self.offset(right + 1);
         while low < high {
             let middle = low + (high - low) / 2;
-            let entry_offset = self.entries_start + middle * 3;
+            let entry_offset = self.entries_start + middle * 4;
             let entry_left = usize::from(u16::from_le_bytes([
                 self.bytes[entry_offset],
                 self.bytes[entry_offset + 1],
@@ -1111,12 +1196,19 @@ impl ConnectionMatrix {
                 std::cmp::Ordering::Less => low = middle + 1,
                 std::cmp::Ordering::Greater => high = middle,
                 std::cmp::Ordering::Equal => {
-                    return decode_connection_cost(self.bytes[entry_offset + 2]);
+                    return i32::from(u16::from_le_bytes([
+                        self.bytes[entry_offset + 2],
+                        self.bytes[entry_offset + 3],
+                    ]));
                 }
             }
         }
 
-        decode_connection_cost(self.bytes[self.modes_start + right])
+        let mode_offset = self.modes_start + right * 2;
+        i32::from(u16::from_le_bytes([
+            self.bytes[mode_offset],
+            self.bytes[mode_offset + 1],
+        ]))
     }
 
     fn offset(self, row: usize) -> usize {
@@ -1127,14 +1219,6 @@ impl ConnectionMatrix {
             self.bytes[offset + 2],
             self.bytes[offset + 3],
         ]) as usize
-    }
-}
-
-fn decode_connection_cost(value: u8) -> i32 {
-    if value == u8::MAX {
-        INVALID_CONNECTION_COST
-    } else {
-        i32::from(value) * CONNECTION_COST_RESOLUTION
     }
 }
 
@@ -1167,10 +1251,46 @@ const LITERAL_CANDIDATE_COST: i32 = i32::MAX;
 const SEGMENT_PENALTY: i32 = 1_000;
 const DEFAULT_N_BEST: usize = 10;
 const N_BEST_BEAM_FACTOR: usize = 8;
-const CONNECTION_COST_RESOLUTION: i32 = 64;
+const CANDIDATE_COST_PER_CHARACTER: i32 = 2_000;
+const MINIMUM_CANDIDATE_COST_WINDOW: i32 = 6_000;
 const INVALID_CONNECTION_COST: i32 = 30_000;
 const BOS_EOS_POS_ID: u16 = 0;
 const UNKNOWN_POS_ID: u16 = 1851;
+const ARABIC_NUMBER_POS_ID: u16 = 2044;
+const KANJI_NUMBER_POS_ID: u16 = 2051;
+const NUMBER_VARIANT_STEP: i32 = 50;
+const KATAKANA_RUN_MAX_CHARACTERS: usize = 12;
+
+fn katakana_run_base_cost() -> i32 {
+    static VALUE: OnceLock<i32> = OnceLock::new();
+    *VALUE.get_or_init(|| tuning_parameter("IME_KATAKANA_BASE", 1_000))
+}
+
+fn katakana_run_character_cost() -> i32 {
+    static VALUE: OnceLock<i32> = OnceLock::new();
+    *VALUE.get_or_init(|| tuning_parameter("IME_KATAKANA_PER_CHAR", 4_000))
+}
+
+fn number_cost() -> i32 {
+    static VALUE: OnceLock<i32> = OnceLock::new();
+    *VALUE.get_or_init(|| tuning_parameter("IME_NUMBER_COST", 2_000))
+}
+
+/// Evaluation-only override hook so cost sweeps do not need a rebuild; the
+/// defaults are the tuned production values.
+fn tuning_parameter(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn candidate_cost_window(reading: &str) -> i32 {
+    let character_count = i32::try_from(reading.chars().count()).unwrap_or(i32::MAX);
+    character_count
+        .saturating_mul(CANDIDATE_COST_PER_CHARACTER)
+        .max(MINIMUM_CANDIDATE_COST_WINDOW)
+}
 
 fn is_grammar_literal(reading: &str) -> bool {
     matches!(
@@ -1209,61 +1329,235 @@ fn is_grammar_literal(reading: &str) -> bool {
     )
 }
 
-fn parse_bundled_entries() -> Vec<DictionaryEntry> {
-    let mut entries: Vec<_> = include_str!("../data/mozc-basic.tsv")
-        .lines()
-        .map(|line| {
-            let mut columns = line.split('\t');
-            let reading = columns.next().expect("bundled dictionary reading");
-            let surface = columns.next().expect("bundled dictionary surface");
-            let left_id = columns
-                .next()
-                .expect("bundled dictionary left ID")
-                .parse()
-                .expect("bundled dictionary numeric left ID");
-            let right_id = columns
-                .next()
-                .expect("bundled dictionary right ID")
-                .parse()
-                .expect("bundled dictionary numeric right ID");
-            let source_cost = columns
-                .next()
-                .expect("bundled dictionary cost")
-                .parse()
-                .expect("bundled dictionary numeric cost");
-            assert!(columns.next().is_none(), "bundled dictionary column count");
-            let word_cost = preferred_basic_cost(reading, surface).unwrap_or(source_cost);
-            DictionaryEntry::with_pos(reading, surface, left_id, right_id, word_cost)
-        })
-        .collect();
-
-    // Word costs alone cannot distinguish 制度 from 精度 because both share
-    // the same noun class. Keep a small, reviewable phrase layer for semantic
-    // collocations that are part of the must-pass suite.
-    entries.push(DictionaryEntry::with_pos(
-        "せいどをたかめる",
-        "精度を高める",
-        1851,
-        680,
-        500,
-    ));
-    entries.push(DictionaryEntry::with_pos(
-        "はしでたべる",
-        "箸で食べる",
-        1851,
-        680,
-        500,
-    ));
-    entries.sort_unstable_by(|left, right| left.reading.cmp(&right.reading));
-    entries
+/// A lattice node generated at runtime instead of coming from the dictionary:
+/// composed numerals (せんきゅうひゃく → 1900) and katakana runs for unknown
+/// foreign words. `end` is the absolute byte offset where the node stops.
+#[derive(Clone, Debug)]
+struct SyntheticEntry {
+    end: usize,
+    surface: String,
+    left_id: u16,
+    right_id: u16,
+    cost: i32,
 }
 
-fn preferred_basic_cost(reading: &str, surface: &str) -> Option<i32> {
-    match (reading, surface) {
-        // Standalone word costs rank 感じ above 漢字. Keep this fundamental
-        // IME term in the must-pass set until a word-context model replaces it.
-        ("かんじ", "漢字") => Some(500),
-        _ => None,
+fn synthetic_entries_by_start(reading: &str) -> Vec<Vec<SyntheticEntry>> {
+    let mut by_start: Vec<Vec<SyntheticEntry>> = (0..=reading.len()).map(|_| Vec::new()).collect();
+    for (start, _) in reading.char_indices() {
+        push_number_entries(reading, start, &mut by_start[start]);
+        push_katakana_entries(reading, start, &mut by_start[start]);
+    }
+    by_start
+}
+
+#[derive(Clone, Copy)]
+enum NumberToken {
+    Digit(u64),
+    Small(u64),
+    Big(u64),
+}
+
+/// Longest-match kana numeral tokens. Single-character readings that are
+/// overwhelmingly grammatical (に, し, く, ご) never form a number on their
+/// own; they only contribute inside longer sequences.
+const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
+    ("きゅう", NumberToken::Digit(9)),
+    ("ぜろ", NumberToken::Digit(0)),
+    ("れい", NumberToken::Digit(0)),
+    ("いち", NumberToken::Digit(1)),
+    ("さん", NumberToken::Digit(3)),
+    ("よん", NumberToken::Digit(4)),
+    ("なな", NumberToken::Digit(7)),
+    ("しち", NumberToken::Digit(7)),
+    ("はち", NumberToken::Digit(8)),
+    ("ろく", NumberToken::Digit(6)),
+    ("じゅっ", NumberToken::Small(10)),
+    ("じゅう", NumberToken::Small(10)),
+    ("ひゃく", NumberToken::Small(100)),
+    ("びゃく", NumberToken::Small(100)),
+    ("ぴゃく", NumberToken::Small(100)),
+    ("せん", NumberToken::Small(1_000)),
+    ("ぜん", NumberToken::Small(1_000)),
+    ("まん", NumberToken::Big(10_000)),
+    ("おく", NumberToken::Big(100_000_000)),
+    ("に", NumberToken::Digit(2)),
+    ("し", NumberToken::Digit(4)),
+    ("ご", NumberToken::Digit(5)),
+    ("く", NumberToken::Digit(9)),
+];
+
+const RISKY_SINGLE_NUMBER_READINGS: &[&str] = &["に", "し", "ご", "く", "ぜん", "じゅっ"];
+
+/// Parses kana numeral prefixes of `suffix`. Returns every token boundary at
+/// which the consumed prefix forms a complete number, with its value.
+fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
+    let mut results = Vec::new();
+    let mut consumed = 0_usize;
+    let mut token_count = 0_usize;
+    let mut total = 0_u64;
+    let mut section = 0_u64;
+    let mut pending = 0_u64;
+    let mut pending_digits = 0_u32;
+    let mut last_small_unit = u64::MAX;
+    let mut first_token: &str = "";
+
+    while consumed < suffix.len() {
+        let rest = &suffix[consumed..];
+        let Some(&(text, token)) = NUMBER_TOKENS
+            .iter()
+            .find(|(text, _)| rest.starts_with(text))
+        else {
+            break;
+        };
+        match token {
+            NumberToken::Digit(value) => {
+                if pending_digits >= 15 {
+                    break;
+                }
+                pending = pending * 10 + value;
+                pending_digits += 1;
+            }
+            NumberToken::Small(unit) => {
+                // Positional units must strictly descend within a section
+                // (千→百→十); せんぜん or じゅうじゅう is not a numeral.
+                if pending_digits > 1 || pending >= 10 || unit >= last_small_unit {
+                    break;
+                }
+                section += pending.max(1) * unit;
+                pending = 0;
+                pending_digits = 0;
+                last_small_unit = unit;
+            }
+            NumberToken::Big(unit) => {
+                if section + pending == 0 {
+                    break;
+                }
+                total += (section + pending) * unit;
+                section = 0;
+                pending = 0;
+                pending_digits = 0;
+                last_small_unit = u64::MAX;
+            }
+        }
+        consumed += text.len();
+        token_count += 1;
+        if token_count == 1 {
+            first_token = text;
+        }
+
+        let single_and_risky =
+            token_count == 1 && RISKY_SINGLE_NUMBER_READINGS.contains(&first_token);
+        if !single_and_risky {
+            results.push((consumed, total + section + pending));
+        }
+    }
+    results
+}
+
+fn to_fullwidth_digits(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '0'..='9' => char::from_u32(u32::from(character) - u32::from('0') + u32::from('０'))
+                .expect("valid fullwidth digit"),
+            _ => character,
+        })
+        .collect()
+}
+
+fn kanji_numeral(mut value: u64) -> String {
+    const DIGITS: [&str; 10] = ["", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    if value == 0 {
+        return "〇".to_owned();
+    }
+    let mut groups = Vec::new();
+    while value > 0 {
+        groups.push(value % 10_000);
+        value /= 10_000;
+    }
+    let mut result = String::new();
+    for (index, &group) in groups.iter().enumerate().rev() {
+        if group == 0 {
+            continue;
+        }
+        let mut group_text = String::new();
+        for (unit, unit_text) in [(1_000, "千"), (100, "百"), (10, "十"), (1, "")] {
+            let digit = (group / unit) % 10;
+            if digit == 0 {
+                continue;
+            }
+            if digit > 1 || unit == 1 {
+                group_text.push_str(DIGITS[usize::try_from(digit).expect("digit fits usize")]);
+            }
+            group_text.push_str(unit_text);
+        }
+        result.push_str(&group_text);
+        match index {
+            0 => {}
+            1 => result.push('万'),
+            2 => result.push('億'),
+            _ => result.push('兆'),
+        }
+    }
+    result
+}
+
+fn push_number_entries(reading: &str, start: usize, out: &mut Vec<SyntheticEntry>) {
+    for (length, value) in parse_kana_number_prefixes(&reading[start..]) {
+        let arabic = value.to_string();
+        out.push(SyntheticEntry {
+            end: start + length,
+            surface: to_fullwidth_digits(&arabic),
+            left_id: ARABIC_NUMBER_POS_ID,
+            right_id: ARABIC_NUMBER_POS_ID,
+            cost: number_cost() + NUMBER_VARIANT_STEP,
+        });
+        out.push(SyntheticEntry {
+            end: start + length,
+            surface: kanji_numeral(value),
+            left_id: KANJI_NUMBER_POS_ID,
+            right_id: KANJI_NUMBER_POS_ID,
+            cost: number_cost() + 2 * NUMBER_VARIANT_STEP,
+        });
+        out.push(SyntheticEntry {
+            end: start + length,
+            surface: arabic,
+            left_id: ARABIC_NUMBER_POS_ID,
+            right_id: ARABIC_NUMBER_POS_ID,
+            cost: number_cost(),
+        });
+    }
+}
+
+fn is_katakana_run_character(character: char) -> bool {
+    matches!(character, 'ぁ'..='ゖ' | 'ー')
+}
+
+fn push_katakana_entries(reading: &str, start: usize, out: &mut Vec<SyntheticEntry>) {
+    let mut surface = String::new();
+    let mut characters = 0_usize;
+    for (offset, character) in reading[start..].char_indices() {
+        if !is_katakana_run_character(character) || characters == KATAKANA_RUN_MAX_CHARACTERS {
+            break;
+        }
+        surface.push(match character {
+            'ぁ'..='ゖ' => {
+                char::from_u32(u32::from(character) + 0x60).expect("valid katakana scalar")
+            }
+            other => other,
+        });
+        characters += 1;
+        if characters >= 2 {
+            out.push(SyntheticEntry {
+                end: start + offset + character.len_utf8(),
+                surface: surface.clone(),
+                left_id: UNKNOWN_POS_ID,
+                right_id: UNKNOWN_POS_ID,
+                cost: katakana_run_base_cost()
+                    + katakana_run_character_cost()
+                        * i32::try_from(characters).expect("run length fits i32"),
+            });
+        }
     }
 }
 
@@ -1351,22 +1645,49 @@ mod tests {
     }
 
     #[test]
-    fn unknown_input_falls_back_without_data_loss() {
+    fn unknown_input_converts_to_katakana_and_keeps_the_literal_reading() {
         let dictionary = Dictionary::bundled();
         let conversion = dictionary.convert_best("ゑゑ").unwrap();
+        assert_eq!(conversion.surface, "ヱヱ");
 
-        assert_eq!(conversion.surface, "ゑゑ");
-        assert_eq!(conversion.segments.len(), 2);
+        let candidates = dictionary.candidates("ゑゑ");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.surface == "ゑゑ")
+        );
     }
 
     #[test]
-    fn input_longer_than_every_dictionary_entry_still_falls_back_losslessly() {
+    fn input_longer_than_every_dictionary_entry_still_converts_completely() {
         let dictionary = Dictionary::bundled();
         let reading = "ゑ".repeat(100);
         let conversion = dictionary.convert_best(&reading).unwrap();
 
-        assert_eq!(conversion.surface, reading);
-        assert_eq!(conversion.segments.len(), 100);
+        assert_eq!(conversion.surface, "ヱ".repeat(100));
+        let reconstructed: String = conversion
+            .segments
+            .iter()
+            .map(|segment| segment.reading.as_str())
+            .collect();
+        assert_eq!(reconstructed, reading);
+    }
+
+    #[test]
+    fn kana_number_readings_compose_into_numerals() {
+        let dictionary = Dictionary::bundled();
+        let candidates = dictionary.candidates("せんきゅうひゃくきゅうじゅういちねん");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.surface == "1991年"),
+            "candidates: {candidates:?}"
+        );
+
+        assert_eq!(super::kanji_numeral(1_991), "千九百九十一");
+        assert_eq!(super::kanji_numeral(45), "四十五");
+        assert_eq!(super::kanji_numeral(30_005), "三万五");
+        assert_eq!(super::to_fullwidth_digits("45"), "４５");
     }
 
     #[test]

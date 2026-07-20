@@ -5,9 +5,9 @@ workspace_dir="$(cd "$(dirname "$0")/.." && pwd)"
 output_file="$workspace_dir/crates/ime-converter/data/mozc-basic.tsv"
 connection_output_file="$workspace_dir/crates/ime-converter/data/mozc-connection.bin"
 mozc_revision="3f235b4eb6fcff7d14ef5f0fb8ee56de7ee4c732"
-dictionary_cost_threshold=5500
-expected_entries=170229
-expected_connection_bytes=2666488
+dictionary_cost_threshold=8500
+expected_entries=1085464
+expected_connection_bytes=3553636
 
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
@@ -66,10 +66,10 @@ perl -e '
         for my $left_id (0 .. $size - 1) {
             my $line = <$input_handle>;
             defined $line or die "connection matrix ended early";
-            my $quantized = int($line / 64);
-            $quantized = 255 if $quantized > 254;
-            push @row, $quantized;
-            $frequencies{$quantized}++;
+            my $cost = int($line);
+            die "connection cost out of range: $cost" if $cost < 0 || $cost > 65535;
+            push @row, $cost;
+            $frequencies{$cost}++;
         }
 
         my ($mode, $highest_frequency) = (0, -1);
@@ -82,7 +82,7 @@ perl -e '
 
         for my $left_id (0 .. $#row) {
             next if $row[$left_id] == $mode;
-            print {$entries_handle} pack("vC", $left_id, $row[$left_id]);
+            print {$entries_handle} pack("vv", $left_id, $row[$left_id]);
             $entry_count++;
         }
         push @offsets, $entry_count;
@@ -92,9 +92,9 @@ perl -e '
     close $input_handle;
 
     open my $output_handle, ">:raw", $output or die $!;
-    print {$output_handle} pack("a4vv", "UCN1", $size, 0);
+    print {$output_handle} pack("a4vv", "UCN2", $size, 0);
     print {$output_handle} pack("V*", @offsets);
-    print {$output_handle} pack("C*", @modes);
+    print {$output_handle} pack("v*", @modes);
 
     open my $entries_input, "<:raw", $entries_file or die $!;
     my $buffer;

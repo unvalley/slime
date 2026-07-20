@@ -19,7 +19,7 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 | `engine/session_context_{empty,128}` | 分野辞書ONで、文脈なしと上限128遷移の最古hitを比較 | 差を0.1 ms未満に保つ |
 | `ffi/engine_{cold,warm}_create` | SwiftからFFI engineを初回・共有辞書初期化後に生成 | cold p95 100 ms未満、warm p95 1 ms未満 |
 
-現状は170,229語の基本辞書と344語の任意分野辞書を使う。今後さらに辞書を増やす場合も、10万、25万、50万entryでのサイズ・RSS・p50/p95/p99を測って製品判断する。
+現状は1,085,466語の基本辞書（抽出閾値8500、AJIMEE-Benchで精度が飽和する下限）と344語の任意分野辞書を使う。基本辞書は`build.rs`でTSVからFST+エントリ表+表層プールのバイナリ形式（計約29 MB、TSV 44 MBから圧縮）へ事前コンパイルし、`include_bytes!`でzero-copy参照する。辞書拡大直後はTSVの起動時parseで cold `Dictionary::bundled()` が約386 msだったが、コンパイル形式への移行後は約70 µs、変換ツール実行時の最大RSSは221 MB→4.2 MBになった（Apple M3、release）。
 
 ## 初回baseline
 

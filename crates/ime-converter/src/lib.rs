@@ -1353,6 +1353,9 @@ fn synthetic_entries_by_start(reading: &str) -> Vec<Vec<SyntheticEntry>> {
 #[derive(Clone, Copy)]
 enum NumberToken {
     Digit(u64),
+    /// A sokuon digit form (いっ, はっ, ろっ) that is only a numeral when a
+    /// positional unit follows: いっせん is 1000, but いった is 行った.
+    SokuonDigit(u64),
     Small(u64),
     Big(u64),
 }
@@ -1371,6 +1374,9 @@ const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
     ("しち", NumberToken::Digit(7)),
     ("はち", NumberToken::Digit(8)),
     ("ろく", NumberToken::Digit(6)),
+    ("いっ", NumberToken::SokuonDigit(1)),
+    ("はっ", NumberToken::SokuonDigit(8)),
+    ("ろっ", NumberToken::SokuonDigit(6)),
     ("じゅっ", NumberToken::Small(10)),
     ("じゅう", NumberToken::Small(10)),
     ("ひゃく", NumberToken::Small(100)),
@@ -1399,6 +1405,7 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
     let mut pending = 0_u64;
     let mut pending_digits = 0_u32;
     let mut last_small_unit = u64::MAX;
+    let mut awaiting_unit = false;
     let mut first_token: &str = "";
 
     while consumed < suffix.len() {
@@ -1409,6 +1416,9 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
         else {
             break;
         };
+        if awaiting_unit && !matches!(token, NumberToken::Small(_) | NumberToken::Big(_)) {
+            break;
+        }
         match token {
             NumberToken::Digit(value) => {
                 if pending_digits >= 15 {
@@ -1416,6 +1426,14 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
                 }
                 pending = pending * 10 + value;
                 pending_digits += 1;
+            }
+            NumberToken::SokuonDigit(value) => {
+                if pending != 0 || pending_digits != 0 {
+                    break;
+                }
+                pending = value;
+                pending_digits = 1;
+                awaiting_unit = true;
             }
             NumberToken::Small(unit) => {
                 // Positional units must strictly descend within a section
@@ -1427,6 +1445,7 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
                 pending = 0;
                 pending_digits = 0;
                 last_small_unit = unit;
+                awaiting_unit = false;
             }
             NumberToken::Big(unit) => {
                 if section + pending == 0 {
@@ -1437,6 +1456,7 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
                 pending = 0;
                 pending_digits = 0;
                 last_small_unit = u64::MAX;
+                awaiting_unit = false;
             }
         }
         consumed += text.len();
@@ -1447,7 +1467,7 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
 
         let single_and_risky =
             token_count == 1 && RISKY_SINGLE_NUMBER_READINGS.contains(&first_token);
-        if !single_and_risky {
+        if !single_and_risky && !awaiting_unit {
             results.push((consumed, total + section + pending));
         }
     }
@@ -1486,7 +1506,9 @@ fn kanji_numeral(mut value: u64) -> String {
             if digit == 0 {
                 continue;
             }
-            if digit > 1 || unit == 1 {
+            // 千万 reads as 一千万; the leading 一 is customary before 千 in
+            // the 万-and-above groups but not in the lowest one (千円).
+            if digit > 1 || unit == 1 || (unit == 1_000 && index > 0) {
                 group_text.push_str(DIGITS[usize::try_from(digit).expect("digit fits usize")]);
             }
             group_text.push_str(unit_text);
@@ -1502,9 +1524,46 @@ fn kanji_numeral(mut value: u64) -> String {
     result
 }
 
+/// Formats large values the way IMEs usually present them: arabic digits per
+/// 万-group with kanji unit markers (10000000 → 1000万, 123450000 → 1億2345万).
+fn mixed_numeral(value: u64) -> Option<String> {
+    if value < 10_000 {
+        return None;
+    }
+    let mut groups = Vec::new();
+    let mut remainder = value;
+    while remainder > 0 {
+        groups.push(remainder % 10_000);
+        remainder /= 10_000;
+    }
+    let mut result = String::new();
+    for (index, &group) in groups.iter().enumerate().rev() {
+        if group == 0 {
+            continue;
+        }
+        result.push_str(&group.to_string());
+        result.push_str(match index {
+            0 => "",
+            1 => "万",
+            2 => "億",
+            _ => "兆",
+        });
+    }
+    Some(result)
+}
+
 fn push_number_entries(reading: &str, start: usize, out: &mut Vec<SyntheticEntry>) {
     for (length, value) in parse_kana_number_prefixes(&reading[start..]) {
         let arabic = value.to_string();
+        if let Some(mixed) = mixed_numeral(value) {
+            out.push(SyntheticEntry {
+                end: start + length,
+                surface: mixed,
+                left_id: ARABIC_NUMBER_POS_ID,
+                right_id: ARABIC_NUMBER_POS_ID,
+                cost: number_cost() - NUMBER_VARIANT_STEP,
+            });
+        }
         out.push(SyntheticEntry {
             end: start + length,
             surface: to_fullwidth_digits(&arabic),
@@ -1687,7 +1746,42 @@ mod tests {
         assert_eq!(super::kanji_numeral(1_991), "千九百九十一");
         assert_eq!(super::kanji_numeral(45), "四十五");
         assert_eq!(super::kanji_numeral(30_005), "三万五");
+        assert_eq!(super::kanji_numeral(10_000_000), "一千万");
         assert_eq!(super::to_fullwidth_digits("45"), "４５");
+        assert_eq!(super::mixed_numeral(10_000_000).as_deref(), Some("1000万"));
+        assert_eq!(
+            super::mixed_numeral(123_450_000).as_deref(),
+            Some("1億2345万")
+        );
+        assert_eq!(super::mixed_numeral(1_991), None);
+    }
+
+    #[test]
+    fn sokuon_digit_readings_compose_only_before_units() {
+        let dictionary = Dictionary::bundled();
+        for (reading, expected) in [
+            ("いっせんまん", "1000万"),
+            ("いっせんまん", "一千万"),
+            ("はっぴゃく", "800"),
+            ("ろっぴゃくえん", "600円"),
+        ] {
+            assert!(
+                dictionary
+                    .candidates(reading)
+                    .iter()
+                    .any(|candidate| candidate.surface == expected),
+                "missing {expected} for {reading}"
+            );
+        }
+
+        // いった must stay 行った; the sokuon form alone is not a numeral.
+        let candidates = dictionary.candidates("いった");
+        assert_eq!(candidates[0].surface, "行った");
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.surface.contains('1'))
+        );
     }
 
     #[test]

@@ -62,6 +62,34 @@ N-bestを10件、ユーザー履歴なし、追加辞書なしで測定した。
 
 全体のlatencyはp50 13.1 ms、p95 50.2 ms、p99 74.2 msで、辞書拡大によりbaseline比でおよそ2倍になった。残る失敗33件は同音異義語の文脈選択（複合姓/複合性、皇帝/工程、高官/交換）と固有名詞（棟方志功、鈴木尚典）が中心で、辞書拡充では解消しない。次の改善は`CandidateRanker`への統計言語モデル（文脈スコア）導入が本命となる。
 
+### 2026-07-20 ニューラルN-best rescoring（Phase 2 Step 1 フィージビリティ）
+
+[phase2-context-model-survey.md](phase2-context-model-survey.md)の第一候補「小型ニューラルLMによるN-best rescoring」を、学習なしの公開モデル**zenz-v3.1-xsmall**（GPT-2系 25.6Mパラメータ、Q5_K_M量子化 21 MB、CC BY-SA 4.0）で検証した。実行方法:
+
+```sh
+just fetch-neural-model   # GGUF取得 + pre-tokenizerメタデータ修正（要uvx）
+just evaluate-dev --neural-model target/evaluation/models/zenz-v3.1-xsmall-Q5_K_M-fixed.gguf            # λスイープ
+just evaluate-ajimee --neural-model target/evaluation/models/zenz-v3.1-xsmall-Q5_K_M-fixed.gguf --lambda 0.8
+```
+
+`ime-tools`の`neural` feature（`llama-cpp-2`、要cmake）でビルドされる。評価スクリプトは`--neural-model`指定時に自動でfeatureを有効にする。
+
+手法: 既存エンジンのN-best 10候補を、zenz-v3形式プロンプト`<左文脈40字><カタカナ読み><候補>`の対数尤度`log P(候補, EOS | 文脈, 読み)`で再順位付けする。最終スコアは`(1−λ)·(−cost/500) + λ·loglik`の対数線形補間。生成はせずprefillのみで、共有プレフィックスを全シーケンスに割り当て、候補ごとに独立シーケンスを継続することで、1アイテムを原則1回のdecode呼び出しで評価する（Metalのカーネル起動オーバーヘッドが支配的なため）。
+
+devset 400件でのλスイープ: λ=0（rescoringなし）のacc@1 0.293に対し、λ∈[0.5, 0.9]で広いプラトーがあり、最良のλ=0.8で**acc@1 0.423（+13.0pt）**。held-outのAJIMEE-Benchをλ=0.8で1回だけ評価した:
+
+| subset | items | acc@1 | acc@10 | MRR@10 | MinCER@1 | MinCER@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 左文脈なし | 100 | 0.690 | 0.860 | 0.761 | 0.034 | 0.015 |
+| 左文脈あり（文脈使用） | 100 | 0.620 | 0.810 | 0.703 | 0.055 | 0.024 |
+| 全体 | 200 | 0.655 | 0.835 | 0.732 | 0.045 | 0.019 |
+
+改善後（辞書施策のみ）比で全体acc@1は**0.535 → 0.655（+12.0pt）**、MRR@10は0.627 → 0.732。左文脈ありサブセットも+11ptで、エンジンとして初めて左文脈を順位付けに使った（`context_used_by_engine: true`）。acc@10はrescoringでは変わらない（候補集合は不変）。サーベイの推定（+10〜25pt）の下限側を、生成方式のZenzai xsmall（同系ベンチでAcc@1 66.5）とほぼ同水準の65.5で裏付けた。
+
+latency（M3、Metal）: 全体でp50 24.7 ms、p95 86.3 ms、p99 116.0 ms。rescoringの追加分はp50でおよそ+11 ms（バッチ投入約1.5 ms + GPU計算と同期・スコアリング約8.5 ms）。実装上の知見: (1) Metalのdecodeは非同期で、コストはlogits取得時の同期に現れる。(2) `llama_get_logits_ith`は呼び出しごとに同期するため、出力バッファ先頭を1回だけ取得して行を直接インデックスする。(3) softmax正規化はベクトル化可能な多項式exp近似で計算する（スカラーlibm expはdecodeと同程度の時間を消費していた）。
+
+判断材料: 品質面はGo（+12pt、残存誤りの型に直効）。latencyはp95 20 ms予算を超過しており、製品組み込みには (a) 候補間コスト差が大きい場合のスキップ、(b) 文脈KVキャッシュの会話内再利用、(c) より小さい量子化・蒸留モデル、のいずれかが必要。ライセンスはCC BY-SA 4.0のため製品bundleへの同梱は要判断で、評価専用に留めている。継続死条件・次段はサーベイの実装ステップ2以降（自前学習）を参照。
+
 ## JWTD-train開発セット
 
 AJIMEE-BenchはJWTD v2のtest分割由来のため、コストや言語モデルの調整に使うと過適合する。調整はJWTD v2の**train分割**から自動生成した開発セットで行い、AJIMEE-Benchはheld-outの報告専用とする。

@@ -76,6 +76,10 @@ build-devset:
 evaluate-dev *args:
     scripts/evaluate-dev.sh {{args}}
 
+# ニューラルrescoring評価用のzenz GGUFモデルを取得する
+fetch-neural-model:
+    scripts/fetch-neural-model.sh
+
 # CI相当の検証をローカルで実行する
 ci: check bench-build
 

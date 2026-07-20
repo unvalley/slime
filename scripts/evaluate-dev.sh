@@ -12,5 +12,12 @@ if [[ ! -f "$dev_file" ]]; then
   "$workspace_dir/scripts/build-devset.sh"
 fi
 
-cargo run --release --quiet -p ime-tools --bin ime-evaluate -- \
+features=()
+for argument in "$@"; do
+  if [[ "$argument" == "--neural-model" ]]; then
+    features=(--features neural)
+  fi
+done
+
+cargo run --release --quiet -p ime-tools "${features[@]}" --bin ime-evaluate -- \
   ajimee "$dev_file" "$@"

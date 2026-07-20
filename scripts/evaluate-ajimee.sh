@@ -28,6 +28,13 @@ if [[ "$actual_sha256" != "$expected_sha256" ]]; then
   exit 1
 fi
 
+features=()
+for argument in "$@"; do
+  if [[ "$argument" == "--neural-model" ]]; then
+    features=(--features neural)
+  fi
+done
+
 AJIMEE_BENCH_REVISION="$revision" AJIMEE_BENCH_SHA256="$actual_sha256" \
-  cargo run --release --quiet -p ime-tools --bin ime-evaluate -- \
+  cargo run --release --quiet -p ime-tools "${features[@]}" --bin ime-evaluate -- \
   ajimee "$data_file" "$@"

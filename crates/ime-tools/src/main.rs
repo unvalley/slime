@@ -1,13 +1,20 @@
 //! Offline evaluation tools for kana-kanji conversion quality.
 
+#[cfg(feature = "neural")]
+mod neural;
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use ime_converter::Dictionary;
+use ime_converter::{Candidate, Dictionary};
 use serde::{Deserialize, Serialize};
+
+/// Mozc-style costs approximate `-scale * ln(probability)`. Used to map
+/// lattice costs onto the neural log-likelihood axis for interpolation.
+const COST_LOG_SCALE: f64 = 500.0;
 
 fn main() -> ExitCode {
     match run() {
@@ -26,16 +33,48 @@ fn run() -> Result<(), String> {
     let items: Vec<AjimeeItem> = serde_json::from_slice(&bytes)
         .map_err(|error| format!("failed to parse {}: {error}", options.input.display()))?;
     let dictionary = Dictionary::bundled();
-    let report = evaluate(&dictionary, &items, &options)?;
+    let reports = evaluate(&dictionary, &items, &options)?;
 
     if options.json {
+        let serialized = if reports.len() == 1 {
+            serde_json::to_string_pretty(&reports[0])
+        } else {
+            serde_json::to_string_pretty(&reports)
+        };
         println!(
             "{}",
-            serde_json::to_string_pretty(&report)
-                .map_err(|error| format!("failed to serialize report: {error}"))?
+            serialized.map_err(|error| format!("failed to serialize report: {error}"))?
         );
+    } else if reports.len() == 1 {
+        print_report(&reports[0]);
     } else {
-        print_report(&report);
+        println!("lambda sweep:");
+        for report in &reports {
+            println!(
+                "  lambda={:.2} acc@1={:.4} acc@{}={:.4} mrr@{}={:.4} mincer@1={:.4} \
+                 latency p50={:.3} p95={:.3}",
+                report.lambda.unwrap_or(0.0),
+                report.accuracy_at_1,
+                report.top_k,
+                report.accuracy_at_k,
+                report.top_k,
+                report.mrr_at_k,
+                report.min_cer_at_1,
+                report.latency_ms.p50,
+                report.latency_ms.p95,
+            );
+        }
+        let best = reports
+            .iter()
+            .max_by(|a, b| {
+                a.accuracy_at_1
+                    .total_cmp(&b.accuracy_at_1)
+                    .then(a.mrr_at_k.total_cmp(&b.mrr_at_k))
+            })
+            .expect("non-empty reports");
+        println!();
+        println!("best lambda={:.2}:", best.lambda.unwrap_or(0.0));
+        print_report(best);
     }
     Ok(())
 }
@@ -79,6 +118,8 @@ struct Options {
     limit: Option<usize>,
     failures: usize,
     json: bool,
+    neural_model: Option<PathBuf>,
+    lambdas: Vec<f64>,
 }
 
 impl Options {
@@ -105,6 +146,8 @@ impl Options {
             limit: None,
             failures: 10,
             json: false,
+            neural_model: None,
+            lambdas: Vec::new(),
         };
 
         while let Some(argument) = arguments.next() {
@@ -119,9 +162,22 @@ impl Options {
                 "--limit" => options.limit = Some(parse_positive("--limit", arguments.next())?),
                 "--failures" => options.failures = parse_usize("--failures", arguments.next())?,
                 "--json" => options.json = true,
+                "--neural-model" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--neural-model requires a path".to_owned())?;
+                    options.neural_model = Some(PathBuf::from(value));
+                }
+                "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
                 "--help" | "-h" => return Err(usage()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
+        }
+        if options.lambdas.is_empty() {
+            // Default sweep for tuning the interpolation weight on the devset.
+            options.lambdas = (0..=10).map(|step| f64::from(step) / 10.0).collect();
+            options.lambdas.push(0.95);
+            options.lambdas.sort_by(f64::total_cmp);
         }
         Ok(options)
     }
@@ -129,8 +185,23 @@ impl Options {
 
 fn usage() -> String {
     "usage: ime-evaluate ajimee <evaluation_items.json> [--top-k N] \
-     [--context all|none|present] [--limit N] [--failures N] [--json]"
+     [--context all|none|present] [--limit N] [--failures N] [--json] \
+     [--neural-model model.gguf] [--lambda X]...\n\
+     --neural-model rescores the N-best with a zenz GGUF model (requires \
+     building with --features neural). --lambda selects interpolation \
+     weights; without it a default sweep runs."
         .to_owned()
+}
+
+fn parse_lambda(value: Option<String>) -> Result<f64, String> {
+    let parsed: f64 = value
+        .ok_or_else(|| "--lambda requires a value".to_owned())?
+        .parse()
+        .map_err(|_| "--lambda requires a number".to_owned())?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err("--lambda must be between 0 and 1".to_owned());
+    }
+    Ok(parsed)
 }
 
 fn parse_positive(name: &str, value: Option<String>) -> Result<usize, String> {
@@ -163,6 +234,10 @@ struct EvaluationReport {
     dataset_sha256: Option<String>,
     context_filter: ContextFilter,
     context_used_by_engine: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lambda: Option<f64>,
     items: usize,
     top_k: usize,
     accuracy_at_1: f64,
@@ -191,11 +266,17 @@ struct Failure {
     candidates: Vec<String>,
 }
 
+struct ItemOutcome<'a> {
+    item: &'a AjimeeItem,
+    candidates: Vec<Candidate>,
+    latency: Duration,
+}
+
 fn evaluate(
     dictionary: &Dictionary,
     items: &[AjimeeItem],
     options: &Options,
-) -> Result<EvaluationReport, String> {
+) -> Result<Vec<EvaluationReport>, String> {
     let selected: Vec<_> = items
         .iter()
         .filter(|item| options.context.includes(item))
@@ -205,15 +286,8 @@ fn evaluate(
         return Err("no evaluation items matched the selected filters".to_owned());
     }
 
-    let mut correct_at_1 = 0_usize;
-    let mut correct_at_k = 0_usize;
-    let mut reciprocal_rank = 0.0;
-    let mut min_cer_at_1 = 0.0;
-    let mut min_cer_at_k = 0.0;
-    let mut latencies = Vec::with_capacity(selected.len());
-    let mut failures = Vec::new();
-
-    for item in &selected {
+    let mut outcomes = Vec::with_capacity(selected.len());
+    for item in selected {
         if item.expected_output.is_empty() {
             return Err(format!("item {} has no expected output", item.index));
         }
@@ -223,9 +297,108 @@ fn evaluate(
             .candidates(&reading)
             .into_iter()
             .take(options.top_k)
-            .map(|candidate| candidate.surface)
             .collect();
-        latencies.push(started.elapsed());
+        let latency = started.elapsed();
+        outcomes.push(ItemOutcome {
+            item,
+            candidates,
+            latency,
+        });
+    }
+
+    let Some(model_path) = &options.neural_model else {
+        return Ok(vec![compute_report(&outcomes, None, None, options)]);
+    };
+
+    #[cfg(not(feature = "neural"))]
+    {
+        let _ = model_path;
+        Err("--neural-model requires building ime-tools with --features neural".to_owned())
+    }
+
+    #[cfg(feature = "neural")]
+    {
+        let rescorer = neural::Rescorer::load(model_path)?;
+        let requests: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| neural::ScoreRequest {
+                context: outcome.item.context_text.clone(),
+                input_katakana: outcome.item.input.clone(),
+                candidates: outcome
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.surface.clone())
+                    .collect(),
+            })
+            .collect();
+        let scored = rescorer.score_all(&requests)?;
+        let neural = NeuralOutcome {
+            logliks: scored.iter().map(|item| item.logliks.clone()).collect(),
+            latencies: scored.iter().map(|item| item.latency).collect(),
+        };
+        Ok(options
+            .lambdas
+            .iter()
+            .map(|&lambda| compute_report(&outcomes, Some(&neural), Some(lambda), options))
+            .collect())
+    }
+}
+
+struct NeuralOutcome {
+    logliks: Vec<Vec<f64>>,
+    latencies: Vec<Duration>,
+}
+
+/// Reorders candidate surfaces by interpolating the lattice cost with the
+/// neural log-likelihood: `(1-lambda) * (-cost/scale) + lambda * loglik`.
+/// The stable sort keeps the lattice order for ties.
+fn rescored_surfaces(candidates: &[Candidate], logliks: &[f64], lambda: f64) -> Vec<String> {
+    let mut indexed: Vec<usize> = (0..candidates.len()).collect();
+    let combined: Vec<f64> = candidates
+        .iter()
+        .zip(logliks)
+        .map(|(candidate, loglik)| {
+            (1.0 - lambda) * (-f64::from(candidate.cost) / COST_LOG_SCALE) + lambda * loglik
+        })
+        .collect();
+    indexed.sort_by(|&a, &b| combined[b].total_cmp(&combined[a]));
+    indexed
+        .into_iter()
+        .map(|index| candidates[index].surface.clone())
+        .collect()
+}
+
+fn compute_report(
+    outcomes: &[ItemOutcome<'_>],
+    neural: Option<&NeuralOutcome>,
+    lambda: Option<f64>,
+    options: &Options,
+) -> EvaluationReport {
+    let mut correct_at_1 = 0_usize;
+    let mut correct_at_k = 0_usize;
+    let mut reciprocal_rank = 0.0;
+    let mut min_cer_at_1 = 0.0;
+    let mut min_cer_at_k = 0.0;
+    let mut latencies = Vec::with_capacity(outcomes.len());
+    let mut failures = Vec::new();
+
+    for (outcome_index, outcome) in outcomes.iter().enumerate() {
+        let item = outcome.item;
+        let candidates: Vec<String> = match (neural, lambda) {
+            (Some(neural), Some(lambda)) => {
+                rescored_surfaces(&outcome.candidates, &neural.logliks[outcome_index], lambda)
+            }
+            _ => outcome
+                .candidates
+                .iter()
+                .map(|candidate| candidate.surface.clone())
+                .collect(),
+        };
+        let mut latency = outcome.latency;
+        if let Some(neural) = neural {
+            latency += neural.latencies[outcome_index];
+        }
+        latencies.push(latency);
 
         let rank = candidates.iter().position(|candidate| {
             item.expected_output
@@ -260,15 +433,20 @@ fn evaluate(
         }
     }
 
-    let total = usize_to_f64(selected.len());
+    let total = usize_to_f64(outcomes.len());
     latencies.sort_unstable();
-    Ok(EvaluationReport {
+    EvaluationReport {
         dataset: "AJIMEE-Bench JWTD_v2/v1",
         dataset_revision: options.dataset_revision.clone(),
         dataset_sha256: options.dataset_sha256.clone(),
         context_filter: options.context,
-        context_used_by_engine: false,
-        items: selected.len(),
+        context_used_by_engine: neural.is_some(),
+        neural_model: options
+            .neural_model
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        lambda,
+        items: outcomes.len(),
         top_k: options.top_k,
         accuracy_at_1: usize_to_f64(correct_at_1) / total,
         accuracy_at_k: usize_to_f64(correct_at_k) / total,
@@ -282,7 +460,7 @@ fn evaluate(
             max: duration_to_millis(*latencies.last().expect("non-empty latencies")),
         },
         failures,
-    })
+    }
 }
 
 fn print_report(report: &EvaluationReport) {
@@ -295,6 +473,12 @@ fn print_report(report: &EvaluationReport) {
     }
     println!("context filter: {:?}", report.context_filter);
     println!("context used by engine: {}", report.context_used_by_engine);
+    if let Some(model) = &report.neural_model {
+        println!("neural model: {model}");
+    }
+    if let Some(lambda) = report.lambda {
+        println!("lambda: {lambda:.2}");
+    }
     println!("items: {}", report.items);
     println!("acc@1: {:.4}", report.accuracy_at_1);
     println!("acc@{}: {:.4}", report.top_k, report.accuracy_at_k);

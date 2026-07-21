@@ -900,6 +900,35 @@ mod tests {
     }
 
     #[test]
+    fn whole_reading_words_suppress_patchwork_candidates() {
+        let dictionary = bundled_dictionary(TECHNOLOGY_DICTIONARY, &UserData::default());
+
+        let github = dictionary.candidates("ぎっとはぶ");
+        assert_eq!(github[0].surface, "GitHub");
+        assert!(
+            github.iter().all(|candidate| {
+                !candidate.surface.contains("は部") && !candidate.surface.contains("羽生")
+            }),
+            "patchwork paths should stay hidden: {github:?}"
+        );
+
+        // Near-tie patchworks stay available when they are plausible.
+        let kyouto = dictionary.candidates("きょうと");
+        assert_eq!(kyouto[0].surface, "京都");
+        assert!(kyouto.iter().any(|candidate| candidate.surface == "今日と"));
+        assert!(kyouto.iter().all(|candidate| candidate.surface != "強と"));
+
+        // Sentence-sized readings keep their multi-segment alternatives.
+        let sentence = dictionary.candidates("らすとのきょく");
+        assert_eq!(sentence[0].surface, "ラストの曲");
+        assert!(
+            sentence
+                .iter()
+                .any(|candidate| candidate.surface == "ラストの極")
+        );
+    }
+
+    #[test]
     fn domain_dictionaries_do_not_override_common_ambiguous_words() {
         let dictionary = bundled_dictionary(ALL_DOMAIN_DICTIONARIES, &UserData::default());
 

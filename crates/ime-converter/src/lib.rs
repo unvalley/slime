@@ -300,13 +300,24 @@ impl Dictionary {
             });
         });
         let n_best = self.convert_n_best(reading, limit);
-        if let Some(best_cost) = n_best.first().map(|conversion| conversion.cost) {
-            let maximum_cost = best_cost.saturating_add(candidate_cost_window(reading));
-            conversions.extend(
-                n_best
-                    .into_iter()
-                    .filter(|conversion| conversion.cost <= maximum_cost),
-            );
+        if let Some(best) = n_best.first() {
+            let maximum_cost = best.cost.saturating_add(candidate_cost_window(reading));
+            // When one strong word covers the whole reading, patchwork paths
+            // like Git+は+部 for ぎっとはぶ read as noise; keep only paths
+            // that are near ties, such as 今日+と alongside 京都.
+            let multi_segment_maximum = if best.segments.len() == 1 {
+                best.cost.saturating_add(MULTI_SEGMENT_COST_WINDOW)
+            } else {
+                maximum_cost
+            };
+            conversions.extend(n_best.into_iter().filter(|conversion| {
+                let maximum = if conversion.segments.len() > 1 {
+                    multi_segment_maximum
+                } else {
+                    maximum_cost
+                };
+                conversion.cost <= maximum
+            }));
         }
 
         for conversion in conversions {
@@ -1304,6 +1315,7 @@ const DEFAULT_N_BEST: usize = 10;
 const N_BEST_BEAM_FACTOR: usize = 8;
 const CANDIDATE_COST_PER_CHARACTER: i32 = 2_000;
 const MINIMUM_CANDIDATE_COST_WINDOW: i32 = 6_000;
+const MULTI_SEGMENT_COST_WINDOW: i32 = 2_500;
 const INVALID_CONNECTION_COST: i32 = 30_000;
 const BOS_EOS_POS_ID: u16 = 0;
 const UNKNOWN_POS_ID: u16 = 1851;

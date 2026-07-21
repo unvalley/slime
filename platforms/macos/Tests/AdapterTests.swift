@@ -518,7 +518,7 @@ enum AdapterTests {
             to: directory.appendingPathComponent("user_dictionary.tsv")
         )
         try Data(
-            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t3\t10\n".utf8
+            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t5\t10\n".utf8
         ).write(to: directory.appendingPathComponent("history.tsv"))
 
         let engine = try RustEngine(dataDirectory: directory)

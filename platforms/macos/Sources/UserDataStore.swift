@@ -69,6 +69,12 @@ struct UserDictionaryEntry: Identifiable, Hashable {
     }
 }
 
+struct DomainDictionaryWord: Decodable, Identifiable, Equatable {
+    let reading: String
+    let surface: String
+    var id: String { "\(reading)\u{0}\(surface)" }
+}
+
 struct InputHistoryEntry: Identifiable, Hashable {
     var id: String { "\(reading)\u{0}\(surface)" }
     let reading: String

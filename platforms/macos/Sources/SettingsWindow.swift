@@ -236,12 +236,6 @@ final class SettingsModel: ObservableObject {
     }
 }
 
-struct DomainDictionaryWord: Decodable, Identifiable, Equatable {
-    let reading: String
-    let surface: String
-    var id: String { "\(reading)\u{0}\(surface)" }
-}
-
 /// Loads the bundled words of the domain dictionaries selected by `mask`.
 /// The default returns nothing so this file can build without the Rust
 /// engine (settings preview); the app installs the FFI-backed loader at

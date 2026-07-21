@@ -10,6 +10,7 @@ const USER_DICTIONARY_HEADER: &str = "# unvalley-ime-user-dictionary-v1";
 const HISTORY_HEADER: &str = "# unvalley-ime-history-v1";
 const MAX_HISTORY_ENTRIES: usize = 500;
 const MIN_COMPLETION_REMAINING_CHARS: usize = 2;
+const MIN_COMPLETION_USE_COUNT: u32 = 5;
 const MAX_HISTORY_READING_CHARS: usize = 64;
 const MAX_HISTORY_SURFACE_CHARS: usize = 128;
 
@@ -106,6 +107,7 @@ impl UserData {
             .iter()
             .filter(|entry| {
                 is_useful_history(&entry.reading, &entry.surface)
+                    && entry.count >= MIN_COMPLETION_USE_COUNT
                     && entry.reading.starts_with(prefix)
                     && entry.reading.chars().count().saturating_sub(prefix_length)
                         >= MIN_COMPLETION_REMAINING_CHARS
@@ -131,6 +133,7 @@ impl UserData {
             .iter()
             .filter(|entry| {
                 is_useful_history(&entry.reading, &entry.surface)
+                    && entry.count >= MIN_COMPLETION_USE_COUNT
                     && entry.reading.starts_with(prefix)
                     && entry.reading != prefix
                     && entry.surface == surface
@@ -408,7 +411,7 @@ mod tests {
         fs::write(
             directory.join("history.tsv"),
             format!(
-                "{HISTORY_HEADER}\nぱふぉーまんす\tパフォーマンス\t3\t10\nぱそこん\tパソコン\t1\t20\n"
+                "{HISTORY_HEADER}\nぱふぉーまんす\tパフォーマンス\t8\t10\nぱそこん\tパソコン\t5\t20\n"
             ),
         )
         .unwrap();
@@ -466,7 +469,7 @@ mod tests {
         fs::write(
             directory.join("history.tsv"),
             format!(
-                "{HISTORY_HEADER}\nぱふぉーまんす\tパフォーマンス\t5\t20\nぱそこん\tパソコン\t1\t10\n"
+                "{HISTORY_HEADER}\nぱふぉーまんす\tパフォーマンス\t5\t20\nぱそこん\tパソコン\t5\t10\n"
             ),
         )
         .unwrap();
@@ -484,7 +487,29 @@ mod tests {
         );
         assert!(reloaded.exact_history_surfaces("ぱ").is_empty());
         let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
-        assert!(history.contains("ぱそこん\tパソコン\t2\t"));
+        assert!(history.contains("ぱそこん\tパソコン\t6\t"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completion_requires_at_least_five_uses() {
+        let directory = test_directory("completion-minimum-count");
+        fs::write(
+            directory.join("history.tsv"),
+            format!(
+                "{HISTORY_HEADER}\nぱふぉーまんす\tパフォーマンス\t4\t20\nぱそこん\tパソコン\t5\t10\n"
+            ),
+        )
+        .unwrap();
+        let mut data = UserData::load(&directory);
+
+        assert_eq!(data.completion_surfaces("ぱ", 5), ["パソコン"]);
+        assert_eq!(data.promote_completion("ぱふ", "パフォーマンス"), None);
+        assert_eq!(
+            data.exact_history_surfaces("ぱふぉーまんす"),
+            ["パフォーマンス"]
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -495,7 +520,7 @@ mod tests {
         fs::write(
             directory.join("history.tsv"),
             format!(
-                "{HISTORY_HEADER}\nぱふぇ\tパフェ\t2\t20\nぱふぉーまんす\tパフォーマンス\t1\t10\n"
+                "{HISTORY_HEADER}\nぱふぇ\tパフェ\t6\t20\nぱふぉーまんす\tパフォーマンス\t5\t10\n"
             ),
         )
         .unwrap();
@@ -512,7 +537,7 @@ mod tests {
         fs::write(
             directory.join("history.tsv"),
             format!(
-                "{HISTORY_HEADER}\nに\t二\t100\t30\nかな\tかな\t100\t20\nnihon\t日本\t100\t10\nにほん\t日本\t1\t1\n"
+                "{HISTORY_HEADER}\nに\t二\t100\t30\nかな\tかな\t100\t20\nnihon\t日本\t100\t10\nにほん\t日本\t5\t1\n"
             ),
         )
         .unwrap();

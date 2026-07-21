@@ -904,7 +904,7 @@ mod tests {
         let directory = test_directory("completion");
         fs::write(
             directory.join("history.tsv"),
-            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t3\t10\n",
+            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t5\t10\n",
         )
         .unwrap();
         let mut engine = ImeEngine::bundled_with_user_data(UserData::load(&directory));
@@ -930,7 +930,7 @@ mod tests {
         let directory = test_directory("completion-stale-hide");
         fs::write(
             directory.join("history.tsv"),
-            "# unvalley-ime-history-v1\nどうじしんこう\t同時進行\t3\t10\n",
+            "# unvalley-ime-history-v1\nどうじしんこう\t同時進行\t5\t10\n",
         )
         .unwrap();
         let mut engine = ImeEngine::bundled_with_user_data(UserData::load(&directory));
@@ -959,7 +959,7 @@ mod tests {
         let directory = test_directory("completion-ranking");
         fs::write(
             directory.join("history.tsv"),
-            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t5\t20\nぱふぇづくり\tパフェ作り\t1\t10\n",
+            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t6\t20\nぱふぇづくり\tパフェ作り\t5\t10\n",
         )
         .unwrap();
         let preferences = EnginePreferences {
@@ -1143,7 +1143,7 @@ mod tests {
         let directory = test_directory("session-completion-context");
         fs::write(
             directory.join("history.tsv"),
-            "# unvalley-ime-history-v1\nかんじへんかん\t漢字変換\t1\t10\nかんじょうひょうげん\t感情表現\t1\t20\n",
+            "# unvalley-ime-history-v1\nかんじへんかん\t漢字変換\t5\t10\nかんじょうひょうげん\t感情表現\t5\t20\n",
         )
         .unwrap();
         let preferences = EnginePreferences {

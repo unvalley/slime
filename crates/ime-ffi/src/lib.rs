@@ -430,7 +430,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             directory.join("history.tsv"),
-            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t2\t10\n",
+            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t5\t10\n",
         )
         .unwrap();
         let path = directory.to_string_lossy();

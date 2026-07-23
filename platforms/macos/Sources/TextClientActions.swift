@@ -44,6 +44,19 @@ struct IMKTextMutationClient: TextMutationClient {
     }
 }
 
+/// Clients choose how to draw a composition handed over as a plain string,
+/// and some (notably web-based editors) fall back to a selection-like
+/// highlight. Explicit attributes request the standard thin underline.
+private func markedTextAttributes(_ text: String) -> NSAttributedString {
+    NSAttributedString(
+        string: text,
+        attributes: [
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .markedClauseSegment: 0,
+        ]
+    )
+}
+
 /// Applies text-mutating engine actions. The optional return value is the new
 /// composition state; `nil` means the action belongs to another UI surface.
 @discardableResult
@@ -56,7 +69,7 @@ func applyTextMutation(
     case "update_preedit":
         let text = action.text ?? ""
         client.replaceMarkedText(
-            text,
+            markedTextAttributes(text),
             selectionRange: NSRange(location: text.utf16.count, length: 0),
             replacementRange: notFoundRange
         )

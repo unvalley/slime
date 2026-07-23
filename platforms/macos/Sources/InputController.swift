@@ -2,9 +2,9 @@ import AppKit
 import InputMethodKit
 import os
 
-final class UnvalleyController: IMKInputController {
+final class SlimeController: IMKInputController {
     private static let performanceLog = OSLog(
-        subsystem: "com.unvalley.inputmethod.Unvalley",
+        subsystem: "com.unvalley.inputmethod.Slime",
         category: .pointsOfInterest
     )
 
@@ -45,9 +45,9 @@ final class UnvalleyController: IMKInputController {
     }
 
     override func menu() -> NSMenu! {
-        let menu = NSMenu(title: "Unvalley IME")
+        let menu = NSMenu(title: "Slime")
         let settings = NSMenuItem(
-            title: "Unvalley IME設定…",
+            title: "Slime設定…",
             action: #selector(openSettings(_:)),
             keyEquivalent: ","
         )
@@ -167,7 +167,7 @@ final class UnvalleyController: IMKInputController {
             let forwarded = apply(actions, client: inputClient)
             return !forwarded
         } catch {
-            NSLog("Unvalley IME: Rust engine error: %@", String(describing: error))
+            NSLog("Slime: Rust engine error: %@", String(describing: error))
             return false
         }
     }
@@ -193,7 +193,7 @@ final class UnvalleyController: IMKInputController {
             let actions = try engine.reloadUserData()
             _ = apply(actions, client: inputClient)
         } catch {
-            NSLog("Unvalley IME: failed to reload user data %@", String(describing: error))
+            NSLog("Slime: failed to reload user data %@", String(describing: error))
         }
     }
 
@@ -222,7 +222,7 @@ final class UnvalleyController: IMKInputController {
             case "update_preedit", "commit", "clear":
                 assertionFailure("text actions must be handled before UI actions")
             default:
-                NSLog("Unvalley IME: unknown action %@", action.type)
+                NSLog("Slime: unknown action %@", action.type)
             }
         }
         return forwarded
@@ -257,7 +257,7 @@ final class UnvalleyController: IMKInputController {
             }
             return true
         } catch {
-            NSLog("Unvalley IME: failed to apply input options %@", String(describing: error))
+            NSLog("Slime: failed to apply input options %@", String(describing: error))
             return false
         }
     }

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 workspace_dir="$(cd "$(dirname "$0")/.." && pwd)"
-output_file="$workspace_dir/crates/ime-converter/data/mozc-basic.tsv"
-connection_output_file="$workspace_dir/crates/ime-converter/data/mozc-connection.bin"
+output_file="$workspace_dir/crates/slime-converter/data/mozc-basic.tsv"
+connection_output_file="$workspace_dir/crates/slime-converter/data/mozc-connection.bin"
 mozc_revision="3f235b4eb6fcff7d14ef5f0fb8ee56de7ee4c732"
 dictionary_cost_threshold=8500
 expected_entries=1085464

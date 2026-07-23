@@ -59,7 +59,7 @@ final class RustEngine {
     init(dataDirectory: URL = UserDataStore.shared.directoryURL) throws {
         let path = Array(dataDirectory.path.utf8)
         let createdHandle = path.withUnsafeBufferPointer { buffer in
-            ime_create_with_data_dir(buffer.baseAddress, buffer.count)
+            slime_create_with_data_dir(buffer.baseAddress, buffer.count)
         }
         guard let handle = createdHandle else {
             throw EngineError.creationFailed
@@ -68,11 +68,11 @@ final class RustEngine {
     }
 
     deinit {
-        ime_destroy(handle)
+        slime_destroy(handle)
     }
 
     func process(_ event: Event) throws -> [Action] {
-        let buffer = ime_process(handle, event.rawValue, event.scalar)
+        let buffer = slime_process(handle, event.rawValue, event.scalar)
         return try decode(buffer)
     }
 
@@ -82,7 +82,7 @@ final class RustEngine {
         historyLearning: Bool? = nil,
         dictionaryPacks: UInt32 = 0
     ) throws -> [Action] {
-        let buffer = ime_set_options_v3(
+        let buffer = slime_set_options_v3(
             handle,
             liveConversion,
             historyCompletion,
@@ -93,7 +93,7 @@ final class RustEngine {
     }
 
     func reloadUserData() throws -> [Action] {
-        let buffer = ime_reload_user_data(handle)
+        let buffer = slime_reload_user_data(handle)
         return try decode(buffer)
     }
 
@@ -104,8 +104,8 @@ final class RustEngine {
             let error: String?
         }
 
-        let buffer = ime_domain_dictionary_words(mask)
-        defer { ime_buffer_destroy(buffer) }
+        let buffer = slime_domain_dictionary_words(mask)
+        defer { slime_buffer_destroy(buffer) }
 
         guard let bytes = buffer.data, buffer.len > 0 else {
             throw EngineError.invalidBuffer
@@ -119,8 +119,8 @@ final class RustEngine {
         return response.words ?? []
     }
 
-    private func decode(_ buffer: ImeBuffer) throws -> [Action] {
-        defer { ime_buffer_destroy(buffer) }
+    private func decode(_ buffer: SlimeBuffer) throws -> [Action] {
+        defer { slime_buffer_destroy(buffer) }
 
         guard let bytes = buffer.data, buffer.len > 0 else {
             throw EngineError.invalidBuffer

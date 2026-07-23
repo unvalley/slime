@@ -15,7 +15,7 @@ set -euo pipefail
 # build artifact.
 
 workspace_dir=$(cd "$(dirname "$0")/.." && pwd)
-models_dir="${IME_EVALUATION_DATA_DIR:-$workspace_dir/target/evaluation}/models"
+models_dir="${SLIME_EVALUATION_DATA_DIR:-$workspace_dir/target/evaluation}/models"
 source_url="https://huggingface.co/Miwa-Keita/zenz-v3.1-xsmall-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
 source_sha256="189638370c43292fd54ba5e83854b24887ddd57e8914e19095514e663f60c7f5"
 source_file="$models_dir/zenz-v3.1-xsmall-Q5_K_M.gguf"

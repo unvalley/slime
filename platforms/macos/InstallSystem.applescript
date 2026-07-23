@@ -5,7 +5,7 @@ on run arguments
 
     set sourcePath to item 1 of arguments
     set destinationPath to item 2 of arguments
-    if destinationPath is not "/Library/Input Methods/Unvalley.app" then
+    if destinationPath is not "/Library/Input Methods/Slime.app" then
         error "refusing unexpected destination: " & destinationPath
     end if
 

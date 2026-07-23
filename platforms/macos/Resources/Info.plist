@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>Unvalley IME</string>
+    <string>Slime</string>
     <key>CFBundleExecutable</key>
-    <string>Unvalley</string>
+    <string>Slime</string>
     <key>CFBundleIdentifier</key>
-    <string>com.unvalley.inputmethod.Unvalley</string>
+    <string>com.unvalley.inputmethod.Slime</string>
     <key>CFBundleName</key>
-    <string>Unvalley</string>
+    <string>Slime</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -23,7 +23,7 @@
             <key>com.apple.inputmethod.Japanese</key>
             <dict>
                 <key>TISInputSourceID</key>
-                <string>com.unvalley.inputmethod.Unvalley.Japanese</string>
+                <string>com.unvalley.inputmethod.Slime.Japanese</string>
                 <key>TISIntendedLanguage</key>
                 <string>ja</string>
                 <key>tsInputModeDefaultStateKey</key>
@@ -48,9 +48,9 @@
         </array>
     </dict>
     <key>InputMethodConnectionName</key>
-    <string>com.unvalley.inputmethod.Unvalley_Connection</string>
+    <string>com.unvalley.inputmethod.Slime_Connection</string>
     <key>InputMethodServerControllerClass</key>
-    <string>Unvalley.UnvalleyController</string>
+    <string>Slime.SlimeController</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSBackgroundOnly</key>
@@ -58,7 +58,7 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSPrincipalClass</key>
-    <string>Unvalley.NSManualApplication</string>
+    <string>Slime.NSManualApplication</string>
     <key>TISIntendedLanguage</key>
     <string>ja</string>
     <key>tsInputMethodCharacterRepertoireKey</key>

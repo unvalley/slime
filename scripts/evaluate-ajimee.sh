@@ -4,7 +4,7 @@ set -euo pipefail
 workspace_dir=$(cd "$(dirname "$0")/.." && pwd)
 revision="401666cd56d1a570c2021798b64b6da4396bfd45"
 expected_sha256="e9eb668fd6aa14b1e26436f429b5550108af0a1dfd443b8cea0bcb3ab3028fca"
-data_dir="${IME_EVALUATION_DATA_DIR:-$workspace_dir/target/evaluation}/ajimee-bench/$revision"
+data_dir="${SLIME_EVALUATION_DATA_DIR:-$workspace_dir/target/evaluation}/ajimee-bench/$revision"
 data_file="$data_dir/evaluation_items.json"
 source_url="https://raw.githubusercontent.com/azooKey/AJIMEE-Bench/$revision/JWTD_v2/v1/evaluation_items.json"
 
@@ -36,5 +36,5 @@ for argument in "$@"; do
 done
 
 AJIMEE_BENCH_REVISION="$revision" AJIMEE_BENCH_SHA256="$actual_sha256" \
-  cargo run --release --quiet -p ime-tools "${features[@]}" --bin ime-evaluate -- \
+  cargo run --release --quiet -p slime-tools "${features[@]}" --bin slime-evaluate -- \
   ajimee "$data_file" "$@"

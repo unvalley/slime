@@ -5,16 +5,16 @@ enum SettingsPreview {
     static func main() {
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
-        if ProcessInfo.processInfo.environment["IME_SETTINGS_APPEARANCE"] == "dark" {
+        if ProcessInfo.processInfo.environment["SLIME_SETTINGS_APPEARANCE"] == "dark" {
             application.appearance = NSAppearance(named: .darkAqua)
         }
         application.finishLaunching()
         let controller = SettingsWindowController.shared
-        let tab = ProcessInfo.processInfo.environment["IME_SETTINGS_TAB"]
+        let tab = ProcessInfo.processInfo.environment["SLIME_SETTINGS_TAB"]
             .flatMap(SettingsTab.init(rawValue:)) ?? .general
         controller.present(initialTab: tab)
         print("Settings preview visible: \(controller.window?.isVisible == true)")
-        if let snapshotPath = ProcessInfo.processInfo.environment["IME_SETTINGS_SNAPSHOT_PATH"] {
+        if let snapshotPath = ProcessInfo.processInfo.environment["SLIME_SETTINGS_SNAPSHOT_PATH"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 do {
                     try capture(window: controller.window, at: URL(fileURLWithPath: snapshotPath))

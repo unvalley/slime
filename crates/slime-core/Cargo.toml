@@ -1,0 +1,19 @@
+[package]
+name = "slime-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+slime-converter = { path = "../slime-converter" }
+slime-romaji = { path = "../slime-romaji" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "engine"
+harness = false
+

@@ -2,13 +2,13 @@
 set -euo pipefail
 
 workspace_dir="$(cd "$(dirname "$0")/.." && pwd)"
-bundle_dir="$workspace_dir/target/macos/UnvalleyIME.app"
+bundle_dir="$workspace_dir/target/macos/Slime.app"
 contents_dir="$bundle_dir/Contents"
 macos_dir="$contents_dir/MacOS"
 frameworks_dir="$contents_dir/Frameworks"
 resources_dir="$contents_dir/Resources"
-executable="$macos_dir/Unvalley"
-codesign_identity="${IME_CODESIGN_IDENTITY:-}"
+executable="$macos_dir/Slime"
+codesign_identity="${SLIME_CODESIGN_IDENTITY:-}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "macOS bundle can only be built on macOS" >&2
@@ -16,7 +16,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 case "$bundle_dir" in
-  "$workspace_dir/target/macos/UnvalleyIME.app") ;;
+  "$workspace_dir/target/macos/Slime.app") ;;
   *) echo "refusing to replace unexpected path: $bundle_dir" >&2; exit 1 ;;
 esac
 
@@ -32,20 +32,20 @@ else
   echo "Signing with: $codesign_identity"
 fi
 
-MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p ime-ffi
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p slime-ffi
 
 rm -rf "$bundle_dir"
 mkdir -p "$macos_dir" "$frameworks_dir" "$resources_dir"
 
 swiftc \
   -swift-version 5 \
-  -module-name Unvalley \
-  -import-objc-header "$workspace_dir/crates/ime-ffi/include/ime_ffi.h" \
+  -module-name Slime \
+  -import-objc-header "$workspace_dir/crates/slime-ffi/include/slime_ffi.h" \
   -framework AppKit \
   -framework InputMethodKit \
   -framework SwiftUI \
   -L "$workspace_dir/target/release" \
-  -lime_ffi \
+  -lslime_ffi \
   -Xlinker -rpath \
   -Xlinker @executable_path/../Frameworks \
   "$workspace_dir/platforms/macos/Sources/RustEngine.swift" \
@@ -60,23 +60,23 @@ swiftc \
   "$workspace_dir/platforms/macos/Sources/main.swift" \
   -o "$executable"
 
-cp "$workspace_dir/target/release/libime_ffi.dylib" "$frameworks_dir/"
+cp "$workspace_dir/target/release/libslime_ffi.dylib" "$frameworks_dir/"
 cp "$workspace_dir/platforms/macos/Resources/Info.plist" "$contents_dir/Info.plist"
 cp "$workspace_dir/platforms/macos/Resources/PkgInfo" "$contents_dir/PkgInfo"
 # The Mozc-derived dictionary notices must accompany binary redistributions.
-cp "$workspace_dir/crates/ime-converter/data/MOZC_DICTIONARY_LICENSE.txt" "$resources_dir/"
+cp "$workspace_dir/crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt" "$resources_dir/"
 cp "$workspace_dir/LICENSE" "$resources_dir/LICENSE.txt"
 swift "$workspace_dir/platforms/macos/GenerateIcon.swift" "$resources_dir/InputMethodIcon.tiff"
 for localization_dir in "$workspace_dir"/platforms/macos/Resources/*.lproj; do
   cp -R "$localization_dir" "$resources_dir/"
 done
 
-original_dylib_id="$(otool -D "$frameworks_dir/libime_ffi.dylib" | tail -n 1)"
+original_dylib_id="$(otool -D "$frameworks_dir/libslime_ffi.dylib" | tail -n 1)"
 install_name_tool \
-  -id @rpath/libime_ffi.dylib \
-  "$frameworks_dir/libime_ffi.dylib"
+  -id @rpath/libslime_ffi.dylib \
+  "$frameworks_dir/libslime_ffi.dylib"
 install_name_tool \
-  -change "$original_dylib_id" @rpath/libime_ffi.dylib \
+  -change "$original_dylib_id" @rpath/libslime_ffi.dylib \
   "$executable"
 
 cc \
@@ -84,12 +84,12 @@ cc \
   "$workspace_dir/platforms/macos/RegisterInputSource.c" \
   -o "$workspace_dir/target/macos/register-input-source"
 
-codesign --force --sign "$codesign_identity" "$frameworks_dir/libime_ffi.dylib"
+codesign --force --sign "$codesign_identity" "$frameworks_dir/libslime_ffi.dylib"
 codesign \
   --force \
   --deep \
   --sign "$codesign_identity" \
-  --entitlements "$workspace_dir/platforms/macos/UnvalleyIME.entitlements" \
+  --entitlements "$workspace_dir/platforms/macos/Slime.entitlements" \
   "$bundle_dir"
 
 echo "Built $bundle_dir"

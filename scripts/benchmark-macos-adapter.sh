@@ -9,15 +9,15 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p ime-ffi
+cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p slime-ffi
 mkdir -p "$workspace_dir/target/macos"
 
 swiftc \
   -O \
   -swift-version 5 \
-  -import-objc-header "$workspace_dir/crates/ime-ffi/include/ime_ffi.h" \
+  -import-objc-header "$workspace_dir/crates/slime-ffi/include/slime_ffi.h" \
   -L "$workspace_dir/target/release" \
-  -lime_ffi \
+  -lslime_ffi \
   "$workspace_dir/platforms/macos/Sources/RustEngine.swift" \
   "$workspace_dir/platforms/macos/Sources/UserDataStore.swift" \
   "$workspace_dir/platforms/macos/Tests/AdapterPerformanceBenchmarks.swift" \

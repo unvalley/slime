@@ -164,43 +164,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
-name = "ime-converter"
-version = "0.1.0"
-dependencies = [
- "bumpalo",
- "fst",
-]
-
-[[package]]
-name = "ime-core"
-version = "0.1.0"
-dependencies = [
- "ime-converter",
- "ime-romaji",
-]
-
-[[package]]
-name = "ime-ffi"
-version = "0.1.0"
-dependencies = [
- "ime-core",
-]
-
-[[package]]
-name = "ime-romaji"
-version = "0.1.0"
-
-[[package]]
-name = "ime-tools"
-version = "0.1.0"
-dependencies = [
- "ime-converter",
- "llama-cpp-2",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -441,6 +404,43 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "slime-converter"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "fst",
+]
+
+[[package]]
+name = "slime-core"
+version = "0.1.0"
+dependencies = [
+ "slime-converter",
+ "slime-romaji",
+]
+
+[[package]]
+name = "slime-ffi"
+version = "0.1.0"
+dependencies = [
+ "slime-core",
+]
+
+[[package]]
+name = "slime-romaji"
+version = "0.1.0"
+
+[[package]]
+name = "slime-tools"
+version = "0.1.0"
+dependencies = [
+ "llama-cpp-2",
+ "serde",
+ "serde_json",
+ "slime-converter",
+]
 
 [[package]]
 name = "syn"

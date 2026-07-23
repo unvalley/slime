@@ -211,7 +211,7 @@ final class SettingsModel: ObservableObject {
     func exportDictionary() {
         let panel = NSSavePanel()
         panel.title = "ユーザー辞書を書き出す"
-        panel.nameFieldStringValue = "Unvalley User Dictionary.tsv"
+        panel.nameFieldStringValue = "Slime User Dictionary.tsv"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         do {
@@ -656,7 +656,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private init() {
         let hostingController = NSHostingController(rootView: SettingsRootView())
         let window = NSWindow(contentViewController: hostingController)
-        window.title = "Unvalley IME設定"
+        window.title = "Slime設定"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 680, height: 520)
@@ -706,11 +706,11 @@ final class SettingsStatusItem: NSObject, NSMenuDelegate {
     private override init() {
         super.init()
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Unvalley IME設定")
-            button.toolTip = "Unvalley IME設定"
+            button.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Slime設定")
+            button.toolTip = "Slime設定"
         }
 
-        let menu = NSMenu(title: "Unvalley IME")
+        let menu = NSMenu(title: "Slime")
         menu.delegate = self
         liveConversionItem.target = self
         historyCompletionItem.target = self
@@ -720,7 +720,7 @@ final class SettingsStatusItem: NSObject, NSMenuDelegate {
         menu.addItem(historyLearningItem)
         menu.addItem(.separator())
         let settingsItem = NSMenuItem(
-            title: "Unvalley IME設定…",
+            title: "Slime設定…",
             action: #selector(openSettings(_:)),
             keyEquivalent: ","
         )

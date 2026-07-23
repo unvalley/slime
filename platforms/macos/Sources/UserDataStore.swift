@@ -119,8 +119,8 @@ final class UserDataStore {
     let dictionaryURL: URL
     let historyURL: URL
 
-    private let dictionaryHeader = "# unvalley-ime-user-dictionary-v1\n"
-    private let historyHeader = "# unvalley-ime-history-v1\n"
+    private let dictionaryHeader = "# slime-user-dictionary-v1\n"
+    private let historyHeader = "# slime-history-v1\n"
 
     private convenience init(fileManager: FileManager = .default) {
         let applicationSupport = fileManager.urls(
@@ -128,7 +128,7 @@ final class UserDataStore {
             in: .userDomainMask
         ).first!
         self.init(directoryURL: applicationSupport.appendingPathComponent(
-            "UnvalleyIME",
+            "Slime",
             isDirectory: true
         ))
     }

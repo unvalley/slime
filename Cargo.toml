@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/ime-converter",
-    "crates/ime-core",
-    "crates/ime-ffi",
-    "crates/ime-romaji",
-    "crates/ime-tools",
+    "crates/slime-converter",
+    "crates/slime-core",
+    "crates/slime-ffi",
+    "crates/slime-romaji",
+    "crates/slime-tools",
 ]
 resolver = "3"
 

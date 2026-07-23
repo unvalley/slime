@@ -2,11 +2,11 @@
 set -euo pipefail
 
 workspace_dir="$(cd "$(dirname "$0")/.." && pwd)"
-bundle_dir="$workspace_dir/target/macos/UnvalleyIME.app"
-executable="$bundle_dir/Contents/MacOS/Unvalley"
+bundle_dir="$workspace_dir/target/macos/Slime.app"
+executable="$bundle_dir/Contents/MacOS/Slime"
 
 test -x "$executable"
-test -f "$bundle_dir/Contents/Frameworks/libime_ffi.dylib"
+test -f "$bundle_dir/Contents/Frameworks/libslime_ffi.dylib"
 test -f "$bundle_dir/Contents/Resources/InputMethodIcon.tiff"
 test -f "$bundle_dir/Contents/Resources/MOZC_DICTIONARY_LICENSE.txt"
 test -f "$bundle_dir/Contents/Resources/LICENSE.txt"
@@ -23,7 +23,7 @@ if [[ "$entitlements" != *"com.apple.security.get-task-allow"* ]]; then
   exit 1
 fi
 
-if ! otool -L "$executable" | grep -q '@rpath/libime_ffi.dylib'; then
+if ! otool -L "$executable" | grep -q '@rpath/libslime_ffi.dylib'; then
   echo "embedded Rust dylib is not linked through @rpath" >&2
   exit 1
 fi

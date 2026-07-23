@@ -4,7 +4,7 @@ import AppKit
 enum AdapterTests {
     static func main() throws {
         let testDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "unvalley-ime-adapter-tests-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)",
+            "slime-adapter-tests-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)",
             isDirectory: true
         )
         try FileManager.default.createDirectory(
@@ -292,7 +292,7 @@ enum AdapterTests {
             withIntermediateDirectories: true
         )
         let createdDictionary = Data(
-            "# unvalley-ime-user-dictionary-v1\nそと\t外部作成\n".utf8
+            "# slime-user-dictionary-v1\nそと\t外部作成\n".utf8
         )
         try createdDictionary.write(to: externallyCreatedStore.dictionaryURL)
         do {
@@ -320,7 +320,7 @@ enum AdapterTests {
             "dictionary readings should normalize Katakana to Hiragana"
         )
 
-        let external = Data("# unvalley-ime-user-dictionary-v1\nそと\t外部変更\n".utf8)
+        let external = Data("# slime-user-dictionary-v1\nそと\t外部変更\n".utf8)
         try external.write(to: store.dictionaryURL, options: .atomic)
         do {
             _ = try store.saveDictionary(
@@ -337,7 +337,7 @@ enum AdapterTests {
         }
 
         let historyData = Data(
-            "# unvalley-ime-history-v1\nにほん\t日本\t2\t100\nぱふぉーまんす\tパフォーマンス\t1\t200\n".utf8
+            "# slime-history-v1\nにほん\t日本\t2\t100\nぱふぉーまんす\tパフォーマンス\t1\t200\n".utf8
         )
         try historyData.write(to: store.historyURL, options: .atomic)
         let history = try store.loadHistorySnapshot()
@@ -358,7 +358,7 @@ enum AdapterTests {
 
         let compactFixture = Data(
             (
-                "# unvalley-ime-history-v1\nに\t二\t3\t50\nかな\tかな\t2\t60\n"
+                "# slime-history-v1\nに\t二\t3\t50\nかな\tかな\t2\t60\n"
                     + "nihon\t日本\t2\t65\nにほん\t日本\t1\t70\n"
                     + "\(String(repeating: "あ", count: 65))\t長すぎる読み\t1\t80\n"
                     + "ながすぎるひょうき\t\(String(repeating: "亜", count: 129))\t1\t90\n"
@@ -375,7 +375,7 @@ enum AdapterTests {
 
         let stale = try store.loadHistorySnapshot()
         let externallyChanged = Data(
-            "# unvalley-ime-history-v1\nそと\t外部変更\t1\t300\n".utf8
+            "# slime-history-v1\nそと\t外部変更\t1\t300\n".utf8
         )
         try externallyChanged.write(to: store.historyURL, options: .atomic)
         do {
@@ -391,7 +391,7 @@ enum AdapterTests {
 
         let absentHistory = try externallyCreatedStore.loadHistorySnapshot()
         let createdHistory = Data(
-            "# unvalley-ime-history-v1\nそと\t外部作成\t1\t400\n".utf8
+            "# slime-history-v1\nそと\t外部作成\t1\t400\n".utf8
         )
         try createdHistory.write(to: externallyCreatedStore.historyURL)
         do {
@@ -514,11 +514,11 @@ enum AdapterTests {
 
     private static func testUserDictionaryAndHistoryCompletion(in directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("# unvalley-ime-user-dictionary-v1\nほげ\tHOGE\n".utf8).write(
+        try Data("# slime-user-dictionary-v1\nほげ\tHOGE\n".utf8).write(
             to: directory.appendingPathComponent("user_dictionary.tsv")
         )
         try Data(
-            "# unvalley-ime-history-v1\nぱふぉーまんす\tパフォーマンス\t5\t10\n".utf8
+            "# slime-history-v1\nぱふぉーまんす\tパフォーマンス\t5\t10\n".utf8
         ).write(to: directory.appendingPathComponent("history.tsv"))
 
         let engine = try RustEngine(dataDirectory: directory)

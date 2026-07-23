@@ -96,7 +96,7 @@ enum AdapterPerformanceBenchmarks {
         report("ffi/live_character_50", samples: liveCharacter50)
 
         let historyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "unvalley-ime-history-benchmark-\(ProcessInfo.processInfo.processIdentifier)-\(UUID())",
+            "slime-history-benchmark-\(ProcessInfo.processInfo.processIdentifier)-\(UUID())",
             isDirectory: true
         )
         try FileManager.default.createDirectory(
@@ -104,7 +104,7 @@ enum AdapterPerformanceBenchmarks {
             withIntermediateDirectories: true
         )
         defer { try? FileManager.default.removeItem(at: historyDirectory) }
-        var history = "# unvalley-ime-history-v1\n"
+        var history = "# slime-history-v1\n"
         for index in 0..<499 {
             history += "れきし\(index)\t履歴\(index)\t1\t\(index)\n"
         }
@@ -162,7 +162,7 @@ enum AdapterPerformanceBenchmarks {
     }
 
     private static func sampleCount() -> Int {
-        ProcessInfo.processInfo.environment["IME_BENCH_SAMPLES"]
+        ProcessInfo.processInfo.environment["SLIME_BENCH_SAMPLES"]
             .flatMap(Int.init) ?? 20_000
     }
 }

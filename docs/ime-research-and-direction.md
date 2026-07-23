@@ -60,7 +60,7 @@ Appleの[InputMethodKit](https://developer.apple.com/documentation/inputmethodki
 
 - macOS側はSwiftで`IMKInputController`を実装する。
 - `NSEvent`、`NSRange`、`IMKTextInput`をRustコアへ渡さない。
-- OSイベントを共通の`InputEvent`へ変換し、Rustが返す`ImeAction`をmarked text、確定文字列、候補UIへ反映する。
+- OSイベントを共通の`InputEvent`へ変換し、Rustが返す`SlimeAction`をmarked text、確定文字列、候補UIへ反映する。
 - 候補UIは初期段階では`IMKCandidates`を優先し、独自ウィンドウは互換性を確認してから検討する。
 - SwiftUIをIMEの必須依存にしない。入力経路はInputMethodKit/AppKitだけで成立させる。
 
@@ -430,13 +430,13 @@ IMEはパスワードや個人情報を扱い得る。macSKKも[README](https://
 ```text
 IME workspace
 ├── crates/
-│   ├── ime-core/          # 状態機械、InputEvent -> ImeAction
-│   ├── ime-romaji/        # ローマ字→かな
-│   ├── ime-converter/     # ラティス、Viterbi、N-best、文節
+│   ├── slime-core/          # 状態機械、InputEvent -> SlimeAction
+│   ├── slime-romaji/        # ローマ字→かな
+│   ├── slime-converter/     # ラティス、Viterbi、N-best、文節
 │   ├── ime-dictionary/    # 静的辞書、user dictionary
 │   ├── ime-learning/      # 小さなunigram/bigram適応
-│   ├── ime-ffi/           # C ABI、panic隔離、UTF-8境界
-│   └── ime-tools/         # 辞書compiler、評価CLI
+│   ├── slime-ffi/           # C ABI、panic隔離、UTF-8境界
+│   └── slime-tools/         # 辞書compiler、評価CLI
 ├── platforms/
 │   ├── macos/             # Swift + InputMethodKit
 │   └── windows/           # 将来のTSF COM DLL + installer（当面は設計資料のみ）
@@ -467,7 +467,7 @@ pub enum InputEvent {
     Deactivate,
 }
 
-pub enum ImeAction {
+pub enum SlimeAction {
     UpdatePreedit(Preedit),
     ShowCandidates(CandidateList),
     HideCandidates,
@@ -481,7 +481,7 @@ pub enum ImeAction {
 OS側の責務:
 
 - OSイベントを`InputEvent`へ変換
-- `ImeAction`をOS APIへ反映
+- `SlimeAction`をOS APIへ反映
 - カーソル位置、DPI、候補ウィンドウ、入力セッションの管理
 - インストール、登録、署名、アップデート
 

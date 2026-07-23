@@ -5,7 +5,7 @@ set -euo pipefail
 # all tuning; AJIMEE-Bench stays held out for reporting.
 
 workspace_dir=$(cd "$(dirname "$0")/.." && pwd)
-data_dir="${IME_EVALUATION_DATA_DIR:-$workspace_dir/target/evaluation}/jwtd/2.0"
+data_dir="${SLIME_EVALUATION_DATA_DIR:-$workspace_dir/target/evaluation}/jwtd/2.0"
 dev_file="$data_dir/dev_items.json"
 
 if [[ ! -f "$dev_file" ]]; then
@@ -19,5 +19,5 @@ for argument in "$@"; do
   fi
 done
 
-cargo run --release --quiet -p ime-tools "${features[@]}" --bin ime-evaluate -- \
+cargo run --release --quiet -p slime-tools "${features[@]}" --bin slime-evaluate -- \
   ajimee "$dev_file" "$@"

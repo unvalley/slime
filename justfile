@@ -45,20 +45,20 @@ build-release:
 
 # Swiftなどから接続するmacOS向けdylibを生成する
 build-ffi:
-    cargo build --release -p ime-ffi
-    @echo "Generated target/release/libime_ffi.dylib"
+    cargo build --release -p slime-ffi
+    @echo "Generated target/release/libslime_ffi.dylib"
 
 # 全micro benchmarkを実行する
 bench:
-    cargo bench -p ime-romaji --bench romaji
-    cargo bench -p ime-converter --bench converter
-    cargo bench -p ime-core --bench engine
+    cargo bench -p slime-romaji --bench romaji
+    cargo bench -p slime-converter --bench converter
+    cargo bench -p slime-core --bench engine
 
 # 反復回数を減らした短時間のmicro benchmarkを実行する
 bench-smoke:
-    IME_BENCH_ITERATIONS=10000 cargo bench -p ime-romaji --bench romaji
-    IME_BENCH_ITERATIONS=10000 cargo bench -p ime-converter --bench converter
-    IME_BENCH_ITERATIONS=10000 cargo bench -p ime-core --bench engine
+    SLIME_BENCH_ITERATIONS=10000 cargo bench -p slime-romaji --bench romaji
+    SLIME_BENCH_ITERATIONS=10000 cargo bench -p slime-converter --bench converter
+    SLIME_BENCH_ITERATIONS=10000 cargo bench -p slime-core --bench engine
 
 # benchmarkを実行せず、コンパイルだけ確認する
 bench-build:

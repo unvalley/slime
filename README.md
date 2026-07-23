@@ -1,6 +1,7 @@
-# Slime
+# Slime IME
 
 This is a lightweight Japanese IME aiming to run entirely locally. It is currently implemented for macOS.
+Currently it's for me.
 
 ---
 

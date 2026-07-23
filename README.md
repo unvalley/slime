@@ -18,4 +18,6 @@ Currently it's for me.
 
 ## License
 
-MIT([LICENSE](LICENSE)）。同梱するMozc由来の辞書・接続データは別ライセンスで、[crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt](crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt)のnoticeが適用されます。ビルドした.appにはこのnoticeを同梱します。
+MIT([LICENSE](LICENSE)）
+
+同梱するMozc由来の辞書・接続データは別ライセンスで、[crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt](crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt)のnoticeが適用

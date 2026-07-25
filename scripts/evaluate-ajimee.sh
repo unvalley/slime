@@ -36,5 +36,5 @@ for argument in "$@"; do
 done
 
 AJIMEE_BENCH_REVISION="$revision" AJIMEE_BENCH_SHA256="$actual_sha256" \
-  cargo run --release --quiet -p slime-tools "${features[@]}" --bin slime-evaluate -- \
+  cargo run --release --quiet -p slime-tools ${features[@]+"${features[@]}"} --bin slime-evaluate -- \
   ajimee "$data_file" "$@"

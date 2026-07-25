@@ -290,11 +290,15 @@ impl Dictionary {
     ) -> Vec<Candidate> {
         let mut candidates = Vec::<Candidate>::new();
         let mut conversions = Vec::new();
+        let connection = self.uses_connection_costs.then(ConnectionMatrix::bundled);
         self.for_each_exact(reading, |entry| {
             let cost = if entry.surface == reading {
                 LITERAL_CANDIDATE_COST
             } else {
-                entry.word_cost
+                // Score exact whole-reading entries with their BOS/EOS
+                // connection costs so they compare on the same scale as the
+                // multi-segment lattice paths they are merged with below.
+                whole_reading_entry_cost(connection, &entry)
             };
             conversions.push(Conversion {
                 surface: entry.surface.to_owned(),
@@ -1370,6 +1374,19 @@ fn candidate_cost_window(reading: &str) -> i32 {
         .max(MINIMUM_CANDIDATE_COST_WINDOW)
 }
 
+/// Cost of one dictionary entry standing alone as the whole conversion:
+/// BOS→entry→EOS when the connection matrix is in use, the raw word cost
+/// otherwise.
+fn whole_reading_entry_cost(connection: Option<ConnectionMatrix>, entry: &EntryView<'_>) -> i32 {
+    match connection {
+        Some(connection) => connection
+            .cost(BOS_EOS_POS_ID, entry.left_id)
+            .saturating_add(entry.word_cost)
+            .saturating_add(connection.cost(entry.right_id, BOS_EOS_POS_ID)),
+        None => entry.word_cost,
+    }
+}
+
 fn is_grammar_literal(reading: &str) -> bool {
     matches!(
         reading,
@@ -1749,14 +1766,32 @@ mod tests {
     }
 
     #[test]
-    fn exact_candidates_are_ordered_by_cost() {
+    fn exact_candidates_are_ordered_by_connected_cost() {
         let dictionary = Dictionary::bundled();
         let candidates = dictionary.candidates("にほん");
+        let surfaces: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.surface.as_str())
+            .collect();
 
-        assert_eq!(candidates[0].surface, "日本");
-        assert_eq!(candidates[1].surface, "ニホン");
-        assert_eq!(candidates[2].surface, "二本");
+        assert_eq!(surfaces[0], "日本");
+        assert!(surfaces.contains(&"二本"), "surfaces: {surfaces:?}");
+        assert!(surfaces.contains(&"ニホン"), "surfaces: {surfaces:?}");
         assert_eq!(candidates.last().unwrap().surface, "にほん");
+    }
+
+    #[test]
+    fn phrase_reading_prefers_its_phrase_entry_over_patchwork_paths() {
+        let dictionary = Dictionary::bundled();
+
+        // Regression: a hard-coded low cost for かんじ→漢字 once leaked into
+        // the lattice and turned いいかんじ into いい漢字. The dictionary's
+        // own phrase entry must win in the window and the preview alike.
+        assert_eq!(dictionary.candidates("いいかんじ")[0].surface, "いい感じ");
+        assert_eq!(
+            dictionary.convert_best("いいかんじ").unwrap().surface,
+            "いい感じ"
+        );
     }
 
     #[test]
@@ -1777,8 +1812,13 @@ mod tests {
         assert_eq!(conversion.segments.len(), 3);
     }
 
+    /// 橋 outranks 箸 on word cost and both are plain nouns, so nothing in
+    /// the current model can pick 箸 from the reading alone. Tracked here as
+    /// an honest gap for the planned context model; do not make it pass by
+    /// editing dictionary costs or adding the test sentence as an entry.
     #[test]
-    fn phrase_entry_resolves_semantically_ambiguous_noun() {
+    #[ignore = "requires a context model"]
+    fn semantically_ambiguous_noun_needs_context() {
         let dictionary = Dictionary::bundled();
 
         assert_eq!(
@@ -1938,7 +1978,9 @@ mod tests {
             );
         }
 
-        assert_eq!(dictionary.candidates("かんじ")[0].surface, "漢字");
+        // 感じ is the cheaper word; 漢字-first would need context or user
+        // history, never a cost override in the bundled dictionary.
+        assert_eq!(dictionary.candidates("かんじ")[0].surface, "感じ");
     }
 
     #[test]

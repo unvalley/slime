@@ -19,5 +19,6 @@ for argument in "$@"; do
   fi
 done
 
-cargo run --release --quiet -p slime-tools "${features[@]}" --bin slime-evaluate -- \
+# ${features[@]+...} keeps the empty array safe under macOS bash 3.2's set -u.
+cargo run --release --quiet -p slime-tools ${features[@]+"${features[@]}"} --bin slime-evaluate -- \
   ajimee "$dev_file" "$@"

@@ -51,13 +51,12 @@ fn read_entries_by_reading(tsv_path: &Path) -> BTreeMap<String, Vec<Entry>> {
             .expect("right ID column")
             .parse()
             .expect("numeric right ID");
-        let source_cost: u16 = columns
+        let word_cost: u16 = columns
             .next()
             .expect("cost column")
             .parse()
             .expect("numeric cost");
         assert!(columns.next().is_none(), "bundled dictionary column count");
-        let word_cost = preferred_basic_cost(reading, surface).unwrap_or(source_cost);
         by_reading
             .entry(reading.to_owned())
             .or_default()
@@ -69,23 +68,6 @@ fn read_entries_by_reading(tsv_path: &Path) -> BTreeMap<String, Vec<Entry>> {
             });
     }
 
-    // Word costs alone cannot distinguish 制度 from 精度 because both share
-    // the same noun class. Keep a small, reviewable phrase layer for semantic
-    // collocations that are part of the must-pass suite.
-    for (reading, surface) in [
-        ("せいどをたかめる", "精度を高める"),
-        ("はしでたべる", "箸で食べる"),
-    ] {
-        by_reading
-            .entry(reading.to_owned())
-            .or_default()
-            .push(Entry {
-                surface: surface.to_owned(),
-                left_id: 1851,
-                right_id: 680,
-                word_cost: 500,
-            });
-    }
     by_reading
 }
 
@@ -162,14 +144,5 @@ fn push_varint(output: &mut Vec<u8>, mut value: u64) {
             break;
         }
         output.push(byte | 0x80);
-    }
-}
-
-fn preferred_basic_cost(reading: &str, surface: &str) -> Option<u16> {
-    match (reading, surface) {
-        // Standalone word costs rank 感じ above 漢字. Keep this fundamental
-        // IME term in the must-pass set until a word-context model replaces it.
-        ("かんじ", "漢字") => Some(500),
-        _ => None,
     }
 }

@@ -35,6 +35,12 @@ const _: () = assert!(std::mem::size_of::<InputEvent>() <= 8);
 /// Live conversion leaves readings shorter than this untouched.
 const MIN_LIVE_CONVERSION_CHARS: usize = 2;
 
+/// The best lattice path must clearly beat the runner-up before live
+/// conversion changes the text under the user's cursor. Mozc-style costs are
+/// approximately negative log probabilities scaled by 500, so this requires
+/// roughly a 2.7:1 advantage. Explicit Space conversion remains unrestricted.
+const MIN_LIVE_CONVERSION_COST_MARGIN: i32 = 500;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlimeAction {
     UpdatePreedit(String),
@@ -401,8 +407,19 @@ impl SlimeEngine {
     }
 
     fn commit(&mut self) -> Vec<SlimeAction> {
+        let live_preview_was_deferred = self.preferences.live_conversion
+            && self
+                .resolved_reading()
+                .chars()
+                .any(|character| character.is_ascii_alphabetic());
         self.reading.push_str(&self.romaji.flush());
-        self.refresh_live_preview();
+        if live_preview_was_deferred {
+            // Enter must commit the reading that was visible while an
+            // unfinished romaji sequence kept live conversion deferred.
+            self.live_preview = None;
+        } else {
+            self.refresh_live_preview();
+        }
         let committed = if self.candidate_kind == Some(CandidateKind::Conversion)
             || (self.candidate_kind == Some(CandidateKind::Completion) && self.completion_selected)
         {
@@ -549,9 +566,19 @@ impl SlimeEngine {
     fn refresh_live_preview(&mut self) {
         self.live_preview = if self.preferences.live_conversion {
             let resolved = self.resolved_reading();
+            // Pending romaji is not evidence of a word boundary. Sending raw
+            // letters through the lattice makes an unfinished `そうs` look
+            // like `総s`, so keep the visible reading until the kana resolves.
+            // A pending `n` is safe because `resolved_reading` turns it into
+            // `ん` rather than leaving an ASCII letter.
+            if resolved
+                .chars()
+                .any(|character| character.is_ascii_alphabetic())
+            {
+                None
             // A single kana is usually wanted literally; converting it makes
             // ひらがな like み unreachable without an extra Escape.
-            if resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS {
+            } else if resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS {
                 self.best_surface(&resolved)
             } else {
                 None
@@ -575,9 +602,17 @@ impl SlimeEngine {
         {
             return Some((*surface).to_owned());
         }
-        self.dictionary
-            .convert_best(reading)
-            .map(|conversion| conversion.surface)
+        let mut conversions = self.dictionary.convert_n_best(reading, 2).into_iter();
+        let best = conversions.next()?;
+        if best.surface == reading {
+            return None;
+        }
+        if let Some(runner_up) = conversions.next()
+            && runner_up.cost.saturating_sub(best.cost) < MIN_LIVE_CONVERSION_COST_MARGIN
+        {
+            return None;
+        }
+        Some(best.surface)
     }
 
     fn refresh_completion_actions(&mut self, include_preedit: bool) -> Vec<SlimeAction> {
@@ -872,6 +907,9 @@ mod tests {
 
         let actions = engine.handle(InputEvent::Enter);
         assert!(actions.contains(&SlimeAction::Commit("日本語".to_owned())));
+
+        type_text(&mut engine, "iikanji");
+        assert_eq!(engine.snapshot().preedit, "いい感じ");
     }
 
     #[test]
@@ -889,6 +927,29 @@ mod tests {
 
         let actions = engine.handle(InputEvent::Enter);
         assert!(actions.contains(&SlimeAction::Commit("み".to_owned())));
+    }
+
+    #[test]
+    fn live_conversion_defers_unfinished_or_ambiguous_input() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: false,
+            history_learning: false,
+            dictionary_packs: 0,
+        });
+
+        type_text(&mut engine, "sou");
+        assert_eq!(engine.snapshot().preedit, "そう");
+
+        type_text(&mut engine, "s");
+        assert_eq!(engine.snapshot().preedit, "そうs");
+
+        type_text(&mut engine, "hima");
+        assert_eq!(engine.snapshot().preedit, "そうしま");
+
+        type_text(&mut engine, "shou");
+        assert_eq!(engine.snapshot().preedit, "そうしましょう");
     }
 
     #[test]

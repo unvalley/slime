@@ -138,18 +138,38 @@ enum AdapterTests {
             "selected candidate should be committed"
         )
 
-        for scalar in "seidowotakamerukufuuwoshiteikimashou".unicodeScalars {
+        for scalar in "jishowokakujuusasemashou".unicodeScalars {
             _ = try engine.process(.character(scalar))
         }
         let phraseConversion = try engine.process(.space)
         try expect(
             phraseConversion.contains(where: {
-                $0.type == "update_preedit" && $0.text == "精度を高める工夫をしていきましょう"
+                $0.type == "update_preedit" && $0.text == "辞書を拡充させましょう"
             }),
             "connected phrase conversion should pass through the Swift adapter"
         )
 
         _ = try engine.process(.enter)
+        let conservativeLiveEngine = try RustEngine(dataDirectory: testDirectory)
+        _ = try conservativeLiveEngine.setOptions(
+            liveConversion: true,
+            historyCompletion: false,
+            historyLearning: false
+        )
+        var livePreedit: String?
+        for scalar in "soushimashou".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+            try expect(
+                livePreedit?.contains("総") != true && livePreedit?.contains("島") != true,
+                "live conversion should defer an ambiguous unfinished phrase"
+            )
+        }
+        try expect(
+            livePreedit == "そうしましょう",
+            "conservative live conversion should preserve the completed reading"
+        )
+
         for scalar in "kikan".unicodeScalars {
             _ = try engine.process(.character(scalar))
         }

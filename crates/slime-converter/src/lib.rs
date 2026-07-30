@@ -2,6 +2,7 @@
 //! Mozc OSS dictionary.
 
 mod compact;
+mod symbol_candidates;
 
 use bumpalo::{Bump, collections::String as BumpString};
 use compact::CompactDictionary;
@@ -361,6 +362,7 @@ impl Dictionary {
         }
 
         candidates.sort_unstable_by_key(|candidate| candidate.cost);
+        symbol_candidates::append_for_reading(reading, &mut candidates);
         candidates
     }
 

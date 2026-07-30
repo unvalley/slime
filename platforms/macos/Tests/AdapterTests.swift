@@ -169,6 +169,44 @@ enum AdapterTests {
             livePreedit == "そうしましょう",
             "conservative live conversion should preserve the completed reading"
         )
+        _ = try conservativeLiveEngine.process(.enter)
+
+        for scalar in "nihon".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(livePreedit == "日本", "live conversion should convert a stable word")
+        livePreedit = try conservativeLiveEngine.process(.character("g")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(
+            livePreedit == "日本g",
+            "unfinished romaji should not discard a converted prefix"
+        )
+        livePreedit = try conservativeLiveEngine.process(.character("o")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(livePreedit == "日本語", "resolved kana should extend the live conversion")
+        _ = try conservativeLiveEngine.process(.enter)
+
+        for scalar in "kyouhaii".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(
+            livePreedit == "今日はいい",
+            "an ambiguous suffix should not roll back a converted prefix"
+        )
+        _ = try conservativeLiveEngine.process(.escape)
+        livePreedit = nil
+        for scalar in "desu".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(
+            livePreedit == "きょうはいいです",
+            "Escape should suppress live conversion until the composition ends"
+        )
 
         for scalar in "kikan".unicodeScalars {
             _ = try engine.process(.character(scalar))

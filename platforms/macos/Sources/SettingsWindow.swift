@@ -296,12 +296,12 @@ private struct GeneralSettingsView: View {
                     get: { model.liveConversion },
                     set: { model.liveConversion = $0 }
                 ))
-                Text("入力中の読みを、Spaceを押さずに最良候補へ変換します。")
+                Text("確度の高い部分だけを変換し、曖昧な末尾はかなのまま保ちます。Escapeで現在の入力中は停止できます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Section("補完") {
-                Toggle("入力履歴から候補を表示", isOn: Binding(
+                Toggle("入力履歴を変換候補に使用", isOn: Binding(
                     get: { model.historyCompletion },
                     set: { model.historyCompletion = $0 }
                 ))
@@ -309,7 +309,7 @@ private struct GeneralSettingsView: View {
                     get: { model.historyLearning },
                     set: { model.historyLearning = $0 }
                 ))
-                Text("候補表示と新規学習は別々に停止できます。履歴は最大500件、このMac内だけに保存され、利用した補完候補は次回から優先されます。")
+                Text("履歴の利用と新規学習は別々に停止できます。明示的に選んだ変換や補完候補を最大500件、このMac内だけに保存し、ライブ変換には使用しません。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

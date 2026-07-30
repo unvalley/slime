@@ -197,7 +197,11 @@ fn iterations(default: u64) -> u64 {
 }
 
 fn run(name: &str, iterations: u64, mut operation: impl FnMut()) {
-    for _ in 0..1_000 {
+    let warmup_iterations = std::env::var("SLIME_BENCH_WARMUP_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000);
+    for _ in 0..warmup_iterations {
         operation();
     }
 

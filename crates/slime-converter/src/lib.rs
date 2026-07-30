@@ -367,9 +367,9 @@ impl Dictionary {
     /// Returns complete conversion paths ordered by their lattice cost.
     ///
     /// Unlike [`Self::convert_best`], this keeps multiple paths which arrive at
-    /// the same part-of-speech state. It is intentionally used only when the
-    /// candidate window is requested; live conversion stays on the optimized
-    /// one-best path.
+    /// the same part-of-speech state. Callers on latency-sensitive paths should
+    /// request only the small limit they need; candidate windows use a wider
+    /// search than live confidence checks.
     #[must_use]
     pub fn convert_n_best(&self, reading: &str, limit: usize) -> Vec<Conversion> {
         if reading.is_empty() || limit == 0 {

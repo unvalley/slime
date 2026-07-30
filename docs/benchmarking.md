@@ -46,6 +46,28 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 
 100文字でも当初予算の1キー5 ms未満には収まる。長文ほど増加率が高いため、将来の辞書拡張時には差分ラティス化の判断材料として同じケースを再計測する。
 
+### 接頭辞を保持するライブ変換
+
+2026-07-29、同じApple M3、arm64、Releaseで100反復を採取した。ライブ変換は
+通常2経路のN-bestで異なる表記のコスト差を調べ、上位経路が同じ表記の場合だけ
+4経路へ適応的に広げる。変換済み接頭辞と未確定末尾は`LivePreview`で分離して保持する。
+
+```sh
+SLIME_BENCH_ITERATIONS=100 \
+SLIME_BENCH_WARMUP_ITERATIONS=10 \
+SLIME_BENCH_LIVE_LENGTHS=10,50,100 \
+cargo bench -q -p slime-core --bench engine
+```
+
+| benchmark | 結果 | 1キー平均 |
+| --- | ---: | ---: |
+| `engine/live_conversion_10` | 178,222 ns/op | 約0.018 ms |
+| `engine/live_conversion_50` | 9,583,383 ns/op | 約0.192 ms |
+| `engine/live_conversion_100` | 47,701,929 ns/op | 約0.477 ms |
+
+50文字ではN-bestを常時4経路にした試作の24,261,967 ns/opから60.5%短縮した。
+100文字でも1キー5 ms予算の10分の1未満である。
+
 ### 複数辞書対応後の長文探索上限
 
 2026-07-20、同じApple M3、arm64、Releaseで、各ケースを10回ずつ採取した。各辞書レイヤーの最長読みを超えるprefix探索を打ち切る変更だけを比較した。
@@ -59,7 +81,7 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 
 ### N-best候補生成
 
-2026-07-20、同じApple M3、arm64、Releaseで各2,000反復を3回実行した中央値。候補生成は入力位置ごとに最大80状態を保持し、ライブ変換の1-best経路とは分離している。
+2026-07-20、同じApple M3、arm64、Releaseで各2,000反復を3回実行した中央値。当時の候補生成は入力位置ごとに最大80状態を保持し、ライブ変換の1-best経路とは分離していた。
 
 | scenario | 中央値 |
 | --- | ---: |
@@ -67,7 +89,8 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 | 1-best `わたしはにほん` | 0.034 ms |
 | N-best `わたしはにほん` | 1.408 ms |
 
-N-bestはSpaceで候補UIを開くときだけ実行する。1.408 msは候補初回表示の20 ms予算内で、入力中のLive Conversionにはこの探索コストを加えない。
+現在もSpaceの候補UIは上位10件を探索する。ライブ変換は上位表記の信頼度判定に
+2経路、表面重複時だけ4経路を使うため、この上位10件のコストは加えない。
 
 3つの分野別辞書を合計344語へ拡充した後、すべて有効にした通常変換をRelease、5,000反復、10 sampleで比較した。
 
@@ -141,7 +164,7 @@ SLIME_BENCH_ITERATIONS=10000 cargo bench -p slime-core --bench engine
 Live Conversionの長さを一つに絞る場合:
 
 ```sh
-SLIME_BENCH_ITERATIONS=100 SLIME_BENCH_LIVE_LENGTHS=10 cargo bench -p slime-core --bench engine
+SLIME_BENCH_ITERATIONS=100 SLIME_BENCH_WARMUP_ITERATIONS=10 SLIME_BENCH_LIVE_LENGTHS=10 cargo bench -p slime-core --bench engine
 ```
 
 Live Conversionを省き、分野別辞書の差だけを測る場合:

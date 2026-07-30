@@ -41,6 +41,12 @@ const MIN_LIVE_CONVERSION_CHARS: usize = 2;
 /// roughly a 2.7:1 advantage. Explicit Space conversion remains unrestricted.
 const MIN_LIVE_CONVERSION_COST_MARGIN: i32 = 500;
 
+/// Live confidence compares visible surfaces, not internal lattice paths.
+/// Expand only when two top paths render the same text, keeping the common
+/// live path on the cheaper two-best search.
+const LIVE_CONVERSION_INITIAL_PATH_LIMIT: usize = 2;
+const LIVE_CONVERSION_EXPANDED_PATH_LIMIT: usize = 4;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlimeAction {
     UpdatePreedit(String),
@@ -74,6 +80,14 @@ enum CandidateKind {
     Completion,
 }
 
+#[derive(Clone, Debug)]
+struct LivePreview {
+    /// Reading covered by `surface`. A later ambiguous suffix can be appended
+    /// without discarding this already useful conversion.
+    reading: String,
+    surface: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -92,7 +106,7 @@ pub struct SlimeEngine {
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
     preferences: EnginePreferences,
-    live_preview: Option<String>,
+    live_preview: Option<LivePreview>,
     live_preview_suppressed: bool,
     user_data: UserData,
     session_history: SessionHistory,
@@ -277,7 +291,6 @@ impl SlimeEngine {
             self.reading.push(normalize_ascii_character(character));
         }
 
-        self.live_preview_suppressed = false;
         actions.extend(self.refresh_composition_actions());
         if had_completions
             && !actions.contains(&SlimeAction::HideCandidates)
@@ -407,29 +420,18 @@ impl SlimeEngine {
     }
 
     fn commit(&mut self) -> Vec<SlimeAction> {
-        let live_preview_was_deferred = self.preferences.live_conversion
-            && self
-                .resolved_reading()
-                .chars()
-                .any(|character| character.is_ascii_alphabetic());
+        // Capture the exact marked text before flushing pending romaji. Live
+        // conversion may intentionally retain a converted prefix and a
+        // literal suffix, and Enter must commit exactly what was visible.
+        let displayed = self.preedit();
         self.reading.push_str(&self.romaji.flush());
-        if live_preview_was_deferred {
-            // Enter must commit the reading that was visible while an
-            // unfinished romaji sequence kept live conversion deferred.
-            self.live_preview = None;
-        } else {
-            self.refresh_live_preview();
-        }
-        let committed = if self.candidate_kind == Some(CandidateKind::Conversion)
-            || (self.candidate_kind == Some(CandidateKind::Completion) && self.completion_selected)
-        {
+        let used_conversion = self.candidate_kind == Some(CandidateKind::Conversion);
+        let used_completion =
+            self.candidate_kind == Some(CandidateKind::Completion) && self.completion_selected;
+        let committed = if used_conversion || used_completion {
             self.selected_candidate().to_owned()
-        } else if let Some(preview) = &self.live_preview
-            && !self.live_preview_suppressed
-        {
-            preview.clone()
         } else {
-            self.reading.clone()
+            displayed
         };
 
         if committed.is_empty() {
@@ -437,12 +439,15 @@ impl SlimeEngine {
         }
 
         let reading = self.reading.clone();
-        let used_completion =
-            self.candidate_kind == Some(CandidateKind::Completion) && self.completion_selected;
         if used_completion {
             self.record_completion_history(&reading, &committed);
-        } else {
+        } else if used_conversion {
             self.record_history(&reading, &committed);
+        } else {
+            // Live conversion is an implicit presentation decision, not an
+            // explicit candidate choice. Learning it would let an unnoticed
+            // mistake immediately override the confidence gate next time.
+            self.session_history.reset_context();
         }
         let had_candidates = self.candidate_kind.is_some();
         self.clear_composition();
@@ -492,7 +497,6 @@ impl SlimeEngine {
             self.reading.pop();
         }
 
-        self.live_preview_suppressed = false;
         let mut actions = self.refresh_composition_actions();
         if had_completions
             && !actions.contains(&SlimeAction::HideCandidates)
@@ -510,13 +514,14 @@ impl SlimeEngine {
             return self.selected_candidate().to_owned();
         }
 
-        // The live preview already covers the pending romaji through
-        // `resolved_reading`, so appending the raw pending here would show
-        // text that an Enter press does not commit.
         if let Some(preview) = &self.live_preview
             && !self.live_preview_suppressed
+            && let Some(suffix) = self.resolved_reading().strip_prefix(&preview.reading)
         {
-            return preview.clone();
+            let mut preedit = String::with_capacity(preview.surface.len() + suffix.len());
+            preedit.push_str(&preview.surface);
+            preedit.push_str(suffix);
+            return preedit;
         }
 
         let mut preedit = self.reading.clone();
@@ -564,50 +569,58 @@ impl SlimeEngine {
     }
 
     fn refresh_live_preview(&mut self) {
-        self.live_preview = if self.preferences.live_conversion {
-            let resolved = self.resolved_reading();
-            // Pending romaji is not evidence of a word boundary. Sending raw
-            // letters through the lattice makes an unfinished `そうs` look
-            // like `総s`, so keep the visible reading until the kana resolves.
-            // A pending `n` is safe because `resolved_reading` turns it into
-            // `ん` rather than leaving an ASCII letter.
-            if resolved
-                .chars()
-                .any(|character| character.is_ascii_alphabetic())
-            {
-                None
-            // A single kana is usually wanted literally; converting it makes
-            // ひらがな like み unreachable without an extra Escape.
-            } else if resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS {
-                self.best_surface(&resolved)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        if !self.preferences.live_conversion {
+            self.live_preview = None;
+            return;
+        }
+
+        let resolved = self.resolved_reading();
+        let can_evaluate = !resolved
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+            && resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS;
+
+        if can_evaluate && let Some(surface) = self.best_surface(&resolved) {
+            self.live_preview = Some(LivePreview {
+                reading: resolved,
+                surface,
+            });
+            return;
+        }
+
+        // Keep a previously converted prefix while the new suffix is
+        // unfinished or ambiguous. This prevents `日本 → にほんg → 日本語`
+        // and `今日は → きょうはいい` style whole-preedit rollbacks.
+        if !self
+            .live_preview
+            .as_ref()
+            .is_some_and(|preview| resolved.starts_with(&preview.reading))
+        {
+            self.live_preview = None;
+        }
     }
 
     fn best_surface(&self, reading: &str) -> Option<String> {
         if let Some(surface) = self.user_data.exact_dictionary_surfaces(reading).next() {
             return Some(surface.to_owned());
         }
-        if self.preferences.history_completion
-            && let Some(surface) = self.session_history.exact_surfaces(reading, 1).first()
-        {
-            return Some((*surface).to_owned());
-        }
-        if self.preferences.history_completion
-            && let Some(surface) = self.user_data.exact_history_surfaces(reading).first()
-        {
-            return Some((*surface).to_owned());
-        }
-        let mut conversions = self.dictionary.convert_n_best(reading, 2).into_iter();
+        let mut conversions = self
+            .dictionary
+            .convert_n_best(reading, LIVE_CONVERSION_INITIAL_PATH_LIMIT)
+            .into_iter();
         let best = conversions.next()?;
         if best.surface == reading {
             return None;
         }
-        if let Some(runner_up) = conversions.next()
+        let runner_up = conversions
+            .find(|conversion| conversion.surface != best.surface)
+            .or_else(|| {
+                self.dictionary
+                    .convert_n_best(reading, LIVE_CONVERSION_EXPANDED_PATH_LIMIT)
+                    .into_iter()
+                    .find(|conversion| conversion.surface != best.surface)
+            });
+        if let Some(runner_up) = runner_up
             && runner_up.cost.saturating_sub(best.cost) < MIN_LIVE_CONVERSION_COST_MARGIN
         {
             return None;
@@ -950,6 +963,102 @@ mod tests {
 
         type_text(&mut engine, "shou");
         assert_eq!(engine.snapshot().preedit, "そうしましょう");
+    }
+
+    #[test]
+    fn live_conversion_preserves_a_stable_prefix() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: false,
+            history_learning: false,
+            dictionary_packs: 0,
+        });
+
+        type_text(&mut engine, "nihon");
+        assert_eq!(engine.snapshot().preedit, "日本");
+        type_text(&mut engine, "g");
+        assert_eq!(engine.snapshot().preedit, "日本g");
+        type_text(&mut engine, "o");
+        assert_eq!(engine.snapshot().preedit, "日本語");
+        engine.handle(InputEvent::Enter);
+
+        type_text(&mut engine, "kyouha");
+        assert_eq!(engine.snapshot().preedit, "今日は");
+        type_text(&mut engine, "ii");
+        assert_eq!(engine.snapshot().preedit, "今日はいい");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("今日はいい".to_owned())));
+    }
+
+    #[test]
+    fn escape_suppresses_live_conversion_until_composition_ends() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: false,
+            history_learning: false,
+            dictionary_packs: 0,
+        });
+
+        type_text(&mut engine, "nihongo");
+        assert_eq!(engine.snapshot().preedit, "日本語");
+        engine.handle(InputEvent::Escape);
+        assert_eq!(engine.snapshot().preedit, "にほんご");
+
+        type_text(&mut engine, "wo");
+        assert_eq!(engine.snapshot().preedit, "にほんごを");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("にほんごを".to_owned())));
+    }
+
+    #[test]
+    fn implicit_live_conversion_is_not_learned() {
+        let directory = test_directory("implicit-live");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+        });
+
+        type_text(&mut engine, "nihongo");
+        assert_eq!(engine.snapshot().preedit, "日本語");
+        engine.handle(InputEvent::Enter);
+
+        assert!(!directory.join("history.tsv").exists());
+        assert!(
+            engine
+                .session_history
+                .exact_surfaces("にほんご", 1)
+                .is_empty()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn learned_history_cannot_bypass_live_confidence() {
+        let directory = test_directory("live-history-confidence");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nそうしま\t総島\t10\t20\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+        });
+
+        type_text(&mut engine, "soushima");
+        assert_eq!(engine.snapshot().preedit, "そうしま");
+
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "総島");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -180,8 +180,8 @@ enum AdapterTests {
             $0.type == "update_preedit"
         })?.text
         try expect(
-            livePreedit == "日本g",
-            "unfinished romaji should not discard a converted prefix"
+            livePreedit == "にほんg",
+            "unfinished romaji should discard a preview for the shorter reading"
         )
         livePreedit = try conservativeLiveEngine.process(.character("o")).last(where: {
             $0.type == "update_preedit"
@@ -194,17 +194,37 @@ enum AdapterTests {
             livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
         }
         try expect(
-            livePreedit == "今日はいい",
-            "an ambiguous suffix should not roll back a converted prefix"
+            livePreedit == "きょうはいい",
+            "an ambiguous full reading should not reuse an older preview"
         )
-        _ = try conservativeLiveEngine.process(.escape)
+        _ = try conservativeLiveEngine.process(.enter)
+
         livePreedit = nil
-        for scalar in "desu".unicodeScalars {
+        for scalar in "ichigachigau".unicodeScalars {
             let actions = try conservativeLiveEngine.process(.character(scalar))
             livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
         }
         try expect(
-            livePreedit == "きょうはいいです",
+            livePreedit == "いちがちがう",
+            "live conversion must not combine 1勝ち with the suffix がう"
+        )
+        _ = try conservativeLiveEngine.process(.enter)
+
+        livePreedit = nil
+        for scalar in "nihongo".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(livePreedit == "日本語", "live conversion should produce a stable word")
+        _ = try conservativeLiveEngine.process(.escape)
+        livePreedit = try conservativeLiveEngine.process(.character("w")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        livePreedit = try conservativeLiveEngine.process(.character("o")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(
+            livePreedit == "にほんごを",
             "Escape should suppress live conversion until the composition ends"
         )
 

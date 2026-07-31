@@ -85,21 +85,6 @@ enum CandidateKind {
     Completion,
 }
 
-#[derive(Clone, Debug)]
-struct LivePreview {
-    /// Reading covered by `surface`. A later ambiguous suffix can be appended
-    /// without discarding this already useful conversion.
-    reading: String,
-    surface: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LiveConversionDecision {
-    Converted(String),
-    Literal,
-    Ambiguous,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -118,7 +103,7 @@ pub struct SlimeEngine {
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
     preferences: EnginePreferences,
-    live_preview: Option<LivePreview>,
+    live_preview: Option<String>,
     live_preview_suppressed: bool,
     user_data: UserData,
     installed_packs: DictionaryPackStore,
@@ -556,12 +541,8 @@ impl SlimeEngine {
 
         if let Some(preview) = &self.live_preview
             && !self.live_preview_suppressed
-            && let Some(suffix) = self.resolved_reading().strip_prefix(&preview.reading)
         {
-            let mut preedit = String::with_capacity(preview.surface.len() + suffix.len());
-            preedit.push_str(&preview.surface);
-            preedit.push_str(suffix);
-            return preedit;
+            return preview.clone();
         }
 
         let mut preedit = self.reading.clone();
@@ -609,66 +590,36 @@ impl SlimeEngine {
     }
 
     fn refresh_live_preview(&mut self) {
-        if !self.preferences.live_conversion {
-            self.live_preview = None;
-            return;
-        }
-
-        let resolved = self.resolved_reading();
-        let can_evaluate = !resolved
-            .chars()
-            .any(|character| character.is_ascii_alphabetic())
-            && resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS;
-
-        if can_evaluate {
-            match self.live_conversion_decision(&resolved) {
-                LiveConversionDecision::Converted(surface) => {
-                    self.live_preview = Some(LivePreview {
-                        reading: resolved,
-                        surface,
-                    });
-                    return;
-                }
-                LiveConversionDecision::Literal => {
-                    // A literal best path is a positive result for the full
-                    // reading, not an ambiguous suffix. Discard any shorter
-                    // preview so `持っ + と` cannot outlive `もっと`.
-                    self.live_preview = None;
-                    return;
-                }
-                LiveConversionDecision::Ambiguous => {}
+        self.live_preview = if self.preferences.live_conversion {
+            let resolved = self.resolved_reading();
+            // Never reuse a preview produced for a shorter reading. A new
+            // suffix can change both word boundaries and the best surface;
+            // retaining the old preview created hybrids such as `1勝ちがう`.
+            if resolved
+                .chars()
+                .any(|character| character.is_ascii_alphabetic())
+                || resolved.chars().count() < MIN_LIVE_CONVERSION_CHARS
+            {
+                None
+            } else {
+                self.best_surface(&resolved)
             }
-        }
-
-        // Keep a previously converted prefix while the new suffix is
-        // unfinished or ambiguous. This prevents `日本 → にほんg → 日本語`
-        // and `今日は → きょうはいい` style whole-preedit rollbacks.
-        if !self
-            .live_preview
-            .as_ref()
-            .is_some_and(|preview| resolved.starts_with(&preview.reading))
-        {
-            self.live_preview = None;
-        }
+        } else {
+            None
+        };
     }
 
-    fn live_conversion_decision(&self, reading: &str) -> LiveConversionDecision {
+    fn best_surface(&self, reading: &str) -> Option<String> {
         if let Some(surface) = self.user_data.exact_dictionary_surfaces(reading).next() {
-            return if surface == reading {
-                LiveConversionDecision::Literal
-            } else {
-                LiveConversionDecision::Converted(surface.to_owned())
-            };
+            return Some(surface.to_owned());
         }
         let mut conversions = self
             .dictionary
             .convert_n_best(reading, LIVE_CONVERSION_INITIAL_PATH_LIMIT)
             .into_iter();
-        let Some(best) = conversions.next() else {
-            return LiveConversionDecision::Literal;
-        };
+        let best = conversions.next()?;
         if best.surface == reading {
-            return LiveConversionDecision::Literal;
+            return None;
         }
         let runner_up = conversions
             .find(|conversion| conversion.surface != best.surface)
@@ -681,9 +632,9 @@ impl SlimeEngine {
         if let Some(runner_up) = runner_up
             && runner_up.cost.saturating_sub(best.cost) < MIN_LIVE_CONVERSION_COST_MARGIN
         {
-            return LiveConversionDecision::Ambiguous;
+            return None;
         }
-        LiveConversionDecision::Converted(best.surface)
+        Some(best.surface)
     }
 
     fn refresh_completion_actions(&mut self, include_preedit: bool) -> Vec<SlimeAction> {
@@ -1035,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn live_conversion_preserves_a_stable_prefix() {
+    fn live_conversion_recomputes_the_entire_reading_after_each_key() {
         let mut engine = SlimeEngine::bundled();
         engine.set_preferences(EnginePreferences {
             live_conversion: true,
@@ -1047,7 +998,7 @@ mod tests {
         type_text(&mut engine, "nihon");
         assert_eq!(engine.snapshot().preedit, "日本");
         type_text(&mut engine, "g");
-        assert_eq!(engine.snapshot().preedit, "日本g");
+        assert_eq!(engine.snapshot().preedit, "にほんg");
         type_text(&mut engine, "o");
         assert_eq!(engine.snapshot().preedit, "日本語");
         engine.handle(InputEvent::Enter);
@@ -1055,13 +1006,13 @@ mod tests {
         type_text(&mut engine, "kyouha");
         assert_eq!(engine.snapshot().preedit, "今日は");
         type_text(&mut engine, "ii");
-        assert_eq!(engine.snapshot().preedit, "今日はいい");
+        assert_eq!(engine.snapshot().preedit, "きょうはいい");
         let actions = engine.handle(InputEvent::Enter);
-        assert!(actions.contains(&SlimeAction::Commit("今日はいい".to_owned())));
+        assert!(actions.contains(&SlimeAction::Commit("きょうはいい".to_owned())));
     }
 
     #[test]
-    fn live_conversion_discards_a_stale_prefix_when_the_full_reading_is_literal() {
+    fn live_conversion_never_combines_a_stale_preview_with_a_new_suffix() {
         let mut engine = SlimeEngine::bundled();
         engine.set_preferences(EnginePreferences {
             live_conversion: true,
@@ -1082,6 +1033,11 @@ mod tests {
         assert_eq!(engine.snapshot().preedit, "こういうの");
         let actions = engine.handle(InputEvent::Enter);
         assert!(actions.contains(&SlimeAction::Commit("こういうの".to_owned())));
+
+        type_text(&mut engine, "ichigachigau");
+        assert_eq!(engine.snapshot().preedit, "いちがちがう");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("いちがちがう".to_owned())));
     }
 
     #[test]

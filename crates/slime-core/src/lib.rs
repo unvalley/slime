@@ -94,6 +94,13 @@ struct LivePreview {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum LiveConversionDecision {
+    Converted(String),
+    Literal,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
     pub preedit: String,
@@ -613,12 +620,24 @@ impl SlimeEngine {
             .any(|character| character.is_ascii_alphabetic())
             && resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS;
 
-        if can_evaluate && let Some(surface) = self.best_surface(&resolved) {
-            self.live_preview = Some(LivePreview {
-                reading: resolved,
-                surface,
-            });
-            return;
+        if can_evaluate {
+            match self.live_conversion_decision(&resolved) {
+                LiveConversionDecision::Converted(surface) => {
+                    self.live_preview = Some(LivePreview {
+                        reading: resolved,
+                        surface,
+                    });
+                    return;
+                }
+                LiveConversionDecision::Literal => {
+                    // A literal best path is a positive result for the full
+                    // reading, not an ambiguous suffix. Discard any shorter
+                    // preview so `持っ + と` cannot outlive `もっと`.
+                    self.live_preview = None;
+                    return;
+                }
+                LiveConversionDecision::Ambiguous => {}
+            }
         }
 
         // Keep a previously converted prefix while the new suffix is
@@ -633,17 +652,23 @@ impl SlimeEngine {
         }
     }
 
-    fn best_surface(&self, reading: &str) -> Option<String> {
+    fn live_conversion_decision(&self, reading: &str) -> LiveConversionDecision {
         if let Some(surface) = self.user_data.exact_dictionary_surfaces(reading).next() {
-            return Some(surface.to_owned());
+            return if surface == reading {
+                LiveConversionDecision::Literal
+            } else {
+                LiveConversionDecision::Converted(surface.to_owned())
+            };
         }
         let mut conversions = self
             .dictionary
             .convert_n_best(reading, LIVE_CONVERSION_INITIAL_PATH_LIMIT)
             .into_iter();
-        let best = conversions.next()?;
+        let Some(best) = conversions.next() else {
+            return LiveConversionDecision::Literal;
+        };
         if best.surface == reading {
-            return None;
+            return LiveConversionDecision::Literal;
         }
         let runner_up = conversions
             .find(|conversion| conversion.surface != best.surface)
@@ -656,9 +681,9 @@ impl SlimeEngine {
         if let Some(runner_up) = runner_up
             && runner_up.cost.saturating_sub(best.cost) < MIN_LIVE_CONVERSION_COST_MARGIN
         {
-            return None;
+            return LiveConversionDecision::Ambiguous;
         }
-        Some(best.surface)
+        LiveConversionDecision::Converted(best.surface)
     }
 
     fn refresh_completion_actions(&mut self, include_preedit: bool) -> Vec<SlimeAction> {
@@ -1033,6 +1058,30 @@ mod tests {
         assert_eq!(engine.snapshot().preedit, "今日はいい");
         let actions = engine.handle(InputEvent::Enter);
         assert!(actions.contains(&SlimeAction::Commit("今日はいい".to_owned())));
+    }
+
+    #[test]
+    fn live_conversion_discards_a_stale_prefix_when_the_full_reading_is_literal() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: false,
+            history_learning: false,
+            dictionary_packs: 0,
+        });
+
+        // Spell the small tsu explicitly so `もっ` is evaluated before the
+        // following `と`, matching insertion/editing paths that expose the
+        // stale-prefix bug.
+        type_text(&mut engine, "moxtuto");
+        assert_eq!(engine.snapshot().preedit, "もっと");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("もっと".to_owned())));
+
+        type_text(&mut engine, "kouiuno");
+        assert_eq!(engine.snapshot().preedit, "こういうの");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("こういうの".to_owned())));
     }
 
     #[test]

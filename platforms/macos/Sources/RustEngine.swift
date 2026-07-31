@@ -119,6 +119,55 @@ final class RustEngine {
         return response.words ?? []
     }
 
+    func installedDictionaryPacks() throws -> InstalledDictionaryPackCatalog {
+        struct CatalogResponse: Decodable {
+            let ok: Bool
+            let packs: [InstalledDictionaryPack]?
+            let errors: [DictionaryPackLoadIssue]?
+            let error: String?
+        }
+
+        let buffer = slime_installed_dictionary_packs(handle)
+        defer { slime_buffer_destroy(buffer) }
+        guard let bytes = buffer.data, buffer.len > 0 else {
+            throw EngineError.invalidBuffer
+        }
+
+        let data = Data(bytes: bytes, count: buffer.len)
+        let response = try JSONDecoder().decode(CatalogResponse.self, from: data)
+        guard response.ok else {
+            throw EngineError.rejected(response.error ?? "unknown_error")
+        }
+        return InstalledDictionaryPackCatalog(
+            packs: response.packs ?? [],
+            errors: response.errors ?? []
+        )
+    }
+
+    func installedDictionaryPackWords(id: String) throws -> [DomainDictionaryWord] {
+        struct WordsResponse: Decodable {
+            let ok: Bool
+            let words: [DomainDictionaryWord]?
+            let error: String?
+        }
+
+        let identifier = Array(id.utf8)
+        let buffer = identifier.withUnsafeBufferPointer { bytes in
+            slime_installed_dictionary_pack_words(handle, bytes.baseAddress, bytes.count)
+        }
+        defer { slime_buffer_destroy(buffer) }
+        guard let bytes = buffer.data, buffer.len > 0 else {
+            throw EngineError.invalidBuffer
+        }
+
+        let data = Data(bytes: bytes, count: buffer.len)
+        let response = try JSONDecoder().decode(WordsResponse.self, from: data)
+        guard response.ok else {
+            throw EngineError.rejected(response.error ?? "unknown_error")
+        }
+        return response.words ?? []
+    }
+
     private func decode(_ buffer: SlimeBuffer) throws -> [Action] {
         defer { slime_buffer_destroy(buffer) }
 

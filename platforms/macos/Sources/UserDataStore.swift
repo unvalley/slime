@@ -75,6 +75,24 @@ struct DomainDictionaryWord: Decodable, Identifiable, Equatable {
     var id: String { "\(reading)\u{0}\(surface)" }
 }
 
+struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    let version: String
+    let license: String
+    let entryCount: Int
+}
+
+struct DictionaryPackLoadIssue: Decodable, Equatable {
+    let file: String
+    let message: String
+}
+
+struct InstalledDictionaryPackCatalog: Decodable, Equatable {
+    let packs: [InstalledDictionaryPack]
+    let errors: [DictionaryPackLoadIssue]
+}
+
 struct InputHistoryEntry: Identifiable, Hashable {
     var id: String { "\(reading)\u{0}\(surface)" }
     let reading: String

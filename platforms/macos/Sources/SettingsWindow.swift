@@ -9,6 +9,8 @@ final class SettingsModel: ObservableObject {
     @Published var surface = ""
     @Published var dictionaryQuery = ""
     @Published var historyQuery = ""
+    @Published var installedDictionaryPacks: [InstalledDictionaryPack] = []
+    @Published var dictionaryPackLoadIssues: [DictionaryPackLoadIssue] = []
     @Published var errorMessage: String?
     @Published var noticeMessage: String?
 
@@ -19,6 +21,7 @@ final class SettingsModel: ObservableObject {
     init() {
         reloadDictionary()
         reloadHistory()
+        reloadInstalledDictionaryPacks(notifyEngine: false)
     }
 
     var liveConversion: Bool {
@@ -55,6 +58,25 @@ final class SettingsModel: ObservableObject {
             IMEPreferences.dictionaryPacks |= mask
         } else {
             IMEPreferences.dictionaryPacks &= ~mask
+        }
+    }
+
+    func reloadInstalledDictionaryPacks(notifyEngine: Bool = true) {
+        do {
+            let catalog = try InstalledDictionaryPackBridge.catalogLoader()
+            installedDictionaryPacks = catalog.packs
+            dictionaryPackLoadIssues = catalog.errors
+            if notifyEngine {
+                NotificationCenter.default.post(name: .unvalleyUserDataDidChange, object: nil)
+            }
+        } catch {
+            installedDictionaryPacks = []
+            dictionaryPackLoadIssues = [
+                DictionaryPackLoadIssue(
+                    file: "dictionary-packs",
+                    message: error.localizedDescription
+                ),
+            ]
         }
     }
 
@@ -244,6 +266,13 @@ enum DomainDictionaryCatalog {
     static var loader: (UInt32) throws -> [DomainDictionaryWord] = { _ in [] }
 }
 
+enum InstalledDictionaryPackBridge {
+    static var catalogLoader: () throws -> InstalledDictionaryPackCatalog = {
+        InstalledDictionaryPackCatalog(packs: [], errors: [])
+    }
+    static var wordsLoader: (String) throws -> [DomainDictionaryWord] = { _ in [] }
+}
+
 enum SettingsTab: String {
     case general
     case dictionary
@@ -336,6 +365,33 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("追加辞書") {
+                if model.installedDictionaryPacks.isEmpty {
+                    Text("インストール済みの追加辞書はありません。")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.installedDictionaryPacks) { pack in
+                        InstalledDictionaryPackRow(pack: pack)
+                    }
+                }
+                ForEach(model.dictionaryPackLoadIssues, id: \.file) { issue in
+                    Label {
+                        Text("\(issue.file): \(issue.message)")
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle")
+                    }
+                    .foregroundStyle(.orange)
+                }
+                HStack {
+                    Text("追加辞書パックは、このMacにインストールすると自動的に有効になります。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("再読み込み") {
+                        model.reloadInstalledDictionaryPacks()
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
     }
@@ -374,14 +430,64 @@ private struct DomainDictionaryToggle: View {
             .help("収録語を見る")
         }
         .sheet(isPresented: $showsWords) {
-            DomainDictionaryWordsView(title: title, mask: mask)
+            DomainDictionaryWordsView(title: title, source: .bundled(mask))
+        }
+    }
+}
+
+private struct InstalledDictionaryPackRow: View {
+    let pack: InstalledDictionaryPack
+    @State private var showsWords = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(pack.name)
+                Text("バージョン \(pack.version)・\(pack.entryCount)語")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                showsWords = true
+            } label: {
+                Image(systemName: "list.bullet.rectangle")
+            }
+            .buttonStyle(.borderless)
+            .help("収録語を見る")
+        }
+        .sheet(isPresented: $showsWords) {
+            DomainDictionaryWordsView(title: pack.name, source: .installed(pack.id))
+        }
+    }
+}
+
+private enum DictionaryWordSource {
+    case bundled(UInt32)
+    case installed(String)
+
+    func load() throws -> [DomainDictionaryWord] {
+        switch self {
+        case let .bundled(mask):
+            try DomainDictionaryCatalog.loader(mask)
+        case let .installed(id):
+            try InstalledDictionaryPackBridge.wordsLoader(id)
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .bundled:
+            "この辞書はアプリに組み込まれていて、編集はユーザー辞書で行います。"
+        case .installed:
+            "この追加辞書は別ライセンスでインストールされています。"
         }
     }
 }
 
 private struct DomainDictionaryWordsView: View {
     let title: String
-    let mask: UInt32
+    let source: DictionaryWordSource
     @Environment(\.dismiss) private var dismiss
     @State private var words: [DomainDictionaryWord] = []
     @State private var query = ""
@@ -401,7 +507,7 @@ private struct DomainDictionaryWordsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("「\(title)」の収録語")
                     .font(.title3.weight(.semibold))
-                Text("この辞書はアプリに組み込まれていて、編集はユーザー辞書で行います。")
+                Text(source.explanation)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -448,7 +554,7 @@ private struct DomainDictionaryWordsView: View {
         .frame(width: 480, height: 440)
         .onAppear {
             do {
-                words = try DomainDictionaryCatalog.loader(mask)
+                words = try source.load()
             } catch {
                 loadError = error.localizedDescription
             }

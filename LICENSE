@@ -16,6 +16,10 @@ The bundled kana-kanji conversion data derived from the Mozc open-source
 dictionary is licensed separately; see
 crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt.
 
+External dictionary packs loaded at runtime are separate works and are not
+licensed under this MIT License. Each pack is governed by the license metadata
+and terms supplied with that pack.
+
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE

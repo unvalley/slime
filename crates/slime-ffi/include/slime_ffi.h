@@ -44,6 +44,10 @@ SlimeBuffer slime_set_options_v3(SlimeHandle *handle, bool live_conversion,
                              uint32_t dictionary_packs);
 SlimeBuffer slime_reload_user_data(SlimeHandle *handle);
 SlimeBuffer slime_domain_dictionary_words(uint32_t mask);
+SlimeBuffer slime_installed_dictionary_packs(const SlimeHandle *handle);
+SlimeBuffer slime_installed_dictionary_pack_words(const SlimeHandle *handle,
+                                                  const uint8_t *pack_id,
+                                                  size_t pack_id_len);
 void slime_buffer_destroy(SlimeBuffer buffer);
 
 #ifdef __cplusplus

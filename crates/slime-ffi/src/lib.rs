@@ -256,6 +256,97 @@ pub extern "C" fn slime_domain_dictionary_words(mask: u32) -> SlimeBuffer {
     SlimeBuffer::from_string(result.unwrap_or_else(|_| error_response("panic")))
 }
 
+/// Returns metadata for external dictionary packs loaded by `handle`.
+///
+/// # Safety
+///
+/// `handle` must be null or a live pointer returned by an IME creation function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_installed_dictionary_packs(
+    handle: *const SlimeHandle,
+) -> SlimeBuffer {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return error_response("null_handle");
+        }
+        // SAFETY: The caller promises a live handle. This function only reads it.
+        let engine = unsafe { &(*handle).engine };
+        let mut output = String::from("{\"ok\":true,\"packs\":[");
+        for (index, pack) in engine.installed_dictionary_packs().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str("{\"id\":");
+            write_json_string(&mut output, &pack.id);
+            output.push_str(",\"name\":");
+            write_json_string(&mut output, &pack.name);
+            output.push_str(",\"version\":");
+            write_json_string(&mut output, &pack.version);
+            output.push_str(",\"license\":");
+            write_json_string(&mut output, &pack.license);
+            write!(output, ",\"entryCount\":{}}}", pack.entry_count)
+                .expect("writing to String cannot fail");
+        }
+        output.push_str("],\"errors\":[");
+        for (index, error) in engine.dictionary_pack_load_errors().iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str("{\"file\":");
+            write_json_string(&mut output, &error.file);
+            output.push_str(",\"message\":");
+            write_json_string(&mut output, &error.message);
+            output.push('}');
+        }
+        output.push_str("]}");
+        output
+    }));
+    SlimeBuffer::from_string(result.unwrap_or_else(|_| error_response("panic")))
+}
+
+/// Returns the words of one external dictionary pack loaded by `handle`.
+///
+/// # Safety
+///
+/// `handle` must be null or a live pointer returned by an IME creation function.
+/// `pack_id` must point to `pack_id_len` readable UTF-8 bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_installed_dictionary_pack_words(
+    handle: *const SlimeHandle,
+    pack_id: *const u8,
+    pack_id_len: usize,
+) -> SlimeBuffer {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return error_response("null_handle");
+        }
+        // SAFETY: This FFI function requires the argument bytes to remain
+        // readable for the duration of the call.
+        let Some(id) = (unsafe { decode_utf8_argument(pack_id, pack_id_len) }) else {
+            return error_response("invalid_dictionary_pack_id");
+        };
+        // SAFETY: The caller promises a live handle. This function only reads it.
+        let engine = unsafe { &(*handle).engine };
+        let Some(words) = engine.installed_dictionary_pack_words(id) else {
+            return error_response("unknown_dictionary_pack");
+        };
+        let mut output = String::from("{\"ok\":true,\"words\":[");
+        for (index, word) in words.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str("{\"reading\":");
+            write_json_string(&mut output, &word.reading);
+            output.push_str(",\"surface\":");
+            write_json_string(&mut output, &word.surface);
+            output.push('}');
+        }
+        output.push_str("]}");
+        output
+    }));
+    SlimeBuffer::from_string(result.unwrap_or_else(|_| error_response("panic")))
+}
+
 /// Releases a buffer returned by [`slime_process`].
 ///
 /// # Safety
@@ -359,6 +450,15 @@ fn write_action(output: &mut String, action: &SlimeAction) {
     }
 }
 
+unsafe fn decode_utf8_argument<'a>(pointer: *const u8, length: usize) -> Option<&'a str> {
+    if pointer.is_null() {
+        return (length == 0).then_some("");
+    }
+    // SAFETY: Callers of the FFI functions using this helper promise a readable
+    // byte slice for the duration of the call.
+    std::str::from_utf8(unsafe { std::slice::from_raw_parts(pointer, length) }).ok()
+}
+
 fn write_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {
@@ -382,7 +482,8 @@ fn write_json_string(output: &mut String, value: &str) {
 mod tests {
     use super::{
         EVENT_CHARACTER, EVENT_ENTER, EVENT_SPACE, SlimeBuffer, slime_buffer_destroy, slime_create,
-        slime_create_with_data_dir, slime_destroy, slime_domain_dictionary_words, slime_process,
+        slime_create_with_data_dir, slime_destroy, slime_domain_dictionary_words,
+        slime_installed_dictionary_pack_words, slime_installed_dictionary_packs, slime_process,
         slime_set_options, slime_set_options_v2, slime_set_options_v3,
     };
     use std::fs;
@@ -528,6 +629,51 @@ mod tests {
         assert_eq!(json, "{\"ok\":true,\"words\":[]}");
         // SAFETY: `empty` is the original live buffer.
         unsafe { slime_buffer_destroy(empty) };
+    }
+
+    #[test]
+    fn installed_dictionary_packs_cross_the_c_boundary() {
+        let directory =
+            std::env::temp_dir().join(format!("slime-ffi-packs-{}", std::process::id()));
+        let pack_directory = directory.join("dictionary-packs");
+        fs::create_dir_all(&pack_directory).unwrap();
+        fs::write(
+            pack_directory.join("sample.slime-dict"),
+            "\
+# slime-dictionary-pack-v1
+# id: sample-pro
+# name: サンプル Pro
+# version: 2026.07.1
+# license: Proprietary
+すらいむぷろ\tSlime Pro
+",
+        )
+        .unwrap();
+        let path = directory.to_string_lossy();
+        // SAFETY: `path` remains readable for the duration of the creation call.
+        let handle = unsafe { slime_create_with_data_dir(path.as_ptr(), path.len()) };
+
+        // SAFETY: `handle` is live and read serially.
+        let catalog = unsafe { slime_installed_dictionary_packs(handle) };
+        // SAFETY: `catalog` is live until the destroy call below.
+        let json = unsafe { copy_buffer(&catalog) };
+        assert!(json.contains("\"id\":\"sample-pro\""), "{json}");
+        assert!(json.contains("\"entryCount\":1"), "{json}");
+        // SAFETY: `catalog` has not previously been released.
+        unsafe { slime_buffer_destroy(catalog) };
+
+        let id = b"sample-pro";
+        // SAFETY: `handle` and `id` are live and readable for this call.
+        let words = unsafe { slime_installed_dictionary_pack_words(handle, id.as_ptr(), id.len()) };
+        // SAFETY: `words` is live until the destroy call below.
+        let json = unsafe { copy_buffer(&words) };
+        assert!(json.contains("Slime Pro"), "{json}");
+        // SAFETY: Resources are live and each is destroyed exactly once.
+        unsafe {
+            slime_buffer_destroy(words);
+            slime_destroy(handle);
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

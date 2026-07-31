@@ -8,8 +8,8 @@ pub const ALL_DOMAIN_DICTIONARIES: u32 =
 
 const SUPPLEMENTAL_POS_ID: u16 = 1851;
 const DOMAIN_WORD_COST: i32 = 500;
-const MIN_DOMAIN_WORD_COST: i32 = 100;
-const MAX_DOMAIN_WORD_COST: i32 = 12_000;
+pub(crate) const MIN_DOMAIN_WORD_COST: i32 = 100;
+pub(crate) const MAX_DOMAIN_WORD_COST: i32 = 12_000;
 const USER_WORD_COST: i32 = 100;
 
 struct DomainSource {
@@ -17,6 +17,7 @@ struct DomainSource {
     id: &'static str,
     name: &'static str,
     source: &'static str,
+    expected_entries: usize,
 }
 
 const SOURCES: [DomainSource; 3] = [
@@ -25,18 +26,21 @@ const SOURCES: [DomainSource; 3] = [
         id: "technology",
         name: "テクノロジー",
         source: include_str!("../data/technology.tsv"),
+        expected_entries: 146,
     },
     DomainSource {
         mask: BUSINESS_DICTIONARY,
         id: "business",
         name: "ビジネス",
         source: include_str!("../data/business.tsv"),
+        expected_entries: 126,
     },
     DomainSource {
         mask: CREATIVE_DICTIONARY,
         id: "creative",
         name: "クリエイティブ",
         source: include_str!("../data/creative.tsv"),
+        expected_entries: 131,
     },
 ];
 
@@ -56,7 +60,12 @@ pub fn layers(mask: u32) -> Vec<DictionaryLayer> {
 /// rule out for shipped data.
 #[must_use]
 pub fn words(mask: u32) -> Vec<(&'static str, &'static str)> {
-    let mut words = Vec::new();
+    let capacity = SOURCES
+        .iter()
+        .filter(|source| mask & source.mask != 0)
+        .map(|source| source.expected_entries)
+        .sum();
+    let mut words = Vec::with_capacity(capacity);
     for source in SOURCES.iter().filter(|source| mask & source.mask != 0) {
         for line in source
             .source
@@ -76,7 +85,7 @@ pub fn user_layer<'a>(
     entries: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Option<DictionaryLayer> {
     let entries: Vec<_> = entries
-        .map(|(reading, surface)| entry(reading, surface, USER_WORD_COST))
+        .map(|(reading, surface)| supplemental_entry(reading, surface, USER_WORD_COST))
         .collect();
     (!entries.is_empty()).then(|| DictionaryLayer::new("user", "ユーザー辞書", entries))
 }
@@ -99,13 +108,13 @@ fn parse_layer(id: &str, name: &str, source: &str, cost: i32) -> DictionaryLayer
                 (MIN_DOMAIN_WORD_COST..=MAX_DOMAIN_WORD_COST).contains(&word_cost),
                 "domain dictionary cost is within the reviewed range"
             );
-            entry(reading, surface, word_cost)
+            supplemental_entry(reading, surface, word_cost)
         })
         .collect();
     DictionaryLayer::new(id, name, entries)
 }
 
-fn entry(reading: &str, surface: &str, cost: i32) -> DictionaryEntry {
+pub(crate) fn supplemental_entry(reading: &str, surface: &str, cost: i32) -> DictionaryEntry {
     DictionaryEntry::with_pos(
         reading,
         surface,
@@ -118,19 +127,26 @@ fn entry(reading: &str, surface: &str, cost: i32) -> DictionaryEntry {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_DOMAIN_DICTIONARIES, BUSINESS_DICTIONARY, CREATIVE_DICTIONARY, TECHNOLOGY_DICTIONARY,
-        layers, parse_layer, words,
+        ALL_DOMAIN_DICTIONARIES, BUSINESS_DICTIONARY, CREATIVE_DICTIONARY, SOURCES,
+        TECHNOLOGY_DICTIONARY, layers, parse_layer, words,
     };
     use std::collections::HashSet;
 
     #[test]
     fn each_domain_dictionary_is_an_independent_layer() {
         let all = layers(ALL_DOMAIN_DICTIONARIES);
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), SOURCES.len());
         assert_eq!(all[0].id(), "technology");
         assert_eq!(all[1].id(), "business");
         assert_eq!(all[2].id(), "creative");
-        assert!(all.iter().all(|layer| layer.entry_count() >= 75));
+        for (layer, source) in all.iter().zip(SOURCES.iter()) {
+            assert_eq!(
+                layer.entry_count(),
+                source.expected_entries,
+                "{}",
+                source.id
+            );
+        }
 
         assert_eq!(layers(TECHNOLOGY_DICTIONARY).len(), 1);
         assert_eq!(layers(BUSINESS_DICTIONARY).len(), 1);
@@ -160,16 +176,13 @@ mod tests {
 
     #[test]
     fn domain_sources_are_well_formed_and_have_unique_pairs() {
-        for (id, source) in [
-            ("technology", include_str!("../data/technology.tsv")),
-            ("business", include_str!("../data/business.tsv")),
-            ("creative", include_str!("../data/creative.tsv")),
-        ] {
-            let layer = parse_layer(id, id, source, 500);
-            assert!(layer.entry_count() >= 75, "{id}");
+        for source in SOURCES {
+            let id = source.id;
+            let layer = parse_layer(id, id, source.source, 500);
+            assert_eq!(layer.entry_count(), source.expected_entries, "{id}");
 
             let mut pairs = HashSet::new();
-            for line in source.lines().filter(|line| !line.is_empty()) {
+            for line in source.source.lines().filter(|line| !line.is_empty()) {
                 let mut columns = line.split('\t');
                 let reading = columns.next().unwrap();
                 let surface = columns.next().unwrap();

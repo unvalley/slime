@@ -8,11 +8,42 @@ enum SettingsPreview {
         if ProcessInfo.processInfo.environment["SLIME_SETTINGS_APPEARANCE"] == "dark" {
             application.appearance = NSAppearance(named: .darkAqua)
         }
+        if ProcessInfo.processInfo.environment["SLIME_SETTINGS_SAMPLE_PACKS"] == "1" {
+            InstalledDictionaryPackBridge.catalogLoader = {
+                InstalledDictionaryPackCatalog(
+                    packs: [
+                        InstalledDictionaryPack(
+                            id: "sample-pro",
+                            name: "専門用語 Plus",
+                            version: "2026.07.1",
+                            license: "Proprietary",
+                            entryCount: 51
+                        ),
+                        InstalledDictionaryPack(
+                            id: "proper-nouns-pro",
+                            name: "固有名詞 Plus",
+                            version: "2026.07.1",
+                            license: "Proprietary",
+                            entryCount: 33
+                        ),
+                    ],
+                    errors: []
+                )
+            }
+            InstalledDictionaryPackBridge.wordsLoader = { _ in
+                [DomainDictionaryWord(reading: "よみ", surface: "表示語")]
+            }
+        }
         application.finishLaunching()
         let controller = SettingsWindowController.shared
         let tab = ProcessInfo.processInfo.environment["SLIME_SETTINGS_TAB"]
             .flatMap(SettingsTab.init(rawValue:)) ?? .general
         controller.present(initialTab: tab)
+        if let height = ProcessInfo.processInfo.environment["SLIME_SETTINGS_HEIGHT"]
+            .flatMap(Double.init)
+        {
+            controller.window?.setContentSize(NSSize(width: 680, height: height))
+        }
         print("Settings preview visible: \(controller.window?.isVisible == true)")
         if let snapshotPath = ProcessInfo.processInfo.environment["SLIME_SETTINGS_SNAPSHOT_PATH"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {

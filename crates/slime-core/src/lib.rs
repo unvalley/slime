@@ -3,14 +3,19 @@
 use slime_converter::Dictionary;
 use slime_romaji::RomajiComposer;
 
+mod dictionary_packs;
 mod domain_dictionaries;
 mod english_reverse;
 mod session_history;
 mod user_data;
 
+use dictionary_packs::DictionaryPackStore;
 use english_reverse::ReverseMatch;
 use session_history::SessionHistory;
 
+pub use dictionary_packs::{
+    DictionaryPackInfo, DictionaryPackLoadError, DictionaryPackWord, validate_dictionary_pack,
+};
 pub use domain_dictionaries::{
     ALL_DOMAIN_DICTIONARIES, BUSINESS_DICTIONARY, CREATIVE_DICTIONARY, TECHNOLOGY_DICTIONARY,
     words as domain_dictionary_words,
@@ -109,6 +114,7 @@ pub struct SlimeEngine {
     live_preview: Option<LivePreview>,
     live_preview_suppressed: bool,
     user_data: UserData,
+    installed_packs: DictionaryPackStore,
     session_history: SessionHistory,
     uses_bundled_dictionary: bool,
     /// `(lowercased key, surface)` pairs of ASCII words from the enabled
@@ -132,6 +138,7 @@ impl SlimeEngine {
             live_preview: None,
             live_preview_suppressed: false,
             user_data: UserData::default(),
+            installed_packs: DictionaryPackStore::default(),
             session_history: SessionHistory::default(),
             uses_bundled_dictionary: false,
             ascii_surfaces: Vec::new(),
@@ -157,9 +164,12 @@ impl SlimeEngine {
 
     #[must_use]
     pub fn bundled_with_user_data(user_data: UserData) -> Self {
-        let dictionary = bundled_dictionary(0, &user_data);
+        let installed_packs = DictionaryPackStore::load(user_data.directory());
+        let dictionary = bundled_dictionary_with_packs(0, &user_data, &installed_packs);
         let mut engine = Self::with_user_data(dictionary, user_data);
+        engine.installed_packs = installed_packs;
         engine.uses_bundled_dictionary = true;
+        engine.rebuild_ascii_surfaces();
         engine
     }
 
@@ -170,7 +180,11 @@ impl SlimeEngine {
         if self.uses_bundled_dictionary
             && self.preferences.dictionary_packs != preferences.dictionary_packs
         {
-            self.dictionary = bundled_dictionary(preferences.dictionary_packs, &self.user_data);
+            self.dictionary = bundled_dictionary_with_packs(
+                preferences.dictionary_packs,
+                &self.user_data,
+                &self.installed_packs,
+            );
         }
         self.preferences = preferences;
         self.rebuild_ascii_surfaces();
@@ -181,9 +195,13 @@ impl SlimeEngine {
 
     pub fn reload_user_data(&mut self) -> Vec<SlimeAction> {
         self.user_data.reload();
+        self.installed_packs = DictionaryPackStore::load(self.user_data.directory());
         if self.uses_bundled_dictionary {
-            self.dictionary =
-                bundled_dictionary(self.preferences.dictionary_packs, &self.user_data);
+            self.dictionary = bundled_dictionary_with_packs(
+                self.preferences.dictionary_packs,
+                &self.user_data,
+                &self.installed_packs,
+            );
         }
         self.rebuild_ascii_surfaces();
         self.refresh_live_preview();
@@ -199,7 +217,8 @@ impl SlimeEngine {
         let domain_words = domain_dictionaries::words(self.preferences.dictionary_packs)
             .into_iter()
             .map(|(_, surface)| surface);
-        for surface in user_entries.chain(domain_words) {
+        let installed_words = self.installed_packs.words().map(|(_, surface)| surface);
+        for surface in user_entries.chain(domain_words).chain(installed_words) {
             if let Some(key) = english_reverse::surface_key(surface)
                 && !self
                     .ascii_surfaces
@@ -209,6 +228,20 @@ impl SlimeEngine {
                 self.ascii_surfaces.push((key, surface.to_owned()));
             }
         }
+    }
+
+    pub fn installed_dictionary_packs(&self) -> impl Iterator<Item = &DictionaryPackInfo> {
+        self.installed_packs.infos()
+    }
+
+    #[must_use]
+    pub fn installed_dictionary_pack_words(&self, id: &str) -> Option<Vec<DictionaryPackWord>> {
+        self.installed_packs.pack_words(id)
+    }
+
+    #[must_use]
+    pub fn dictionary_pack_load_errors(&self) -> &[DictionaryPackLoadError] {
+        self.installed_packs.errors()
     }
 
     /// Returns ASCII surfaces whose spelling the current reading retypes,
@@ -710,8 +743,18 @@ impl SlimeEngine {
     }
 }
 
+#[cfg(test)]
 fn bundled_dictionary(dictionary_packs: u32, user_data: &UserData) -> Dictionary {
+    bundled_dictionary_with_packs(dictionary_packs, user_data, &DictionaryPackStore::default())
+}
+
+fn bundled_dictionary_with_packs(
+    dictionary_packs: u32,
+    user_data: &UserData,
+    installed_packs: &DictionaryPackStore,
+) -> Dictionary {
     let mut layers = domain_dictionaries::layers(dictionary_packs);
+    layers.extend(installed_packs.layers());
     if let Some(user_layer) = domain_dictionaries::user_layer(user_data.dictionary_entries()) {
         layers.push(user_layer);
     }
@@ -786,8 +829,9 @@ impl Default for SlimeEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_DOMAIN_DICTIONARIES, EnginePreferences, InputEvent, Phase, SlimeAction, SlimeEngine,
-        TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary, katakana_candidate,
+        ALL_DOMAIN_DICTIONARIES, DictionaryPackWord, EnginePreferences, InputEvent, Phase,
+        SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary,
+        katakana_candidate,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1146,6 +1190,64 @@ mod tests {
             technology.candidates("すうぃふとゆーあい")[0].surface,
             "SwiftUI"
         );
+    }
+
+    #[test]
+    fn installed_dictionary_pack_is_loaded_from_user_data_directory() {
+        let directory = test_directory("installed-pack");
+        let pack_directory = directory.join("dictionary-packs");
+        fs::create_dir_all(&pack_directory).unwrap();
+        fs::write(
+            pack_directory.join("sample.slime-dict"),
+            "\
+# slime-dictionary-pack-v1
+# id: sample-pro
+# name: サンプル Pro
+# version: 2026.07.1
+# license: Proprietary
+すらいむぷろ\tSlime Pro
+こまわり\t専門小回り\t6000
+",
+        )
+        .unwrap();
+
+        let engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        assert_eq!(
+            engine.dictionary.candidates("すらいむぷろ")[0].surface,
+            "Slime Pro"
+        );
+        assert_eq!(
+            engine.dictionary.candidates("こまわり")[0].surface,
+            "小回り"
+        );
+        assert!(
+            engine
+                .dictionary
+                .candidates("こまわり")
+                .iter()
+                .any(|candidate| candidate.surface == "専門小回り")
+        );
+        let infos: Vec<_> = engine.installed_dictionary_packs().collect();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, "sample-pro");
+        assert_eq!(
+            engine
+                .installed_dictionary_pack_words("sample-pro")
+                .unwrap(),
+            [
+                DictionaryPackWord {
+                    reading: "すらいむぷろ".to_owned(),
+                    surface: "Slime Pro".to_owned(),
+                },
+                DictionaryPackWord {
+                    reading: "こまわり".to_owned(),
+                    surface: "専門小回り".to_owned(),
+                },
+            ]
+        );
+        assert!(engine.dictionary_pack_load_errors().is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

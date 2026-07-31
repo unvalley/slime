@@ -70,6 +70,10 @@ impl UserData {
         *self = Self::load(directory);
     }
 
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+
     pub fn exact_dictionary_surfaces(&self, reading: &str) -> impl Iterator<Item = &str> {
         self.dictionary
             .iter()

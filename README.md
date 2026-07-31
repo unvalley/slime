@@ -7,7 +7,8 @@ Currently it's for me.
 
 軽量・ローカル完結を目指す日本語IME。現在はmacOS向けに実装しています。
 
-- Mozc OSS由来の基本辞書, ユーザー辞書, 分野別辞書（テクノロジー・ビジネス・クリエイティブ）
+- Mozc OSS由来の基本辞書, ユーザー辞書, 無料の分野別辞書（テクノロジー・ビジネス・クリエイティブ）
+- 別ライセンスの追加辞書パックをローカルにインストールできる拡張境界
 - かな数詞の合成候補（半角・全角・漢数字）
 - 確度の高い接頭辞を保持し、曖昧な末尾をかなのまま扱うライブ変換
 - 利用履歴からのローカル補完・管理の容易さ
@@ -26,3 +27,6 @@ Slime IME is licensed under the MIT License.
 
 This project includes third-party components that are distributed
 under their respective licenses. See [MOZC_DICTIONARY_LICENSE.txt](crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt).
+
+External dictionary packs are separate products and are not covered by the
+Slime IME MIT License. See [Dictionary packs](docs/dictionary-packs.md).

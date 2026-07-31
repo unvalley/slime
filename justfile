@@ -102,6 +102,14 @@ verify-macos: build-macos
 # macOS版をまとめて検証する
 check-macos: check test-macos verify-macos
 
+# Git管理外の開発用追加辞書をApplication Supportへ配置する
+install-local-dictionary-packs:
+    scripts/install-local-dictionary-packs.sh
+
+# Git管理外の開発用追加辞書を形式検証する
+validate-local-dictionary-packs:
+    cargo run -q -p slime-tools --bin slime-dictionary-pack -- validate .slime-private/dictionary-packs/*.slime-dict
+
 # macOS版をユーザー領域へインストールして選択する
 install-macos: check-macos
     scripts/install-macos.sh

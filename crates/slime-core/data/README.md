@@ -1,6 +1,6 @@
 # 分野別辞書
 
-`technology.tsv`、`business.tsv`、`creative.tsv`は、Slime用に個別レビューした補助辞書です。外部用語集のデータを複製したものではありません。
+`technology.tsv`、`business.tsv`、`creative.tsv`は、Slime用に個別レビューしたMITライセンスの補助辞書です。外部用語集のデータを複製したものではありません。
 
 各行は次の形式です。
 
@@ -15,3 +15,6 @@
 - 語を追加したらmust-pass変換と一般語の副作用回帰を同時に追加する。
 
 表記の確認には、製品・仕様の公式文書、デジタル庁デザインシステム、Adobeの公式ヘルプ、日本取引所グループと国税庁の用語解説を参照しています。参照先は`docs/dictionary-personalization-and-migration.md`に記録しています。
+
+別ライセンスの追加辞書はこのディレクトリへ置かず、実行時に
+`Application Support/Slime/dictionary-packs`から読み込みます。

@@ -552,6 +552,26 @@ enum AdapterTests {
     }
 
     private static func testDomainDictionary(in directory: URL) throws {
+        let packDirectory = directory.appendingPathComponent(
+            "dictionary-packs",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: packDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data(
+            """
+            # slime-dictionary-pack-v1
+            # id: sample-pro
+            # name: サンプル Pro
+            # version: 2026.07.1
+            # license: Proprietary
+            すらいむぷろ\tSlime Pro
+
+            """.utf8
+        ).write(to: packDirectory.appendingPathComponent("sample.slime-dict"))
+
         let engine = try RustEngine(dataDirectory: directory)
         _ = try engine.setOptions(
             liveConversion: false,
@@ -567,6 +587,39 @@ enum AdapterTests {
                 $0.type == "show_candidates" && $0.candidates?.contains("SwiftUI") == true
             }),
             "technology dictionary should cross the Swift/C/Rust boundary"
+        )
+
+        let catalog = try engine.installedDictionaryPacks()
+        try expect(
+            catalog.packs == [
+                InstalledDictionaryPack(
+                    id: "sample-pro",
+                    name: "サンプル Pro",
+                    version: "2026.07.1",
+                    license: "Proprietary",
+                    entryCount: 1
+                ),
+            ] && catalog.errors.isEmpty,
+            "installed dictionary metadata should cross the Swift/C/Rust boundary"
+        )
+        let installedWords = try engine.installedDictionaryPackWords(id: "sample-pro")
+        try expect(
+            installedWords.contains(where: {
+                $0.reading == "すらいむぷろ" && $0.surface == "Slime Pro"
+            }),
+            "installed dictionary words should cross the Swift/C/Rust boundary"
+        )
+
+        let installedEngine = try RustEngine(dataDirectory: directory)
+        for scalar in "すらいむぷろ".unicodeScalars {
+            _ = try installedEngine.process(.character(scalar))
+        }
+        let installedActions = try installedEngine.process(.space)
+        try expect(
+            installedActions.contains(where: {
+                $0.type == "show_candidates" && $0.candidates?.contains("Slime Pro") == true
+            }),
+            "installed dictionary should participate in conversion"
         )
     }
 

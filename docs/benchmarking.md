@@ -14,12 +14,18 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 | `converter/candidate_window_single_word` | 完全一致候補とN-best経路の生成・sort | 20 ms未満 |
 | `converter/segmented_phrase` | `わたしはにほん`のラティス探索 | 20 ms未満 |
 | `converter/n_best_phrase` | `わたしはにほん`の上位10候補を有限ビームで探索 | 20 ms未満 |
+| `converter/n_best_search_20` | 同じ入力で内部探索幅だけ20へ広げた比較用ケース | 評価用。上位10件との差分を記録 |
+| `converter/digit_counter_phrase` | 全角数字列と年・月・日の数詞接続を含む候補窓 | 20 ms未満 |
 | `engine/nihon_conversion` | engine生成から入力、変換、確定まで | 参考値。cold startを分離予定 |
 | `engine/history_completion_{off,on}_500_entries` | 500件の履歴を保持した長寿命engineで`pafu`を入力・確定 | ON/OFFの絶対差を5 ms未満に保つ |
 | `engine/session_context_{empty,128}` | 分野辞書ONで、文脈なしと上限128遷移の最古hitを比較 | 差を0.1 ms未満に保つ |
 | `ffi/engine_{cold,warm}_create` | SwiftからFFI engineを初回・共有辞書初期化後に生成 | cold p95 100 ms未満、warm p95 1 ms未満 |
 
 現状は1,085,466語の基本辞書（抽出閾値8500、AJIMEE-Benchで精度が飽和する下限）と344語の任意分野辞書を使う。基本辞書は`build.rs`でTSVからFST+エントリ表+表層プールのバイナリ形式（計約29 MB、TSV 44 MBから圧縮）へ事前コンパイルし、`include_bytes!`でzero-copy参照する。辞書拡大直後はTSVの起動時parseで cold `Dictionary::bundled()` が約386 msだったが、コンパイル形式への移行後は約70 µs、変換ツール実行時の最大RSSは221 MB→4.2 MBになった（Apple M3、release）。
+
+2026-08-01、Apple M3、release、1,000 iterationsで、全角数字と年・月・日を含む`converter/digit_counter_phrase`は489,084 ns/opだった。allocation benchmarkは419 allocations/op、101,387 bytes/op。数詞node追加後も20 ms予算の十分内側にある。
+
+同日、語bigramの再ランキング対象を広げる判断のため`わたしはにほん`を探索幅10/20で比較した。幅10は1,366,503 ns/op、172 allocations/op、59,605 bytes/op、幅20は4,756,460 ns/op、300 allocations/op、152,305 bytes/opだった。状態identityを`HashMap`で索引する試作は幅20を4,592,558 ns/opへ3.4%短縮しただけで、幅10を1,794,526 ns/opへ悪化させ、割当も増えたため撤回した。広い探索を常用する前に、線形scanを置き換える低割当なbucket/heap設計が必要である。
 
 ## 初回baseline
 

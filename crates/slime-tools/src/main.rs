@@ -1,16 +1,18 @@
 //! Offline evaluation tools for kana-kanji conversion quality.
 
+mod corpus_bigram;
 #[cfg(feature = "neural")]
 mod neural;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use corpus_bigram::{CorpusBigramRanker, Diagnostics as BigramDiagnostics, TransitionDiagnostics};
 use serde::{Deserialize, Serialize};
-use slime_converter::{Candidate, Dictionary};
+use slime_converter::{Candidate, CandidateRanker, CostOnlyRanker, Dictionary};
 
 /// Mozc-style costs approximate `-scale * ln(probability)`. Used to map
 /// lattice costs onto the neural log-likelihood axis for interpolation.
@@ -28,12 +30,18 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let options = Options::parse(env::args().skip(1))?;
-    let bytes = fs::read(&options.input)
-        .map_err(|error| format!("failed to read {}: {error}", options.input.display()))?;
-    let items: Vec<AjimeeItem> = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("failed to parse {}: {error}", options.input.display()))?;
+    let items = load_items(&options)?;
     let dictionary = Dictionary::bundled();
-    let reports = evaluate(&dictionary, &items, &options)?;
+    let word_bigram_ranker = (options.word_bigram_weight > 0 || options.skip_bigram_weight > 0)
+        .then(|| {
+            CorpusBigramRanker::load(
+                &options.word_bigram_corpora,
+                options.word_bigram_weight,
+                options.skip_bigram_weight,
+            )
+        })
+        .transpose()?;
+    let reports = evaluate(&dictionary, &items, &options, word_bigram_ranker.as_ref())?;
 
     if options.json {
         let serialized = if reports.len() == 1 {
@@ -108,18 +116,49 @@ impl ContextFilter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatasetFormat {
+    Ajimee,
+    Anthy,
+}
+
+impl DatasetFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "ajimee" => Ok(Self::Ajimee),
+            "anthy" => Ok(Self::Anthy),
+            _ => Err(format!(
+                "unsupported evaluation format {value:?}\n{}",
+                usage()
+            )),
+        }
+    }
+
+    const fn dataset_name(self) -> &'static str {
+        match self {
+            Self::Ajimee => "AJIMEE-Bench JWTD_v2/v1",
+            Self::Anthy => "Anthy conversion corpus",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Options {
-    input: PathBuf,
+    format: DatasetFormat,
+    inputs: Vec<PathBuf>,
     dataset_revision: Option<String>,
     dataset_sha256: Option<String>,
     top_k: usize,
+    search_k: Option<usize>,
     context: ContextFilter,
     limit: Option<usize>,
     failures: usize,
     json: bool,
     neural_model: Option<PathBuf>,
     lambdas: Vec<f64>,
+    word_bigram_corpora: Vec<PathBuf>,
+    word_bigram_weight: i32,
+    skip_bigram_weight: i32,
 }
 
 impl Options {
@@ -128,31 +167,43 @@ impl Options {
         let Some(format) = arguments.next() else {
             return Err(usage());
         };
-        if format != "ajimee" {
-            return Err(format!(
-                "unsupported evaluation format {format:?}\n{}",
-                usage()
-            ));
-        }
-        let Some(input) = arguments.next() else {
-            return Err(usage());
-        };
+        let format = DatasetFormat::parse(&format)?;
         let mut options = Self {
-            input: PathBuf::from(input),
-            dataset_revision: env::var("AJIMEE_BENCH_REVISION").ok(),
-            dataset_sha256: env::var("AJIMEE_BENCH_SHA256").ok(),
+            format,
+            inputs: Vec::new(),
+            dataset_revision: match format {
+                DatasetFormat::Ajimee => env::var("AJIMEE_BENCH_REVISION").ok(),
+                DatasetFormat::Anthy => env::var("ANTHY_CORPUS_REVISION").ok(),
+            },
+            dataset_sha256: match format {
+                DatasetFormat::Ajimee => env::var("AJIMEE_BENCH_SHA256").ok(),
+                DatasetFormat::Anthy => env::var("ANTHY_CORPUS_SHA256").ok(),
+            },
             top_k: 10,
+            search_k: None,
             context: ContextFilter::All,
             limit: None,
             failures: 10,
             json: false,
             neural_model: None,
             lambdas: Vec::new(),
+            word_bigram_corpora: Vec::new(),
+            word_bigram_weight: 0,
+            skip_bigram_weight: 0,
         };
 
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "--input" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--input requires a path".to_owned())?;
+                    options.inputs.push(PathBuf::from(value));
+                }
                 "--top-k" => options.top_k = parse_positive("--top-k", arguments.next())?,
+                "--search-k" => {
+                    options.search_k = Some(parse_positive("--search-k", arguments.next())?);
+                }
                 "--context" => {
                     let value = arguments
                         .next()
@@ -169,9 +220,45 @@ impl Options {
                     options.neural_model = Some(PathBuf::from(value));
                 }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
+                "--word-bigram-corpus" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--word-bigram-corpus requires a path".to_owned())?;
+                    options.word_bigram_corpora.push(PathBuf::from(value));
+                }
+                "--word-bigram-weight" => {
+                    options.word_bigram_weight =
+                        parse_non_negative_i32("--word-bigram-weight", arguments.next())?;
+                }
+                "--skip-bigram-weight" => {
+                    options.skip_bigram_weight =
+                        parse_non_negative_i32("--skip-bigram-weight", arguments.next())?;
+                }
                 "--help" | "-h" => return Err(usage()),
+                _ if !argument.starts_with('-') => {
+                    // Keep the original `ajimee items.json` invocation valid;
+                    // `--input` is preferred when multiple Anthy files are used.
+                    options.inputs.push(PathBuf::from(argument));
+                }
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
+        }
+        if options.inputs.is_empty() {
+            return Err(format!("at least one --input is required\n{}", usage()));
+        }
+        if options.format == DatasetFormat::Ajimee && options.inputs.len() != 1 {
+            return Err("ajimee format requires exactly one --input".to_owned());
+        }
+        if options
+            .search_k
+            .is_some_and(|search_k| search_k < options.top_k)
+        {
+            return Err("--search-k must be greater than or equal to --top-k".to_owned());
+        }
+        if (options.word_bigram_weight > 0 || options.skip_bigram_weight > 0)
+            && options.word_bigram_corpora.is_empty()
+        {
+            return Err("bigram weights require --word-bigram-corpus".to_owned());
         }
         if options.lambdas.is_empty() {
             // Default sweep for tuning the interpolation weight on the devset.
@@ -184,13 +271,79 @@ impl Options {
 }
 
 fn usage() -> String {
-    "usage: ime-evaluate ajimee <evaluation_items.json> [--top-k N] \
+    "usage: slime-evaluate <ajimee|anthy> --input <path> [--input <path> ...] [--top-k N] \
+     [--search-k N] \
      [--context all|none|present] [--limit N] [--failures N] [--json] \
-     [--neural-model model.gguf] [--lambda X]...\n\
+     [--neural-model model.gguf] [--lambda X]... \
+     [--word-bigram-corpus corpus.txt] [--word-bigram-weight N] \
+     [--skip-bigram-weight N]\n\
      --neural-model rescores the N-best with a zenz GGUF model (requires \
      building with --features neural). --lambda selects interpolation \
-     weights; without it a default sweep runs."
+     weights; without it a default sweep runs. The optional annotated corpus \
+     uses whitespace-separated surface/reading tokens and only affects offline \
+     N-best ranking."
         .to_owned()
+}
+
+fn parse_non_negative_i32(name: &str, value: Option<String>) -> Result<i32, String> {
+    let value = value.ok_or_else(|| format!("{name} requires a value"))?;
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| format!("{name} requires a non-negative integer"))?;
+    if parsed < 0 {
+        return Err(format!("{name} requires a non-negative integer"));
+    }
+    Ok(parsed)
+}
+
+fn load_items(options: &Options) -> Result<Vec<AjimeeItem>, String> {
+    match options.format {
+        DatasetFormat::Ajimee => load_ajimee_items(&options.inputs[0]),
+        DatasetFormat::Anthy => load_anthy_items(&options.inputs),
+    }
+}
+
+fn load_ajimee_items(path: &Path) -> Result<Vec<AjimeeItem>, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn load_anthy_items(paths: &[PathBuf]) -> Result<Vec<AjimeeItem>, String> {
+    let mut items = Vec::new();
+    for path in paths {
+        let source = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        for (line_index, line) in source.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (reading, expected) = parse_anthy_line(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), line_index + 1))?;
+            items.push(AjimeeItem {
+                index: format!("{}:{}", path.display(), line_index + 1),
+                context_text: String::new(),
+                input: reading,
+                expected_output: vec![expected],
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn parse_anthy_line(line: &str) -> Result<(String, String), String> {
+    let (reading, expected) = line
+        .split_once("| |")
+        .ok_or_else(|| "expected a '| |' separator between reading and surface".to_owned())?;
+    let concatenate_segments = |value: &str| value.split('|').collect::<String>();
+    let reading = concatenate_segments(reading);
+    let expected = concatenate_segments(expected);
+    if reading.is_empty() || expected.is_empty() {
+        return Err("reading and surface must not be empty".to_owned());
+    }
+    Ok((reading, expected))
 }
 
 fn parse_lambda(value: Option<String>) -> Result<f64, String> {
@@ -238,8 +391,13 @@ struct EvaluationReport {
     neural_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lambda: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    word_bigram: Option<NgramReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_bigram: Option<NgramReport>,
     items: usize,
     top_k: usize,
+    search_k: usize,
     accuracy_at_1: f64,
     accuracy_at_k: f64,
     mrr_at_k: f64,
@@ -247,6 +405,50 @@ struct EvaluationReport {
     min_cer_at_k: f64,
     latency_ms: LatencyReport,
     failures: Vec<Failure>,
+}
+
+#[derive(Debug, Serialize)]
+struct NgramReport {
+    entries: usize,
+    weight: i32,
+    candidates_scored: u64,
+    transitions_scored: u64,
+    matched_transitions: u64,
+    match_rate: f64,
+}
+
+impl NgramReport {
+    fn new(diagnostics: TransitionDiagnostics, candidates_scored: u64) -> Self {
+        let match_rate = if diagnostics.transitions_scored == 0 {
+            0.0
+        } else {
+            u64_to_f64(diagnostics.matched_transitions) / u64_to_f64(diagnostics.transitions_scored)
+        };
+        Self {
+            entries: diagnostics.entries,
+            weight: diagnostics.weight,
+            candidates_scored,
+            transitions_scored: diagnostics.transitions_scored,
+            matched_transitions: diagnostics.matched_transitions,
+            match_rate,
+        }
+    }
+}
+
+fn word_bigram_report(diagnostics: Option<BigramDiagnostics>) -> Option<NgramReport> {
+    diagnostics.and_then(|diagnostics| {
+        diagnostics
+            .word
+            .map(|word| NgramReport::new(word, diagnostics.candidates_scored))
+    })
+}
+
+fn skip_bigram_report(diagnostics: Option<BigramDiagnostics>) -> Option<NgramReport> {
+    diagnostics.and_then(|diagnostics| {
+        diagnostics
+            .skip
+            .map(|skip| NgramReport::new(skip, diagnostics.candidates_scored))
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -276,6 +478,7 @@ fn evaluate(
     dictionary: &Dictionary,
     items: &[AjimeeItem],
     options: &Options,
+    word_bigram_ranker: Option<&CorpusBigramRanker>,
 ) -> Result<Vec<EvaluationReport>, String> {
     let selected: Vec<_> = items
         .iter()
@@ -286,6 +489,9 @@ fn evaluate(
         return Err("no evaluation items matched the selected filters".to_owned());
     }
 
+    let ranker = word_bigram_ranker.map_or(&CostOnlyRanker as &dyn CandidateRanker, |ranker| {
+        ranker as &dyn CandidateRanker
+    });
     let mut outcomes = Vec::with_capacity(selected.len());
     for item in selected {
         if item.expected_output.is_empty() {
@@ -293,8 +499,9 @@ fn evaluate(
         }
         let reading = katakana_to_hiragana(&item.input);
         let started = Instant::now();
+        let search_k = options.search_k.unwrap_or(options.top_k);
         let candidates: Vec<_> = dictionary
-            .candidates(&reading)
+            .candidates_with_ranker(&reading, search_k, ranker)
             .into_iter()
             .take(options.top_k)
             .collect();
@@ -305,9 +512,16 @@ fn evaluate(
             latency,
         });
     }
+    let word_bigram_diagnostics = word_bigram_ranker.map(CorpusBigramRanker::diagnostics);
 
     let Some(model_path) = &options.neural_model else {
-        return Ok(vec![compute_report(&outcomes, None, None, options)]);
+        return Ok(vec![compute_report(
+            &outcomes,
+            None,
+            None,
+            options,
+            word_bigram_diagnostics,
+        )]);
     };
 
     #[cfg(not(feature = "neural"))]
@@ -339,7 +553,15 @@ fn evaluate(
         Ok(options
             .lambdas
             .iter()
-            .map(|&lambda| compute_report(&outcomes, Some(&neural), Some(lambda), options))
+            .map(|&lambda| {
+                compute_report(
+                    &outcomes,
+                    Some(&neural),
+                    Some(lambda),
+                    options,
+                    word_bigram_diagnostics,
+                )
+            })
             .collect())
     }
 }
@@ -373,6 +595,7 @@ fn compute_report(
     neural: Option<&NeuralOutcome>,
     lambda: Option<f64>,
     options: &Options,
+    word_bigram_diagnostics: Option<BigramDiagnostics>,
 ) -> EvaluationReport {
     let mut correct_at_1 = 0_usize;
     let mut correct_at_k = 0_usize;
@@ -400,8 +623,17 @@ fn compute_report(
         }
         latencies.push(latency);
 
-        let rank = candidates.iter().position(|candidate| {
-            item.expected_output
+        let normalized_candidates: Vec<String> = candidates
+            .iter()
+            .map(|candidate| normalize_for_evaluation(candidate, options.format))
+            .collect();
+        let normalized_expected: Vec<String> = item
+            .expected_output
+            .iter()
+            .map(|expected| normalize_for_evaluation(expected, options.format))
+            .collect();
+        let rank = normalized_candidates.iter().position(|candidate| {
+            normalized_expected
                 .iter()
                 .any(|expected| expected == candidate)
         });
@@ -413,12 +645,12 @@ fn compute_report(
             reciprocal_rank += 1.0 / usize_to_f64(rank + 1);
         }
 
-        min_cer_at_1 += candidates.first().map_or(1.0, |candidate| {
-            minimum_cer(&item.expected_output, candidate)
+        min_cer_at_1 += normalized_candidates.first().map_or(1.0, |candidate| {
+            minimum_cer(&normalized_expected, candidate)
         });
-        min_cer_at_k += candidates
+        min_cer_at_k += normalized_candidates
             .iter()
-            .map(|candidate| minimum_cer(&item.expected_output, candidate))
+            .map(|candidate| minimum_cer(&normalized_expected, candidate))
             .reduce(f64::min)
             .unwrap_or(1.0);
 
@@ -436,7 +668,7 @@ fn compute_report(
     let total = usize_to_f64(outcomes.len());
     latencies.sort_unstable();
     EvaluationReport {
-        dataset: "AJIMEE-Bench JWTD_v2/v1",
+        dataset: options.format.dataset_name(),
         dataset_revision: options.dataset_revision.clone(),
         dataset_sha256: options.dataset_sha256.clone(),
         context_filter: options.context,
@@ -446,8 +678,11 @@ fn compute_report(
             .as_ref()
             .map(|path| path.display().to_string()),
         lambda,
+        word_bigram: word_bigram_report(word_bigram_diagnostics),
+        skip_bigram: skip_bigram_report(word_bigram_diagnostics),
         items: outcomes.len(),
         top_k: options.top_k,
+        search_k: options.search_k.unwrap_or(options.top_k),
         accuracy_at_1: usize_to_f64(correct_at_1) / total,
         accuracy_at_k: usize_to_f64(correct_at_k) / total,
         mrr_at_k: reciprocal_rank / total,
@@ -460,6 +695,21 @@ fn compute_report(
             max: duration_to_millis(*latencies.last().expect("non-empty latencies")),
         },
         failures,
+    }
+}
+
+fn normalize_for_evaluation(value: &str, format: DatasetFormat) -> String {
+    match format {
+        DatasetFormat::Ajimee => value.to_owned(),
+        DatasetFormat::Anthy => value
+            .chars()
+            .map(|character| match character {
+                '０'..='９' => {
+                    char::from_u32(u32::from(character) - 0xFEE0).expect("valid ASCII digit")
+                }
+                _ => character,
+            })
+            .collect(),
     }
 }
 
@@ -479,7 +729,42 @@ fn print_report(report: &EvaluationReport) {
     if let Some(lambda) = report.lambda {
         println!("lambda: {lambda:.2}");
     }
+    if let Some(bigram) = &report.word_bigram {
+        println!("word bigram entries: {}", bigram.entries);
+        println!("word bigram weight: {}", bigram.weight);
+        println!(
+            "word bigram candidates scored: {}",
+            bigram.candidates_scored
+        );
+        println!(
+            "word bigram transitions scored: {}",
+            bigram.transitions_scored
+        );
+        println!(
+            "word bigram matched transitions: {}",
+            bigram.matched_transitions
+        );
+        println!("word bigram match rate: {:.4}", bigram.match_rate);
+    }
+    if let Some(bigram) = &report.skip_bigram {
+        println!("skip bigram entries: {}", bigram.entries);
+        println!("skip bigram weight: {}", bigram.weight);
+        println!(
+            "skip bigram candidates scored: {}",
+            bigram.candidates_scored
+        );
+        println!(
+            "skip bigram transitions scored: {}",
+            bigram.transitions_scored
+        );
+        println!(
+            "skip bigram matched transitions: {}",
+            bigram.matched_transitions
+        );
+        println!("skip bigram match rate: {:.4}", bigram.match_rate);
+    }
     println!("items: {}", report.items);
+    println!("search k: {}", report.search_k);
     println!("acc@1: {:.4}", report.accuracy_at_1);
     println!("acc@{}: {:.4}", report.top_k, report.accuracy_at_k);
     println!("mrr@{}: {:.4}", report.top_k, report.mrr_at_k);
@@ -565,9 +850,16 @@ fn usize_to_f64(value: usize) -> f64 {
     f64::from(u32::try_from(value).expect("evaluation counts fit in u32"))
 }
 
+fn u64_to_f64(value: u64) -> f64 {
+    f64::from(u32::try_from(value).expect("evaluation counts fit in u32"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ContextFilter, Options, character_error_rate, katakana_to_hiragana, percentile};
+    use super::{
+        ContextFilter, DatasetFormat, Options, character_error_rate, katakana_to_hiragana,
+        normalize_for_evaluation, parse_anthy_line, percentile,
+    };
     use std::time::Duration;
 
     fn assert_close(actual: f64, expected: f64) {
@@ -602,9 +894,12 @@ mod tests {
         let options = Options::parse(
             [
                 "ajimee",
+                "--input",
                 "items.json",
                 "--top-k",
                 "5",
+                "--search-k",
+                "20",
                 "--context",
                 "none",
                 "--limit",
@@ -612,6 +907,12 @@ mod tests {
                 "--failures",
                 "0",
                 "--json",
+                "--word-bigram-corpus",
+                "annotated.txt",
+                "--word-bigram-weight",
+                "500",
+                "--skip-bigram-weight",
+                "250",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -619,9 +920,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.top_k, 5);
+        assert_eq!(options.search_k, Some(20));
+        assert_eq!(options.format, DatasetFormat::Ajimee);
+        assert_eq!(options.inputs, [std::path::PathBuf::from("items.json")]);
         assert_eq!(options.context, ContextFilter::None);
         assert_eq!(options.limit, Some(25));
         assert_eq!(options.failures, 0);
         assert!(options.json);
+        assert_eq!(
+            options.word_bigram_corpora,
+            [std::path::PathBuf::from("annotated.txt")]
+        );
+        assert_eq!(options.word_bigram_weight, 500);
+        assert_eq!(options.skip_bigram_weight, 250);
+    }
+
+    #[test]
+    fn keeps_the_original_positional_ajimee_input() {
+        let options =
+            Options::parse(["ajimee", "items.json"].into_iter().map(str::to_owned)).unwrap();
+
+        assert_eq!(options.inputs, [std::path::PathBuf::from("items.json")]);
+    }
+
+    #[test]
+    fn parses_anthy_segments_without_losing_literal_text() {
+        assert_eq!(
+            parse_anthy_line("|uim-fepの|あたらしい|ばーじょん| |uim-fepの|新しい|バージョン|")
+                .unwrap(),
+            (
+                "uim-fepのあたらしいばーじょん".to_owned(),
+                "uim-fepの新しいバージョン".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn anthy_scoring_normalizes_full_width_digits() {
+        assert_eq!(
+            normalize_for_evaluation("今日は２０２６年", DatasetFormat::Anthy),
+            "今日は2026年"
+        );
+        assert_eq!(
+            normalize_for_evaluation("今日は２０２６年", DatasetFormat::Ajimee),
+            "今日は２０２６年"
+        );
     }
 }

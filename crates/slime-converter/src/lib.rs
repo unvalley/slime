@@ -1427,8 +1427,9 @@ fn is_grammar_literal(reading: &str) -> bool {
 }
 
 /// A lattice node generated at runtime instead of coming from the dictionary:
-/// composed numerals (せんきゅうひゃく → 1900) and katakana runs for unknown
-/// foreign words. `end` is the absolute byte offset where the node stops.
+/// digit runs, composed numerals (せんきゅうひゃく → 1900), and katakana runs
+/// for unknown foreign words. `end` is the absolute byte offset where the node
+/// stops.
 #[derive(Clone, Debug)]
 struct SyntheticEntry<'a> {
     end: usize,
@@ -1438,13 +1439,37 @@ struct SyntheticEntry<'a> {
     cost: i32,
 }
 
-fn synthetic_entries_by_start<'a>(reading: &str, arena: &'a Bump) -> Vec<Vec<SyntheticEntry<'a>>> {
+fn synthetic_entries_by_start<'a>(
+    reading: &'a str,
+    arena: &'a Bump,
+) -> Vec<Vec<SyntheticEntry<'a>>> {
     let mut by_start: Vec<Vec<SyntheticEntry>> = (0..=reading.len()).map(|_| Vec::new()).collect();
     for (start, _) in reading.char_indices() {
+        push_digit_run_entry(reading, start, &mut by_start[start]);
         push_number_entries(reading, start, arena, &mut by_start[start]);
         push_katakana_entries(reading, start, arena, &mut by_start[start]);
     }
     by_start
+}
+
+fn push_digit_run_entry<'a>(reading: &'a str, start: usize, out: &mut Vec<SyntheticEntry<'a>>) {
+    let mut end = start;
+    for (offset, character) in reading[start..].char_indices() {
+        if !matches!(character, '0'..='9' | '０'..='９') {
+            break;
+        }
+        end = start + offset + character.len_utf8();
+    }
+    if end == start {
+        return;
+    }
+    out.push(SyntheticEntry {
+        end,
+        surface: &reading[start..end],
+        left_id: ARABIC_NUMBER_POS_ID,
+        right_id: ARABIC_NUMBER_POS_ID,
+        cost: number_cost(),
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -1906,6 +1931,21 @@ mod tests {
             Some("1億2345万")
         );
         assert_eq!(super::mixed_numeral(1_991), None);
+    }
+
+    #[test]
+    fn literal_digit_runs_use_number_connections() {
+        let dictionary = Dictionary::bundled();
+        for (reading, expected) in [("２じごろ", "２時頃"), ("100えん", "100円")] {
+            let candidates = dictionary.candidates(reading);
+            assert!(
+                candidates
+                    .iter()
+                    .take(10)
+                    .any(|candidate| candidate.surface == expected),
+                "missing {expected} for {reading}: {candidates:?}"
+            );
+        }
     }
 
     #[test]

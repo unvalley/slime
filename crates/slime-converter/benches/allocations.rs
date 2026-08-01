@@ -65,8 +65,14 @@ fn main() {
     run("converter/n_best_search", iterations, || {
         black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(10)));
     });
+    run("converter/n_best_search_20", iterations, || {
+        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(20)));
+    });
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
+    });
+    run("converter/digit_counter_phrase", iterations, || {
+        black_box(dictionary.candidates(black_box("２０２６ねん８がつ１にち")));
     });
     run("converter/short_dictionary_layer", iterations, || {
         black_box(short_dictionary_layer());

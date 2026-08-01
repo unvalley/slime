@@ -37,4 +37,4 @@ done
 
 AJIMEE_BENCH_REVISION="$revision" AJIMEE_BENCH_SHA256="$actual_sha256" \
   cargo run --release --quiet -p slime-tools ${features[@]+"${features[@]}"} --bin slime-evaluate -- \
-  ajimee "$data_file" "$@"
+  ajimee --input "$data_file" "$@"

@@ -278,12 +278,22 @@ pub unsafe extern "C" fn slime_installed_dictionary_packs(
             }
             output.push_str("{\"id\":");
             write_json_string(&mut output, &pack.id);
+            write!(output, ",\"formatVersion\":{}", pack.format_version)
+                .expect("writing to String cannot fail");
             output.push_str(",\"name\":");
             write_json_string(&mut output, &pack.name);
             output.push_str(",\"version\":");
             write_json_string(&mut output, &pack.version);
             output.push_str(",\"license\":");
             write_json_string(&mut output, &pack.license);
+            output.push_str(",\"minimumSlimeVersion\":");
+            write_optional_json_string(&mut output, pack.minimum_slime_version.as_deref());
+            output.push_str(",\"publishedAt\":");
+            write_optional_json_string(&mut output, pack.published_at.as_deref());
+            output.push_str(",\"provenance\":");
+            write_optional_json_string(&mut output, pack.provenance.as_deref());
+            output.push_str(",\"entriesSHA256\":");
+            write_optional_json_string(&mut output, pack.entries_sha256.as_deref());
             write!(output, ",\"entryCount\":{}}}", pack.entry_count)
                 .expect("writing to String cannot fail");
         }
@@ -478,6 +488,14 @@ fn write_json_string(output: &mut String, value: &str) {
     output.push('"');
 }
 
+fn write_optional_json_string(output: &mut String, value: Option<&str>) {
+    if let Some(value) = value {
+        write_json_string(output, value);
+    } else {
+        output.push_str("null");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -658,6 +676,8 @@ mod tests {
         // SAFETY: `catalog` is live until the destroy call below.
         let json = unsafe { copy_buffer(&catalog) };
         assert!(json.contains("\"id\":\"sample-pro\""), "{json}");
+        assert!(json.contains("\"formatVersion\":1"), "{json}");
+        assert!(json.contains("\"provenance\":null"), "{json}");
         assert!(json.contains("\"entryCount\":1"), "{json}");
         // SAFETY: `catalog` has not previously been released.
         unsafe { slime_buffer_destroy(catalog) };

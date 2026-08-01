@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 slime-converter = { path = "../slime-converter" }
 slime-romaji = { path = "../slime-romaji" }
+sha2 = "0.10"
 
 [lints]
 workspace = true
@@ -16,4 +17,3 @@ workspace = true
 [[bench]]
 name = "engine"
 harness = false
-

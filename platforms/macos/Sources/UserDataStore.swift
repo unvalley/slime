@@ -77,10 +77,39 @@ struct DomainDictionaryWord: Decodable, Identifiable, Equatable {
 
 struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
     let id: String
+    let formatVersion: Int?
     let name: String
     let version: String
     let license: String
+    let minimumSlimeVersion: String?
+    let publishedAt: String?
+    let provenance: String?
+    let entriesSHA256: String?
     let entryCount: Int
+
+    init(
+        id: String,
+        formatVersion: Int? = nil,
+        name: String,
+        version: String,
+        license: String,
+        minimumSlimeVersion: String? = nil,
+        publishedAt: String? = nil,
+        provenance: String? = nil,
+        entriesSHA256: String? = nil,
+        entryCount: Int
+    ) {
+        self.id = id
+        self.formatVersion = formatVersion
+        self.name = name
+        self.version = version
+        self.license = license
+        self.minimumSlimeVersion = minimumSlimeVersion
+        self.publishedAt = publishedAt
+        self.provenance = provenance
+        self.entriesSHA256 = entriesSHA256
+        self.entryCount = entryCount
+    }
 }
 
 struct DictionaryPackLoadIssue: Decodable, Equatable {

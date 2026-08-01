@@ -446,6 +446,11 @@ private struct InstalledDictionaryPackRow: View {
                 Text("バージョン \(pack.version)・\(pack.entryCount)語")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let provenance = pack.provenance {
+                    Text("提供元: \(provenance)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
             Button {

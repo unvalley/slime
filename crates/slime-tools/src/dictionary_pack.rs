@@ -31,8 +31,15 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), String> {
         let info = slime_core::validate_dictionary_pack(&source)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         println!(
-            "{}\t{}\t{}\t{}\t{}",
-            info.id, info.name, info.version, info.license, info.entry_count
+            "v{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            info.format_version,
+            info.id,
+            info.name,
+            info.version,
+            info.license,
+            info.minimum_slime_version.as_deref().unwrap_or("-"),
+            info.published_at.as_deref().unwrap_or("-"),
+            info.entry_count
         );
     }
     Ok(())

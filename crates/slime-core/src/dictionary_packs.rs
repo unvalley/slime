@@ -2,13 +2,16 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use slime_converter::DictionaryLayer;
 
 use crate::domain_dictionaries::{MAX_DOMAIN_WORD_COST, MIN_DOMAIN_WORD_COST, supplemental_entry};
 
 const PACK_DIRECTORY_NAME: &str = "dictionary-packs";
 const PACK_FILE_EXTENSION: &str = "slime-dict";
-const PACK_HEADER: &str = "# slime-dictionary-pack-v1";
+const PACK_HEADER_V1: &str = "# slime-dictionary-pack-v1";
+const PACK_HEADER_V2: &str = "# slime-dictionary-pack-v2";
+const PACK_ENTRIES_MARKER: &str = "# entries";
 const DEFAULT_WORD_COST: i32 = 500;
 const MAX_PACKS: usize = 64;
 const MAX_PACK_BYTES: u64 = 32 * 1024 * 1024;
@@ -17,10 +20,15 @@ const MAX_LINE_BYTES: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DictionaryPackInfo {
+    pub format_version: u8,
     pub id: String,
     pub name: String,
     pub version: String,
     pub license: String,
+    pub minimum_slime_version: Option<String>,
+    pub published_at: Option<String>,
+    pub provenance: Option<String>,
+    pub entries_sha256: Option<String>,
     pub entry_count: usize,
 }
 
@@ -65,6 +73,36 @@ struct PackEntry {
     reading: String,
     surface: String,
     word_cost: i32,
+}
+
+#[derive(Default)]
+struct PackMetadata {
+    id: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    license: Option<String>,
+    minimum_slime_version: Option<String>,
+    published_at: Option<String>,
+    provenance: Option<String>,
+    entries_sha256: Option<String>,
+}
+
+impl PackMetadata {
+    fn set(&mut self, key: &str, value: &str, line_number: usize) -> Result<(), String> {
+        match key {
+            "id" => set_once(&mut self.id, value, key, line_number),
+            "name" => set_once(&mut self.name, value, key, line_number),
+            "version" => set_once(&mut self.version, value, key, line_number),
+            "license" => set_once(&mut self.license, value, key, line_number),
+            "minimum-slime-version" => {
+                set_once(&mut self.minimum_slime_version, value, key, line_number)
+            }
+            "published-at" => set_once(&mut self.published_at, value, key, line_number),
+            "provenance" => set_once(&mut self.provenance, value, key, line_number),
+            "entries-sha256" => set_once(&mut self.entries_sha256, value, key, line_number),
+            _ => Err(format!("line {line_number} has unknown metadata {key:?}")),
+        }
+    }
 }
 
 impl DictionaryPackStore {
@@ -189,40 +227,55 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
     let Some((_, header)) = lines.next() else {
         return Err("dictionary pack is empty".to_owned());
     };
-    if header != PACK_HEADER {
-        return Err(format!("first line must be {PACK_HEADER:?}"));
-    }
+    let format_version = match header {
+        PACK_HEADER_V1 => 1,
+        PACK_HEADER_V2 => 2,
+        _ => {
+            return Err(format!(
+                "first line must be {PACK_HEADER_V1:?} or {PACK_HEADER_V2:?}"
+            ));
+        }
+    };
 
-    let mut id = None;
-    let mut name = None;
-    let mut version = None;
-    let mut license = None;
+    let mut metadata = PackMetadata::default();
     let mut entries = Vec::new();
     let mut pairs = HashSet::new();
+    let mut entries_started = format_version == 1;
 
     for (line_index, line) in lines {
-        let line_number = line_index + 1;
+        let line_number = line_index + 2;
         if line.len() > MAX_LINE_BYTES {
             return Err(format!("line {line_number} exceeds the byte limit"));
         }
         if line.is_empty() {
             continue;
         }
-        if let Some(metadata) = line.strip_prefix("# ") {
-            let (key, value) = metadata
+        if format_version == 2 && line == PACK_ENTRIES_MARKER {
+            if entries_started {
+                return Err(format!("line {line_number} duplicates the entries marker"));
+            }
+            entries_started = true;
+            continue;
+        }
+        if let Some(metadata_source) = line.strip_prefix("# ") {
+            if entries_started && format_version == 2 {
+                return Err(format!(
+                    "line {line_number} has metadata after the entries marker"
+                ));
+            }
+            let (key, value) = metadata_source
                 .split_once(": ")
                 .ok_or_else(|| format!("line {line_number} has malformed metadata"))?;
-            match key {
-                "id" => set_once(&mut id, value, key, line_number)?,
-                "name" => set_once(&mut name, value, key, line_number)?,
-                "version" => set_once(&mut version, value, key, line_number)?,
-                "license" => set_once(&mut license, value, key, line_number)?,
-                _ => return Err(format!("line {line_number} has unknown metadata {key:?}")),
-            }
+            metadata.set(key, value, line_number)?;
             continue;
         }
         if line.starts_with('#') {
             return Err(format!("line {line_number} has malformed metadata"));
+        }
+        if !entries_started {
+            return Err(format!(
+                "line {line_number} appears before {PACK_ENTRIES_MARKER:?}"
+            ));
         }
         if entries.len() == MAX_ENTRIES_PER_PACK {
             return Err(format!(
@@ -236,21 +289,34 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
         entries.push(entry);
     }
 
-    let id = required(id, "id")?;
-    let name = required(name, "name")?;
-    let version = required(version, "version")?;
-    let license = required(license, "license")?;
+    let id = required(metadata.id, "id")?;
+    let name = required(metadata.name, "name")?;
+    let version = required(metadata.version, "version")?;
+    let license = required(metadata.license, "license")?;
     validate_metadata(&id, &name, &version, &license)?;
+    let v2 = validate_v2_metadata(
+        source,
+        format_version,
+        metadata.minimum_slime_version,
+        metadata.published_at,
+        metadata.provenance,
+        metadata.entries_sha256,
+    )?;
     if entries.is_empty() {
         return Err("dictionary pack has no entries".to_owned());
     }
 
     Ok(DictionaryPack {
         info: DictionaryPackInfo {
+            format_version,
             id,
             name,
             version,
             license,
+            minimum_slime_version: v2.minimum_slime_version,
+            published_at: v2.published_at,
+            provenance: v2.provenance,
+            entries_sha256: v2.entries_sha256,
             entry_count: entries.len(),
         },
         entries,
@@ -340,6 +406,117 @@ fn validate_metadata(id: &str, name: &str, version: &str, license: &str) -> Resu
     Ok(())
 }
 
+struct ValidatedV2Metadata {
+    minimum_slime_version: Option<String>,
+    published_at: Option<String>,
+    provenance: Option<String>,
+    entries_sha256: Option<String>,
+}
+
+fn validate_v2_metadata(
+    source: &str,
+    format_version: u8,
+    minimum_slime_version: Option<String>,
+    published_at: Option<String>,
+    provenance: Option<String>,
+    entries_sha256: Option<String>,
+) -> Result<ValidatedV2Metadata, String> {
+    if format_version == 1 {
+        if minimum_slime_version.is_some()
+            || published_at.is_some()
+            || provenance.is_some()
+            || entries_sha256.is_some()
+        {
+            return Err("v2 metadata requires the v2 pack header".to_owned());
+        }
+        return Ok(ValidatedV2Metadata {
+            minimum_slime_version: None,
+            published_at: None,
+            provenance: None,
+            entries_sha256: None,
+        });
+    }
+
+    let minimum_slime_version = required(minimum_slime_version, "minimum-slime-version")?;
+    let published_at = required(published_at, "published-at")?;
+    let provenance = required(provenance, "provenance")?;
+    let entries_sha256 = required(entries_sha256, "entries-sha256")?;
+    let minimum = parse_semantic_version(&minimum_slime_version)
+        .ok_or_else(|| "minimum-slime-version must use MAJOR.MINOR.PATCH".to_owned())?;
+    let current = parse_semantic_version(env!("CARGO_PKG_VERSION"))
+        .expect("workspace package version is semantic");
+    if minimum > current {
+        return Err(format!(
+            "dictionary pack requires Slime {minimum_slime_version} or newer; current version is {}",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    if !is_iso_date(&published_at) {
+        return Err("published-at must use YYYY-MM-DD".to_owned());
+    }
+    if provenance.is_empty()
+        || provenance.chars().count() > 256
+        || provenance.chars().any(char::is_control)
+    {
+        return Err("dictionary pack provenance is invalid".to_owned());
+    }
+    if entries_sha256.len() != 64 || !entries_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("entries-sha256 must be a 64-character hexadecimal digest".to_owned());
+    }
+    let marker = format!("{PACK_ENTRIES_MARKER}\n");
+    let (_, entries_source) = source
+        .split_once(&marker)
+        .ok_or_else(|| format!("v2 dictionary pack is missing {PACK_ENTRIES_MARKER:?}"))?;
+    let actual_sha256 = sha256_hex(entries_source.as_bytes());
+    if !entries_sha256.eq_ignore_ascii_case(&actual_sha256) {
+        return Err(format!(
+            "entries SHA-256 mismatch: expected {entries_sha256}, got {actual_sha256}"
+        ));
+    }
+
+    Ok(ValidatedV2Metadata {
+        minimum_slime_version: Some(minimum_slime_version),
+        published_at: Some(published_at),
+        provenance: Some(provenance),
+        entries_sha256: Some(actual_sha256),
+    })
+}
+
+fn parse_semantic_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut components = value.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components.next()?.parse().ok()?;
+    if components.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let year = value[0..4].parse::<u16>().ok();
+    let month = value[5..7].parse::<u8>().ok();
+    let day = value[8..10].parse::<u8>().ok();
+    year.is_some_and(|year| year >= 2000)
+        && month.is_some_and(|month| (1..=12).contains(&month))
+        && day.is_some_and(|day| (1..=31).contains(&day))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 fn load_error(path: &Path, message: String) -> DictionaryPackLoadError {
     DictionaryPackLoadError {
         file: path.file_name().map_or_else(
@@ -352,7 +529,9 @@ fn load_error(path: &Path, message: String) -> DictionaryPackLoadError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DictionaryPackStore, PACK_DIRECTORY_NAME, parse_pack, validate_dictionary_pack};
+    use super::{
+        DictionaryPackStore, PACK_DIRECTORY_NAME, parse_pack, sha256_hex, validate_dictionary_pack,
+    };
     use std::fs;
 
     const VALID_PACK: &str = "\
@@ -368,13 +547,52 @@ mod tests {
     #[test]
     fn parses_versioned_pack_metadata_and_entries() {
         let pack = parse_pack(VALID_PACK).unwrap();
+        assert_eq!(pack.info.format_version, 1);
         assert_eq!(pack.info.id, "sample-pro");
         assert_eq!(pack.info.name, "サンプル Pro");
         assert_eq!(pack.info.version, "2026.07.1");
         assert_eq!(pack.info.license, "Proprietary");
         assert_eq!(pack.info.entry_count, 2);
+        assert_eq!(pack.info.minimum_slime_version, None);
         assert_eq!(pack.entries[1].word_cost, 6000);
         assert_eq!(validate_dictionary_pack(VALID_PACK).unwrap(), pack.info);
+    }
+
+    #[test]
+    fn validates_v2_compatibility_provenance_and_entries_digest() {
+        let entries = "すらいむぷろ\tSlime Pro\nこまわり\t専門小回り\t6000\n";
+        let digest = sha256_hex(entries.as_bytes());
+        let source = format!(
+            "# slime-dictionary-pack-v2\n\
+             # id: sample-pro\n\
+             # name: サンプル Pro\n\
+             # version: 2026.08.1\n\
+             # license: Proprietary\n\
+             # minimum-slime-version: 0.1.0\n\
+             # published-at: 2026-08-01\n\
+             # provenance: unvalley/context-packs/sample-pro\n\
+             # entries-sha256: {digest}\n\
+             # entries\n\
+             {entries}"
+        );
+        let info = validate_dictionary_pack(&source).unwrap();
+        assert_eq!(info.format_version, 2);
+        assert_eq!(info.minimum_slime_version.as_deref(), Some("0.1.0"));
+        assert_eq!(info.published_at.as_deref(), Some("2026-08-01"));
+        assert_eq!(
+            info.provenance.as_deref(),
+            Some("unvalley/context-packs/sample-pro")
+        );
+        assert_eq!(info.entries_sha256.as_deref(), Some(digest.as_str()));
+
+        assert!(validate_dictionary_pack(&source.replace("Slime Pro", "Slime Plus")).is_err());
+        assert!(
+            validate_dictionary_pack(&source.replace(
+                "# minimum-slime-version: 0.1.0",
+                "# minimum-slime-version: 99.0.0"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

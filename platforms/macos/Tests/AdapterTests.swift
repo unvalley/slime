@@ -614,17 +614,22 @@ enum AdapterTests {
             at: packDirectory,
             withIntermediateDirectories: true
         )
-        try Data(
-            """
-            # slime-dictionary-pack-v1
+        let packEntries = "すらいむぷろ\tSlime Pro\n"
+        let packManifest = """
+            # slime-dictionary-pack-v2
             # id: sample-pro
             # name: サンプル Pro
-            # version: 2026.07.1
+            # version: 2026.08.1
             # license: Proprietary
-            すらいむぷろ\tSlime Pro
-
-            """.utf8
-        ).write(to: packDirectory.appendingPathComponent("sample.slime-dict"))
+            # minimum-slime-version: 0.1.0
+            # published-at: 2026-08-01
+            # provenance: unvalley/context-packs/sample-pro
+            # entries-sha256: 2e6e02b5291160ed2aa237f7163fad3c16afb55d3d89b471e5b9a272bb804b4c
+            # entries
+            """ + "\n" + packEntries
+        try Data(packManifest.utf8).write(
+            to: packDirectory.appendingPathComponent("sample.slime-dict")
+        )
 
         let engine = try RustEngine(dataDirectory: directory)
         _ = try engine.setOptions(
@@ -648,13 +653,18 @@ enum AdapterTests {
             catalog.packs == [
                 InstalledDictionaryPack(
                     id: "sample-pro",
+                    formatVersion: 2,
                     name: "サンプル Pro",
-                    version: "2026.07.1",
+                    version: "2026.08.1",
                     license: "Proprietary",
+                    minimumSlimeVersion: "0.1.0",
+                    publishedAt: "2026-08-01",
+                    provenance: "unvalley/context-packs/sample-pro",
+                    entriesSHA256: "2e6e02b5291160ed2aa237f7163fad3c16afb55d3d89b471e5b9a272bb804b4c",
                     entryCount: 1
                 ),
             ] && catalog.errors.isEmpty,
-            "installed dictionary metadata should cross the Swift/C/Rust boundary"
+            "installed dictionary metadata should cross the Swift/C/Rust boundary: \(catalog)"
         )
         let installedWords = try engine.installedDictionaryPackWords(id: "sample-pro")
         try expect(

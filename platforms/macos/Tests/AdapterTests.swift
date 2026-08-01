@@ -154,7 +154,8 @@ enum AdapterTests {
         _ = try conservativeLiveEngine.setOptions(
             liveConversion: true,
             historyCompletion: false,
-            historyLearning: false
+            historyLearning: false,
+            dictionaryPacks: 0b111
         )
         var livePreedit: String?
         for scalar in "soushimashou".unicodeScalars {
@@ -180,8 +181,8 @@ enum AdapterTests {
             $0.type == "update_preedit"
         })?.text
         try expect(
-            livePreedit == "にほんg",
-            "unfinished romaji should discard a preview for the shorter reading"
+            livePreedit == "日本g",
+            "unfinished romaji should preserve the surface for the unchanged kana reading"
         )
         livePreedit = try conservativeLiveEngine.process(.character("o")).last(where: {
             $0.type == "update_preedit"
@@ -189,13 +190,46 @@ enum AdapterTests {
         try expect(livePreedit == "日本語", "resolved kana should extend the live conversion")
         _ = try conservativeLiveEngine.process(.enter)
 
+        for scalar in "raibuhenkan".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(livePreedit == "ライブ変換", "live conversion should convert the stable prefix")
+        livePreedit = try conservativeLiveEngine.process(.character("d")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(livePreedit == "ライブ変換d", "pending romaji should preserve the stable prefix")
+        livePreedit = try conservativeLiveEngine.process(.character("e")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(
+            livePreedit == "ライブ変換で",
+            "a lattice-confirmed suffix must not roll the full preedit back"
+        )
+        _ = try conservativeLiveEngine.process(.enter)
+
+        for scalar in "tashika".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(livePreedit == "確か", "live conversion should convert tashika")
+        livePreedit = try conservativeLiveEngine.process(.character("n")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(livePreedit == "確かn", "ambiguous n should not roll the surface back")
+        livePreedit = try conservativeLiveEngine.process(.character("a")).last(where: {
+            $0.type == "update_preedit"
+        })?.text
+        try expect(livePreedit == "確かな", "resolved na should rerank the full reading")
+        _ = try conservativeLiveEngine.process(.enter)
+
         for scalar in "kyouhaii".unicodeScalars {
             let actions = try conservativeLiveEngine.process(.character(scalar))
             livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
         }
         try expect(
-            livePreedit == "きょうはいい",
-            "an ambiguous full reading should not reuse an older preview"
+            livePreedit == "今日はいい",
+            "the full best path should confirm a literal suffix extension"
         )
         _ = try conservativeLiveEngine.process(.enter)
 

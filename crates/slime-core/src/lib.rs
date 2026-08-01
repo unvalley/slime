@@ -85,6 +85,20 @@ enum CandidateKind {
     Completion,
 }
 
+#[derive(Clone, Debug)]
+struct LivePreview {
+    /// Complete kana reading covered by `surface`.
+    reading: String,
+    surface: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LiveConversionDecision {
+    Confident(String),
+    Ambiguous(String),
+    Literal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -103,7 +117,7 @@ pub struct SlimeEngine {
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
     preferences: EnginePreferences,
-    live_preview: Option<String>,
+    live_preview: Option<LivePreview>,
     live_preview_suppressed: bool,
     user_data: UserData,
     installed_packs: DictionaryPackStore,
@@ -542,7 +556,21 @@ impl SlimeEngine {
         if let Some(preview) = &self.live_preview
             && !self.live_preview_suppressed
         {
-            return preview.clone();
+            let resolved = self.resolved_reading();
+            if resolved == preview.reading {
+                return preview.surface.clone();
+            }
+
+            // Keep the surface only while the next kana is still pending.
+            // Once a vowel resolves the suffix, the whole reading is ranked
+            // again, so a stale segmentation can never leak into the result.
+            if !self.romaji.pending().is_empty() && self.reading == preview.reading {
+                let mut preedit =
+                    String::with_capacity(preview.surface.len() + self.romaji.preview().len());
+                preedit.push_str(&preview.surface);
+                preedit.push_str(self.romaji.preview());
+                return preedit;
+            }
         }
 
         let mut preedit = self.reading.clone();
@@ -590,36 +618,77 @@ impl SlimeEngine {
     }
 
     fn refresh_live_preview(&mut self) {
-        self.live_preview = if self.preferences.live_conversion {
-            let resolved = self.resolved_reading();
-            // Never reuse a preview produced for a shorter reading. A new
-            // suffix can change both word boundaries and the best surface;
-            // retaining the old preview created hybrids such as `1勝ちがう`.
-            if resolved
-                .chars()
-                .any(|character| character.is_ascii_alphabetic())
-                || resolved.chars().count() < MIN_LIVE_CONVERSION_CHARS
-            {
-                None
-            } else {
-                self.best_surface(&resolved)
+        if !self.preferences.live_conversion {
+            self.live_preview = None;
+            return;
+        }
+
+        let resolved = self.resolved_reading();
+        let can_evaluate = !resolved
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+            && resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS;
+
+        if can_evaluate {
+            match self.live_conversion_decision(&resolved) {
+                LiveConversionDecision::Confident(surface) => {
+                    self.live_preview = Some(LivePreview {
+                        reading: resolved,
+                        surface,
+                    });
+                    return;
+                }
+                LiveConversionDecision::Ambiguous(surface)
+                    if self.live_preview.as_ref().is_some_and(|preview| {
+                        confirmed_literal_extension(preview, &resolved, &surface)
+                    }) =>
+                {
+                    // The full lattice independently confirms exactly the
+                    // surface already shown plus the newly resolved suffix.
+                    // Keep that stable extension even when an alternative
+                    // spelling is inside the global confidence margin.
+                    self.live_preview = Some(LivePreview {
+                        reading: resolved,
+                        surface,
+                    });
+                    return;
+                }
+                LiveConversionDecision::Ambiguous(_) | LiveConversionDecision::Literal => {}
             }
-        } else {
-            None
-        };
+        }
+
+        // A pending romaji suffix (`n`, `k`, `sh`, ...) has not extended the
+        // kana reading yet. Preserve the preview for exactly that unchanged
+        // reading, but discard it as soon as completed kana changes the input.
+        if !self.romaji.pending().is_empty()
+            && self
+                .live_preview
+                .as_ref()
+                .is_some_and(|preview| preview.reading == self.reading)
+        {
+            return;
+        }
+
+        self.live_preview = None;
     }
 
-    fn best_surface(&self, reading: &str) -> Option<String> {
+    fn live_conversion_decision(&self, reading: &str) -> LiveConversionDecision {
         if let Some(surface) = self.user_data.exact_dictionary_surfaces(reading).next() {
-            return Some(surface.to_owned());
+            return if surface == reading {
+                LiveConversionDecision::Literal
+            } else {
+                LiveConversionDecision::Confident(surface.to_owned())
+            };
         }
         let mut conversions = self
             .dictionary
             .convert_n_best(reading, LIVE_CONVERSION_INITIAL_PATH_LIMIT)
             .into_iter();
-        let best = conversions.next()?;
+        let Some(best) = conversions.next() else {
+            return LiveConversionDecision::Literal;
+        };
         if best.surface == reading {
-            return None;
+            return LiveConversionDecision::Literal;
         }
         let runner_up = conversions
             .find(|conversion| conversion.surface != best.surface)
@@ -632,9 +701,9 @@ impl SlimeEngine {
         if let Some(runner_up) = runner_up
             && runner_up.cost.saturating_sub(best.cost) < MIN_LIVE_CONVERSION_COST_MARGIN
         {
-            return None;
+            return LiveConversionDecision::Ambiguous(best.surface);
         }
-        Some(best.surface)
+        LiveConversionDecision::Confident(best.surface)
     }
 
     fn refresh_completion_actions(&mut self, include_preedit: bool) -> Vec<SlimeAction> {
@@ -778,6 +847,13 @@ fn insert_visible_katakana_candidate(candidates: &mut Vec<String>, reading: &str
     candidates.insert(usize::from(!candidates.is_empty()), katakana);
 }
 
+fn confirmed_literal_extension(preview: &LivePreview, reading: &str, surface: &str) -> bool {
+    let Some(suffix) = reading.strip_prefix(&preview.reading) else {
+        return false;
+    };
+    !suffix.is_empty() && surface.strip_prefix(&preview.surface) == Some(suffix)
+}
+
 fn normalize_ascii_character(character: char) -> char {
     match character {
         '-' => 'ー',
@@ -805,9 +881,9 @@ impl Default for SlimeEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_DOMAIN_DICTIONARIES, DictionaryPackWord, EnginePreferences, InputEvent, Phase,
-        SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary,
-        katakana_candidate,
+        ALL_DOMAIN_DICTIONARIES, DictionaryPackWord, EnginePreferences, InputEvent,
+        LiveConversionDecision, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY, UserData,
+        bundled_dictionary, katakana_candidate,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -986,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn live_conversion_recomputes_the_entire_reading_after_each_key() {
+    fn live_conversion_preserves_a_surface_only_during_pending_romaji() {
         let mut engine = SlimeEngine::bundled();
         engine.set_preferences(EnginePreferences {
             live_conversion: true,
@@ -998,17 +1074,75 @@ mod tests {
         type_text(&mut engine, "nihon");
         assert_eq!(engine.snapshot().preedit, "日本");
         type_text(&mut engine, "g");
-        assert_eq!(engine.snapshot().preedit, "にほんg");
+        assert_eq!(engine.snapshot().preedit, "日本g");
         type_text(&mut engine, "o");
         assert_eq!(engine.snapshot().preedit, "日本語");
+        engine.handle(InputEvent::Enter);
+
+        type_text(&mut engine, "tashika");
+        assert_eq!(engine.snapshot().preedit, "確か");
+        type_text(&mut engine, "n");
+        assert_eq!(engine.snapshot().preedit, "確かn");
+        type_text(&mut engine, "a");
+        assert_eq!(engine.snapshot().preedit, "確かな");
         engine.handle(InputEvent::Enter);
 
         type_text(&mut engine, "kyouha");
         assert_eq!(engine.snapshot().preedit, "今日は");
         type_text(&mut engine, "ii");
-        assert_eq!(engine.snapshot().preedit, "きょうはいい");
+        assert_eq!(engine.snapshot().preedit, "今日はいい");
         let actions = engine.handle(InputEvent::Enter);
-        assert!(actions.contains(&SlimeAction::Commit("きょうはいい".to_owned())));
+        assert!(actions.contains(&SlimeAction::Commit("今日はいい".to_owned())));
+    }
+
+    #[test]
+    fn live_conversion_keeps_lattice_confirmed_suffix_extensions() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            live_conversion: true,
+            history_completion: false,
+            history_learning: false,
+            dictionary_packs: 0,
+        });
+
+        assert_eq!(
+            engine.live_conversion_decision("らいぶへんかん"),
+            LiveConversionDecision::Confident("ライブ変換".to_owned())
+        );
+        assert_eq!(
+            engine.live_conversion_decision("らいぶへんかんで"),
+            LiveConversionDecision::Ambiguous("ライブ変換で".to_owned())
+        );
+
+        type_text(&mut engine, "raibuhenkan");
+        assert_eq!(engine.snapshot().preedit, "ライブ変換");
+        type_text(&mut engine, "d");
+        assert_eq!(engine.snapshot().preedit, "ライブ変換d");
+        type_text(&mut engine, "e");
+        assert_eq!(engine.snapshot().preedit, "ライブ変換で");
+    }
+
+    #[test]
+    fn live_conversion_handles_terms_with_particles_and_inflections() {
+        let cases = [
+            ("henkande", "変換で"),
+            ("de-tahenkande", "データ変換で"),
+            ("nihongonyuuryokude", "日本語入力で"),
+            ("kouhosentakude", "候補選択で"),
+            ("pafo-mansuwotakameru", "パフォーマンスを高める"),
+        ];
+
+        for (input, expected) in cases {
+            let mut engine = SlimeEngine::bundled();
+            engine.set_preferences(EnginePreferences {
+                live_conversion: true,
+                history_completion: false,
+                history_learning: false,
+                dictionary_packs: 0,
+            });
+            type_text(&mut engine, input);
+            assert_eq!(engine.snapshot().preedit, expected, "{input}");
+        }
     }
 
     #[test]

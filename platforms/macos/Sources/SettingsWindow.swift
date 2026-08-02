@@ -48,6 +48,19 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    func isDateCandidateFormatEnabled(_ format: DateCandidateFormat) -> Bool {
+        IMEPreferences.dateCandidateFormats & format.rawValue != 0
+    }
+
+    func setDateCandidateFormat(_ format: DateCandidateFormat, enabled: Bool) {
+        objectWillChange.send()
+        if enabled {
+            IMEPreferences.dateCandidateFormats |= format.rawValue
+        } else {
+            IMEPreferences.dateCandidateFormats &= ~format.rawValue
+        }
+    }
+
     func isDictionaryPackEnabled(_ mask: UInt32) -> Bool {
         IMEPreferences.dictionaryPacks & mask != 0
     }
@@ -326,6 +339,27 @@ private struct GeneralSettingsView: View {
                     set: { model.liveConversion = $0 }
                 ))
                 Text("確度の高い部分だけを変換し、曖昧な末尾はかなのまま保ちます。Escapeで現在の入力中は停止できます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("日付候補") {
+                ForEach(DateCandidateFormat.allCases) { format in
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(format.name)
+                            Text(format.example)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Toggle(format.name, isOn: Binding(
+                            get: { model.isDateCandidateFormatEnabled(format) },
+                            set: { model.setDateCandidateFormat(format, enabled: $0) }
+                        ))
+                        .labelsHidden()
+                    }
+                }
+                Text("「きのう」「きょう」「あした」の変換候補に、選択した形式だけを表示します。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -817,6 +851,11 @@ final class SettingsStatusItem: NSObject, NSMenuDelegate {
         action: #selector(toggleHistoryLearning(_:)),
         keyEquivalent: ""
     )
+    private let privateModeItem = NSMenuItem(
+        title: "プライベートモード",
+        action: #selector(togglePrivateMode(_:)),
+        keyEquivalent: ""
+    )
 
     private override init() {
         super.init()
@@ -830,9 +869,12 @@ final class SettingsStatusItem: NSObject, NSMenuDelegate {
         liveConversionItem.target = self
         historyCompletionItem.target = self
         historyLearningItem.target = self
+        privateModeItem.target = self
         menu.addItem(liveConversionItem)
         menu.addItem(historyCompletionItem)
         menu.addItem(historyLearningItem)
+        menu.addItem(.separator())
+        menu.addItem(privateModeItem)
         menu.addItem(.separator())
         let settingsItem = NSMenuItem(
             title: "Slime設定…",
@@ -867,6 +909,11 @@ final class SettingsStatusItem: NSObject, NSMenuDelegate {
         updateStates()
     }
 
+    @objc private func togglePrivateMode(_ sender: Any?) {
+        InputPrivacySession.toggle()
+        updateStates()
+    }
+
     @objc private func openSettings(_ sender: Any?) {
         SettingsWindowController.shared.present()
     }
@@ -875,5 +922,6 @@ final class SettingsStatusItem: NSObject, NSMenuDelegate {
         liveConversionItem.state = IMEPreferences.liveConversion ? .on : .off
         historyCompletionItem.state = IMEPreferences.historyCompletion ? .on : .off
         historyLearningItem.state = IMEPreferences.historyLearning ? .on : .off
+        privateModeItem.state = InputPrivacySession.isPrivate ? .on : .off
     }
 }

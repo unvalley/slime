@@ -6,18 +6,33 @@ struct InputRuntimeOptions: Equatable {
     let historyCompletion: Bool
     let historyLearning: Bool
     let dictionaryPacks: UInt32
+    let privateMode: Bool
+    let dateFormatMask: UInt32
 
     init(
         liveConversion: Bool,
         historyCompletion: Bool,
         historyLearning: Bool,
         dictionaryPacks: UInt32,
-        secureEventInput: Bool
+        secureEventInput: Bool,
+        privateMode: Bool = InputPrivacySession.isPrivate,
+        dateFormatMask: UInt32 = DateCandidateFormat.allMask
     ) {
         self.liveConversion = liveConversion
-        self.historyCompletion = historyCompletion
-        self.historyLearning = historyLearning && !secureEventInput
+        self.privateMode = privateMode || secureEventInput
+        self.historyCompletion = historyCompletion && !self.privateMode
+        self.historyLearning = historyLearning && !self.privateMode
         self.dictionaryPacks = dictionaryPacks
+        self.dateFormatMask = dateFormatMask
+    }
+}
+
+enum InputPrivacySession {
+    private(set) static var isPrivate = false
+
+    static func toggle() {
+        isPrivate.toggle()
+        NotificationCenter.default.post(name: .unvalleyPreferencesDidChange, object: nil)
     }
 }
 

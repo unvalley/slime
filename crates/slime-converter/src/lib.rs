@@ -7,6 +7,7 @@ mod symbol_candidates;
 use bumpalo::{Bump, collections::String as BumpString};
 use compact::CompactDictionary;
 use compact_str::CompactString;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 
@@ -199,6 +200,28 @@ impl Dictionary {
     #[must_use]
     pub fn layer_count(&self) -> usize {
         usize::from(self.bundled.is_some()) + self.layers.len()
+    }
+
+    /// Returns exact dictionary readings for a committed surface, ordered by
+    /// word cost. This lookup is used only for explicit reconversion.
+    #[must_use]
+    pub fn readings_for_surface(&self, surface: &str) -> Vec<String> {
+        let mut readings = self
+            .bundled
+            .map_or_else(Vec::new, |compact| compact.readings_for_surface(surface));
+        for layer in self.layers.iter() {
+            for entry in layer
+                .entries
+                .iter()
+                .filter(|entry| entry.surface == surface)
+            {
+                readings.push((entry.reading.to_string(), entry.word_cost));
+            }
+        }
+        readings.sort_unstable_by(|left, right| (left.1, &left.0).cmp(&(right.1, &right.0)));
+        let mut seen = HashSet::with_capacity(readings.len());
+        readings.retain(|(reading, _)| seen.insert(reading.clone()));
+        readings.into_iter().map(|(reading, _)| reading).collect()
     }
 
     /// Calls `callback` for every entry whose reading equals `reading`.

@@ -18,6 +18,15 @@ pub const EVENT_NEXT_CANDIDATE: u32 = 5;
 pub const EVENT_PREVIOUS_CANDIDATE: u32 = 6;
 pub const EVENT_SELECT_CANDIDATE: u32 = 7;
 pub const EVENT_ACCEPT_CANDIDATE: u32 = 8;
+pub const EVENT_TRANSFORM_HIRAGANA: u32 = 9;
+pub const EVENT_TRANSFORM_FULL_KATAKANA: u32 = 10;
+pub const EVENT_TRANSFORM_HALF_KATAKANA: u32 = 11;
+pub const EVENT_TRANSFORM_FULL_ALPHANUMERIC: u32 = 12;
+pub const EVENT_TRANSFORM_HALF_ALPHANUMERIC: u32 = 13;
+pub const EVENT_NEXT_SEGMENT: u32 = 14;
+pub const EVENT_PREVIOUS_SEGMENT: u32 = 15;
+pub const EVENT_EXPAND_SEGMENT: u32 = 16;
+pub const EVENT_SHRINK_SEGMENT: u32 = 17;
 
 pub struct SlimeHandle {
     engine: SlimeEngine,
@@ -159,6 +168,8 @@ pub unsafe extern "C" fn slime_set_options(
                 history_completion,
                 history_learning: history_completion,
                 dictionary_packs: 0,
+                private_mode: false,
+                date_format_mask: slime_core::ALL_DATE_FORMATS,
             })
         })
     }
@@ -185,6 +196,8 @@ pub unsafe extern "C" fn slime_set_options_v2(
                 history_completion,
                 history_learning: history_completion,
                 dictionary_packs,
+                private_mode: false,
+                date_format_mask: slime_core::ALL_DATE_FORMATS,
             })
         })
     }
@@ -212,9 +225,95 @@ pub unsafe extern "C" fn slime_set_options_v3(
                 history_completion,
                 history_learning,
                 dictionary_packs,
+                private_mode: false,
+                date_format_mask: slime_core::ALL_DATE_FORMATS,
             })
         })
     }
+}
+
+/// Updates runtime options, including process-local private mode.
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed pointer returned by an IME
+/// creation function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_set_options_v4(
+    handle: *mut SlimeHandle,
+    live_conversion: bool,
+    history_completion: bool,
+    history_learning: bool,
+    dictionary_packs: u32,
+    private_mode: bool,
+) -> SlimeBuffer {
+    // SAFETY: This function's contract requires a live, exclusive handle.
+    unsafe {
+        engine_control(handle, |engine| {
+            engine.set_preferences(EnginePreferences {
+                live_conversion,
+                history_completion,
+                history_learning,
+                dictionary_packs,
+                private_mode,
+                date_format_mask: slime_core::ALL_DATE_FORMATS,
+            })
+        })
+    }
+}
+
+/// Updates runtime options, including the enabled date candidate formats.
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed pointer returned by an IME
+/// creation function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_set_options_v5(
+    handle: *mut SlimeHandle,
+    live_conversion: bool,
+    history_completion: bool,
+    history_learning: bool,
+    dictionary_packs: u32,
+    private_mode: bool,
+    date_format_mask: u32,
+) -> SlimeBuffer {
+    // SAFETY: This function's contract requires a live, exclusive handle.
+    unsafe {
+        engine_control(handle, |engine| {
+            engine.set_preferences(EnginePreferences {
+                live_conversion,
+                history_completion,
+                history_learning,
+                dictionary_packs,
+                private_mode,
+                date_format_mask,
+            })
+        })
+    }
+}
+
+/// Starts explicit reconversion of a selected committed UTF-8 surface.
+///
+/// # Safety
+///
+/// `handle` must be live and `surface` must point to `surface_len` readable
+/// bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_begin_reconversion(
+    handle: *mut SlimeHandle,
+    surface: *const u8,
+    surface_len: usize,
+) -> SlimeBuffer {
+    if handle.is_null() {
+        return SlimeBuffer::from_string(error_response("null_handle"));
+    }
+    // SAFETY: The caller promises readable bytes for the duration of the call.
+    let Some(surface) = (unsafe { decode_utf8_argument(surface, surface_len) }) else {
+        return SlimeBuffer::from_string(error_response("invalid_surface"));
+    };
+    // SAFETY: This function's contract requires a live, exclusive handle.
+    unsafe { engine_control(handle, |engine| engine.begin_reconversion(surface)) }
 }
 
 /// Reloads user dictionary and history files from the configured data folder.
@@ -386,6 +485,15 @@ fn decode_event(event_kind: u32, value: u32) -> Result<InputEvent, &'static str>
         EVENT_PREVIOUS_CANDIDATE => Ok(InputEvent::PreviousCandidate),
         EVENT_SELECT_CANDIDATE => Ok(InputEvent::SelectCandidate(value)),
         EVENT_ACCEPT_CANDIDATE => Ok(InputEvent::AcceptCandidate),
+        EVENT_TRANSFORM_HIRAGANA => Ok(InputEvent::TransformHiragana),
+        EVENT_TRANSFORM_FULL_KATAKANA => Ok(InputEvent::TransformFullKatakana),
+        EVENT_TRANSFORM_HALF_KATAKANA => Ok(InputEvent::TransformHalfKatakana),
+        EVENT_TRANSFORM_FULL_ALPHANUMERIC => Ok(InputEvent::TransformFullAlphanumeric),
+        EVENT_TRANSFORM_HALF_ALPHANUMERIC => Ok(InputEvent::TransformHalfAlphanumeric),
+        EVENT_NEXT_SEGMENT => Ok(InputEvent::NextSegment),
+        EVENT_PREVIOUS_SEGMENT => Ok(InputEvent::PreviousSegment),
+        EVENT_EXPAND_SEGMENT => Ok(InputEvent::ExpandSegment),
+        EVENT_SHRINK_SEGMENT => Ok(InputEvent::ShrinkSegment),
         _ => Err("invalid_event_kind"),
     }
 }
@@ -433,6 +541,19 @@ fn write_action(output: &mut String, action: &SlimeAction) {
             output.push_str("{\"type\":\"update_preedit\",\"text\":");
             write_json_string(output, text);
             output.push('}');
+        }
+        SlimeAction::UpdateSegmentedPreedit {
+            text,
+            selection_start,
+            selection_length,
+        } => {
+            output.push_str("{\"type\":\"update_preedit\",\"text\":");
+            write_json_string(output, text);
+            write!(
+                output,
+                ",\"selectedStart\":{selection_start},\"selectedLength\":{selection_length}}}"
+            )
+            .expect("writing to String cannot fail");
         }
         SlimeAction::ShowCandidates {
             candidates,
@@ -499,10 +620,11 @@ fn write_optional_json_string(output: &mut String, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        EVENT_CHARACTER, EVENT_ENTER, EVENT_SPACE, SlimeBuffer, slime_buffer_destroy, slime_create,
-        slime_create_with_data_dir, slime_destroy, slime_domain_dictionary_words,
-        slime_installed_dictionary_pack_words, slime_installed_dictionary_packs, slime_process,
-        slime_set_options, slime_set_options_v2, slime_set_options_v3,
+        EVENT_CHARACTER, EVENT_ENTER, EVENT_PREVIOUS_SEGMENT, EVENT_SPACE, SlimeBuffer,
+        slime_begin_reconversion, slime_buffer_destroy, slime_create, slime_create_with_data_dir,
+        slime_destroy, slime_domain_dictionary_words, slime_installed_dictionary_pack_words,
+        slime_installed_dictionary_packs, slime_process, slime_set_options, slime_set_options_v2,
+        slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
     };
     use std::fs;
 
@@ -537,6 +659,53 @@ mod tests {
         // SAFETY: Resources are live and each is destroyed exactly once.
         unsafe {
             slime_buffer_destroy(buffer);
+            slime_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn reconversion_and_segment_selection_cross_the_c_boundary() {
+        let handle = slime_create();
+        let surface = "日本";
+        // SAFETY: `handle` and `surface` remain live and are accessed serially.
+        let reconversion =
+            unsafe { slime_begin_reconversion(handle, surface.as_ptr(), surface.len()) };
+        // SAFETY: `reconversion` remains live until the destroy call below.
+        let json = unsafe { copy_buffer(&reconversion) };
+        assert!(
+            json.contains("show_candidates") && json.contains("日本"),
+            "{json}"
+        );
+        // SAFETY: `reconversion` is the original live buffer.
+        unsafe { slime_buffer_destroy(reconversion) };
+
+        // Commit the reconversion before starting a separate phrase.
+        // SAFETY: `handle` is live and exclusively accessed.
+        let committed = unsafe { slime_process(handle, EVENT_ENTER, 0) };
+        // SAFETY: `committed` is the original live buffer.
+        unsafe { slime_buffer_destroy(committed) };
+        for character in "watashihanihon".chars() {
+            // SAFETY: `handle` is live and exclusively accessed.
+            let buffer = unsafe { slime_process(handle, EVENT_CHARACTER, character.into()) };
+            // SAFETY: `buffer` is the original live buffer.
+            unsafe { slime_buffer_destroy(buffer) };
+        }
+        // SAFETY: `handle` is live and exclusively accessed.
+        let conversion = unsafe { slime_process(handle, EVENT_SPACE, 0) };
+        // SAFETY: `conversion` is the original live buffer.
+        unsafe { slime_buffer_destroy(conversion) };
+        // SAFETY: `handle` is live and exclusively accessed.
+        let segmented = unsafe { slime_process(handle, EVENT_PREVIOUS_SEGMENT, 0) };
+        // SAFETY: `segmented` remains live until the destroy call below.
+        let json = unsafe { copy_buffer(&segmented) };
+        assert!(
+            json.contains("selectedStart") && json.contains("selectedLength"),
+            "{json}"
+        );
+
+        // SAFETY: Resources are live and each is destroyed exactly once.
+        unsafe {
+            slime_buffer_destroy(segmented);
             slime_destroy(handle);
         }
     }
@@ -601,6 +770,78 @@ mod tests {
         // SAFETY: `handle` is live and has not previously been released.
         unsafe { slime_destroy(handle) };
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn v4_private_mode_hides_history_and_prevents_learning() {
+        let directory =
+            std::env::temp_dir().join(format!("slime-ffi-private-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let original = "# slime-history-v1\nぱふぉーまんす\tパフォーマンス履歴\t5\t10\n";
+        fs::write(directory.join("history.tsv"), original).unwrap();
+        let path = directory.to_string_lossy();
+        // SAFETY: `path` remains readable for the duration of the creation call.
+        let handle = unsafe { slime_create_with_data_dir(path.as_ptr(), path.len()) };
+        assert!(!handle.is_null());
+
+        // SAFETY: `handle` is live and exclusively accessed in this test.
+        let options = unsafe { slime_set_options_v4(handle, false, true, true, 0, true) };
+        // SAFETY: `options` is the original live buffer.
+        unsafe { slime_buffer_destroy(options) };
+        let mut latest = String::new();
+        for character in "pafomansu".chars() {
+            // SAFETY: `handle` is live and exclusively accessed in this test.
+            let buffer = unsafe { slime_process(handle, EVENT_CHARACTER, character.into()) };
+            // SAFETY: `buffer` remains live until the destroy call below.
+            latest = unsafe { copy_buffer(&buffer) };
+            // SAFETY: `buffer` is the original live buffer.
+            unsafe { slime_buffer_destroy(buffer) };
+        }
+        assert!(!latest.contains("パフォーマンス履歴"), "{latest}");
+        // SAFETY: `handle` is live and exclusively accessed in this test.
+        let conversion = unsafe { slime_process(handle, EVENT_SPACE, 0) };
+        // SAFETY: `conversion` is the original live buffer.
+        unsafe { slime_buffer_destroy(conversion) };
+        // SAFETY: `handle` is live and exclusively accessed in this test.
+        let commit = unsafe { slime_process(handle, EVENT_ENTER, 0) };
+        // SAFETY: `commit` is the original live buffer.
+        unsafe { slime_buffer_destroy(commit) };
+
+        assert_eq!(
+            fs::read_to_string(directory.join("history.tsv")).unwrap(),
+            original
+        );
+        // SAFETY: `handle` is live and has not previously been released.
+        unsafe { slime_destroy(handle) };
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn v5_limits_date_candidate_formats() {
+        let handle = slime_create();
+        assert!(!handle.is_null());
+        // SAFETY: `handle` is live and exclusively accessed in this test.
+        let options =
+            unsafe { slime_set_options_v5(handle, false, false, false, 0, false, 1 << 5) };
+        // SAFETY: `options` is the original live buffer.
+        unsafe { slime_buffer_destroy(options) };
+        for character in "kyou".chars() {
+            // SAFETY: `handle` is live and exclusively accessed.
+            let buffer = unsafe { slime_process(handle, EVENT_CHARACTER, character.into()) };
+            // SAFETY: `buffer` is the original live buffer.
+            unsafe { slime_buffer_destroy(buffer) };
+        }
+        // SAFETY: `handle` is live and exclusively accessed.
+        let conversion = unsafe { slime_process(handle, EVENT_SPACE, 0) };
+        // SAFETY: `conversion` remains live until the destroy call below.
+        let json = unsafe { copy_buffer(&conversion) };
+        assert!(json.contains("\"R") && json.contains('/'), "{json}");
+
+        // SAFETY: Resources are live and each is destroyed exactly once.
+        unsafe {
+            slime_buffer_destroy(conversion);
+            slime_destroy(handle);
+        }
     }
 
     #[test]

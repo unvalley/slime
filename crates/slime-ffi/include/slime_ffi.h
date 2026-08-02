@@ -27,6 +27,15 @@ enum SlimeEventKind {
   SLIME_EVENT_PREVIOUS_CANDIDATE = 6,
   SLIME_EVENT_SELECT_CANDIDATE = 7,
   SLIME_EVENT_ACCEPT_CANDIDATE = 8,
+  SLIME_EVENT_TRANSFORM_HIRAGANA = 9,
+  SLIME_EVENT_TRANSFORM_FULL_KATAKANA = 10,
+  SLIME_EVENT_TRANSFORM_HALF_KATAKANA = 11,
+  SLIME_EVENT_TRANSFORM_FULL_ALPHANUMERIC = 12,
+  SLIME_EVENT_TRANSFORM_HALF_ALPHANUMERIC = 13,
+  SLIME_EVENT_NEXT_SEGMENT = 14,
+  SLIME_EVENT_PREVIOUS_SEGMENT = 15,
+  SLIME_EVENT_EXPAND_SEGMENT = 16,
+  SLIME_EVENT_SHRINK_SEGMENT = 17,
 };
 
 SlimeHandle *slime_create(void);
@@ -42,6 +51,15 @@ SlimeBuffer slime_set_options_v2(SlimeHandle *handle, bool live_conversion,
 SlimeBuffer slime_set_options_v3(SlimeHandle *handle, bool live_conversion,
                              bool history_completion, bool history_learning,
                              uint32_t dictionary_packs);
+SlimeBuffer slime_set_options_v4(SlimeHandle *handle, bool live_conversion,
+                             bool history_completion, bool history_learning,
+                             uint32_t dictionary_packs, bool private_mode);
+SlimeBuffer slime_set_options_v5(SlimeHandle *handle, bool live_conversion,
+                             bool history_completion, bool history_learning,
+                             uint32_t dictionary_packs, bool private_mode,
+                             uint32_t date_format_mask);
+SlimeBuffer slime_begin_reconversion(SlimeHandle *handle,
+                                 const uint8_t *surface, size_t surface_len);
 SlimeBuffer slime_reload_user_data(SlimeHandle *handle);
 SlimeBuffer slime_domain_dictionary_words(uint32_t mask);
 SlimeBuffer slime_installed_dictionary_packs(const SlimeHandle *handle);

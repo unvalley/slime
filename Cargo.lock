@@ -505,6 +505,7 @@ dependencies = [
 name = "slime-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sha2",
  "slime-converter",
  "slime-romaji",

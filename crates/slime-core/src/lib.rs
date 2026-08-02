@@ -1,12 +1,14 @@
 //! Platform-independent IME state machine.
 
-use slime_converter::Dictionary;
+use slime_converter::{Dictionary, Segment};
 use slime_romaji::RomajiComposer;
 
+mod date_time_candidates;
 mod dictionary_packs;
 mod domain_dictionaries;
 mod english_reverse;
 mod session_history;
+mod text_transform;
 mod user_data;
 
 use dictionary_packs::DictionaryPackStore;
@@ -22,6 +24,9 @@ pub use domain_dictionaries::{
 };
 pub use user_data::{HistoryEntry, UserData, UserDictionaryEntry};
 
+/// Every built-in date candidate format, used as the default by adapters.
+pub const ALL_DATE_FORMATS: u32 = date_time_candidates::ALL_FORMATS;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
     Character(char),
@@ -33,6 +38,15 @@ pub enum InputEvent {
     PreviousCandidate,
     SelectCandidate(u32),
     AcceptCandidate,
+    TransformHiragana,
+    TransformFullKatakana,
+    TransformHalfKatakana,
+    TransformFullAlphanumeric,
+    TransformHalfAlphanumeric,
+    NextSegment,
+    PreviousSegment,
+    ExpandSegment,
+    ShrinkSegment,
 }
 
 const _: () = assert!(std::mem::size_of::<InputEvent>() <= 8);
@@ -55,6 +69,11 @@ const LIVE_CONVERSION_EXPANDED_PATH_LIMIT: usize = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlimeAction {
     UpdatePreedit(String),
+    UpdateSegmentedPreedit {
+        text: String,
+        selection_start: usize,
+        selection_length: usize,
+    },
     ShowCandidates {
         candidates: Vec<String>,
         selected: usize,
@@ -71,18 +90,41 @@ pub enum Phase {
     Converting,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EnginePreferences {
     pub live_conversion: bool,
     pub history_completion: bool,
     pub history_learning: bool,
     pub dictionary_packs: u32,
+    pub private_mode: bool,
+    pub date_format_mask: u32,
+}
+
+impl Default for EnginePreferences {
+    fn default() -> Self {
+        Self {
+            live_conversion: false,
+            history_completion: false,
+            history_learning: false,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: date_time_candidates::ALL_FORMATS,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CandidateKind {
     Conversion,
+    SegmentedConversion,
     Completion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditableSegment {
+    reading: String,
+    surface: String,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +141,15 @@ enum LiveConversionDecision {
     Literal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransformStyle {
+    Hiragana,
+    FullKatakana,
+    HalfKatakana,
+    FullAlphanumeric,
+    HalfAlphanumeric,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -112,10 +163,14 @@ pub struct SlimeEngine {
     dictionary: Dictionary,
     romaji: RomajiComposer,
     reading: String,
+    raw_input: String,
     candidates: Vec<String>,
     selected: usize,
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
+    segments: Vec<EditableSegment>,
+    active_segment: usize,
+    transformed_surface: Option<String>,
     preferences: EnginePreferences,
     live_preview: Option<LivePreview>,
     live_preview_suppressed: bool,
@@ -136,10 +191,14 @@ impl SlimeEngine {
             dictionary,
             romaji: RomajiComposer::new(),
             reading: String::new(),
+            raw_input: String::new(),
             candidates: Vec::new(),
             selected: 0,
             candidate_kind: None,
             completion_selected: false,
+            segments: Vec::new(),
+            active_segment: 0,
+            transformed_surface: None,
             preferences: EnginePreferences::default(),
             live_preview: None,
             live_preview_suppressed: false,
@@ -180,7 +239,9 @@ impl SlimeEngine {
     }
 
     pub fn set_preferences(&mut self, preferences: EnginePreferences) -> Vec<SlimeAction> {
-        if self.preferences.history_learning && !preferences.history_learning {
+        if (!self.preferences.private_mode && preferences.private_mode)
+            || (self.preferences.history_learning && !preferences.history_learning)
+        {
             self.session_history.reset_context();
         }
         if self.uses_bundled_dictionary
@@ -212,6 +273,37 @@ impl SlimeEngine {
         self.rebuild_ascii_surfaces();
         self.refresh_live_preview();
         self.refresh_completion_actions(true)
+    }
+
+    /// Starts explicit reconversion for a selected committed surface. An
+    /// empty action list means the surface has no safe dictionary reading.
+    pub fn begin_reconversion(&mut self, surface: &str) -> Vec<SlimeAction> {
+        let mut readings = self.dictionary.readings_for_surface(surface);
+        if readings.is_empty() {
+            let hiragana = text_transform::hiragana(surface);
+            if hiragana != surface || surface.chars().all(is_hiragana_or_mark) {
+                readings.push(hiragana);
+            }
+        }
+        let Some(reading) = readings.into_iter().next() else {
+            return Vec::new();
+        };
+
+        self.clear_composition();
+        self.reading = reading;
+        self.candidates = self.conversion_candidates_for_reading(&self.reading);
+        if let Some(index) = self
+            .candidates
+            .iter()
+            .position(|candidate| candidate == surface)
+        {
+            self.selected = index;
+        } else {
+            self.candidates.insert(0, surface.to_owned());
+            self.selected = 0;
+        }
+        self.candidate_kind = Some(CandidateKind::Conversion);
+        self.candidate_actions()
     }
 
     fn rebuild_ascii_surfaces(&mut self) {
@@ -282,7 +374,10 @@ impl SlimeEngine {
 
     #[must_use]
     pub fn phase(&self) -> Phase {
-        if self.candidate_kind == Some(CandidateKind::Conversion) {
+        if matches!(
+            self.candidate_kind,
+            Some(CandidateKind::Conversion | CandidateKind::SegmentedConversion)
+        ) {
             Phase::Converting
         } else {
             Phase::Composing
@@ -297,6 +392,19 @@ impl SlimeEngine {
             InputEvent::PreviousCandidate => self.previous_candidate(),
             InputEvent::SelectCandidate(index) => self.select_candidate(index),
             InputEvent::AcceptCandidate => self.accept_candidate(),
+            InputEvent::TransformHiragana => self.transform(TransformStyle::Hiragana),
+            InputEvent::TransformFullKatakana => self.transform(TransformStyle::FullKatakana),
+            InputEvent::TransformHalfKatakana => self.transform(TransformStyle::HalfKatakana),
+            InputEvent::TransformFullAlphanumeric => {
+                self.transform(TransformStyle::FullAlphanumeric)
+            }
+            InputEvent::TransformHalfAlphanumeric => {
+                self.transform(TransformStyle::HalfAlphanumeric)
+            }
+            InputEvent::NextSegment => self.move_segment(true),
+            InputEvent::PreviousSegment => self.move_segment(false),
+            InputEvent::ExpandSegment => self.resize_segment(true),
+            InputEvent::ShrinkSegment => self.resize_segment(false),
             InputEvent::Enter => self.commit(),
             InputEvent::Escape => self.cancel(),
             InputEvent::Backspace => self.backspace(),
@@ -306,8 +414,8 @@ impl SlimeEngine {
     fn handle_character(&mut self, character: char) -> Vec<SlimeAction> {
         let mut actions = Vec::with_capacity(4);
         let had_completions = self.candidate_kind == Some(CandidateKind::Completion);
-        if self.phase() == Phase::Converting {
-            let committed = self.selected_candidate().to_owned();
+        if self.phase() == Phase::Converting || self.transformed_surface.is_some() {
+            let committed = self.committed_surface();
             let reading = self.reading.clone();
             self.record_history(&reading, &committed);
             actions.push(SlimeAction::Commit(committed));
@@ -317,12 +425,14 @@ impl SlimeEngine {
             self.clear_candidates();
         }
 
+        self.raw_input.push(character);
+
         if character.is_ascii_alphabetic()
             || (character == '\'' && matches!(self.romaji.pending(), "n" | "t" | "d"))
         {
             let kana = self
                 .romaji
-                .push(character)
+                .push(character.to_ascii_lowercase())
                 .expect("ASCII romaji was validated");
             self.reading.push_str(&kana);
         } else {
@@ -342,8 +452,12 @@ impl SlimeEngine {
 
     fn start_or_cycle_conversion(&mut self) -> Vec<SlimeAction> {
         let mut actions = Vec::with_capacity(3);
-        if self.candidate_kind == Some(CandidateKind::Conversion) {
+        if matches!(
+            self.candidate_kind,
+            Some(CandidateKind::Conversion | CandidateKind::SegmentedConversion)
+        ) {
             self.selected = (self.selected + 1) % self.candidates.len();
+            self.update_active_segment_surface();
             return self.candidate_actions();
         }
         if self.candidate_kind == Some(CandidateKind::Completion) {
@@ -356,20 +470,29 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
+        self.candidates = self.conversion_candidates_for_reading(&self.reading);
+        self.selected = 0;
+        self.candidate_kind = Some(CandidateKind::Conversion);
+        self.completion_selected = false;
+        actions.extend(self.candidate_actions());
+        actions
+    }
+
+    fn conversion_candidates_for_reading(&self, reading: &str) -> Vec<String> {
         let mut candidates = Vec::new();
-        for surface in self.user_data.exact_dictionary_surfaces(&self.reading) {
+        for surface in self.user_data.exact_dictionary_surfaces(reading) {
             push_unique(&mut candidates, surface.to_owned());
         }
-        if self.preferences.history_completion {
-            for surface in self.session_history.exact_surfaces(&self.reading, 9) {
+        if self.history_is_available() {
+            for surface in self.session_history.exact_surfaces(reading, 9) {
                 push_unique(&mut candidates, surface.to_owned());
             }
-            for surface in self.user_data.exact_history_surfaces(&self.reading) {
+            for surface in self.user_data.exact_history_surfaces(reading) {
                 push_unique(&mut candidates, surface.to_owned());
             }
         }
         for (key, surface) in &self.ascii_surfaces {
-            if english_reverse::reverse_match(&self.reading, key) == Some(ReverseMatch::Exact) {
+            if english_reverse::reverse_match(reading, key) == Some(ReverseMatch::Exact) {
                 push_unique(&mut candidates, surface.clone());
             }
         }
@@ -377,19 +500,22 @@ impl SlimeEngine {
         // single-kana words like み unreachable through the candidate window.
         for surface in self
             .dictionary
-            .candidates(&self.reading)
+            .candidates(reading)
             .into_iter()
             .map(|candidate| candidate.surface)
         {
             push_unique(&mut candidates, surface);
         }
-        insert_visible_katakana_candidate(&mut candidates, &self.reading);
-        self.candidates = candidates;
-        self.selected = 0;
-        self.candidate_kind = Some(CandidateKind::Conversion);
-        self.completion_selected = false;
-        actions.extend(self.candidate_actions());
-        actions
+        insert_visible_katakana_candidate(&mut candidates, reading);
+        insert_unique_candidates_after_first(
+            &mut candidates,
+            date_time_candidates::candidates(reading, self.preferences.date_format_mask),
+        );
+        candidates
+    }
+
+    fn history_is_available(&self) -> bool {
+        self.preferences.history_completion && !self.preferences.private_mode
     }
 
     fn next_candidate(&mut self) -> Vec<SlimeAction> {
@@ -398,6 +524,7 @@ impl SlimeEngine {
         }
 
         self.selected = (self.selected + 1) % self.candidates.len();
+        self.update_active_segment_surface();
         if self.candidate_kind == Some(CandidateKind::Completion) {
             self.completion_selected = true;
         }
@@ -413,6 +540,7 @@ impl SlimeEngine {
             .selected
             .checked_sub(1)
             .unwrap_or(self.candidates.len() - 1);
+        self.update_active_segment_surface();
         if self.candidate_kind == Some(CandidateKind::Completion) {
             self.completion_selected = true;
         }
@@ -426,12 +554,17 @@ impl SlimeEngine {
         }
 
         self.selected = index;
+        self.update_active_segment_surface();
         if self.candidate_kind == Some(CandidateKind::Completion) {
             self.completion_selected = true;
         }
-        vec![SlimeAction::UpdatePreedit(
-            self.selected_candidate().to_owned(),
-        )]
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            self.candidate_actions()
+        } else {
+            vec![SlimeAction::UpdatePreedit(
+                self.selected_candidate().to_owned(),
+            )]
+        }
     }
 
     fn accept_candidate(&mut self) -> Vec<SlimeAction> {
@@ -444,9 +577,176 @@ impl SlimeEngine {
         self.commit()
     }
 
+    fn transform(&mut self, style: TransformStyle) -> Vec<SlimeAction> {
+        self.reading.push_str(&self.romaji.flush());
+        if self.reading.is_empty() {
+            return vec![SlimeAction::ForwardKey];
+        }
+
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            let reading = self.segments[self.active_segment].reading.clone();
+            let transformed = transform_text(style, &reading, None);
+            self.segments[self.active_segment].surface = transformed;
+            self.candidates = vec![self.segments[self.active_segment].surface.clone()];
+            self.selected = 0;
+            return self.candidate_actions();
+        }
+
+        let had_candidates = self.candidate_kind.is_some();
+        self.clear_candidates();
+        let raw = (!self.raw_input.is_empty()).then_some(self.raw_input.as_str());
+        self.transformed_surface = Some(transform_text(style, &self.reading, raw));
+        let mut actions = vec![SlimeAction::UpdatePreedit(self.preedit())];
+        if had_candidates {
+            actions.push(SlimeAction::HideCandidates);
+        }
+        actions
+    }
+
+    fn move_segment(&mut self, forward: bool) -> Vec<SlimeAction> {
+        if self.phase() != Phase::Converting {
+            return vec![SlimeAction::ForwardKey];
+        }
+        let entered = self.enter_segment_mode();
+        if self.segments.is_empty() {
+            return vec![SlimeAction::ForwardKey];
+        }
+        if !entered || forward {
+            if forward {
+                self.active_segment = (self.active_segment + 1).min(self.segments.len() - 1);
+            } else {
+                self.active_segment = self.active_segment.saturating_sub(1);
+            }
+        }
+        self.activate_segment_candidates();
+        self.candidate_actions()
+    }
+
+    fn resize_segment(&mut self, expand: bool) -> Vec<SlimeAction> {
+        if self.phase() != Phase::Converting {
+            return vec![SlimeAction::ForwardKey];
+        }
+        self.enter_segment_mode();
+        if self.segments.is_empty() {
+            return vec![SlimeAction::ForwardKey];
+        }
+
+        if expand {
+            let next_index = self.active_segment + 1;
+            if next_index >= self.segments.len() {
+                return self.candidate_actions();
+            }
+            let next_reading = self.segments[next_index].reading.clone();
+            let character = next_reading.chars().next().expect("non-empty segment");
+            self.segments[self.active_segment].reading.push(character);
+            next_reading[character.len_utf8()..].clone_into(&mut self.segments[next_index].reading);
+            if self.segments[next_index].reading.is_empty() {
+                self.segments.remove(next_index);
+            } else {
+                self.reset_segment_surface(next_index);
+            }
+        } else {
+            let Some(character) = self.segments[self.active_segment].reading.pop() else {
+                return self.candidate_actions();
+            };
+            if self.segments[self.active_segment].reading.is_empty() {
+                self.segments[self.active_segment].reading.push(character);
+                return self.candidate_actions();
+            }
+            let next_index = self.active_segment + 1;
+            if next_index == self.segments.len() {
+                self.segments.push(EditableSegment {
+                    reading: character.to_string(),
+                    surface: character.to_string(),
+                });
+            } else {
+                self.segments[next_index].reading.insert(0, character);
+            }
+            self.reset_segment_surface(next_index);
+        }
+        self.reset_segment_surface(self.active_segment);
+        self.activate_segment_candidates();
+        self.candidate_actions()
+    }
+
+    /// Returns true when this call changed whole-phrase conversion into
+    /// segmented conversion.
+    fn enter_segment_mode(&mut self) -> bool {
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            return false;
+        }
+        let selected_surface = self.selected_candidate().to_owned();
+        let conversion = self
+            .dictionary
+            .convert_n_best(&self.reading, 32)
+            .into_iter()
+            .find(|conversion| conversion.surface == selected_surface)
+            .or_else(|| self.dictionary.convert_best(&self.reading));
+        self.segments = conversion.map_or_else(
+            || {
+                vec![EditableSegment {
+                    reading: self.reading.clone(),
+                    surface: selected_surface.clone(),
+                }]
+            },
+            |conversion| {
+                conversion
+                    .segments
+                    .into_iter()
+                    .map(editable_segment)
+                    .collect()
+            },
+        );
+        if self
+            .segments
+            .iter()
+            .map(|segment| segment.surface.as_str())
+            .collect::<String>()
+            != selected_surface
+        {
+            self.segments = vec![EditableSegment {
+                reading: self.reading.clone(),
+                surface: selected_surface,
+            }];
+        }
+        self.active_segment = 0;
+        self.candidate_kind = Some(CandidateKind::SegmentedConversion);
+        self.activate_segment_candidates();
+        true
+    }
+
+    fn activate_segment_candidates(&mut self) {
+        let segment = &self.segments[self.active_segment];
+        let reading = segment.reading.clone();
+        let surface = segment.surface.clone();
+        self.candidates = self.conversion_candidates_for_reading(&reading);
+        if let Some(index) = self
+            .candidates
+            .iter()
+            .position(|candidate| candidate == &surface)
+        {
+            self.selected = index;
+        } else {
+            self.candidates.insert(0, surface);
+            self.selected = 0;
+        }
+    }
+
+    fn reset_segment_surface(&mut self, index: usize) {
+        let reading = self.segments[index].reading.clone();
+        self.segments[index].surface = self
+            .conversion_candidates_for_reading(&reading)
+            .into_iter()
+            .next()
+            .unwrap_or(reading);
+    }
+
     fn candidate_actions(&self) -> Vec<SlimeAction> {
         let mut actions = Vec::with_capacity(2);
-        if self.candidate_kind == Some(CandidateKind::Conversion) || self.completion_selected {
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            actions.push(self.segmented_preedit_action());
+        } else if self.candidate_kind == Some(CandidateKind::Conversion) || self.completion_selected
+        {
             actions.push(SlimeAction::UpdatePreedit(
                 self.selected_candidate().to_owned(),
             ));
@@ -464,11 +764,16 @@ impl SlimeEngine {
         // literal suffix, and Enter must commit exactly what was visible.
         let displayed = self.preedit();
         self.reading.push_str(&self.romaji.flush());
-        let used_conversion = self.candidate_kind == Some(CandidateKind::Conversion);
+        let used_conversion = matches!(
+            self.candidate_kind,
+            Some(CandidateKind::Conversion | CandidateKind::SegmentedConversion)
+        );
         let used_completion =
             self.candidate_kind == Some(CandidateKind::Completion) && self.completion_selected;
         let committed = if used_conversion || used_completion {
-            self.selected_candidate().to_owned()
+            self.committed_surface()
+        } else if let Some(transformed) = &self.transformed_surface {
+            transformed.clone()
         } else {
             displayed
         };
@@ -520,8 +825,9 @@ impl SlimeEngine {
     }
 
     fn backspace(&mut self) -> Vec<SlimeAction> {
-        if self.candidate_kind == Some(CandidateKind::Conversion) {
+        if self.phase() == Phase::Converting || self.transformed_surface.is_some() {
             self.clear_candidates();
+            self.transformed_surface = None;
             return vec![
                 SlimeAction::HideCandidates,
                 SlimeAction::UpdatePreedit(self.preedit()),
@@ -532,8 +838,11 @@ impl SlimeEngine {
             self.clear_candidates();
         }
 
-        if !self.romaji.backspace() {
+        if self.romaji.backspace() {
+            self.raw_input.pop();
+        } else {
             self.reading.pop();
+            self.raw_input.clear();
         }
 
         let mut actions = self.refresh_composition_actions();
@@ -547,6 +856,12 @@ impl SlimeEngine {
     }
 
     fn preedit(&self) -> String {
+        if let Some(transformed) = &self.transformed_surface {
+            return transformed.clone();
+        }
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            return self.segmented_surface();
+        }
         if self.candidate_kind == Some(CandidateKind::Conversion)
             || (self.candidate_kind == Some(CandidateKind::Completion) && self.completion_selected)
         {
@@ -582,11 +897,59 @@ impl SlimeEngine {
         &self.candidates[self.selected]
     }
 
+    fn committed_surface(&self) -> String {
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            self.segmented_surface()
+        } else if let Some(transformed) = &self.transformed_surface {
+            transformed.clone()
+        } else if self.candidate_kind.is_some() {
+            self.selected_candidate().to_owned()
+        } else {
+            self.preedit()
+        }
+    }
+
+    fn segmented_surface(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| segment.surface.as_str())
+            .collect()
+    }
+
+    fn segmented_preedit_action(&self) -> SlimeAction {
+        let selection_start = self.segments[..self.active_segment]
+            .iter()
+            .map(|segment| segment.surface.encode_utf16().count())
+            .sum();
+        let selection_length = self.segments[self.active_segment]
+            .surface
+            .encode_utf16()
+            .count();
+        SlimeAction::UpdateSegmentedPreedit {
+            text: self.segmented_surface(),
+            selection_start,
+            selection_length,
+        }
+    }
+
+    fn update_active_segment_surface(&mut self) {
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion)
+            && let Some(segment) = self.segments.get_mut(self.active_segment)
+            && let Some(surface) = self.candidates.get(self.selected)
+        {
+            segment.surface.clone_from(surface);
+        }
+    }
+
     fn clear_composition(&mut self) {
         self.romaji.clear();
         self.reading.clear();
+        self.raw_input.clear();
         self.live_preview = None;
         self.live_preview_suppressed = false;
+        self.segments.clear();
+        self.active_segment = 0;
+        self.transformed_surface = None;
         self.clear_candidates();
     }
 
@@ -595,6 +958,8 @@ impl SlimeEngine {
         self.selected = 0;
         self.candidate_kind = None;
         self.completion_selected = false;
+        self.segments.clear();
+        self.active_segment = 0;
     }
 
     fn refresh_composition_actions(&mut self) -> Vec<SlimeAction> {
@@ -718,7 +1083,7 @@ impl SlimeEngine {
         for surface in self.english_reverse_surfaces(&reverse_target) {
             push_unique(&mut suggestions, surface);
         }
-        if self.preferences.history_completion && self.reading.chars().count() >= 2 {
+        if self.history_is_available() && self.reading.chars().count() >= 2 {
             for surface in self.session_history.completion_surfaces(&self.reading, 9) {
                 push_unique(&mut suggestions, surface.to_owned());
             }
@@ -753,7 +1118,7 @@ impl SlimeEngine {
     }
 
     fn record_history(&mut self, reading: &str, surface: &str) {
-        if !self.preferences.history_learning {
+        if !self.preferences.history_learning || self.preferences.private_mode {
             self.session_history.reset_context();
             return;
         }
@@ -767,7 +1132,7 @@ impl SlimeEngine {
     }
 
     fn record_completion_history(&mut self, prefix: &str, surface: &str) {
-        if !self.preferences.history_learning {
+        if !self.preferences.history_learning || self.preferences.private_mode {
             self.session_history.reset_context();
             return;
         }
@@ -812,8 +1177,52 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+fn insert_unique_candidates_after_first(values: &mut Vec<String>, additions: Vec<String>) {
+    let mut index = usize::from(!values.is_empty());
+    for value in additions {
+        if values.contains(&value) {
+            continue;
+        }
+        values.insert(index, value);
+        index += 1;
+    }
+}
+
 fn should_record_history(reading: &str, surface: &str) -> bool {
     user_data::is_useful_history(reading, surface)
+}
+
+fn editable_segment(segment: Segment) -> EditableSegment {
+    EditableSegment {
+        reading: segment.reading,
+        surface: segment.surface,
+    }
+}
+
+fn transform_text(style: TransformStyle, reading: &str, raw: Option<&str>) -> String {
+    match style {
+        TransformStyle::Hiragana => text_transform::hiragana(reading),
+        TransformStyle::FullKatakana => text_transform::full_katakana(reading),
+        TransformStyle::HalfKatakana => text_transform::half_katakana(reading),
+        TransformStyle::FullAlphanumeric => {
+            let romanized;
+            let source = if let Some(raw) = raw {
+                raw
+            } else {
+                romanized = text_transform::romanize(reading);
+                &romanized
+            };
+            text_transform::full_alphanumeric(source)
+        }
+        TransformStyle::HalfAlphanumeric => raw.map_or_else(
+            || text_transform::romanize(reading),
+            text_transform::half_alphanumeric,
+        ),
+    }
+}
+
+fn is_hiragana_or_mark(character: char) -> bool {
+    matches!(character, '\u{3041}'..='\u{3096}' | 'ー' | 'ゝ' | 'ゞ')
 }
 
 fn katakana_candidate(reading: &str) -> String {
@@ -881,9 +1290,10 @@ impl Default for SlimeEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_DOMAIN_DICTIONARIES, DictionaryPackWord, EnginePreferences, InputEvent,
-        LiveConversionDecision, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY, UserData,
-        bundled_dictionary, katakana_candidate,
+        ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateKind, DictionaryPackWord,
+        EnginePreferences, InputEvent, LiveConversionDecision, Phase, SlimeAction, SlimeEngine,
+        TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary, date_time_candidates,
+        katakana_candidate,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1008,6 +1418,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "nihongo");
@@ -1029,6 +1441,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "mi");
@@ -1046,6 +1460,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "sou");
@@ -1069,6 +1485,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "nihon");
@@ -1103,6 +1521,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         assert_eq!(
@@ -1139,6 +1559,8 @@ mod tests {
                 history_completion: false,
                 history_learning: false,
                 dictionary_packs: 0,
+                private_mode: false,
+                date_format_mask: ALL_DATE_FORMATS,
             });
             type_text(&mut engine, input);
             assert_eq!(engine.snapshot().preedit, expected, "{input}");
@@ -1153,6 +1575,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         // Spell the small tsu explicitly so `もっ` is evaluated before the
@@ -1182,6 +1606,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "nihongo");
@@ -1204,6 +1630,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "nihongo");
@@ -1234,6 +1662,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "soushima");
@@ -1252,6 +1682,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         // The trailing n is still pending romaji; the preview must already
@@ -1286,6 +1718,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
         type_text(&mut engine, "nihongo");
 
@@ -1457,6 +1891,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: TECHNOLOGY_DICTIONARY,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "github");
@@ -1481,6 +1917,8 @@ mod tests {
             history_completion: false,
             history_learning: false,
             dictionary_packs: TECHNOLOGY_DICTIONARY,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
         type_text(&mut engine, "python");
         assert!(
@@ -1556,6 +1994,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "pafo");
@@ -1582,6 +2022,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "dou");
@@ -1610,6 +2052,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         };
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         engine.set_preferences(preferences);
@@ -1643,6 +2087,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "nihon");
@@ -1668,6 +2114,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "kanji");
@@ -1690,6 +2138,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         };
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         engine.set_preferences(preferences);
@@ -1724,6 +2174,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         };
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         engine.set_preferences(preferences);
@@ -1759,6 +2211,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         };
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         engine.set_preferences(learning);
@@ -1794,6 +2248,8 @@ mod tests {
             history_completion: true,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         };
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         engine.set_preferences(preferences);
@@ -1829,6 +2285,8 @@ mod tests {
             history_completion: true,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "kanji");
@@ -1849,6 +2307,8 @@ mod tests {
             history_completion: false,
             history_learning: true,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         });
 
         type_text(&mut engine, "nihon");
@@ -2035,6 +2495,265 @@ mod tests {
         assert_eq!(engine.snapshot().preedit, "か");
         engine.handle(InputEvent::Backspace);
         assert_eq!(engine.snapshot().preedit, "");
+    }
+
+    #[test]
+    fn standard_function_key_transforms_keep_the_same_composition() {
+        let cases = [
+            (InputEvent::TransformHiragana, "にほんご"),
+            (InputEvent::TransformFullKatakana, "ニホンゴ"),
+            (InputEvent::TransformHalfKatakana, "ﾆﾎﾝｺﾞ"),
+            (InputEvent::TransformFullAlphanumeric, "ｎｉｈｏｎｇｏ"),
+            (InputEvent::TransformHalfAlphanumeric, "nihongo"),
+        ];
+        for (event, expected) in cases {
+            let mut engine = SlimeEngine::bundled();
+            type_text(&mut engine, "nihongo");
+            let actions = engine.handle(event);
+            assert!(actions.contains(&SlimeAction::UpdatePreedit(expected.to_owned())));
+            assert!(
+                engine
+                    .handle(InputEvent::Enter)
+                    .contains(&SlimeAction::Commit(expected.to_owned()))
+            );
+        }
+
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "Slime");
+        assert!(
+            engine
+                .handle(InputEvent::TransformFullAlphanumeric)
+                .contains(&SlimeAction::UpdatePreedit("Ｓｌｉｍｅ".to_owned()))
+        );
+    }
+
+    #[test]
+    fn segment_navigation_and_resizing_preserve_the_complete_reading() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "watashihanihon");
+        engine.handle(InputEvent::Space);
+
+        let actions = engine.handle(InputEvent::PreviousSegment);
+        assert!(matches!(
+            actions.first(),
+            Some(SlimeAction::UpdateSegmentedPreedit { .. })
+        ));
+        assert!(
+            engine.segments.len() >= 2,
+            "segments: {:?}",
+            engine.segments
+        );
+        let reading = engine
+            .segments
+            .iter()
+            .map(|segment| segment.reading.as_str())
+            .collect::<String>();
+        assert_eq!(reading, "わたしはにほん");
+
+        engine.handle(InputEvent::ShrinkSegment);
+        let shrunk = engine
+            .segments
+            .iter()
+            .map(|segment| segment.reading.as_str())
+            .collect::<String>();
+        assert_eq!(shrunk, "わたしはにほん");
+        engine.handle(InputEvent::ExpandSegment);
+        let expanded = engine
+            .segments
+            .iter()
+            .map(|segment| segment.reading.as_str())
+            .collect::<String>();
+        assert_eq!(expanded, "わたしはにほん");
+    }
+
+    #[test]
+    fn segmented_candidates_update_only_the_active_segment() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "watashihanihon");
+        engine.handle(InputEvent::Space);
+        engine.handle(InputEvent::PreviousSegment);
+
+        assert_eq!(
+            engine.candidate_kind,
+            Some(CandidateKind::SegmentedConversion)
+        );
+        assert!(
+            engine.segments.len() >= 2,
+            "segments: {:?}",
+            engine.segments
+        );
+        let trailing = engine.segments[1..]
+            .iter()
+            .map(|segment| segment.surface.as_str())
+            .collect::<String>();
+
+        let actions = engine.handle(InputEvent::Space);
+        assert!(matches!(
+            actions.first(),
+            Some(SlimeAction::UpdateSegmentedPreedit { .. })
+        ));
+        assert_eq!(
+            engine.segments[0].surface,
+            engine.candidates[engine.selected]
+        );
+        assert_eq!(
+            engine.segments[1..]
+                .iter()
+                .map(|segment| segment.surface.as_str())
+                .collect::<String>(),
+            trailing
+        );
+
+        let actions = engine.handle(InputEvent::SelectCandidate(0));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, SlimeAction::ShowCandidates { selected: 0, .. }))
+        );
+
+        let actions = engine.handle(InputEvent::TransformFullKatakana);
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                SlimeAction::UpdateSegmentedPreedit { .. },
+                SlimeAction::ShowCandidates { .. }
+            ]
+        ));
+        assert_eq!(engine.phase(), Phase::Converting);
+    }
+
+    #[test]
+    fn escape_leaves_segment_mode_and_restores_the_complete_reading() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "watashihanihon");
+        engine.handle(InputEvent::Space);
+        engine.handle(InputEvent::NextSegment);
+
+        engine.handle(InputEvent::Escape);
+
+        assert_eq!(engine.snapshot().preedit, "わたしはにほん");
+        assert_eq!(engine.snapshot().phase, Phase::Composing);
+    }
+
+    #[test]
+    fn reconversion_uses_the_reverse_dictionary_without_changing_unknown_text() {
+        let mut engine = SlimeEngine::bundled();
+        let actions = engine.begin_reconversion("日本");
+        assert_eq!(engine.reading, "にほん");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            SlimeAction::ShowCandidates { candidates, .. }
+                if candidates.iter().any(|candidate| candidate == "日本")
+        )));
+
+        let snapshot = engine.snapshot();
+        assert!(engine.begin_reconversion("🫠").is_empty());
+        assert_eq!(engine.snapshot(), snapshot);
+    }
+
+    #[test]
+    fn reconversion_includes_user_dictionary_readings() {
+        let directory = test_directory("reconversion-user-dictionary");
+        fs::write(
+            directory.join("user_dictionary.tsv"),
+            "# slime-user-dictionary-v1\nすらいむてすと\tSlimeTest\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+
+        let actions = engine.begin_reconversion("SlimeTest");
+
+        assert_eq!(engine.reading, "すらいむてすと");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            SlimeAction::ShowCandidates { candidates, .. }
+                if candidates.iter().any(|candidate| candidate == "SlimeTest")
+        )));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn date_and_time_are_additional_candidates_not_new_first_choices() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "kyou");
+        engine.handle(InputEvent::Space);
+        let candidates = engine.snapshot().candidates;
+        assert_eq!(candidates[0], "今日");
+        let expected = date_time_candidates::candidates("きょう", ALL_DATE_FORMATS);
+        assert_eq!(&candidates[1..=expected.len()], expected, "{candidates:?}");
+
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "ima");
+        engine.handle(InputEvent::Space);
+        assert!(engine.snapshot().candidates.iter().any(|candidate| {
+            candidate.len() == 5 && candidate.as_bytes().get(2) == Some(&b':')
+        }));
+    }
+
+    #[test]
+    fn date_candidate_formats_follow_the_enabled_mask() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            date_format_mask: date_time_candidates::SHORT_REIWA | date_time_candidates::WEEKDAY,
+            ..EnginePreferences::default()
+        });
+        type_text(&mut engine, "kyou");
+        engine.handle(InputEvent::Space);
+        let candidates = engine.snapshot().candidates;
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.starts_with('R') && candidate.contains('/')),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.ends_with("曜日")),
+            "{candidates:?}"
+        );
+        assert!(
+            !candidates.iter().any(|candidate| {
+                candidate.len() == 10
+                    && candidate.as_bytes().get(4) == Some(&b'/')
+                    && candidate.as_bytes().get(7) == Some(&b'/')
+            }),
+            "{candidates:?}"
+        );
+    }
+
+    #[test]
+    fn private_mode_neither_reads_nor_writes_history() {
+        let directory = test_directory("private-mode");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nにほんご	日本語履歴	10	10\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: true,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+
+        type_text(&mut engine, "nih");
+        assert!(
+            !engine
+                .snapshot()
+                .candidates
+                .contains(&"日本語履歴".to_owned())
+        );
+        type_text(&mut engine, "on");
+        engine.handle(InputEvent::Space);
+        engine.handle(InputEvent::Enter);
+        let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
+        assert_eq!(history.lines().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

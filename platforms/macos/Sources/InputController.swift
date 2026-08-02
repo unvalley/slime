@@ -11,9 +11,11 @@ final class SlimeController: IMKInputController {
     private let engine: RustEngine
     private let candidatePanel: CandidatePanel
     private var hasComposition = false
+    private var isSegmentedConversion = false
     private var candidateValues: [String] = []
     private var selectedCandidateIndex = 0
     private var appliedOptions: InputRuntimeOptions?
+    private var replacementRangeOnNextUpdate: NSRange?
 
     override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
         guard let engine = try? RustEngine() else {
@@ -85,12 +87,6 @@ final class SlimeController: IMKInputController {
             }
         }
 
-        let commandModifiers = event.modifierFlags.intersection([.command, .control, .option])
-        if !commandModifiers.isEmpty {
-            commitIfNeeded(client: sender)
-            return false
-        }
-
         if shouldForwardBackspaceDirectly(
             keyCode: event.keyCode,
             hasComposition: hasComposition
@@ -98,7 +94,10 @@ final class SlimeController: IMKInputController {
             return false
         }
 
-        if let index = candidateSelectionIndex(
+        let candidateSelectionModifiers = event.modifierFlags.intersection([
+            .shift, .command, .control, .option,
+        ])
+        if candidateSelectionModifiers.isEmpty, let index = candidateSelectionIndex(
             keyCode: event.keyCode,
             candidateCount: candidateValues.count,
             pageStart: (selectedCandidateIndex / 9) * 9
@@ -107,27 +106,26 @@ final class SlimeController: IMKInputController {
             return true
         }
 
-        let mappedEvent: RustEngine.Event?
-        switch event.keyCode {
-        case 36, 76:
-            mappedEvent = .enter
-        case 49:
-            mappedEvent = .space
-        case 48 where !candidateValues.isEmpty:
-            mappedEvent = .acceptCandidate
-        case 51:
-            mappedEvent = .backspace
-        case 53:
-            mappedEvent = .escape
-        case 125 where !candidateValues.isEmpty:
-            mappedEvent = .nextCandidate
-        case 126 where !candidateValues.isEmpty:
-            mappedEvent = .previousCandidate
-        default:
-            mappedEvent = characterEvent(from: event)
+        if let action = fixedInputAction(
+            from: event,
+            hasComposition: hasComposition,
+            hasCandidates: !candidateValues.isEmpty
+        ) {
+            switch action {
+            case let .engine(engineEvent):
+                return process(engineEvent, client: sender)
+            case .reconvert:
+                return beginReconversion(client: sender)
+            }
         }
 
-        guard let mappedEvent else {
+        let commandModifiers = event.modifierFlags.intersection([.command, .control, .option])
+        if !commandModifiers.isEmpty {
+            commitIfNeeded(client: sender)
+            return false
+        }
+
+        guard let mappedEvent = characterEvent(from: event) else {
             if !candidateValues.isEmpty {
                 return false
             }
@@ -165,6 +163,9 @@ final class SlimeController: IMKInputController {
         do {
             let actions = try engine.process(event)
             let forwarded = apply(actions, client: inputClient)
+            if forwarded && hasComposition {
+                commitIfNeeded(client: inputClient)
+            }
             return !forwarded
         } catch {
             NSLog("Slime: Rust engine error: %@", String(describing: error))
@@ -204,8 +205,18 @@ final class SlimeController: IMKInputController {
         var forwarded = false
         let textClient = IMKTextMutationClient(base: inputClient)
         for action in actions {
-            if let compositionState = applyTextMutation(action, client: textClient) {
+            if let compositionState = applyTextMutation(
+                action,
+                client: textClient,
+                replacementRange: replacementRangeOnNextUpdate
+            ) {
                 hasComposition = compositionState
+                if action.type == "update_preedit" {
+                    isSegmentedConversion = action.selectedStart != nil
+                    replacementRangeOnNextUpdate = nil
+                } else if !compositionState {
+                    isSegmentedConversion = false
+                }
                 continue
             }
             switch action.type {
@@ -238,7 +249,8 @@ final class SlimeController: IMKInputController {
             historyCompletion: IMEPreferences.historyCompletion,
             historyLearning: IMEPreferences.historyLearning,
             dictionaryPacks: IMEPreferences.dictionaryPacks,
-            secureEventInput: secureEventInputIsEnabled()
+            secureEventInput: secureEventInputIsEnabled(),
+            dateFormatMask: IMEPreferences.dateCandidateFormats
         )
         guard force || options != appliedOptions else {
             return true
@@ -249,7 +261,9 @@ final class SlimeController: IMKInputController {
                 liveConversion: options.liveConversion,
                 historyCompletion: options.historyCompletion,
                 historyLearning: options.historyLearning,
-                dictionaryPacks: options.dictionaryPacks
+                dictionaryPacks: options.dictionaryPacks,
+                privateMode: options.privateMode,
+                dateFormatMask: options.dateFormatMask
             )
             appliedOptions = options
             if let inputClient {
@@ -265,6 +279,30 @@ final class SlimeController: IMKInputController {
     private func commitIfNeeded(client sender: Any!) {
         guard hasComposition else { return }
         _ = process(.enter, client: sender)
+    }
+
+    private func beginReconversion(client sender: Any!) -> Bool {
+        guard let inputClient = sender as? (any IMKTextInput & NSObjectProtocol) else {
+            return false
+        }
+        let selectedRange = inputClient.selectedRange()
+        guard selectedRange.location != NSNotFound,
+              selectedRange.length > 0,
+              let selected = inputClient.attributedSubstring(from: selectedRange)?.string,
+              !selected.isEmpty
+        else {
+            return false
+        }
+        do {
+            let actions = try engine.beginReconversion(surface: selected)
+            guard !actions.isEmpty else { return false }
+            replacementRangeOnNextUpdate = selectedRange
+            _ = apply(actions, client: inputClient)
+            return true
+        } catch {
+            NSLog("Slime: failed to begin reconversion %@", String(describing: error))
+            return false
+        }
     }
 
     private func showCandidates(
@@ -295,7 +333,7 @@ final class SlimeController: IMKInputController {
     private func selectCandidate(at index: Int, commit: Bool) {
         guard candidateValues.indices.contains(index) else { return }
         _ = process(.selectCandidate(UInt32(index)), client: client())
-        if commit {
+        if commit && !isSegmentedConversion {
             _ = process(.enter, client: client())
         }
     }

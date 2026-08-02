@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+libc = "0.2"
 slime-converter = { path = "../slime-converter" }
 slime-romaji = { path = "../slime-romaji" }
 sha2 = "0.10"

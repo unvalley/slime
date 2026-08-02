@@ -11,6 +11,15 @@ final class RustEngine {
         case previousCandidate
         case selectCandidate(UInt32)
         case acceptCandidate
+        case transformHiragana
+        case transformFullKatakana
+        case transformHalfKatakana
+        case transformFullAlphanumeric
+        case transformHalfAlphanumeric
+        case nextSegment
+        case previousSegment
+        case expandSegment
+        case shrinkSegment
 
         fileprivate var rawValue: UInt32 {
             switch self {
@@ -23,6 +32,15 @@ final class RustEngine {
             case .previousCandidate: 6
             case .selectCandidate: 7
             case .acceptCandidate: 8
+            case .transformHiragana: 9
+            case .transformFullKatakana: 10
+            case .transformHalfKatakana: 11
+            case .transformFullAlphanumeric: 12
+            case .transformHalfAlphanumeric: 13
+            case .nextSegment: 14
+            case .previousSegment: 15
+            case .expandSegment: 16
+            case .shrinkSegment: 17
             }
         }
 
@@ -40,6 +58,8 @@ final class RustEngine {
         let text: String?
         let candidates: [String]?
         let selected: Int?
+        let selectedStart: Int?
+        let selectedLength: Int?
     }
 
     enum EngineError: Error, Equatable {
@@ -80,15 +100,27 @@ final class RustEngine {
         liveConversion: Bool,
         historyCompletion: Bool,
         historyLearning: Bool? = nil,
-        dictionaryPacks: UInt32 = 0
+        dictionaryPacks: UInt32 = 0,
+        privateMode: Bool = false,
+        dateFormatMask: UInt32 = DateCandidateFormat.allMask
     ) throws -> [Action] {
-        let buffer = slime_set_options_v3(
+        let buffer = slime_set_options_v5(
             handle,
             liveConversion,
             historyCompletion,
             historyLearning ?? historyCompletion,
-            dictionaryPacks
+            dictionaryPacks,
+            privateMode,
+            dateFormatMask
         )
+        return try decode(buffer)
+    }
+
+    func beginReconversion(surface: String) throws -> [Action] {
+        let bytes = Array(surface.utf8)
+        let buffer = bytes.withUnsafeBufferPointer { buffer in
+            slime_begin_reconversion(handle, buffer.baseAddress, buffer.count)
+        }
         return try decode(buffer)
     }
 

@@ -15,6 +15,7 @@ enum IMEPreferences {
     private static let historyCompletionKey = "historyCompletion"
     private static let historyLearningKey = "historyLearning"
     private static let dictionaryPacksKey = "dictionaryPacks"
+    private static let dateCandidateFormatsKey = "dateCandidateFormats"
 
     static var liveConversion: Bool {
         get { UserDefaults.standard.bool(forKey: liveConversionKey) }
@@ -53,6 +54,71 @@ enum IMEPreferences {
         set {
             UserDefaults.standard.set(Int(newValue), forKey: dictionaryPacksKey)
             NotificationCenter.default.post(name: .unvalleyPreferencesDidChange, object: nil)
+        }
+    }
+
+    static var dateCandidateFormats: UInt32 {
+        get {
+            guard UserDefaults.standard.object(forKey: dateCandidateFormatsKey) != nil else {
+                return DateCandidateFormat.allMask
+            }
+            return UInt32(
+                truncatingIfNeeded: UserDefaults.standard.integer(forKey: dateCandidateFormatsKey)
+            )
+        }
+        set {
+            UserDefaults.standard.set(Int(newValue), forKey: dateCandidateFormatsKey)
+            NotificationCenter.default.post(name: .unvalleyPreferencesDidChange, object: nil)
+        }
+    }
+}
+
+enum DateCandidateFormat: UInt32, CaseIterable, Identifiable {
+    case shortNumeric = 1
+    case isoNumeric = 2
+    case monthDayWeekday = 4
+    case longGregorian = 8
+    case longReiwa = 16
+    case shortReiwa = 32
+    case weekday = 64
+
+    static let allMask = allCases.reduce(UInt32(0)) { $0 | $1.rawValue }
+
+    var id: UInt32 { rawValue }
+
+    var name: String {
+        return switch self {
+        case .shortNumeric: "月/日"
+        case .isoNumeric: "年/月/日"
+        case .monthDayWeekday: "月日と曜日"
+        case .longGregorian: "西暦の年月日"
+        case .longReiwa: "和暦の年月日"
+        case .shortReiwa: "和暦の短縮表記"
+        case .weekday: "曜日"
+        }
+    }
+
+    var example: String {
+        let calendar = Calendar(identifier: .gregorian)
+        let components = calendar.dateComponents([.year, .month, .day, .weekday], from: Date())
+        let year = components.year ?? 1970
+        let month = components.month ?? 1
+        let day = components.day ?? 1
+        let weekdayIndex = max(0, min(6, (components.weekday ?? 1) - 1))
+        let shortWeekday = ["日", "月", "火", "水", "木", "金", "土"][weekdayIndex]
+        let weekday = [
+            "日曜日", "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日",
+        ][weekdayIndex]
+        let reiwaYear = max(1, year - 2018)
+        return switch self {
+        case .shortNumeric: "\(month)/\(day)"
+        case .isoNumeric: String(format: "%04d/%02d/%02d", year, month, day)
+        case .monthDayWeekday: "\(month)月\(day)日(\(shortWeekday))"
+        case .longGregorian: "\(year)年\(month)月\(day)日"
+        case .longReiwa:
+            "令和\(reiwaYear == 1 ? "元" : String(reiwaYear))年\(month)月\(day)日"
+        case .shortReiwa: String(format: "R%02d/%02d/%02d", reiwaYear, month, day)
+        case .weekday: weekday
         }
     }
 }

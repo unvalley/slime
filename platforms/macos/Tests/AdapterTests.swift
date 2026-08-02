@@ -37,9 +37,10 @@ enum AdapterTests {
         )
         try expect(
             secureInputOptions.liveConversion
-                && secureInputOptions.historyCompletion
+                && !secureInputOptions.historyCompletion
+                && secureInputOptions.privateMode
                 && secureInputOptions.dictionaryPacks == 7,
-            "secure event input should not rewrite unrelated preferences"
+            "secure event input should use private mode without rewriting conversion or dictionaries"
         )
         let userDisabledLearning = InputRuntimeOptions(
             liveConversion: false,
@@ -52,6 +53,33 @@ enum AdapterTests {
             !userDisabledLearning.historyLearning,
             "leaving secure input should not override a disabled user preference"
         )
+        let explicitPrivateOptions = InputRuntimeOptions(
+            liveConversion: true,
+            historyCompletion: true,
+            historyLearning: true,
+            dictionaryPacks: 7,
+            secureEventInput: false,
+            privateMode: true
+        )
+        try expect(
+            explicitPrivateOptions.privateMode
+                && !explicitPrivateOptions.historyCompletion
+                && !explicitPrivateOptions.historyLearning,
+            "process-private mode should disable both history reads and writes"
+        )
+        InputPrivacySession.toggle()
+        let toggledPrivateOptions = InputRuntimeOptions(
+            liveConversion: true,
+            historyCompletion: true,
+            historyLearning: true,
+            dictionaryPacks: 0,
+            secureEventInput: false
+        )
+        try expect(
+            toggledPrivateOptions.privateMode,
+            "private mode should be process-local and apply without a persistent preference"
+        )
+        InputPrivacySession.toggle()
         let privacyDirectory = testDirectory.appendingPathComponent(
             "secure-input-history",
             isDirectory: true
@@ -61,7 +89,8 @@ enum AdapterTests {
             liveConversion: secureInputOptions.liveConversion,
             historyCompletion: secureInputOptions.historyCompletion,
             historyLearning: secureInputOptions.historyLearning,
-            dictionaryPacks: secureInputOptions.dictionaryPacks
+            dictionaryPacks: secureInputOptions.dictionaryPacks,
+            privateMode: secureInputOptions.privateMode
         )
         try commitNihon(using: privacyEngine)
         let privacyHistoryURL = privacyDirectory.appendingPathComponent("history.tsv")
@@ -108,6 +137,140 @@ enum AdapterTests {
             textView.string == appKitCandidate && textView.markedRange().length == 0,
             "commit actions should replace AppKit marked text with the selected candidate"
         )
+
+        let transformEngine = try RustEngine(dataDirectory: testDirectory)
+        for scalar in "nihongo".unicodeScalars {
+            _ = try transformEngine.process(.character(scalar))
+        }
+        let halfKatakana = try transformEngine.process(.transformHalfKatakana)
+        try expect(
+            halfKatakana.contains(where: { $0.type == "update_preedit" && $0.text == "ﾆﾎﾝｺﾞ" }),
+            "F8 event should expose half-width Katakana through the adapter"
+        )
+
+        try expect(
+            DateCandidateFormat.allMask == 127,
+            "all seven date candidate formats should be enabled by default"
+        )
+        let dateEngine = try RustEngine(dataDirectory: testDirectory)
+        _ = try dateEngine.setOptions(
+            liveConversion: false,
+            historyCompletion: false,
+            dateFormatMask: DateCandidateFormat.shortReiwa.rawValue
+        )
+        for scalar in "kyou".unicodeScalars {
+            _ = try dateEngine.process(.character(scalar))
+        }
+        let dateActions = try dateEngine.process(.space)
+        let configuredDateCandidates = try expectValue(
+            dateActions.first(where: { $0.type == "show_candidates" })?.candidates,
+            "configured date candidates should cross the Swift bridge"
+        )
+        try expect(
+            configuredDateCandidates.contains(where: {
+                $0.hasPrefix("R") && $0.filter { $0 == "/" }.count == 2
+            }),
+            "the enabled abbreviated Reiwa format should be offered"
+        )
+        try expect(
+            !configuredDateCandidates.contains(where: {
+                $0.count == 10 && $0.dropFirst(4).first == "/"
+            }),
+            "disabled Gregorian numeric formats should not be offered"
+        )
+
+        let reconversionEngine = try RustEngine(dataDirectory: testDirectory)
+        let reconversionActions = try reconversionEngine.beginReconversion(surface: "日本")
+        try expect(
+            reconversionActions.contains(where: {
+                $0.type == "show_candidates" && $0.candidates?.contains("日本") == true
+            }),
+            "selected 日本 should enter conversion through the reverse dictionary"
+        )
+        let reconversionView = NSTextView(frame: .zero)
+        reconversionView.string = "前日本後"
+        reconversionView.setSelectedRange(NSRange(location: 1, length: 2))
+        var replacement: NSRange? = NSRange(location: 1, length: 2)
+        for action in reconversionActions {
+            if applyTextMutation(action, client: reconversionView, replacementRange: replacement) != nil,
+               action.type == "update_preedit"
+            {
+                replacement = nil
+            }
+        }
+        try expect(
+            reconversionView.string == "前日本後" && reconversionView.markedRange().location == 1,
+            "reconversion should mark only the selected replacement range"
+        )
+
+        let f7Event = try expectValue(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: "",
+                charactersIgnoringModifiers: "",
+                isARepeat: false,
+                keyCode: 98
+            ),
+            "F7 event should be created"
+        )
+        guard case .engine(.transformFullKatakana)? = fixedInputAction(
+            from: f7Event,
+            hasComposition: true,
+            hasCandidates: false
+        ) else {
+            throw TestFailure(message: "fixed keymap should map F7 to full-width Katakana")
+        }
+
+        let shiftedRight = try expectValue(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: .shift,
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: "",
+                charactersIgnoringModifiers: "",
+                isARepeat: false,
+                keyCode: 124
+            ),
+            "Shift-Right event should be created"
+        )
+        guard case .engine(.expandSegment)? = fixedInputAction(
+            from: shiftedRight,
+            hasComposition: true,
+            hasCandidates: true
+        ) else {
+            throw TestFailure(message: "fixed keymap should map Shift-Right to segment expansion")
+        }
+
+        let reconvertEvent = try expectValue(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.control, .shift],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: "R",
+                charactersIgnoringModifiers: "r",
+                isARepeat: false,
+                keyCode: 15
+            ),
+            "reconversion shortcut event should be created"
+        )
+        guard case .reconvert? = fixedInputAction(
+            from: reconvertEvent,
+            hasComposition: false,
+            hasCandidates: false
+        ) else {
+            throw TestFailure(message: "Ctrl-Shift-R should request selected-text reconversion")
+        }
 
         let engine = try RustEngine(dataDirectory: testDirectory)
         var latestPreedit: String?

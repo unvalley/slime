@@ -10,6 +10,10 @@ use std::sync::OnceLock;
 static READINGS_FST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mozc-readings.fst"));
 static ENTRIES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mozc-entries.bin"));
 static SURFACES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mozc-surfaces.bin"));
+static REVERSE_FST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mozc-reverse.fst"));
+static REVERSE_BLOCKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mozc-reverse.bin"));
+static REVERSE_READINGS: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mozc-reverse-readings.bin"));
 
 const ENTRIES_HEADER_BYTES: usize = 16;
 
@@ -23,6 +27,7 @@ pub(crate) struct CompactEntry {
 
 pub(crate) struct CompactDictionary {
     fst: fst::raw::Fst<&'static [u8]>,
+    reverse_fst: fst::raw::Fst<&'static [u8]>,
     entry_count: usize,
     max_reading_bytes: usize,
 }
@@ -42,12 +47,14 @@ impl CompactDictionary {
         static INSTANCE: OnceLock<CompactDictionary> = OnceLock::new();
         INSTANCE.get_or_init(|| {
             assert_eq!(&ENTRIES[0..4], b"UDE1", "bundled dictionary magic");
+            assert_eq!(&REVERSE_BLOCKS[0..4], b"RDE1", "reverse dictionary magic");
             let entry_count =
                 u32::from_le_bytes(ENTRIES[4..8].try_into().expect("header slice")) as usize;
             let max_reading_bytes =
                 u32::from_le_bytes(ENTRIES[8..12].try_into().expect("header slice")) as usize;
             Self {
                 fst: fst::raw::Fst::new(READINGS_FST).expect("valid bundled reading FST"),
+                reverse_fst: fst::raw::Fst::new(REVERSE_FST).expect("valid bundled reverse FST"),
                 entry_count,
                 max_reading_bytes,
             }
@@ -88,6 +95,40 @@ impl CompactDictionary {
                 for_each_entry_at(block, &mut |entry| callback(index + 1, entry));
             }
         }
+    }
+
+    pub(crate) fn readings_for_surface(&self, surface: &str) -> Vec<(String, i32)> {
+        let Some(output) = self.reverse_fst.get(surface.as_bytes()) else {
+            return Vec::new();
+        };
+        let mut cursor = usize::try_from(output.value()).expect("reverse block offset");
+        let count = read_reverse_varint(&mut cursor);
+        let mut readings = Vec::with_capacity(usize::try_from(count).expect("reading count"));
+        for _ in 0..count {
+            let offset = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
+            let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
+            let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
+                .expect("valid reverse reading UTF-8")
+                .to_owned();
+            let cost = u16::from_le_bytes([REVERSE_BLOCKS[cursor], REVERSE_BLOCKS[cursor + 1]]);
+            cursor += 2;
+            readings.push((reading, i32::from(cost)));
+        }
+        readings
+    }
+}
+
+fn read_reverse_varint(cursor: &mut usize) -> u64 {
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    loop {
+        let byte = REVERSE_BLOCKS[*cursor];
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
     }
 }
 
@@ -156,5 +197,11 @@ mod tests {
         let dictionary = CompactDictionary::bundled();
         assert!(dictionary.entry_count() > 1_000_000);
         assert!(dictionary.max_reading_bytes >= 24);
+    }
+
+    #[test]
+    fn reverse_index_returns_ranked_readings() {
+        let readings = CompactDictionary::bundled().readings_for_surface("日本");
+        assert!(readings.iter().any(|(reading, _)| reading == "にほん"));
     }
 }

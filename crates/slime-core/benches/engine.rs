@@ -3,7 +3,9 @@ use std::fs;
 use std::hint::black_box;
 use std::time::Instant;
 
-use slime_core::{ALL_DOMAIN_DICTIONARIES, EnginePreferences, InputEvent, SlimeEngine, UserData};
+use slime_core::{
+    ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, EnginePreferences, InputEvent, SlimeEngine, UserData,
+};
 
 fn main() {
     let iterations = iterations(50_000);
@@ -23,6 +25,8 @@ fn main() {
         history_completion: false,
         history_learning: false,
         dictionary_packs: ALL_DOMAIN_DICTIONARIES,
+        private_mode: false,
+        date_format_mask: ALL_DATE_FORMATS,
     }));
     run("engine/nihon_conversion_all_packs", iterations, || {
         let mut engine = all_packs_engine.clone();
@@ -50,6 +54,8 @@ fn main() {
                     history_completion: false,
                     history_learning: false,
                     dictionary_packs: 0,
+                    private_mode: false,
+                    date_format_mask: ALL_DATE_FORMATS,
                 }));
                 for character in black_box(input).chars() {
                     black_box(engine.handle(InputEvent::Character(character)));
@@ -70,6 +76,8 @@ fn run_session_context_benchmarks(iterations: u64) {
         history_completion: true,
         history_learning: true,
         dictionary_packs: ALL_DOMAIN_DICTIONARIES,
+        private_mode: false,
+        date_format_mask: ALL_DATE_FORMATS,
     };
 
     let mut empty_context = SlimeEngine::bundled();
@@ -160,6 +168,8 @@ fn run_history_benchmarks(iterations: u64) {
             history_completion,
             history_learning: false,
             dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
         }));
         let state = if history_completion { "on" } else { "off" };
         run(

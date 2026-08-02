@@ -62,7 +62,8 @@ private func markedTextAttributes(_ text: String) -> NSAttributedString {
 @discardableResult
 func applyTextMutation(
     _ action: RustEngine.Action,
-    client: some TextMutationClient
+    client: some TextMutationClient,
+    replacementRange: NSRange? = nil
 ) -> Bool? {
     let notFoundRange = NSRange(location: NSNotFound, length: NSNotFound)
     switch action.type {
@@ -70,8 +71,10 @@ func applyTextMutation(
         let text = action.text ?? ""
         client.replaceMarkedText(
             markedTextAttributes(text),
-            selectionRange: NSRange(location: text.utf16.count, length: 0),
-            replacementRange: notFoundRange
+            selectionRange: action.selectedStart.map {
+                NSRange(location: $0, length: action.selectedLength ?? 0)
+            } ?? NSRange(location: text.utf16.count, length: 0),
+            replacementRange: replacementRange ?? notFoundRange
         )
         return !text.isEmpty
     case "commit":

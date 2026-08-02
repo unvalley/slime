@@ -25,6 +25,9 @@ fn main() {
     run("converter/digit_counter_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("２０２６ねん８がつ１にち")));
     });
+    run("converter/reconversion_lookup", iterations, || {
+        black_box(dictionary.readings_for_surface(black_box("日本")));
+    });
     run("converter/short_dictionary_layer", iterations, || {
         black_box(short_dictionary_layer());
     });

@@ -7,12 +7,14 @@
 //!   of (varint surface offset, varint surface length, u16 left ID, u16 right
 //!   ID, u16 word cost), sorted by cost.
 //! - `mozc-surfaces.bin`: deduplicated concatenated UTF-8 surfaces.
+//! - `mozc-reverse.fst` / `mozc-reverse.bin`: exact surface-to-reading index
+//!   used only for explicit reconversion.
 //!
 //! Parsing 44 MB of TSV at every process start took ~390 ms and duplicated
 //! every string on the heap; the compiled form loads by pointer cast.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -31,7 +33,57 @@ fn main() {
     println!("cargo::rerun-if-changed={}", tsv_path.display());
 
     let by_reading = read_entries_by_reading(&tsv_path);
+    write_reverse_dictionary(&by_reading, Path::new(&out_dir));
     write_compact_dictionary(by_reading, Path::new(&out_dir));
+}
+
+fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Path) {
+    let mut by_surface = BTreeMap::<&str, Vec<(&str, u16)>>::new();
+    for (reading, entries) in by_reading {
+        for entry in entries {
+            if entry.surface == *reading || entry.word_cost > MAX_RECONVERSION_WORD_COST {
+                continue;
+            }
+            by_surface
+                .entry(&entry.surface)
+                .or_default()
+                .push((reading, entry.word_cost));
+        }
+    }
+
+    let mut blocks = vec![0_u8; REVERSE_HEADER_BYTES];
+    let mut reading_pool = Vec::<u8>::new();
+    let mut reading_offsets = HashMap::<&str, (usize, usize)>::new();
+    let mut fst_builder = fst::raw::Builder::memory();
+    for (surface, mut readings) in by_surface {
+        readings.sort_unstable_by(|left, right| (left.1, left.0).cmp(&(right.1, right.0)));
+        let mut seen = HashSet::with_capacity(readings.len());
+        readings.retain(|(reading, _)| seen.insert(*reading));
+        let block_offset = blocks.len() as u64;
+        push_varint(&mut blocks, readings.len() as u64);
+        for (reading, word_cost) in readings {
+            let (offset, length) = *reading_offsets.entry(reading).or_insert_with(|| {
+                let offset = reading_pool.len();
+                reading_pool.extend_from_slice(reading.as_bytes());
+                (offset, reading.len())
+            });
+            push_varint(&mut blocks, offset as u64);
+            push_varint(&mut blocks, length as u64);
+            blocks.extend_from_slice(&word_cost.to_le_bytes());
+        }
+        fst_builder
+            .insert(surface.as_bytes(), block_offset)
+            .expect("insert sorted surface into reverse FST");
+    }
+    blocks[0..4].copy_from_slice(b"RDE1");
+    fs::write(
+        out.join("mozc-reverse.fst"),
+        fst_builder.into_inner().expect("finish reverse FST"),
+    )
+    .expect("write reverse FST");
+    fs::write(out.join("mozc-reverse.bin"), blocks).expect("write reverse blocks");
+    fs::write(out.join("mozc-reverse-readings.bin"), reading_pool)
+        .expect("write reverse reading pool");
 }
 
 fn read_entries_by_reading(tsv_path: &Path) -> BTreeMap<String, Vec<Entry>> {
@@ -134,6 +186,12 @@ fn write_compact_dictionary(by_reading: BTreeMap<String, Vec<Entry>>, out: &Path
 }
 
 const ENTRIES_HEADER_BYTES: usize = 16;
+const REVERSE_HEADER_BYTES: usize = 8;
+// Keep explicit reconversion broad enough for ordinary writing without
+// embedding low-confidence proper-name and spelling variants that dominate
+// the full Mozc source size. User and installed dictionaries are always
+// indexed at runtime regardless of this bundled cutoff.
+const MAX_RECONVERSION_WORD_COST: u16 = 6_500;
 
 fn push_varint(output: &mut Vec<u8>, mut value: u64) {
     loop {

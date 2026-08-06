@@ -33,3 +33,7 @@ path = "src/devset.rs"
 [[bin]]
 name = "slime-dictionary-pack"
 path = "src/dictionary_pack.rs"
+
+[[bin]]
+name = "slime-dictionary-coverage"
+path = "src/dictionary_coverage.rs"

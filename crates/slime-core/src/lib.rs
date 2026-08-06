@@ -7,12 +7,14 @@ mod date_time_candidates;
 mod dictionary_packs;
 mod domain_dictionaries;
 mod english_reverse;
+mod live_conversion;
 mod session_history;
 mod text_transform;
 mod user_data;
 
 use dictionary_packs::DictionaryPackStore;
 use english_reverse::ReverseMatch;
+use live_conversion::Decision as LiveConversionDecision;
 use session_history::SessionHistory;
 
 pub use dictionary_packs::{
@@ -50,21 +52,6 @@ pub enum InputEvent {
 }
 
 const _: () = assert!(std::mem::size_of::<InputEvent>() <= 8);
-
-/// Live conversion leaves readings shorter than this untouched.
-const MIN_LIVE_CONVERSION_CHARS: usize = 2;
-
-/// The best lattice path must clearly beat the runner-up before live
-/// conversion changes the text under the user's cursor. Mozc-style costs are
-/// approximately negative log probabilities scaled by 500, so this requires
-/// roughly a 2.7:1 advantage. Explicit Space conversion remains unrestricted.
-const MIN_LIVE_CONVERSION_COST_MARGIN: i32 = 500;
-
-/// Live confidence compares visible surfaces, not internal lattice paths.
-/// Expand only when two top paths render the same text, keeping the common
-/// live path on the cheaper two-best search.
-const LIVE_CONVERSION_INITIAL_PATH_LIMIT: usize = 2;
-const LIVE_CONVERSION_EXPANDED_PATH_LIMIT: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlimeAction {
@@ -132,13 +119,6 @@ struct LivePreview {
     /// Complete kana reading covered by `surface`.
     reading: String,
     surface: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LiveConversionDecision {
-    Confident(String),
-    Ambiguous(String),
-    Literal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -988,11 +968,28 @@ impl SlimeEngine {
             return;
         }
 
+        // After an explicit `nn` has resolved to `ん`, the next `n` starts a
+        // possible `な`/`に`/`ぬ`/`ね`/`の` syllable. Flushing that pending
+        // key for speculative live conversion would create a phantom second
+        // `ん` and can replace a stable preview with an unrelated candidate
+        // (for example ライブ変換 -> ライブ返還ン while typing 変換の).
+        // Keep the existing preview until the following vowel resolves the
+        // actual kana, then evaluate the full reading below on the next key.
+        if self.romaji.pending() == "n"
+            && self.reading.ends_with('ん')
+            && self
+                .live_preview
+                .as_ref()
+                .is_some_and(|preview| preview.reading == self.reading)
+        {
+            return;
+        }
+
         let resolved = self.resolved_reading();
         let can_evaluate = !resolved
             .chars()
             .any(|character| character.is_ascii_alphabetic())
-            && resolved.chars().count() >= MIN_LIVE_CONVERSION_CHARS;
+            && resolved.chars().count() >= live_conversion::MINIMUM_READING_CHARACTERS;
 
         if can_evaluate {
             match self.live_conversion_decision(&resolved) {
@@ -1038,37 +1035,7 @@ impl SlimeEngine {
     }
 
     fn live_conversion_decision(&self, reading: &str) -> LiveConversionDecision {
-        if let Some(surface) = self.user_data.exact_dictionary_surfaces(reading).next() {
-            return if surface == reading {
-                LiveConversionDecision::Literal
-            } else {
-                LiveConversionDecision::Confident(surface.to_owned())
-            };
-        }
-        let mut conversions = self
-            .dictionary
-            .convert_n_best(reading, LIVE_CONVERSION_INITIAL_PATH_LIMIT)
-            .into_iter();
-        let Some(best) = conversions.next() else {
-            return LiveConversionDecision::Literal;
-        };
-        if best.surface == reading {
-            return LiveConversionDecision::Literal;
-        }
-        let runner_up = conversions
-            .find(|conversion| conversion.surface != best.surface)
-            .or_else(|| {
-                self.dictionary
-                    .convert_n_best(reading, LIVE_CONVERSION_EXPANDED_PATH_LIMIT)
-                    .into_iter()
-                    .find(|conversion| conversion.surface != best.surface)
-            });
-        if let Some(runner_up) = runner_up
-            && runner_up.cost.saturating_sub(best.cost) < MIN_LIVE_CONVERSION_COST_MARGIN
-        {
-            return LiveConversionDecision::Ambiguous(best.surface);
-        }
-        LiveConversionDecision::Confident(best.surface)
+        live_conversion::decide(&self.dictionary, &self.user_data, reading)
     }
 
     fn refresh_completion_actions(&mut self, include_preedit: bool) -> Vec<SlimeAction> {
@@ -1533,6 +1500,10 @@ mod tests {
             engine.live_conversion_decision("らいぶへんかんで"),
             LiveConversionDecision::Ambiguous("ライブ変換で".to_owned())
         );
+        assert_eq!(
+            engine.live_conversion_decision("らいぶへんかんの"),
+            LiveConversionDecision::Ambiguous("ライブ変換の".to_owned())
+        );
 
         type_text(&mut engine, "raibuhenkan");
         assert_eq!(engine.snapshot().preedit, "ライブ変換");
@@ -1540,6 +1511,10 @@ mod tests {
         assert_eq!(engine.snapshot().preedit, "ライブ変換d");
         type_text(&mut engine, "e");
         assert_eq!(engine.snapshot().preedit, "ライブ変換で");
+        engine.handle(InputEvent::Enter);
+
+        type_text(&mut engine, "raibuhenkannno");
+        assert_eq!(engine.snapshot().preedit, "ライブ変換の");
     }
 
     #[test]

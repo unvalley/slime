@@ -126,7 +126,6 @@ Linux対応時は、独自にWayland/XIMを直接抱えるより、最初にIBus
 | [CorvusSKK](https://github.com/nathancorvussolis/corvusskk) | Windows | C++、TSF、SKK、インストーラー | 小さいWindows IMEが実現可能 | TSF登録、bitness、配布の重要な参考 |
 | [Rime/librime](https://github.com/rime/librime) | macOS / Windows / Linux | C++共通コア + Squirrel/Weasel等のOS frontend | コアとfrontend分離の成功例。依存は多い | アーキテクチャを参考。日本語エンジンとしては採用しない |
 | [libkkc](https://github.com/ueno/libkkc) | 主にLinux | C/Vala、MARISA trie、N-gram | 小さな統計変換器の実例だが長期停滞・GPL | アルゴリズムを参考。依存にはしない |
-| [Akaza](https://github.com/akaza-im/akaza) | Linux/IBus | Rust、MARISA/Cedar trie、unigram/bigram、Viterbi、学習 | 今回に最も近いRust統計IME。ただし既定モデルは大きい | `libakaza`を詳細評価し、再利用可能部分を検討 |
 | [azooKey Desktop](https://github.com/azooKey/azooKey-Desktop) | macOS | Swift + 統計変換 + Zenzaiニューラル変換 | 高精度だがモデルと配布物が大きい | ニューラル追加パックの将来参考 |
 | [imekit](https://github.com/SergioRibera/imekit) | macOS / Windows / Linuxを標榜 | RustでIMK/TSF/Wayland等を抽象化 | 方向性は近いが若く、OS登録・実運用の検証が不足 | 初期依存にはしない。継続監視 |
 
@@ -141,7 +140,6 @@ Linux対応時は、独自にWayland/XIMを直接抱えるより、最初にIBus
 | Rime Squirrel 1.1.2 | [PKG](https://github.com/rime/squirrel/releases/download/1.1.2/Squirrel-1.1.2.pkg) | 25.50 MB |
 | Rime Weasel 0.17.4 | [EXE](https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.17.4.0-installer.exe) | 12.43 MB |
 | azooKey Desktop 0.1.4 | [PKG](https://github.com/azooKey/azooKey-Desktop/releases/download/v0.1.4/azooKey-release-signed.pkg) | 123.69 MB |
-| Akaza default model 2026.602.0 | [モデルのみ](https://github.com/akaza-im/akaza/releases/download/v2026.602.0/akaza-default-model.tar.gz) | 165.23 MB |
 
 この比較から分かること:
 
@@ -200,22 +198,7 @@ SKK辞書の公式配布ページにはS/M/ML/Lの段階がある。2026-07-19�
 
 一方、Boost、LevelDB、MARISA、OpenCC、yaml-cppなど複数の依存を持つ。今回の日本語IMEでは、設定DSLやプラグイン基盤を初期要件にせず、共通コアの依存数を抑える。
 
-### 4.6 Akazaから学ぶこと
-
-[Akaza](https://github.com/akaza-im/akaza)はRust製の統計的かな漢字変換IMEで、今回のエンジン方針に最も近い。
-
-Akazaの構成:
-
-- 読みから候補をtrieで検索
-- ラティスを構築
-- unigram/bigramコストを使用
-- Viterbiで最小コスト経路を選択
-- ユーザー確定結果からunigram/bigram頻度を学習
-- 数字や日付を動的候補として生成
-
-この基本構造は採用候補である。ただし最新のdefault model圧縮配布物は約165 MBあり、今回のサイズ予算には合わない。`libakaza`のコード再利用、辞書形式、MARISA依存、モデル生成パイプライン、ライセンスを個別に評価し、モデルは独自に小さく作る必要がある。
-
-### 4.7 imekitをすぐ採用しない理由
+### 4.6 imekitをすぐ採用しない理由
 
 [imekit](https://github.com/SergioRibera/imekit)はRustからmacOS IMK、Windows TSF、Linux入力プロトコルを扱うことを目指しており、方向性は一致している。しかし2026-07-19時点では0.2系、少数コミットの若い実装である。
 
@@ -343,6 +326,7 @@ AJIMEE-Benchは難例回帰として使い、BCCWJ等のbalanced corpus、独自
 | --- | --- | --- |
 | Mozc OSS辞書 | IPAdicベース + カタカナ語・複合語等 | 生データと接続表が大きく、複数由来ライセンス |
 | SKK-JISYO | 読み→候補が単純、S/M/Lを選べる | 小さいが主要辞書はGPL系 |
+| Wikipedia由来SKK辞書 | 新語・固有名詞・長い見出し語が多い | 一般語の基礎辞書にはせず、生成物の帰属・再配布条件を確認 |
 | [UniDic](https://clrd.ninjal.ac.jp/unidic/en/) | 高品質な形態論情報 | 配布元の通常版でも数百MB。triple licenseから選択可能 |
 | [SudachiDict](https://github.com/WorksApplications/SudachiDict) | Apache-2.0、現代語・正規化が豊富 | Coreでも約200MB級で、そのまま同梱できない |
 | IPAdic | 成熟した品詞・接続情報 | 古い語彙。帰属・免責表示が必要 |
@@ -356,7 +340,37 @@ AJIMEE-Benchは難例回帰として使い、BCCWJ等のbalanced corpus、独自
 4. ランタイム形式は固定・read-only・memory-map可能にする。
 5. ユーザー辞書は小さな追記ログまたは別ファイルにし、システム辞書を再構築しない。
 
-### 6.2 初期辞書のサイズ戦略
+### 6.2 辞書置換の実測判断
+
+2026-08-05に、UD Japanese GSD r2.18のtrain 7,050文から得た表層・読み列を使い、同じ条件で辞書の語彙被覆を測定した。比較対象は同梱Mozc派生辞書、SKK-JISYO.L（commit `0a164e6b990c5eb5b59eb7d8789f08865dc2f644`）、Wikipedia日本語版から生成されたSKK辞書（release `v2026.08.01.150202`）である。かな表記のままでよいtokenは除き、表層と読みの完全一致、および読みだけの一致を別々に数えた。
+
+| 辞書 | source size | entries | 表層・読み完全一致 | 読み一致 |
+| --- | ---: | ---: | ---: | ---: |
+| 同梱Mozc派生 | 49.09 MB | 1,085,464 | 58.28% | 80.31% |
+| SKK-JISYO.L | 6.16 MB | 184,457 | 40.62% | 59.59% |
+| Wikipedia由来 | 28.94 MB | 684,010 | 0.59% | 19.54% |
+| SKK-JISYO.L + Wikipedia由来 | 35.09 MB | 868,467 | 41.20% | 66.62% |
+| 全辞書の和集合 | 84.18 MB | 1,953,931 | 58.91% | 82.06% |
+
+この指標は辞書単体の保守的な語彙被覆であり、複数nodeをつなぐ変換精度や候補順位を直接表さない。Wikipedia等のコーパスから学習するunigram/bigram modelの効果とも別である。特に送りありSKK entryはSKK固有の入力規則なしでは活用を復元できないため除外した。一方、Mozc派生辞書は左右品詞ID、単語cost、接続行列を持ち、通常の連文節変換で活用語と機能語を接続できる。SKKとWikipedia由来のSKK辞書は基本的に読みと表層の対応であり、そのまま置換すると文法costを失う。文脈modelは候補集合を保った別のrankerとして、複数domainのheld-out精度とlatencyを通った場合だけ採用する。
+
+判断は次のとおり。
+
+1. **Core辞書はMozc派生を維持する。** SKK-JISYO.Lへの置換は完全一致の出現頻度を17.66ポイント落とし、通常IMEに必要な品詞・接続情報も失うため採用しない。
+2. **Wikipedia由来辞書を丸ごと同梱しない。** 主に固有名詞・長い見出し語を増やす資料であり、一般news/blog上の完全一致は0.59%だった。MozcへSKKとWikipediaを全追加しても完全一致は+0.63ポイント、読み一致は+1.75ポイントに留まる。
+3. **追加語彙はoptional packとして選別する。** 新語・固有名詞を足す場合は、頻度、適合domain、再配布条件を確認し、品詞IDとcostを付けた小さな差分にする。held-outのN-best被覆とtop-1、配布サイズがともに改善した場合だけ採用する。
+4. **読み・表層だけのentryをダミー品詞で混ぜない。** 不可能な語の接続や不自然な混成表記を作るため、接続classを推定できないentryは通常ラティスから分離する。
+
+測定は`slime-dictionary-coverage`で再実行できる。入力は辞書ソースに依存しない`surface/reading`列で、`--dictionary LABEL FORMAT PATH`を同じlabelで繰り返すと和集合を測れる。
+
+```sh
+cargo run --release -p slime-tools --bin slime-dictionary-coverage -- \
+  --corpus target/evaluation/ud-japanese-gsd/r2.18/annotated_train.txt \
+  --dictionary core tsv crates/slime-converter/data/mozc-basic.tsv \
+  --dictionary alternative skk /path/to/SKK-JISYO.L.utf8
+```
+
+### 6.3 初期辞書のサイズ戦略
 
 目標は次の三層である。
 
@@ -653,10 +667,10 @@ Windows（将来）:
 
 - Windows adapterの全面Rust化
 - Windows実装の着手時期
-- Akaza/libakazaのコード再利用
-- skip-bigram、phrase class model
+- 商用可能な複数domain corpusを確保した後のcontext/class bigram（UD GSD exactは同一domain +6.81ptだが汎化なし、JWTD+GSD固定合成もGSD test +1.24ptに対しAJIMEE -3.0ptでNo-Go）
 - Linux IBus
 - optional neural N-best rescoring
+- balanced corpusを用意してから再設計するN-best専用student（25.6M teacherは品質Go・latency No-Go、1MB hashと1.74M bi-encoderの蒸留はheld-out No-Go）
 
 ### 不採用（初期版）
 
@@ -691,7 +705,6 @@ Windows（将来）:
 - [macSKK](https://github.com/mtgto/macSKK)
 - [AquaSKK](https://github.com/codefirst/aquaskk)
 - [CorvusSKK](https://github.com/nathancorvussolis/corvusskk)
-- [Akaza](https://github.com/akaza-im/akaza)
 - [libkkc](https://github.com/ueno/libkkc)
 - [azooKey Desktop](https://github.com/azooKey/azooKey-Desktop)
 - [imekit](https://github.com/SergioRibera/imekit)

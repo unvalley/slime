@@ -2,7 +2,10 @@
 //! Mozc OSS dictionary.
 
 mod compact;
+mod ranking;
 mod symbol_candidates;
+
+pub use ranking::{CandidateRanker, CostOnlyRanker};
 
 use bumpalo::{Bump, collections::String as BumpString};
 use compact::CompactDictionary;
@@ -74,25 +77,6 @@ pub struct Conversion {
     pub surface: String,
     pub segments: Vec<Segment>,
     pub cost: i32,
-}
-
-/// Assigns a final ordering cost to a complete conversion candidate.
-///
-/// The dictionary and connection matrix generate plausible paths first. A
-/// statistical language model can implement this trait later without changing
-/// the lattice search or the platform-facing candidate API. Lower costs rank
-/// first.
-pub trait CandidateRanker {
-    fn ranking_cost(&self, reading: &str, conversion: &Conversion) -> i32;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CostOnlyRanker;
-
-impl CandidateRanker for CostOnlyRanker {
-    fn ranking_cost(&self, _reading: &str, conversion: &Conversion) -> i32 {
-        conversion.cost
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +296,17 @@ impl Dictionary {
         limit: usize,
         ranker: &dyn CandidateRanker,
     ) -> Vec<Candidate> {
+        self.candidates_with_context_ranker(reading, "", limit, ranker)
+    }
+
+    #[must_use]
+    pub fn candidates_with_context_ranker(
+        &self,
+        reading: &str,
+        left_context: &str,
+        limit: usize,
+        ranker: &dyn CandidateRanker,
+    ) -> Vec<Candidate> {
         let mut candidates = Vec::<Candidate>::new();
         let mut conversions = Vec::new();
         let connection = self.uses_connection_costs.then(ConnectionMatrix::bundled);
@@ -359,7 +354,7 @@ impl Dictionary {
             let cost = if conversion.surface == reading {
                 LITERAL_CANDIDATE_COST
             } else {
-                ranker.ranking_cost(reading, &conversion)
+                ranker.ranking_cost_with_context(reading, left_context, &conversion)
             };
             if let Some(existing) = candidates
                 .iter_mut()
@@ -1794,6 +1789,30 @@ mod tests {
         }
     }
 
+    struct PreferSurfaceInContext<'a> {
+        context: &'a str,
+        surface: &'a str,
+    }
+
+    impl CandidateRanker for PreferSurfaceInContext<'_> {
+        fn ranking_cost(&self, _reading: &str, conversion: &Conversion) -> i32 {
+            conversion.cost
+        }
+
+        fn ranking_cost_with_context(
+            &self,
+            _reading: &str,
+            left_context: &str,
+            conversion: &Conversion,
+        ) -> i32 {
+            if left_context == self.context && conversion.surface == self.surface {
+                i32::MIN
+            } else {
+                conversion.cost
+            }
+        }
+    }
+
     #[test]
     fn short_dictionary_entry_strings_stay_inline() {
         let entry = DictionaryEntry::new("かんじ", "漢字", 500);
@@ -1901,6 +1920,27 @@ mod tests {
         let candidates = dictionary.candidates_with_ranker("あい", 5, &PreferSurface("阿伊"));
 
         assert_eq!(candidates[0].surface, "阿伊");
+    }
+
+    #[test]
+    fn candidate_ranker_receives_left_context_without_changing_the_legacy_api() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あ", "亜", 10),
+            DictionaryEntry::new("あ", "阿", 20),
+        ]);
+        let ranker = PreferSurfaceInContext {
+            context: "文脈",
+            surface: "阿",
+        };
+
+        assert_eq!(
+            dictionary.candidates_with_ranker("あ", 5, &ranker)[0].surface,
+            "亜"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context_ranker("あ", "文脈", 5, &ranker)[0].surface,
+            "阿"
+        );
     }
 
     #[test]

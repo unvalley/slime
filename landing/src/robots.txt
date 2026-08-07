@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://slime.unvalley.me/sitemap.xml

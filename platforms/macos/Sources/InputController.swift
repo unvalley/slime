@@ -2,6 +2,7 @@ import AppKit
 import InputMethodKit
 import os
 
+@MainActor
 final class SlimeController: IMKInputController {
     private static let performanceLog = OSLog(
         subsystem: "com.unvalley.inputmethod.Slime",
@@ -60,6 +61,12 @@ final class SlimeController: IMKInputController {
 
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event, event.type == .keyDown else { return false }
+        guard SlimeAccessController.shared.allowsInput else {
+            DispatchQueue.main.async {
+                SettingsWindowController.shared.present(initialTab: .license)
+            }
+            return true
+        }
         let deleteSignpostID: OSSignpostID? = if event.keyCode == 51 || event.keyCode == 117 {
             OSSignpostID(log: Self.performanceLog)
         } else {

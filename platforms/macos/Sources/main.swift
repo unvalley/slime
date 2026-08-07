@@ -17,6 +17,7 @@ final class NSManualApplication: NSApplication {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DomainDictionaryCatalog.loader = RustEngine.domainDictionaryWords(mask:)
@@ -38,6 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         sharedServer = server
         SettingsStatusItem.shared.install()
+        Task {
+            await SlimeAccessController.shared.refreshStoredLicense()
+        }
         let registrationStatus = TISRegisterInputSource(bundle.bundleURL as CFURL)
         if registrationStatus != noErr {
             let message = "TISRegisterInputSource failed: \(registrationStatus)\n"

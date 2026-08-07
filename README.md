@@ -24,6 +24,12 @@ Currently it's for me.
 設定は、メニューバーの歯車から「Slime設定…」を選びます。ユーザー辞書タブの「辞書を読み込む…」から既存IMEの書き出しファイルを移行できます。
 プライベートモードも同じメニューから切り替えられ、Slimeを終了すると解除されます。macOSのセキュア入力中は自動的に同じ保護を適用します。
 
+## Billing
+
+配布用macOSビルドはPolarのsubscriptionで提供し、14日間の無料期間後は月額200円です。trialと契約中に発行されるLicense Keys benefitを起動時に確認します。入力内容や辞書、入力履歴は課金処理へ送信しません。ローカル開発ビルドは課金確認を行いません。
+
+Polarの商品設定、Sandbox、配布ビルドとLandingの手順は[docs/billing.md](docs/billing.md)を参照してください。
+
 ライブ変換の状態設計、UX上の保証、既知の限界は
 [docs/live-conversion.md](docs/live-conversion.md)にまとめています。
 

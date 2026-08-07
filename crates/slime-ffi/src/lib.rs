@@ -3,6 +3,7 @@
 //! The first version returns a compact JSON action list. This keeps Swift-side
 //! integration simple while the action schema is still evolving.
 
+use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -27,6 +28,59 @@ pub const EVENT_NEXT_SEGMENT: u32 = 14;
 pub const EVENT_PREVIOUS_SEGMENT: u32 = 15;
 pub const EVENT_EXPAND_SEGMENT: u32 = 16;
 pub const EVENT_SHRINK_SEGMENT: u32 = 17;
+
+pub const ACTION_UPDATE_PREEDIT: u32 = 0;
+pub const ACTION_SHOW_CANDIDATES: u32 = 1;
+pub const ACTION_HIDE_CANDIDATES: u32 = 2;
+pub const ACTION_COMMIT: u32 = 3;
+pub const ACTION_CLEAR: u32 = 4;
+pub const ACTION_FORWARD_KEY: u32 = 5;
+
+pub const STATUS_OK: u32 = 0;
+pub const STATUS_NULL_HANDLE: u32 = 1;
+pub const STATUS_INVALID_EVENT: u32 = 2;
+pub const STATUS_NULL_CALLBACK: u32 = 3;
+pub const STATUS_PANIC: u32 = 4;
+pub const STATUS_INVALID_UTF8: u32 = 5;
+pub const STATUS_INVALID_CANDIDATE: u32 = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SlimeStringView {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+impl SlimeStringView {
+    fn new(value: &str) -> Self {
+        Self {
+            data: value.as_ptr(),
+            len: value.len(),
+        }
+    }
+
+    const fn empty() -> Self {
+        Self {
+            data: ptr::null(),
+            len: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct SlimeActionView {
+    pub kind: u32,
+    pub text: SlimeStringView,
+    pub candidates: *const SlimeStringView,
+    pub candidate_count: usize,
+    pub selected: usize,
+    pub selection_start: usize,
+    pub selection_length: usize,
+}
+
+pub type SlimeActionCallback = unsafe extern "C" fn(*mut c_void, *const SlimeActionView);
+pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView);
 
 pub struct SlimeHandle {
     engine: SlimeEngine,
@@ -146,6 +200,121 @@ pub unsafe extern "C" fn slime_process(
         Ok(response) => response,
         Err(_) => error_response("panic"),
     })
+}
+
+/// Processes one event and synchronously visits typed action views.
+///
+/// The action, text, and candidate pointers are borrowed and valid only for the
+/// duration of each callback. This avoids JSON encoding and parsing in native
+/// platform hot paths while keeping [`slime_process`] backward compatible.
+///
+/// # Safety
+///
+/// `handle` must be null or a live, exclusively accessed pointer returned by an
+/// IME creation function. `callback` must not unwind, retain borrowed views, or
+/// re-enter an API with the same handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_process_actions(
+    handle: *mut SlimeHandle,
+    event_kind: u32,
+    value: u32,
+    context: *mut c_void,
+    callback: Option<SlimeActionCallback>,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        let Some(callback) = callback else {
+            return STATUS_NULL_CALLBACK;
+        };
+        let Ok(event) = decode_event(event_kind, value) else {
+            return STATUS_INVALID_EVENT;
+        };
+
+        // SAFETY: The caller promises a live, exclusively accessed handle.
+        let actions = unsafe { &mut *handle }.engine.handle(event);
+        for action in &actions {
+            visit_action(action, context, callback);
+        }
+        STATUS_OK
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
+/// Enumerates conversion candidates without mutating the active composition.
+///
+/// # Safety
+///
+/// `handle` must be null or a live pointer returned by an IME creation
+/// function. `reading` must point to `reading_len` readable UTF-8 bytes.
+/// `callback` is invoked synchronously and must not retain the borrowed view,
+/// unwind, or re-enter this handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_conversion_candidates(
+    handle: *const SlimeHandle,
+    reading: *const u8,
+    reading_len: usize,
+    context: *mut c_void,
+    callback: Option<SlimeStringCallback>,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        let Some(callback) = callback else {
+            return STATUS_NULL_CALLBACK;
+        };
+        // SAFETY: The caller promises readable bytes for this call.
+        let Some(reading) = (unsafe { decode_utf8_argument(reading, reading_len) }) else {
+            return STATUS_INVALID_UTF8;
+        };
+        // SAFETY: The caller promises a live handle. This operation only reads
+        // engine data and cannot affect the active composition.
+        let candidates = unsafe { &(*handle).engine }.conversion_candidates(reading);
+        for candidate in &candidates {
+            // SAFETY: The callback contract requires synchronous use only.
+            unsafe { callback(context, SlimeStringView::new(candidate)) };
+        }
+        STATUS_OK
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
+/// Records a candidate chosen by an external conversion consumer.
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed pointer returned by an IME
+/// creation function. Both byte ranges must be readable UTF-8 for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_record_external_selection(
+    handle: *mut SlimeHandle,
+    reading: *const u8,
+    reading_len: usize,
+    surface: *const u8,
+    surface_len: usize,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        // SAFETY: The caller promises readable bytes for this call.
+        let Some(reading) = (unsafe { decode_utf8_argument(reading, reading_len) }) else {
+            return STATUS_INVALID_UTF8;
+        };
+        // SAFETY: The caller promises readable bytes for this call.
+        let Some(surface) = (unsafe { decode_utf8_argument(surface, surface_len) }) else {
+            return STATUS_INVALID_UTF8;
+        };
+        // SAFETY: The caller promises a live, exclusively accessed handle.
+        if unsafe { &mut (*handle).engine }.record_external_selection(reading, surface) {
+            STATUS_OK
+        } else {
+            STATUS_INVALID_CANDIDATE
+        }
+    }));
+    result.unwrap_or(STATUS_PANIC)
 }
 
 /// Updates runtime options and returns any resulting preedit/candidate actions.
@@ -535,6 +704,81 @@ fn error_response(error: &str) -> String {
     output
 }
 
+fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActionCallback) {
+    let mut candidate_views = Vec::new();
+    let view = match action {
+        SlimeAction::UpdatePreedit(text) => SlimeActionView {
+            kind: ACTION_UPDATE_PREEDIT,
+            text: SlimeStringView::new(text),
+            candidates: ptr::null(),
+            candidate_count: 0,
+            selected: usize::MAX,
+            selection_start: usize::MAX,
+            selection_length: 0,
+        },
+        SlimeAction::UpdateSegmentedPreedit {
+            text,
+            selection_start,
+            selection_length,
+        } => SlimeActionView {
+            kind: ACTION_UPDATE_PREEDIT,
+            text: SlimeStringView::new(text),
+            candidates: ptr::null(),
+            candidate_count: 0,
+            selected: usize::MAX,
+            selection_start: *selection_start,
+            selection_length: *selection_length,
+        },
+        SlimeAction::ShowCandidates {
+            candidates,
+            selected,
+        } => {
+            candidate_views.extend(
+                candidates
+                    .iter()
+                    .map(|candidate| SlimeStringView::new(candidate)),
+            );
+            SlimeActionView {
+                kind: ACTION_SHOW_CANDIDATES,
+                text: SlimeStringView::empty(),
+                candidates: candidate_views.as_ptr(),
+                candidate_count: candidate_views.len(),
+                selected: *selected,
+                selection_start: usize::MAX,
+                selection_length: 0,
+            }
+        }
+        SlimeAction::HideCandidates => action_without_payload(ACTION_HIDE_CANDIDATES),
+        SlimeAction::Commit(text) => SlimeActionView {
+            kind: ACTION_COMMIT,
+            text: SlimeStringView::new(text),
+            candidates: ptr::null(),
+            candidate_count: 0,
+            selected: usize::MAX,
+            selection_start: usize::MAX,
+            selection_length: 0,
+        },
+        SlimeAction::Clear => action_without_payload(ACTION_CLEAR),
+        SlimeAction::ForwardKey => action_without_payload(ACTION_FORWARD_KEY),
+    };
+
+    // SAFETY: The public function contract requires a callback that remains
+    // valid for the call and does not retain the borrowed view.
+    unsafe { callback(context, &raw const view) };
+}
+
+const fn action_without_payload(kind: u32) -> SlimeActionView {
+    SlimeActionView {
+        kind,
+        text: SlimeStringView::empty(),
+        candidates: ptr::null(),
+        candidate_count: 0,
+        selected: usize::MAX,
+        selection_start: usize::MAX,
+        selection_length: 0,
+    }
+}
+
 fn write_action(output: &mut String, action: &SlimeAction) {
     match action {
         SlimeAction::UpdatePreedit(text) => {
@@ -620,18 +864,119 @@ fn write_optional_json_string(output: &mut String, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        EVENT_CHARACTER, EVENT_ENTER, EVENT_PREVIOUS_SEGMENT, EVENT_SPACE, SlimeBuffer,
-        slime_begin_reconversion, slime_buffer_destroy, slime_create, slime_create_with_data_dir,
-        slime_destroy, slime_domain_dictionary_words, slime_installed_dictionary_pack_words,
-        slime_installed_dictionary_packs, slime_process, slime_set_options, slime_set_options_v2,
-        slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
+        ACTION_SHOW_CANDIDATES, ACTION_UPDATE_PREEDIT, EVENT_CHARACTER, EVENT_ENTER,
+        EVENT_PREVIOUS_SEGMENT, EVENT_SPACE, STATUS_INVALID_CANDIDATE, STATUS_INVALID_UTF8,
+        STATUS_OK, SlimeActionView, SlimeBuffer, SlimeStringView, slime_begin_reconversion,
+        slime_buffer_destroy, slime_conversion_candidates, slime_create,
+        slime_create_with_data_dir, slime_destroy, slime_domain_dictionary_words,
+        slime_installed_dictionary_pack_words, slime_installed_dictionary_packs, slime_process,
+        slime_process_actions, slime_record_external_selection, slime_set_options,
+        slime_set_options_v2, slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
     };
+    use std::ffi::c_void;
     use std::fs;
 
     unsafe fn copy_buffer(buffer: &SlimeBuffer) -> String {
         // SAFETY: Tests read a live buffer before handing it back to its destructor.
         let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) };
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[derive(Default)]
+    struct TypedCapture {
+        last_preedit: String,
+        candidate_count: usize,
+    }
+
+    unsafe extern "C" fn collect_typed_action(
+        context: *mut c_void,
+        action: *const SlimeActionView,
+    ) {
+        // SAFETY: The test passes live pointers for the synchronous callback.
+        let capture = unsafe { &mut *context.cast::<TypedCapture>() };
+        // SAFETY: The callback contract supplies a live action view.
+        let action = unsafe { &*action };
+        if action.kind == ACTION_UPDATE_PREEDIT {
+            // SAFETY: Text is borrowed for the callback and contains UTF-8.
+            let bytes = unsafe { std::slice::from_raw_parts(action.text.data, action.text.len) };
+            capture.last_preedit = std::str::from_utf8(bytes).unwrap().to_owned();
+        } else if action.kind == ACTION_SHOW_CANDIDATES {
+            capture.candidate_count = action.candidate_count;
+        }
+    }
+
+    unsafe extern "C" fn collect_string(context: *mut c_void, value: SlimeStringView) {
+        // SAFETY: The test passes a live vector and the callback view is valid
+        // for this synchronous invocation.
+        let candidates = unsafe { &mut *context.cast::<Vec<String>>() };
+        // SAFETY: The callback contract guarantees readable UTF-8 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(value.data, value.len) };
+        candidates.push(std::str::from_utf8(bytes).unwrap().to_owned());
+    }
+
+    #[test]
+    fn read_only_candidates_and_external_selection_cross_the_c_boundary() {
+        let handle = slime_create();
+        assert!(!handle.is_null());
+        let reading = "にほん";
+        let mut candidates = Vec::<String>::new();
+        // SAFETY: All pointers remain live for the synchronous call.
+        let status = unsafe {
+            slime_conversion_candidates(
+                handle,
+                reading.as_ptr(),
+                reading.len(),
+                (&raw mut candidates).cast(),
+                Some(collect_string),
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        assert!(candidates.iter().any(|candidate| candidate == "日本"));
+
+        let surface = "日本";
+        // SAFETY: All pointers are live and the handle is exclusively accessed.
+        assert_eq!(
+            unsafe {
+                slime_record_external_selection(
+                    handle,
+                    reading.as_ptr(),
+                    reading.len(),
+                    surface.as_ptr(),
+                    surface.len(),
+                )
+            },
+            STATUS_OK
+        );
+        let invalid = "無関係";
+        // SAFETY: All pointers are live and the handle is exclusively accessed.
+        assert_eq!(
+            unsafe {
+                slime_record_external_selection(
+                    handle,
+                    reading.as_ptr(),
+                    reading.len(),
+                    invalid.as_ptr(),
+                    invalid.len(),
+                )
+            },
+            STATUS_INVALID_CANDIDATE
+        );
+        let invalid_utf8 = [0xff];
+        // SAFETY: The byte is readable but deliberately invalid UTF-8.
+        assert_eq!(
+            unsafe {
+                slime_conversion_candidates(
+                    handle,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    (&raw mut candidates).cast(),
+                    Some(collect_string),
+                )
+            },
+            STATUS_INVALID_UTF8
+        );
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(handle) };
     }
 
     #[test]
@@ -661,6 +1006,47 @@ mod tests {
             slime_buffer_destroy(buffer);
             slime_destroy(handle);
         }
+    }
+
+    #[test]
+    fn typed_actions_cover_live_preedit_and_candidates_without_json() {
+        let handle = slime_create();
+        assert!(!handle.is_null());
+        // SAFETY: `handle` is live and exclusively accessed.
+        let options = unsafe { slime_set_options(handle, true, false) };
+        // SAFETY: `options` is the original live buffer.
+        unsafe { slime_buffer_destroy(options) };
+        let mut capture = TypedCapture::default();
+        for character in "raibuhenkannno".chars() {
+            // SAFETY: Pointers are live for the synchronous callback.
+            let status = unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_CHARACTER,
+                    character.into(),
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            };
+            assert_eq!(status, STATUS_OK);
+        }
+        assert_eq!(capture.last_preedit, "ライブ変換の");
+
+        // SAFETY: Pointers are live for the synchronous callback.
+        let status = unsafe {
+            slime_process_actions(
+                handle,
+                EVENT_SPACE,
+                0,
+                (&raw mut capture).cast(),
+                Some(collect_typed_action),
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        assert!(capture.candidate_count > 0);
+
+        // SAFETY: `handle` is live and has not previously been released.
+        unsafe { slime_destroy(handle) };
     }
 
     #[test]

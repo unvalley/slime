@@ -30,7 +30,7 @@ fi
 
 features=()
 for argument in "$@"; do
-  if [[ "$argument" == "--neural-model" ]]; then
+  if [[ "$argument" == "--neural-model" || "$argument" == "--discriminative-teacher-model" ]]; then
     features=(--features neural)
   fi
 done

@@ -1,16 +1,21 @@
 //! Offline evaluation tools for kana-kanji conversion quality.
 
 mod corpus_bigram;
+mod discriminative;
 #[cfg(feature = "neural")]
 mod neural;
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use corpus_bigram::{CorpusBigramRanker, Diagnostics as BigramDiagnostics, TransitionDiagnostics};
+use corpus_bigram::{
+    CorpusBigramRanker, Diagnostics as BigramDiagnostics, TransitionDiagnostics,
+    parse_annotated_corpus_line,
+};
 use serde::{Deserialize, Serialize};
 use slime_converter::{Candidate, CandidateRanker, CostOnlyRanker, Dictionary};
 
@@ -32,12 +37,14 @@ fn run() -> Result<(), String> {
     let options = Options::parse(env::args().skip(1))?;
     let items = load_items(&options)?;
     let dictionary = Dictionary::bundled();
-    let word_bigram_ranker = (options.word_bigram_weight > 0 || options.skip_bigram_weight > 0)
+    let word_bigram_ranker = options
+        .uses_corpus_ranker()
         .then(|| {
             CorpusBigramRanker::load(
                 &options.word_bigram_corpora,
                 options.word_bigram_weight,
                 options.skip_bigram_weight,
+                options.context_bigram_weight,
             )
         })
         .transpose()?;
@@ -56,12 +63,15 @@ fn run() -> Result<(), String> {
     } else if reports.len() == 1 {
         print_report(&reports[0]);
     } else {
-        println!("lambda sweep:");
+        println!("ranking parameter sweep:");
         for report in &reports {
+            let parameter = report.discriminative_weight.map_or_else(
+                || format!("lambda={:.2}", report.lambda.unwrap_or(0.0)),
+                |weight| format!("discriminative_weight={weight:.3}"),
+            );
             println!(
-                "  lambda={:.2} acc@1={:.4} acc@{}={:.4} mrr@{}={:.4} mincer@1={:.4} \
+                "  {parameter} acc@1={:.4} acc@{}={:.4} mrr@{}={:.4} mincer@1={:.4} \
                  latency p50={:.3} p95={:.3}",
-                report.lambda.unwrap_or(0.0),
                 report.accuracy_at_1,
                 report.top_k,
                 report.accuracy_at_k,
@@ -81,7 +91,11 @@ fn run() -> Result<(), String> {
             })
             .expect("non-empty reports");
         println!();
-        println!("best lambda={:.2}:", best.lambda.unwrap_or(0.0));
+        if let Some(weight) = best.discriminative_weight {
+            println!("best discriminative weight={weight:.3}:");
+        } else {
+            println!("best lambda={:.2}:", best.lambda.unwrap_or(0.0));
+        }
         print_report(best);
     }
     Ok(())
@@ -120,6 +134,7 @@ impl ContextFilter {
 enum DatasetFormat {
     Ajimee,
     Anthy,
+    Annotated,
 }
 
 impl DatasetFormat {
@@ -127,6 +142,7 @@ impl DatasetFormat {
         match value {
             "ajimee" => Ok(Self::Ajimee),
             "anthy" => Ok(Self::Anthy),
+            "annotated" => Ok(Self::Annotated),
             _ => Err(format!(
                 "unsupported evaluation format {value:?}\n{}",
                 usage()
@@ -138,6 +154,23 @@ impl DatasetFormat {
         match self {
             Self::Ajimee => "AJIMEE-Bench JWTD_v2/v1",
             Self::Anthy => "Anthy conversion corpus",
+            Self::Annotated => "Annotated surface/reading corpus",
+        }
+    }
+
+    fn revision(self) -> Option<String> {
+        match self {
+            Self::Ajimee => env::var("AJIMEE_BENCH_REVISION").ok(),
+            Self::Anthy => env::var("ANTHY_CORPUS_REVISION").ok(),
+            Self::Annotated => None,
+        }
+    }
+
+    fn sha256(self) -> Option<String> {
+        match self {
+            Self::Ajimee => env::var("AJIMEE_BENCH_SHA256").ok(),
+            Self::Anthy => env::var("ANTHY_CORPUS_SHA256").ok(),
+            Self::Annotated => None,
         }
     }
 }
@@ -146,6 +179,7 @@ impl DatasetFormat {
 struct Options {
     format: DatasetFormat,
     inputs: Vec<PathBuf>,
+    dataset_name: Option<String>,
     dataset_revision: Option<String>,
     dataset_sha256: Option<String>,
     top_k: usize,
@@ -155,13 +189,26 @@ struct Options {
     failures: usize,
     json: bool,
     neural_model: Option<PathBuf>,
+    neural_max_cost_gap: Option<i32>,
     lambdas: Vec<f64>,
+    discriminative_train: Option<PathBuf>,
+    discriminative_teacher_model: Option<PathBuf>,
+    discriminative_teacher_lambda: f64,
+    export_nbest: Option<PathBuf>,
+    discriminative_export_training: Option<PathBuf>,
+    discriminative_export_evaluation: Option<PathBuf>,
+    discriminative_train_limit: usize,
+    discriminative_dimensions: usize,
+    discriminative_epochs: usize,
+    discriminative_weights: Vec<f32>,
     word_bigram_corpora: Vec<PathBuf>,
     word_bigram_weight: i32,
     skip_bigram_weight: i32,
+    context_bigram_weight: i32,
 }
 
 impl Options {
+    #[allow(clippy::too_many_lines)]
     fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut arguments = arguments.peekable();
         let Some(format) = arguments.next() else {
@@ -171,14 +218,9 @@ impl Options {
         let mut options = Self {
             format,
             inputs: Vec::new(),
-            dataset_revision: match format {
-                DatasetFormat::Ajimee => env::var("AJIMEE_BENCH_REVISION").ok(),
-                DatasetFormat::Anthy => env::var("ANTHY_CORPUS_REVISION").ok(),
-            },
-            dataset_sha256: match format {
-                DatasetFormat::Ajimee => env::var("AJIMEE_BENCH_SHA256").ok(),
-                DatasetFormat::Anthy => env::var("ANTHY_CORPUS_SHA256").ok(),
-            },
+            dataset_name: None,
+            dataset_revision: format.revision(),
+            dataset_sha256: format.sha256(),
             top_k: 10,
             search_k: None,
             context: ContextFilter::All,
@@ -186,10 +228,22 @@ impl Options {
             failures: 10,
             json: false,
             neural_model: None,
+            neural_max_cost_gap: None,
             lambdas: Vec::new(),
+            discriminative_train: None,
+            discriminative_teacher_model: None,
+            discriminative_teacher_lambda: 0.8,
+            export_nbest: None,
+            discriminative_export_training: None,
+            discriminative_export_evaluation: None,
+            discriminative_train_limit: 10_000,
+            discriminative_dimensions: 1 << 18,
+            discriminative_epochs: 3,
+            discriminative_weights: Vec::new(),
             word_bigram_corpora: Vec::new(),
             word_bigram_weight: 0,
             skip_bigram_weight: 0,
+            context_bigram_weight: 0,
         };
 
         while let Some(argument) = arguments.next() {
@@ -199,6 +253,27 @@ impl Options {
                         .next()
                         .ok_or_else(|| "--input requires a path".to_owned())?;
                     options.inputs.push(PathBuf::from(value));
+                }
+                "--dataset-name" => {
+                    options.dataset_name = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--dataset-name requires a value".to_owned())?,
+                    );
+                }
+                "--dataset-revision" => {
+                    options.dataset_revision = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--dataset-revision requires a value".to_owned())?,
+                    );
+                }
+                "--dataset-sha256" => {
+                    options.dataset_sha256 = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--dataset-sha256 requires a value".to_owned())?,
+                    );
                 }
                 "--top-k" => options.top_k = parse_positive("--top-k", arguments.next())?,
                 "--search-k" => {
@@ -219,20 +294,71 @@ impl Options {
                         .ok_or_else(|| "--neural-model requires a path".to_owned())?;
                     options.neural_model = Some(PathBuf::from(value));
                 }
+                "--neural-max-cost-gap" => {
+                    options.neural_max_cost_gap = Some(parse_non_negative_i32(
+                        "--neural-max-cost-gap",
+                        arguments.next(),
+                    )?);
+                }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
+                "--discriminative-train" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--discriminative-train requires a path".to_owned())?;
+                    options.discriminative_train = Some(PathBuf::from(value));
+                }
+                "--discriminative-teacher-model" => {
+                    let value = arguments.next().ok_or_else(|| {
+                        "--discriminative-teacher-model requires a path".to_owned()
+                    })?;
+                    options.discriminative_teacher_model = Some(PathBuf::from(value));
+                }
+                "--discriminative-teacher-lambda" => {
+                    options.discriminative_teacher_lambda = parse_lambda(arguments.next())?;
+                }
+                "--export-nbest" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--export-nbest requires a path".to_owned())?;
+                    options.export_nbest = Some(PathBuf::from(value));
+                }
+                "--discriminative-export-training" => {
+                    let value = arguments.next().ok_or_else(|| {
+                        "--discriminative-export-training requires a path".to_owned()
+                    })?;
+                    options.discriminative_export_training = Some(PathBuf::from(value));
+                }
+                "--discriminative-export-evaluation" => {
+                    let value = arguments.next().ok_or_else(|| {
+                        "--discriminative-export-evaluation requires a path".to_owned()
+                    })?;
+                    options.discriminative_export_evaluation = Some(PathBuf::from(value));
+                }
+                "--discriminative-train-limit" => {
+                    options.discriminative_train_limit =
+                        parse_positive("--discriminative-train-limit", arguments.next())?;
+                }
+                "--discriminative-dimensions" => {
+                    options.discriminative_dimensions =
+                        parse_positive("--discriminative-dimensions", arguments.next())?;
+                }
+                "--discriminative-epochs" => {
+                    options.discriminative_epochs =
+                        parse_positive("--discriminative-epochs", arguments.next())?;
+                }
+                "--discriminative-weight" => options.discriminative_weights.push(
+                    parse_non_negative_f32("--discriminative-weight", arguments.next())?,
+                ),
                 "--word-bigram-corpus" => {
                     let value = arguments
                         .next()
                         .ok_or_else(|| "--word-bigram-corpus requires a path".to_owned())?;
                     options.word_bigram_corpora.push(PathBuf::from(value));
                 }
-                "--word-bigram-weight" => {
-                    options.word_bigram_weight =
-                        parse_non_negative_i32("--word-bigram-weight", arguments.next())?;
-                }
-                "--skip-bigram-weight" => {
-                    options.skip_bigram_weight =
-                        parse_non_negative_i32("--skip-bigram-weight", arguments.next())?;
+                name @ ("--word-bigram-weight"
+                | "--skip-bigram-weight"
+                | "--context-bigram-weight") => {
+                    options.set_ngram_weight(name, arguments.next())?;
                 }
                 "--help" | "-h" => return Err(usage()),
                 _ if !argument.starts_with('-') => {
@@ -255,10 +381,33 @@ impl Options {
         {
             return Err("--search-k must be greater than or equal to --top-k".to_owned());
         }
-        if (options.word_bigram_weight > 0 || options.skip_bigram_weight > 0)
-            && options.word_bigram_corpora.is_empty()
+        if options.uses_corpus_ranker() && options.word_bigram_corpora.is_empty() {
+            return Err("n-gram weights require --word-bigram-corpus".to_owned());
+        }
+        if options.neural_max_cost_gap.is_some() && options.neural_model.is_none() {
+            return Err("--neural-max-cost-gap requires --neural-model".to_owned());
+        }
+        if options.neural_model.is_some() && options.discriminative_train.is_some() {
+            return Err(
+                "neural and discriminative rerankers cannot be evaluated together".to_owned(),
+            );
+        }
+        if options.discriminative_teacher_model.is_some() && options.discriminative_train.is_none()
         {
-            return Err("bigram weights require --word-bigram-corpus".to_owned());
+            return Err(
+                "--discriminative-teacher-model requires --discriminative-train".to_owned(),
+            );
+        }
+        if (options.discriminative_export_training.is_some()
+            || options.discriminative_export_evaluation.is_some())
+            && options.discriminative_train.is_none()
+        {
+            return Err("discriminative export requires --discriminative-train".to_owned());
+        }
+        if options.discriminative_train.is_some()
+            && !options.discriminative_dimensions.is_power_of_two()
+        {
+            return Err("--discriminative-dimensions must be a power of two".to_owned());
         }
         if options.lambdas.is_empty() {
             // Default sweep for tuning the interpolation weight on the devset.
@@ -266,20 +415,48 @@ impl Options {
             options.lambdas.push(0.95);
             options.lambdas.sort_by(f64::total_cmp);
         }
+        if options.discriminative_weights.is_empty() {
+            options.discriminative_weights = vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+        }
         Ok(options)
+    }
+
+    const fn uses_corpus_ranker(&self) -> bool {
+        self.word_bigram_weight > 0 || self.skip_bigram_weight > 0 || self.context_bigram_weight > 0
+    }
+
+    fn set_ngram_weight(&mut self, name: &str, value: Option<String>) -> Result<(), String> {
+        let parsed = parse_non_negative_i32(name, value)?;
+        match name {
+            "--word-bigram-weight" => self.word_bigram_weight = parsed,
+            "--skip-bigram-weight" => self.skip_bigram_weight = parsed,
+            "--context-bigram-weight" => self.context_bigram_weight = parsed,
+            _ => unreachable!("matched n-gram option"),
+        }
+        Ok(())
     }
 }
 
 fn usage() -> String {
-    "usage: slime-evaluate <ajimee|anthy> --input <path> [--input <path> ...] [--top-k N] \
+    "usage: slime-evaluate <ajimee|anthy|annotated> --input <path> [--input <path> ...] \
+     [--dataset-name NAME] [--dataset-revision REV] [--dataset-sha256 HEX] [--top-k N] \
      [--search-k N] \
      [--context all|none|present] [--limit N] [--failures N] [--json] \
-     [--neural-model model.gguf] [--lambda X]... \
+     [--neural-model model.gguf] [--neural-max-cost-gap N] [--lambda X]... \
+     [--export-nbest path] \
+     [--discriminative-train items.json] [--discriminative-train-limit N] \
+     [--discriminative-teacher-model model.gguf] [--discriminative-teacher-lambda X] \
+     [--discriminative-export-training path] [--discriminative-export-evaluation path] \
+     [--discriminative-dimensions N] [--discriminative-epochs N] \
+     [--discriminative-weight X]... \
      [--word-bigram-corpus corpus.txt] [--word-bigram-weight N] \
-     [--skip-bigram-weight N]\n\
+     [--skip-bigram-weight N] [--context-bigram-weight N]\n\
      --neural-model rescores the N-best with a zenz GGUF model (requires \
-     building with --features neural). --lambda selects interpolation \
-     weights; without it a default sweep runs. The optional annotated corpus \
+     building with --features neural). --neural-max-cost-gap skips neural \
+     scoring when the base top-two cost gap exceeds N. --lambda selects \
+     interpolation weights; without it a default sweep runs. The discriminative \
+     options train an evaluation-only hashed averaged perceptron on a disjoint \
+     AJIMEE-format training file. The optional annotated corpus \
      uses whitespace-separated surface/reading tokens and only affects offline \
      N-best ranking."
         .to_owned()
@@ -296,10 +473,30 @@ fn parse_non_negative_i32(name: &str, value: Option<String>) -> Result<i32, Stri
     Ok(parsed)
 }
 
+fn parse_non_negative_f32(name: &str, value: Option<String>) -> Result<f32, String> {
+    let value = value.ok_or_else(|| format!("{name} requires a value"))?;
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("{name} requires a non-negative number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{name} requires a non-negative number"));
+    }
+    Ok(parsed)
+}
+
 fn load_items(options: &Options) -> Result<Vec<AjimeeItem>, String> {
-    match options.format {
-        DatasetFormat::Ajimee => load_ajimee_items(&options.inputs[0]),
-        DatasetFormat::Anthy => load_anthy_items(&options.inputs),
+    load_items_from_paths(options.format, &options.inputs)
+}
+
+fn load_items_from_paths(
+    format: DatasetFormat,
+    paths: &[PathBuf],
+) -> Result<Vec<AjimeeItem>, String> {
+    match format {
+        DatasetFormat::Ajimee if paths.len() == 1 => load_ajimee_items(&paths[0]),
+        DatasetFormat::Ajimee => Err("ajimee format requires exactly one input".to_owned()),
+        DatasetFormat::Anthy => load_anthy_items(paths),
+        DatasetFormat::Annotated => load_annotated_items(paths),
     }
 }
 
@@ -323,9 +520,39 @@ fn load_anthy_items(paths: &[PathBuf]) -> Result<Vec<AjimeeItem>, String> {
             let (reading, expected) = parse_anthy_line(line)
                 .map_err(|error| format!("{}:{}: {error}", path.display(), line_index + 1))?;
             items.push(AjimeeItem {
+                source_split: None,
                 index: format!("{}:{}", path.display(), line_index + 1),
                 context_text: String::new(),
                 input: reading,
+                expected_output: vec![expected],
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn load_annotated_items(paths: &[PathBuf]) -> Result<Vec<AjimeeItem>, String> {
+    let mut items = Vec::new();
+    for path in paths {
+        let source = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        for (line_index, line) in source.lines().enumerate() {
+            let tokens = parse_annotated_corpus_line(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), line_index + 1))?;
+            if tokens.is_empty() {
+                continue;
+            }
+            let mut input = String::new();
+            let mut expected = String::new();
+            for (surface, reading) in tokens {
+                input.push_str(&reading);
+                expected.push_str(&surface);
+            }
+            items.push(AjimeeItem {
+                source_split: None,
+                index: format!("{}:{}", path.display(), line_index + 1),
+                context_text: String::new(),
+                input,
                 expected_output: vec![expected],
             });
         }
@@ -374,6 +601,8 @@ fn parse_usize(name: &str, value: Option<String>) -> Result<usize, String> {
 
 #[derive(Debug, Deserialize)]
 struct AjimeeItem {
+    #[serde(default)]
+    source_split: Option<String>,
     index: String,
     context_text: String,
     input: String,
@@ -382,7 +611,7 @@ struct AjimeeItem {
 
 #[derive(Debug, Serialize)]
 struct EvaluationReport {
-    dataset: &'static str,
+    dataset: String,
     dataset_revision: Option<String>,
     dataset_sha256: Option<String>,
     context_filter: ContextFilter,
@@ -390,11 +619,23 @@ struct EvaluationReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    neural_max_cost_gap: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_scored_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_skipped_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     lambda: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discriminative: Option<DiscriminativeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discriminative_weight: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     word_bigram: Option<NgramReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skip_bigram: Option<NgramReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_bigram: Option<NgramReport>,
     items: usize,
     top_k: usize,
     search_k: usize,
@@ -405,6 +646,40 @@ struct EvaluationReport {
     min_cer_at_k: f64,
     latency_ms: LatencyReport,
     failures: Vec<Failure>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DiscriminativeReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teacher_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teacher_lambda: Option<f64>,
+    dimensions: usize,
+    epochs: usize,
+    training_items: usize,
+    oracle_items: usize,
+    updates: usize,
+    nonzero_weights: usize,
+    model_bytes: usize,
+    scoring_latency_ms: LatencyReport,
+}
+
+impl DiscriminativeReport {
+    fn new(outcome: &DiscriminativeOutcome) -> Self {
+        let diagnostics = outcome.diagnostics;
+        Self {
+            teacher_model: outcome.teacher_model.clone(),
+            teacher_lambda: outcome.teacher_lambda,
+            dimensions: diagnostics.dimensions,
+            epochs: diagnostics.epochs,
+            training_items: diagnostics.training_items,
+            oracle_items: diagnostics.oracle_items,
+            updates: diagnostics.updates,
+            nonzero_weights: diagnostics.nonzero_weights,
+            model_bytes: diagnostics.model_bytes,
+            scoring_latency_ms: latency_report(outcome.latencies.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -451,7 +726,15 @@ fn skip_bigram_report(diagnostics: Option<BigramDiagnostics>) -> Option<NgramRep
     })
 }
 
-#[derive(Debug, Serialize)]
+fn context_bigram_report(diagnostics: Option<BigramDiagnostics>) -> Option<NgramReport> {
+    diagnostics.and_then(|diagnostics| {
+        diagnostics
+            .context
+            .map(|context| NgramReport::new(context, diagnostics.candidates_scored))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
 struct LatencyReport {
     p50: f64,
     p95: f64,
@@ -474,12 +757,38 @@ struct ItemOutcome<'a> {
     latency: Duration,
 }
 
+#[derive(Serialize)]
+struct NbestExport {
+    label_source: String,
+    items: Vec<NbestExportItem>,
+}
+
+#[derive(Serialize)]
+struct NbestExportItem {
+    source_split: Option<String>,
+    index: String,
+    context_text: String,
+    input: String,
+    expected_output: Vec<String>,
+    label_index: Option<usize>,
+    candidates: Vec<NbestExportCandidate>,
+}
+
+#[derive(Serialize)]
+struct NbestExportCandidate {
+    surface: String,
+    cost: i32,
+}
+
 fn evaluate(
     dictionary: &Dictionary,
     items: &[AjimeeItem],
     options: &Options,
     word_bigram_ranker: Option<&CorpusBigramRanker>,
 ) -> Result<Vec<EvaluationReport>, String> {
+    let ranker = word_bigram_ranker.map_or(&CostOnlyRanker as &dyn CandidateRanker, |ranker| {
+        ranker as &dyn CandidateRanker
+    });
     let selected: Vec<_> = items
         .iter()
         .filter(|item| options.context.includes(item))
@@ -489,34 +798,44 @@ fn evaluate(
         return Err("no evaluation items matched the selected filters".to_owned());
     }
 
-    let ranker = word_bigram_ranker.map_or(&CostOnlyRanker as &dyn CandidateRanker, |ranker| {
-        ranker as &dyn CandidateRanker
-    });
-    let mut outcomes = Vec::with_capacity(selected.len());
-    for item in selected {
-        if item.expected_output.is_empty() {
-            return Err(format!("item {} has no expected output", item.index));
-        }
-        let reading = katakana_to_hiragana(&item.input);
-        let started = Instant::now();
-        let search_k = options.search_k.unwrap_or(options.top_k);
-        let candidates: Vec<_> = dictionary
-            .candidates_with_ranker(&reading, search_k, ranker)
-            .into_iter()
-            .take(options.top_k)
-            .collect();
-        let latency = started.elapsed();
-        outcomes.push(ItemOutcome {
-            item,
-            candidates,
-            latency,
-        });
+    let outcomes = generate_outcomes(
+        dictionary,
+        &selected,
+        options.search_k.unwrap_or(options.top_k),
+        options.top_k,
+        ranker,
+        None,
+    )?;
+    if let Some(path) = &options.export_nbest {
+        export_nbest(path, "gold", &outcomes, None)?;
     }
     let word_bigram_diagnostics = word_bigram_ranker.map(CorpusBigramRanker::diagnostics);
+
+    if let Some(training_path) = &options.discriminative_train {
+        let discriminative =
+            train_discriminative(dictionary, training_path, &outcomes, options, ranker)?;
+        return Ok(options
+            .discriminative_weights
+            .iter()
+            .map(|&weight| {
+                compute_report(
+                    &outcomes,
+                    None,
+                    None,
+                    Some(&discriminative),
+                    Some(weight),
+                    options,
+                    word_bigram_diagnostics,
+                )
+            })
+            .collect());
+    }
 
     let Some(model_path) = &options.neural_model else {
         return Ok(vec![compute_report(
             &outcomes,
+            None,
+            None,
             None,
             None,
             options,
@@ -533,23 +852,7 @@ fn evaluate(
     #[cfg(feature = "neural")]
     {
         let rescorer = neural::Rescorer::load(model_path)?;
-        let requests: Vec<_> = outcomes
-            .iter()
-            .map(|outcome| neural::ScoreRequest {
-                context: outcome.item.context_text.clone(),
-                input_katakana: outcome.item.input.clone(),
-                candidates: outcome
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.surface.clone())
-                    .collect(),
-            })
-            .collect();
-        let scored = rescorer.score_all(&requests)?;
-        let neural = NeuralOutcome {
-            logliks: scored.iter().map(|item| item.logliks.clone()).collect(),
-            latencies: scored.iter().map(|item| item.latency).collect(),
-        };
+        let neural = score_neural_outcomes(&rescorer, &outcomes, options.neural_max_cost_gap)?;
         Ok(options
             .lambdas
             .iter()
@@ -558,6 +861,8 @@ fn evaluate(
                     &outcomes,
                     Some(&neural),
                     Some(lambda),
+                    None,
+                    None,
                     options,
                     word_bigram_diagnostics,
                 )
@@ -566,9 +871,308 @@ fn evaluate(
     }
 }
 
+fn generate_outcomes<'a>(
+    dictionary: &Dictionary,
+    items: &[&'a AjimeeItem],
+    search_k: usize,
+    top_k: usize,
+    ranker: &dyn CandidateRanker,
+    progress_label: Option<&str>,
+) -> Result<Vec<ItemOutcome<'a>>, String> {
+    let mut outcomes = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        if item.expected_output.is_empty() {
+            return Err(format!("item {} has no expected output", item.index));
+        }
+        let reading = katakana_to_hiragana(&item.input);
+        let started = Instant::now();
+        let candidates: Vec<_> = dictionary
+            .candidates_with_context_ranker(&reading, &item.context_text, search_k, ranker)
+            .into_iter()
+            .take(top_k)
+            .collect();
+        let latency = started.elapsed();
+        outcomes.push(ItemOutcome {
+            item,
+            candidates,
+            latency,
+        });
+        if let Some(label) = progress_label
+            && (index + 1).is_multiple_of(1_000)
+        {
+            eprintln!(
+                "{label}: generated {}/{} candidate sets",
+                index + 1,
+                items.len()
+            );
+        }
+    }
+    Ok(outcomes)
+}
+
+struct DiscriminativeOutcome {
+    scores: Vec<Vec<f32>>,
+    latencies: Vec<Duration>,
+    diagnostics: discriminative::Diagnostics,
+    teacher_model: Option<String>,
+    teacher_lambda: Option<f64>,
+}
+
+fn train_discriminative(
+    dictionary: &Dictionary,
+    training_path: &Path,
+    evaluation_outcomes: &[ItemOutcome<'_>],
+    options: &Options,
+    ranker: &dyn CandidateRanker,
+) -> Result<DiscriminativeOutcome, String> {
+    let training_items = load_ajimee_items(training_path)?;
+    let excluded: HashSet<(Option<&str>, &str)> = evaluation_outcomes
+        .iter()
+        .map(|outcome| {
+            (
+                outcome.item.source_split.as_deref(),
+                outcome.item.index.as_str(),
+            )
+        })
+        .collect();
+    let eligible: Vec<_> = training_items
+        .iter()
+        .filter(|item| !excluded.contains(&(item.source_split.as_deref(), item.index.as_str())))
+        .collect();
+    let count = options.discriminative_train_limit.min(eligible.len());
+    if count == 0 {
+        return Err("no non-overlapping discriminative training items remain".to_owned());
+    }
+    let selected: Vec<_> = (0..count)
+        .map(|index| &eligible[index * eligible.len() / count])
+        .copied()
+        .collect();
+    eprintln!(
+        "discriminative training: selected {} of {} non-overlapping items",
+        selected.len(),
+        eligible.len()
+    );
+    let outcomes = generate_outcomes(
+        dictionary,
+        &selected,
+        options.search_k.unwrap_or(options.top_k),
+        options.top_k,
+        ranker,
+        Some("discriminative training"),
+    )?;
+    let teacher_expected = options
+        .discriminative_teacher_model
+        .as_ref()
+        .map(|path| {
+            discriminative_teacher_expected(&outcomes, path, options.discriminative_teacher_lambda)
+        })
+        .transpose()?;
+    if let Some(path) = &options.discriminative_export_training {
+        let label_source = options.discriminative_teacher_model.as_ref().map_or_else(
+            || "gold".to_owned(),
+            |model| format!("teacher:{}", model.display()),
+        );
+        export_nbest(path, &label_source, &outcomes, teacher_expected.as_deref())?;
+    }
+    if let Some(path) = &options.discriminative_export_evaluation {
+        export_nbest(path, "gold", evaluation_outcomes, None)?;
+    }
+    let training: Vec<_> = outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| discriminative::TrainingItem {
+            context: &outcome.item.context_text,
+            candidates: &outcome.candidates,
+            expected: teacher_expected
+                .as_ref()
+                .map_or(outcome.item.expected_output.as_slice(), |expected| {
+                    expected[index].as_slice()
+                }),
+        })
+        .collect();
+    let model = discriminative::HashedPerceptron::train(
+        &training,
+        options.discriminative_dimensions,
+        options.discriminative_epochs,
+    );
+    let diagnostics = model.diagnostics();
+    eprintln!("discriminative diagnostics: {diagnostics:?}");
+    let scored: Vec<_> = evaluation_outcomes
+        .iter()
+        .map(|outcome| model.score(&outcome.item.context_text, &outcome.candidates))
+        .collect();
+    Ok(DiscriminativeOutcome {
+        scores: scored.iter().map(|item| item.scores.clone()).collect(),
+        latencies: scored.iter().map(|item| item.latency).collect(),
+        diagnostics,
+        teacher_model: options
+            .discriminative_teacher_model
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        teacher_lambda: options
+            .discriminative_teacher_model
+            .as_ref()
+            .map(|_| options.discriminative_teacher_lambda),
+    })
+}
+
+fn export_nbest(
+    path: &Path,
+    label_source: &str,
+    outcomes: &[ItemOutcome<'_>],
+    expected_override: Option<&[Vec<String>]>,
+) -> Result<(), String> {
+    let items = outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            let expected = expected_override
+                .map_or(outcome.item.expected_output.as_slice(), |expected| {
+                    expected[index].as_slice()
+                });
+            NbestExportItem {
+                source_split: outcome.item.source_split.clone(),
+                index: outcome.item.index.clone(),
+                context_text: outcome.item.context_text.clone(),
+                input: outcome.item.input.clone(),
+                expected_output: expected.to_vec(),
+                label_index: outcome
+                    .candidates
+                    .iter()
+                    .position(|candidate| expected.contains(&candidate.surface)),
+                candidates: outcome
+                    .candidates
+                    .iter()
+                    .map(|candidate| NbestExportCandidate {
+                        surface: candidate.surface.clone(),
+                        cost: candidate.cost,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    let export = NbestExport {
+        label_source: label_source.to_owned(),
+        items,
+    };
+    let bytes = serde_json::to_vec(&export)
+        .map_err(|error| format!("failed to serialize {}: {error}", path.display()))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, bytes)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    eprintln!(
+        "wrote {} N-best items to {}",
+        outcomes.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+fn discriminative_teacher_expected(
+    outcomes: &[ItemOutcome<'_>],
+    model_path: &Path,
+    lambda: f64,
+) -> Result<Vec<Vec<String>>, String> {
+    #[cfg(not(feature = "neural"))]
+    {
+        let _ = (outcomes, model_path, lambda);
+        Err("--discriminative-teacher-model requires building with --features neural".to_owned())
+    }
+    #[cfg(feature = "neural")]
+    {
+        eprintln!(
+            "discriminative teacher: scoring {} candidate sets with {}",
+            outcomes.len(),
+            model_path.display()
+        );
+        let rescorer = neural::Rescorer::load(model_path)?;
+        let neural = score_neural_outcomes(&rescorer, outcomes, None)?;
+        Ok(outcomes
+            .iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                let surface =
+                    rescored_surfaces(&outcome.candidates, &neural.logliks[index], lambda)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                vec![surface]
+            })
+            .collect())
+    }
+}
+
 struct NeuralOutcome {
     logliks: Vec<Vec<f64>>,
     latencies: Vec<Duration>,
+    scored_items: usize,
+}
+
+#[cfg(feature = "neural")]
+fn score_neural_outcomes(
+    rescorer: &neural::Rescorer,
+    outcomes: &[ItemOutcome<'_>],
+    max_cost_gap: Option<i32>,
+) -> Result<NeuralOutcome, String> {
+    let score_item: Vec<_> = outcomes
+        .iter()
+        .map(|outcome| should_score_neurally(&outcome.candidates, max_cost_gap))
+        .collect();
+    let requests: Vec<_> = outcomes
+        .iter()
+        .zip(&score_item)
+        .filter(|(_, score)| **score)
+        .map(|(outcome, _)| neural::ScoreRequest {
+            context: outcome.item.context_text.clone(),
+            input_katakana: outcome.item.input.clone(),
+            candidates: outcome
+                .candidates
+                .iter()
+                .map(|candidate| candidate.surface.clone())
+                .collect(),
+        })
+        .collect();
+    let scored = rescorer.score_all(&requests)?;
+    let mut scored = scored.into_iter();
+    let mut logliks = Vec::with_capacity(outcomes.len());
+    let mut latencies = Vec::with_capacity(outcomes.len());
+    for (outcome, score) in outcomes.iter().zip(&score_item) {
+        if *score {
+            let item = scored.next().expect("one score per selected request");
+            logliks.push(item.logliks);
+            latencies.push(item.latency);
+        } else {
+            logliks.push(vec![0.0; outcome.candidates.len()]);
+            latencies.push(Duration::ZERO);
+        }
+    }
+    debug_assert!(scored.next().is_none());
+    Ok(NeuralOutcome {
+        logliks,
+        latencies,
+        scored_items: score_item.iter().filter(|score| **score).count(),
+    })
+}
+
+#[cfg(any(feature = "neural", test))]
+fn base_cost_gap(candidates: &[Candidate]) -> Option<i32> {
+    let first = candidates.first()?.cost;
+    candidates
+        .iter()
+        .skip(1)
+        .map(|candidate| candidate.cost)
+        .min()
+        .map(|alternative| alternative.saturating_sub(first).max(0))
+}
+
+#[cfg(any(feature = "neural", test))]
+fn should_score_neurally(candidates: &[Candidate], max_cost_gap: Option<i32>) -> bool {
+    max_cost_gap.is_none_or(|maximum| base_cost_gap(candidates).is_some_and(|gap| gap <= maximum))
 }
 
 /// Reorders candidate surfaces by interpolating the lattice cost with the
@@ -590,10 +1194,13 @@ fn rescored_surfaces(candidates: &[Candidate], logliks: &[f64], lambda: f64) -> 
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn compute_report(
     outcomes: &[ItemOutcome<'_>],
     neural: Option<&NeuralOutcome>,
     lambda: Option<f64>,
+    discriminative: Option<&DiscriminativeOutcome>,
+    discriminative_weight: Option<f32>,
     options: &Options,
     word_bigram_diagnostics: Option<BigramDiagnostics>,
 ) -> EvaluationReport {
@@ -607,10 +1214,16 @@ fn compute_report(
 
     for (outcome_index, outcome) in outcomes.iter().enumerate() {
         let item = outcome.item;
-        let candidates: Vec<String> = match (neural, lambda) {
-            (Some(neural), Some(lambda)) => {
+        let candidates: Vec<String> = match (neural, lambda, discriminative, discriminative_weight)
+        {
+            (Some(neural), Some(lambda), None, None) => {
                 rescored_surfaces(&outcome.candidates, &neural.logliks[outcome_index], lambda)
             }
+            (None, None, Some(discriminative), Some(weight)) => discriminative::rescored_surfaces(
+                &outcome.candidates,
+                &discriminative.scores[outcome_index],
+                weight,
+            ),
             _ => outcome
                 .candidates
                 .iter()
@@ -620,6 +1233,9 @@ fn compute_report(
         let mut latency = outcome.latency;
         if let Some(neural) = neural {
             latency += neural.latencies[outcome_index];
+        }
+        if let Some(discriminative) = discriminative {
+            latency += discriminative.latencies[outcome_index];
         }
         latencies.push(latency);
 
@@ -666,20 +1282,32 @@ fn compute_report(
     }
 
     let total = usize_to_f64(outcomes.len());
-    latencies.sort_unstable();
     EvaluationReport {
-        dataset: options.format.dataset_name(),
+        dataset: options
+            .dataset_name
+            .clone()
+            .unwrap_or_else(|| options.format.dataset_name().to_owned()),
         dataset_revision: options.dataset_revision.clone(),
         dataset_sha256: options.dataset_sha256.clone(),
         context_filter: options.context,
-        context_used_by_engine: neural.is_some(),
+        context_used_by_engine: neural.is_some_and(|neural| neural.scored_items > 0)
+            || discriminative.is_some()
+            || word_bigram_diagnostics
+                .and_then(|diagnostics| diagnostics.context)
+                .is_some_and(|diagnostics| diagnostics.matched_transitions > 0),
         neural_model: options
             .neural_model
             .as_ref()
             .map(|path| path.display().to_string()),
+        neural_max_cost_gap: options.neural_max_cost_gap,
+        neural_scored_items: neural.map(|neural| neural.scored_items),
+        neural_skipped_items: neural.map(|neural| outcomes.len() - neural.scored_items),
         lambda,
+        discriminative: discriminative.map(DiscriminativeReport::new),
+        discriminative_weight,
         word_bigram: word_bigram_report(word_bigram_diagnostics),
         skip_bigram: skip_bigram_report(word_bigram_diagnostics),
+        context_bigram: context_bigram_report(word_bigram_diagnostics),
         items: outcomes.len(),
         top_k: options.top_k,
         search_k: options.search_k.unwrap_or(options.top_k),
@@ -688,19 +1316,14 @@ fn compute_report(
         mrr_at_k: reciprocal_rank / total,
         min_cer_at_1: min_cer_at_1 / total,
         min_cer_at_k: min_cer_at_k / total,
-        latency_ms: LatencyReport {
-            p50: percentile(&latencies, 50),
-            p95: percentile(&latencies, 95),
-            p99: percentile(&latencies, 99),
-            max: duration_to_millis(*latencies.last().expect("non-empty latencies")),
-        },
+        latency_ms: latency_report(latencies),
         failures,
     }
 }
 
 fn normalize_for_evaluation(value: &str, format: DatasetFormat) -> String {
     match format {
-        DatasetFormat::Ajimee => value.to_owned(),
+        DatasetFormat::Ajimee | DatasetFormat::Annotated => value.to_owned(),
         DatasetFormat::Anthy => value
             .chars()
             .map(|character| match character {
@@ -726,8 +1349,24 @@ fn print_report(report: &EvaluationReport) {
     if let Some(model) = &report.neural_model {
         println!("neural model: {model}");
     }
+    if let Some(maximum) = report.neural_max_cost_gap {
+        println!("neural max base cost gap: {maximum}");
+    }
+    if let Some(scored) = report.neural_scored_items {
+        println!("neural scored items: {scored}");
+        println!(
+            "neural skipped items: {}",
+            report.neural_skipped_items.unwrap_or(0)
+        );
+    }
     if let Some(lambda) = report.lambda {
         println!("lambda: {lambda:.2}");
+    }
+    if let Some(discriminative) = &report.discriminative {
+        print_discriminative_report(discriminative);
+    }
+    if let Some(weight) = report.discriminative_weight {
+        println!("discriminative weight: {weight:.3}");
     }
     if let Some(bigram) = &report.word_bigram {
         println!("word bigram entries: {}", bigram.entries);
@@ -783,6 +1422,32 @@ fn print_report(report: &EvaluationReport) {
             );
         }
     }
+}
+
+fn print_discriminative_report(report: &DiscriminativeReport) {
+    if let Some(model) = &report.teacher_model {
+        println!("discriminative teacher model: {model}");
+        println!(
+            "discriminative teacher lambda: {:.2}",
+            report.teacher_lambda.unwrap_or(0.0)
+        );
+    }
+    println!("discriminative dimensions: {}", report.dimensions);
+    println!("discriminative epochs: {}", report.epochs);
+    println!(
+        "discriminative training/oracle items: {}/{}",
+        report.training_items, report.oracle_items
+    );
+    println!("discriminative updates: {}", report.updates);
+    println!("discriminative nonzero weights: {}", report.nonzero_weights);
+    println!("discriminative model bytes: {}", report.model_bytes);
+    println!(
+        "discriminative scoring latency ms: p50={:.3} p95={:.3} p99={:.3} max={:.3}",
+        report.scoring_latency_ms.p50,
+        report.scoring_latency_ms.p95,
+        report.scoring_latency_ms.p99,
+        report.scoring_latency_ms.max
+    );
 }
 
 fn katakana_to_hiragana(input: &str) -> String {
@@ -842,6 +1507,16 @@ fn percentile(sorted_durations: &[Duration], percentile: usize) -> f64 {
     duration_to_millis(sorted_durations[rank])
 }
 
+fn latency_report(mut durations: Vec<Duration>) -> LatencyReport {
+    durations.sort_unstable();
+    LatencyReport {
+        p50: percentile(&durations, 50),
+        p95: percentile(&durations, 95),
+        p99: percentile(&durations, 99),
+        max: duration_to_millis(*durations.last().expect("non-empty latencies")),
+    }
+}
+
 fn duration_to_millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
@@ -857,9 +1532,12 @@ fn u64_to_f64(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextFilter, DatasetFormat, Options, character_error_rate, katakana_to_hiragana,
-        normalize_for_evaluation, parse_anthy_line, percentile,
+        ContextFilter, DatasetFormat, Options, base_cost_gap, character_error_rate,
+        katakana_to_hiragana, load_annotated_items, normalize_for_evaluation, parse_anthy_line,
+        percentile, should_score_neurally,
     };
+    use slime_converter::Candidate;
+    use std::fs;
     use std::time::Duration;
 
     fn assert_close(actual: f64, expected: f64) {
@@ -896,6 +1574,12 @@ mod tests {
                 "ajimee",
                 "--input",
                 "items.json",
+                "--dataset-name",
+                "custom",
+                "--dataset-revision",
+                "revision",
+                "--dataset-sha256",
+                "digest",
                 "--top-k",
                 "5",
                 "--search-k",
@@ -907,12 +1591,20 @@ mod tests {
                 "--failures",
                 "0",
                 "--json",
+                "--neural-model",
+                "model.gguf",
+                "--neural-max-cost-gap",
+                "750",
+                "--export-nbest",
+                "nbest.json",
                 "--word-bigram-corpus",
                 "annotated.txt",
                 "--word-bigram-weight",
                 "500",
                 "--skip-bigram-weight",
                 "250",
+                "--context-bigram-weight",
+                "125",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -923,16 +1615,48 @@ mod tests {
         assert_eq!(options.search_k, Some(20));
         assert_eq!(options.format, DatasetFormat::Ajimee);
         assert_eq!(options.inputs, [std::path::PathBuf::from("items.json")]);
+        assert_eq!(options.dataset_name.as_deref(), Some("custom"));
+        assert_eq!(options.dataset_revision.as_deref(), Some("revision"));
+        assert_eq!(options.dataset_sha256.as_deref(), Some("digest"));
         assert_eq!(options.context, ContextFilter::None);
         assert_eq!(options.limit, Some(25));
         assert_eq!(options.failures, 0);
         assert!(options.json);
+        assert_eq!(options.neural_max_cost_gap, Some(750));
+        assert_eq!(
+            options.export_nbest,
+            Some(std::path::PathBuf::from("nbest.json"))
+        );
         assert_eq!(
             options.word_bigram_corpora,
             [std::path::PathBuf::from("annotated.txt")]
         );
         assert_eq!(options.word_bigram_weight, 500);
         assert_eq!(options.skip_bigram_weight, 250);
+        assert_eq!(options.context_bigram_weight, 125);
+    }
+
+    #[test]
+    fn neural_cost_gap_gate_skips_confident_or_single_candidate_items() {
+        let candidates = vec![
+            Candidate {
+                surface: "第一".to_owned(),
+                cost: 1_000,
+            },
+            Candidate {
+                surface: "第二".to_owned(),
+                cost: 1_600,
+            },
+            Candidate {
+                surface: "第三".to_owned(),
+                cost: 2_000,
+            },
+        ];
+        assert_eq!(base_cost_gap(&candidates), Some(600));
+        assert!(should_score_neurally(&candidates, None));
+        assert!(should_score_neurally(&candidates, Some(600)));
+        assert!(!should_score_neurally(&candidates, Some(599)));
+        assert!(!should_score_neurally(&candidates[..1], Some(1_000)));
     }
 
     #[test]
@@ -953,6 +1677,22 @@ mod tests {
                 "uim-fepの新しいバージョン".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn loads_annotated_sentences_as_evaluation_items() {
+        let path = std::env::temp_dir().join(format!(
+            "slime-tools-annotated-evaluation-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, ";; comment\n夏/なつ は/は 暑い/あつい\n").unwrap();
+
+        let items = load_annotated_items(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].input, "なつはあつい");
+        assert_eq!(items[0].expected_output, ["夏は暑い"]);
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

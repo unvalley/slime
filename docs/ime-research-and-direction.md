@@ -2,7 +2,7 @@
 
 - 調査日: 2026-07-19
 - 初期実装: macOS
-- 将来対応: Windows（方針のみ先に固定）、Linux
+- 技術スパイク中: Windows。将来対応: Linux
 - 優先事項: **軽量で、インストール後すぐ使え、入力内容を外部へ送信しないこと**
 
 ## 1. 結論
@@ -10,7 +10,7 @@
 このIMEは、次の方針で進めるのがよい。
 
 1. **変換エンジンは最初からRustで実装する。**
-2. **macOSはSwift + InputMethodKitで先に完成させる。WindowsはTSFの薄いネイティブアダプターという境界だけ固定し、実装はmacOS版の後に行う。**
+2. **macOSはSwift + InputMethodKit、WindowsはTSFの薄いネイティブアダプターとし、変換コアを共有する。**
 3. **通常のローマ字入力・かな漢字変換を採用し、SKK固有の入力操作をユーザーへ要求しない。**
 4. **初期版はニューラルモデル、クラウド変換、形態素解析器一式を搭載しない。**
 5. **コンパクトな辞書、unigram/bigram、ラティス、Viterbi探索で文節変換する。**
@@ -75,9 +75,9 @@ macOSで完全なゼロクリック有効化を目標にするのは現実的で
 
 > 入力ソースに「IME名」を追加してください。
 
-### 3.2 Windows: Text Services Framework（将来方針）
+### 3.2 Windows: Text Services Framework（技術スパイク中）
 
-この節は将来の移植を妨げないための設計方針であり、現在の実装対象ではない。macOS MVPが安定し、RustコアのAPIと辞書形式が固まるまでは、Windows用DLL、インストーラー、互換性試験へ着手しない。
+2026-08-02にWindows向けの技術スパイクを開始した。`platforms/windows/native`に、`ITfTextInputProcessorEx`、キーストロークsink、composition、同期edit session、COM/language profile/category登録、`InstallLayoutOrTip`による有効化ヘルパーを実装し、既存RustコアとはJSONを介さない型付きC ABIで接続した。x64/x86のMSVCビルドとDLL export検証もWindows CIへ追加している。候補のsurface循環に加えて、`ITfCandidateListUIElement`で候補・選択・ページ更新をUILess consumerへ公開し、`ITfCandidateListUIElementBehavior`と`ITfIntegratableCandidateListUIElement`でアプリ側からの選択・確定・中止・Search boxキー操作を同じ同期edit sessionへ戻す。`ITfFunctionProvider`/`ITfFnSearchCandidateProvider`は通常compositionを変更しないread-only C ABIから最大20件の変換候補を取得し、重複・prefix overlapを除外して、選択結果だけをローカル履歴へ戻す。TSFがservice側UIを要求した場合は、非activate型の通常desktop候補popupをcomposition位置へ表示し、1–9キー、mouse選択、double-click確定を扱う。popupは`EVENT_OBJECT_IME_SHOW/HIDE/CHANGE`に加え、`IME_Candidate_Window`のUI Automation list、候補名、単一選択、MenuOpened/MenuClosed/SelectionItemイベントを公開する。`SlimeSettings.exe`はライブ変換、履歴利用・学習、分野別辞書、日付形式をversion付き設定へ原子的に保存し、各text serviceはdirectory changeのoverlapped eventだけを入力経路でpollして、composition外で再読み込みする。TSFの`ITfFnConfigure`からも起動でき、secure activationではprivate modeを強制する。x64/x86 payloadを内包し、登録失敗時にrollbackするoffline NSIS installerとunsigned CI artifactまで実装した。各PEとinstallerの署名、Windows実機でのinstall/update/uninstall、popup配置・Search・Narrator・設定伝播・入力・互換性試験はまだ未完了であり、配布可能なWindows IMEではない。
 
 新規のWindows IMEは[Text Services Framework (TSF)](https://learn.microsoft.com/en-us/windows/win32/tsf/text-services-framework)で実装する。Microsoftの[カスタムIME要件](https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editor-requirements)は、IMM32方式ではなくTSFを使用するよう求めている。
 
@@ -453,7 +453,7 @@ IME workspace
 │   └── slime-tools/         # 辞書compiler、評価CLI
 ├── platforms/
 │   ├── macos/             # Swift + InputMethodKit
-│   └── windows/           # 将来のTSF COM DLL + installer（当面は設計資料のみ）
+│   └── windows/           # TSF COM DLL + 登録helper + NSIS installer
 ├── data/
 │   ├── source/            # ライセンス追跡可能な辞書ソース
 │   ├── generated/         # ビルド生成物。原則git管理しない
@@ -536,7 +536,7 @@ Rustコアの責務:
 - ログアウトが必要な場合だけ、その理由と保存前の注意を表示する。
 - アップデートで入力ソース登録やユーザー辞書を壊さない。
 
-### 9.2 Windows（将来）
+### 9.2 Windows（技術スパイク中）
 
 理想フロー:
 
@@ -549,7 +549,7 @@ Rustコアの責務:
 
 - 再起動を要求しないことを目標とする。
 - 手作業の`regsvr32`を要求しない。
-- 管理者権限の要否をインストール方式のスパイクで確定する。
+- per-machine installとして管理者権限を要求する。
 - x64/x86 DLLを同じインストーラーで正しく配置・登録する。
 - uninstall時にlanguage profile、category、COM登録を確実に削除する。
 
@@ -575,9 +575,9 @@ macOS:
 - Secure Inputとパスワード欄
 - Apple Silicon / Intel
 
-Windows（将来）:
+Windows（技術スパイク中）:
 
-- 以下は将来の移植時に実施し、macOS MVPの完成条件には含めない
+- 以下はWindows実機で実施し、macOS MVPの完成条件には含めない
 - Notepad、Word、Edge、Chrome、VS Code、Windows Terminal、JetBrains IDE
 - Win32、UWP/packaged app、Electron、Java
 - x64アプリと32-bitアプリ
@@ -632,20 +632,27 @@ Windows（将来）:
 - cold start、RSS、latencyの最適化
 - Linux IBus frontendの再評価
 
-### Future W: Windows MVP（macOS版安定後まで着手しない）
+### Future W: Windows MVP（技術スパイク着手済み）
 
-- Rustコアと辞書形式を変更せずにTSFへ接続する技術スパイク
-- x64/x86 TSF DLL
-- 候補UI、UILess mode
-- signed installer
-- `InstallLayoutOrTip`
+- Rustコアと辞書形式を変更せず、型付きC ABIでTSFへ接続（完了）
+- TSF COM DLL、composition、edit session（実装済み、Windows実機検証は未完了）
+- x64/x86 TSF DLL（MSVC CI追加済み、Windows実機検証は未完了）
+- `InstallLayoutOrTip`によるprofileの有効化・無効化helper（実装済み、Windows実機検証は未完了）
+- `ITfCandidateListUIElement`によるUILess候補data（実装済み、Windows実機検証は未完了）
+- `ITfCandidateListUIElementBehavior`と`ITfIntegratableCandidateListUIElement`によるUILess操作（実装済み、Windows実機検証は未完了）
+- 通常desktop候補popup、1–9キー、mouse選択（実装済み、Windows実機検証は未完了）
+- `ITfFnSearchCandidateProvider`による独立Search候補（実装済み、Windows実機検証は未完了）
+- popupのUI Automation/Narrator対応（実装済み、Windows実機検証は未完了）
+- 永続設定、設定UI、`ITfFnConfigure`、実行中の非同期変更検知（実装済み、Windows実機検証は未完了）
+- x64/x86を同梱するoffline NSIS installer、silent install、登録rollback（unsigned artifact生成まで完了、Windows実機検証は未完了）
+- 各PEとinstallerのAuthenticode署名
 - クリーン環境の導入テスト
 
 ## 12. 直近で確定すべき未解決事項
 
 1. **辞書ライセンス**: IPAdic/UniDic/SKK/Mozc由来データのどれを採用し、生成物をどのライセンスで配布できるか。
 2. **最低macOS**: macOS 13以降を仮置きし、利用者範囲とテストコストで確定する。
-3. **Windows shellの言語（将来）**: 着手時にC++で公式サンプルへ寄せる案と`windows-rs`案を実動比較する。現在は決定しない。
+3. **Windows shellの言語**: COM/TSF境界は公式サンプルと照合しやすいC++、変換処理は既存Rustコアとし、型付きC ABIで分離した。全面`windows-rs`化は、実機計測で明確な保守性・安全性の改善が確認できない限り行わない。
 4. **辞書サイズ予算**: 圧縮後8 MBを仮上限にし、変換品質とのPareto曲線を測る。
 5. **ライセンス方針**: コアをMIT/Apache-2.0にするか、辞書由来条件を含めGPL系にするか。
 6. **製品名とbundle/profile ID**: インストール・更新互換性に直結するため、実装初期に固定する。
@@ -725,5 +732,5 @@ Windows（将来）:
 - 配布物サイズは2026-07-19時点の公開release assetであり、将来変わる。
 - 配布物サイズからRSS、起動時間、変換速度は推定していない。
 - 論文間でデータセット、正解定義、入力単位が異なるため、精度数値を横並びにはしていない。
-- macOSの実アプリ互換性、署名済みinstaller、更新・削除は未実装であり、Phase 0以降で実機確認が必要である。Windowsは将来着手時に別途検証する。
+- macOSの実アプリ互換性、署名済みinstaller、更新・削除は未実装であり、Phase 0以降で実機確認が必要である。Windowsはunsigned offline installerのartifact生成までで、署名、実機互換性、install/update/uninstallは別途検証する。
 - 辞書ライセンスの記述は技術調査であり、最終的な法的判断ではない。

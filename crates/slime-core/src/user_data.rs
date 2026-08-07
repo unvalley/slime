@@ -10,7 +10,8 @@ const USER_DICTIONARY_HEADER: &str = "# slime-user-dictionary-v1";
 const HISTORY_HEADER: &str = "# slime-history-v1";
 const MAX_HISTORY_ENTRIES: usize = 500;
 const MIN_COMPLETION_REMAINING_CHARS: usize = 2;
-const MIN_COMPLETION_USE_COUNT: u32 = 5;
+const MIN_ESTABLISHED_HISTORY_COUNT: u32 = 5;
+const MIN_COMPLETION_USE_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
 const MAX_HISTORY_READING_CHARS: usize = 64;
 const MAX_HISTORY_SURFACE_CHARS: usize = 128;
 
@@ -191,12 +192,19 @@ fn sort_completions(entries: &mut Vec<&HistoryEntry>) {
 
 fn sort_history(entries: &mut Vec<&HistoryEntry>) {
     entries.sort_unstable_by(|left, right| {
-        right
-            .last_used
-            .cmp(&left.last_used)
+        history_strength(right)
+            .cmp(&history_strength(left))
+            .then_with(|| right.last_used.cmp(&left.last_used))
             .then_with(|| right.count.cmp(&left.count))
             .then_with(|| left.surface.cmp(&right.surface))
     });
+}
+
+/// A single exceptional selection should not replace an established spelling.
+/// Once both spellings are established, recency remains the deciding signal so
+/// an intentional change in preference can still take effect.
+fn history_strength(entry: &HistoryEntry) -> bool {
+    entry.count >= MIN_ESTABLISHED_HISTORY_COUNT
 }
 
 fn update_history(history: &mut Vec<HistoryEntry>, reading: &str, surface: &str, last_used: u64) {
@@ -451,11 +459,26 @@ mod tests {
     }
 
     #[test]
-    fn a_recent_selection_outranks_an_old_frequent_selection() {
-        let directory = test_directory("recent-selection");
+    fn an_established_selection_outranks_a_recent_one_off_selection() {
+        let directory = test_directory("learning-strength");
         fs::write(
             directory.join("history.tsv"),
             format!("{HISTORY_HEADER}\nかんじ\t漢字\t100\t10\nかんじ\t感じ\t1\t20\n"),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        assert_eq!(data.exact_history_surfaces("かんじ"), ["漢字", "感じ"]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recency_decides_between_established_selections() {
+        let directory = test_directory("established-recency");
+        fs::write(
+            directory.join("history.tsv"),
+            format!("{HISTORY_HEADER}\nかんじ\t漢字\t100\t10\nかんじ\t感じ\t5\t20\n"),
         )
         .unwrap();
 

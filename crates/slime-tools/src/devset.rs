@@ -49,11 +49,14 @@ struct TrainDiff {
 
 #[derive(Debug, Serialize)]
 struct DevItem {
+    source_split: String,
     index: String,
     context_text: String,
     input: String,
     expected_output: Vec<String>,
     original_text: String,
+    #[serde(skip)]
+    annotated_tokens: Vec<(String, String)>,
 }
 
 struct Options {
@@ -61,6 +64,10 @@ struct Options {
     dictionary_path: PathBuf,
     output_path: PathBuf,
     count: usize,
+    partition_count: usize,
+    partition_index: Option<usize>,
+    exclude_partition_index: Option<usize>,
+    annotated_output: Option<PathBuf>,
 }
 
 fn run() -> Result<(), String> {
@@ -86,7 +93,17 @@ fn run() -> Result<(), String> {
     }
     eprintln!("accepted {} candidate items", accepted.len());
 
-    let selected = sample_evenly(accepted, options.count);
+    let partitioned = partition_items(
+        accepted,
+        options.partition_count,
+        options.partition_index,
+        options.exclude_partition_index,
+    );
+    eprintln!("partition contains {} items", partitioned.len());
+    if let Some(path) = options.annotated_output {
+        write_annotated_corpus(&path, &partitioned)?;
+    }
+    let selected = sample_evenly(partitioned, options.count);
     let json = serde_json::to_string_pretty(&selected)
         .map_err(|error| format!("failed to serialize items: {error}"))?;
     fs::write(&options.output_path, json)
@@ -100,11 +117,18 @@ fn run() -> Result<(), String> {
 }
 
 fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options, String> {
-    let usage = "usage: ime-devset <train.jsonl> <mozc-basic.tsv> <output.json> [--count N]";
+    let usage = "usage: ime-devset <train.jsonl> <mozc-basic.tsv> <output.json> \
+                 [--count N] [--partition-count N \
+                 (--partition-index N | --exclude-partition-index N)] \
+                 [--annotated-output PATH]";
     let train_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let dictionary_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let output_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let mut count = 400;
+    let mut partition_count = 1;
+    let mut partition_index = None;
+    let mut exclude_partition_index = None;
+    let mut annotated_output = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--count" => {
@@ -114,15 +138,111 @@ fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options,
                     .parse()
                     .map_err(|_| "--count requires a positive integer")?;
             }
+            "--partition-count" => {
+                partition_count = arguments
+                    .next()
+                    .ok_or("--partition-count requires a value")?
+                    .parse()
+                    .map_err(|_| "--partition-count requires a positive integer")?;
+            }
+            "--partition-index" => {
+                partition_index = Some(
+                    arguments
+                        .next()
+                        .ok_or("--partition-index requires a value")?
+                        .parse()
+                        .map_err(|_| "--partition-index requires a non-negative integer")?,
+                );
+            }
+            "--exclude-partition-index" => {
+                exclude_partition_index = Some(
+                    arguments
+                        .next()
+                        .ok_or("--exclude-partition-index requires a value")?
+                        .parse()
+                        .map_err(|_| "--exclude-partition-index requires a non-negative integer")?,
+                );
+            }
+            "--annotated-output" => {
+                annotated_output = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or("--annotated-output requires a path")?,
+                ));
+            }
             _ => return Err(format!("unknown argument {argument:?}\n{usage}")),
         }
+    }
+    if count == 0 {
+        return Err("--count requires a positive integer".to_owned());
+    }
+    if partition_count == 0 {
+        return Err("--partition-count requires a positive integer".to_owned());
+    }
+    if partition_index.is_some() && exclude_partition_index.is_some() {
+        return Err(
+            "--partition-index and --exclude-partition-index are mutually exclusive".to_owned(),
+        );
+    }
+    let selected_partition = partition_index.or(exclude_partition_index);
+    if selected_partition.is_some_and(|index| index >= partition_count) {
+        return Err("partition index must be less than --partition-count".to_owned());
+    }
+    if partition_count > 1 && selected_partition.is_none() {
+        return Err(
+            "--partition-count requires --partition-index or --exclude-partition-index".to_owned(),
+        );
     }
     Ok(Options {
         train_path,
         dictionary_path,
         output_path,
         count,
+        partition_count,
+        partition_index,
+        exclude_partition_index,
+        annotated_output,
     })
+}
+
+fn partition_items(
+    items: Vec<DevItem>,
+    partition_count: usize,
+    partition_index: Option<usize>,
+    exclude_partition_index: Option<usize>,
+) -> Vec<DevItem> {
+    let Some(selected_index) = partition_index.or(exclude_partition_index) else {
+        return items;
+    };
+    let exclude = exclude_partition_index.is_some();
+    items
+        .into_iter()
+        .filter(|item| {
+            item.index.parse::<usize>().is_ok_and(|line_number| {
+                let matches = line_number % partition_count == selected_index;
+                if exclude { !matches } else { matches }
+            })
+        })
+        .collect()
+}
+
+fn write_annotated_corpus(path: &PathBuf, items: &[DevItem]) -> Result<(), String> {
+    let mut output = String::new();
+    for item in items {
+        for (index, (surface, reading)) in item.annotated_tokens.iter().enumerate() {
+            if index > 0 {
+                output.push(' ');
+            }
+            output.push_str(surface);
+            output.push('/');
+            output.push_str(reading);
+        }
+        output.push('\n');
+    }
+    fs::write(path, output)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    eprintln!("wrote annotated corpus to {}", path.display());
+    Ok(())
 }
 
 /// Maps each dictionary surface to its reading when every dictionary entry
@@ -181,7 +301,11 @@ fn build_item(
         return None;
     }
 
-    let reading = derive_reading(&post[window_start..window_end], readings)?;
+    let annotated_tokens = derive_annotated_tokens(&post[window_start..window_end], readings)?;
+    let reading = annotated_tokens
+        .iter()
+        .map(|(_, reading)| reading.as_str())
+        .collect::<String>();
 
     // A kana-kanji misconversion types the same reading for both surfaces;
     // if the readings of the two variants are derivable and differ, the
@@ -203,11 +327,13 @@ fn build_item(
     };
 
     Some(DevItem {
+        source_split: "jwtd-v2-train".to_owned(),
         index: line_number.to_string(),
         context_text,
         input: hiragana_to_katakana(&reading),
         expected_output: vec![span],
         original_text: pair.post_text.clone(),
+        annotated_tokens,
     })
 }
 
@@ -285,7 +411,15 @@ const MAXIMUM_SURFACE_CHARACTERS: usize = 12;
 /// dictionary surfaces, falling back to kana and punctuation passthrough.
 /// Returns `None` when any part of the span cannot be read confidently.
 fn derive_reading(span: &[char], readings: &HashMap<String, Option<String>>) -> Option<String> {
-    let mut reading = String::new();
+    derive_annotated_tokens(span, readings)
+        .map(|tokens| tokens.into_iter().map(|(_, reading)| reading).collect())
+}
+
+fn derive_annotated_tokens(
+    span: &[char],
+    readings: &HashMap<String, Option<String>>,
+) -> Option<Vec<(String, String)>> {
+    let mut tokens = Vec::new();
     let mut position = 0;
     while position < span.len() {
         let mut matched = false;
@@ -293,7 +427,10 @@ fn derive_reading(span: &[char], readings: &HashMap<String, Option<String>>) -> 
         for length in (2..=longest).rev() {
             let surface: String = span[position..position + length].iter().collect();
             if let Some(Some(surface_reading)) = readings.get(&surface) {
-                reading.push_str(surface_reading);
+                if surface.contains(['/', ' ', '\t']) || surface_reading.contains('/') {
+                    return None;
+                }
+                tokens.push((surface, surface_reading.clone()));
                 position += length;
                 matched = true;
                 break;
@@ -305,19 +442,25 @@ fn derive_reading(span: &[char], readings: &HashMap<String, Option<String>>) -> 
 
         let character = span[position];
         if is_kana(character) {
-            reading.push(katakana_to_hiragana(character));
+            tokens.push((
+                character.to_string(),
+                katakana_to_hiragana(character).to_string(),
+            ));
             position += 1;
         } else if is_clause_boundary(character) || character == '・' || character == '…' {
-            reading.push(character);
+            tokens.push((character.to_string(), character.to_string()));
             position += 1;
         } else if let Some(Some(surface_reading)) = readings.get(&character.to_string()) {
-            reading.push_str(surface_reading);
+            if surface_reading.contains('/') {
+                return None;
+            }
+            tokens.push((character.to_string(), surface_reading.clone()));
             position += 1;
         } else {
             return None;
         }
     }
-    Some(reading)
+    Some(tokens)
 }
 
 fn katakana_to_hiragana(character: char) -> char {
@@ -352,11 +495,13 @@ fn sample_evenly(items: Vec<DevItem>, count: usize) -> Vec<DevItem> {
             let position = index * items.len() / count;
             let item = &items[position];
             DevItem {
+                source_split: item.source_split.clone(),
                 index: item.index.clone(),
                 context_text: item.context_text.clone(),
                 input: item.input.clone(),
                 expected_output: item.expected_output.clone(),
                 original_text: item.original_text.clone(),
+                annotated_tokens: item.annotated_tokens.clone(),
             }
         })
         .collect()
@@ -364,7 +509,10 @@ fn sample_evenly(items: Vec<DevItem>, count: usize) -> Vec<DevItem> {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_span, hiragana_to_katakana};
+    use super::{
+        DevItem, derive_annotated_tokens, diff_span, hiragana_to_katakana, partition_items,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn diff_span_finds_the_changed_region() {
@@ -375,6 +523,71 @@ mod tests {
         let pre: Vec<char> = "ああいう".chars().collect();
         let post: Vec<char> = "ああそういう".chars().collect();
         assert_eq!(diff_span(&pre, &post), Some((2, 4)));
+    }
+
+    #[test]
+    fn partitions_items_by_stable_source_line_number() {
+        let items: Vec<_> = (0..10)
+            .map(|index| DevItem {
+                source_split: "test".to_owned(),
+                index: index.to_string(),
+                context_text: String::new(),
+                input: String::new(),
+                expected_output: vec![String::new()],
+                original_text: String::new(),
+                annotated_tokens: Vec::new(),
+            })
+            .collect();
+        let selected = partition_items(items, 3, Some(1), None);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.index.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "4", "7"]
+        );
+    }
+
+    #[test]
+    fn excludes_a_stable_partition_for_training() {
+        let items: Vec<_> = (0..10)
+            .map(|index| DevItem {
+                source_split: "test".to_owned(),
+                index: index.to_string(),
+                context_text: String::new(),
+                input: String::new(),
+                expected_output: vec![String::new()],
+                original_text: String::new(),
+                annotated_tokens: Vec::new(),
+            })
+            .collect();
+        let selected = partition_items(items, 3, None, Some(1));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.index.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "2", "3", "5", "6", "8", "9"]
+        );
+    }
+
+    #[test]
+    fn annotated_tokens_preserve_the_derived_reading() {
+        let readings = HashMap::from([
+            ("漢字".to_owned(), Some("かんじ".to_owned())),
+            ("変換".to_owned(), Some("へんかん".to_owned())),
+        ]);
+        let span: Vec<_> = "漢字への変換".chars().collect();
+        let tokens = derive_annotated_tokens(&span, &readings).unwrap();
+        assert_eq!(
+            tokens,
+            [
+                ("漢字".to_owned(), "かんじ".to_owned()),
+                ("へ".to_owned(), "へ".to_owned()),
+                ("の".to_owned(), "の".to_owned()),
+                ("変換".to_owned(), "へんかん".to_owned()),
+            ]
+        );
     }
 
     #[test]

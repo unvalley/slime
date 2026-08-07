@@ -371,6 +371,16 @@ enum AdapterTests {
         )
         _ = try conservativeLiveEngine.process(.enter)
 
+        for scalar in "raibuhenkannno".unicodeScalars {
+            let actions = try conservativeLiveEngine.process(.character(scalar))
+            livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text
+        }
+        try expect(
+            livePreedit == "ライブ変換の",
+            "a new n-syllable after ん must not create a phantom ん in live conversion"
+        )
+        _ = try conservativeLiveEngine.process(.enter)
+
         for scalar in "tashika".unicodeScalars {
             let actions = try conservativeLiveEngine.process(.character(scalar))
             livePreedit = actions.last(where: { $0.type == "update_preedit" })?.text

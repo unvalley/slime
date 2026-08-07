@@ -289,6 +289,16 @@ impl Dictionary {
         self.candidates_with_ranker(reading, DEFAULT_N_BEST, &CostOnlyRanker)
     }
 
+    /// Returns cost-ranked candidates using an explicit N-best search width.
+    ///
+    /// Interactive callers can keep the default search on the initial key
+    /// path, then request a wider search only after the user reaches the end
+    /// of the visible candidates.
+    #[must_use]
+    pub fn candidates_with_limit(&self, reading: &str, limit: usize) -> Vec<Candidate> {
+        self.candidates_with_ranker(reading, limit, &CostOnlyRanker)
+    }
+
     #[must_use]
     pub fn candidates_with_ranker(
         &self,
@@ -1907,6 +1917,24 @@ mod tests {
 
         assert!(surfaces.contains(&"橋で食べる"), "surfaces: {surfaces:?}");
         assert!(surfaces.contains(&"箸で食べる"), "surfaces: {surfaces:?}");
+    }
+
+    #[test]
+    fn explicit_wider_search_recovers_a_deep_compound_candidate() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(
+            !dictionary
+                .candidates("あさいり")
+                .iter()
+                .any(|candidate| candidate.surface == "浅煎り")
+        );
+        assert!(
+            dictionary
+                .candidates_with_limit("あさいり", 32)
+                .iter()
+                .any(|candidate| candidate.surface == "浅煎り")
+        );
     }
 
     #[test]

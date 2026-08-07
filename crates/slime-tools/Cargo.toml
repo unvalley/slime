@@ -31,6 +31,10 @@ name = "slime-devset"
 path = "src/devset.rs"
 
 [[bin]]
+name = "slime-balanced-devset"
+path = "src/balanced_devset.rs"
+
+[[bin]]
 name = "slime-dictionary-pack"
 path = "src/dictionary_pack.rs"
 

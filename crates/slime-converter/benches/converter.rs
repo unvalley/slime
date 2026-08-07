@@ -22,6 +22,12 @@ fn main() {
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
     });
+    run("converter/short_candidates_initial", iterations, || {
+        black_box(dictionary.candidates(black_box("あさいり")));
+    });
+    run("converter/short_candidates_expanded", iterations, || {
+        black_box(dictionary.candidates_with_limit(black_box("あさいり"), black_box(32)));
+    });
     run("converter/digit_counter_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("２０２６ねん８がつ１にち")));
     });

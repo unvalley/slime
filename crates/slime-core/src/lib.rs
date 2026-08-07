@@ -29,6 +29,9 @@ pub use user_data::{HistoryEntry, UserData, UserDictionaryEntry};
 /// Every built-in date candidate format, used as the default by adapters.
 pub const ALL_DATE_FORMATS: u32 = date_time_candidates::ALL_FORMATS;
 
+const EXPANDED_N_BEST: usize = 32;
+const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
     Character(char),
@@ -108,6 +111,12 @@ enum CandidateKind {
     Completion,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConversionSearch {
+    Initial,
+    Expanded,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EditableSegment {
     reading: String,
@@ -148,6 +157,7 @@ pub struct SlimeEngine {
     selected: usize,
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
+    conversion_search: ConversionSearch,
     segments: Vec<EditableSegment>,
     active_segment: usize,
     transformed_surface: Option<String>,
@@ -176,6 +186,7 @@ impl SlimeEngine {
             selected: 0,
             candidate_kind: None,
             completion_selected: false,
+            conversion_search: ConversionSearch::Initial,
             segments: Vec::new(),
             active_segment: 0,
             transformed_surface: None,
@@ -253,6 +264,28 @@ impl SlimeEngine {
         self.rebuild_ascii_surfaces();
         self.refresh_live_preview();
         self.refresh_completion_actions(true)
+    }
+
+    /// Returns conversion candidates without changing the active composition.
+    /// Platform search integrations use this path so querying alternatives
+    /// cannot move the user's selection or commit text as a side effect.
+    #[must_use]
+    pub fn conversion_candidates(&self, reading: &str) -> Vec<String> {
+        self.conversion_candidates_for_reading(reading)
+    }
+
+    /// Records a selection made outside the normal composition UI only when
+    /// the surface is one of the engine's current conversions for `reading`.
+    pub fn record_external_selection(&mut self, reading: &str, surface: &str) -> bool {
+        if !self
+            .conversion_candidates_for_reading(reading)
+            .iter()
+            .any(|candidate| candidate == surface)
+        {
+            return false;
+        }
+        self.record_history(reading, surface);
+        true
     }
 
     /// Starts explicit reconversion for a selected committed surface. An
@@ -436,6 +469,9 @@ impl SlimeEngine {
             self.candidate_kind,
             Some(CandidateKind::Conversion | CandidateKind::SegmentedConversion)
         ) {
+            if self.selected + 1 == self.candidates.len() {
+                self.expand_conversion_candidates_if_needed();
+            }
             self.selected = (self.selected + 1) % self.candidates.len();
             self.update_active_segment_surface();
             return self.candidate_actions();
@@ -459,6 +495,14 @@ impl SlimeEngine {
     }
 
     fn conversion_candidates_for_reading(&self, reading: &str) -> Vec<String> {
+        self.conversion_candidates_for_reading_with_limit(reading, None)
+    }
+
+    fn conversion_candidates_for_reading_with_limit(
+        &self,
+        reading: &str,
+        dictionary_limit: Option<usize>,
+    ) -> Vec<String> {
         let mut candidates = Vec::new();
         for surface in self.user_data.exact_dictionary_surfaces(reading) {
             push_unique(&mut candidates, surface.to_owned());
@@ -478,9 +522,11 @@ impl SlimeEngine {
         }
         // The literal hiragana reading stays selectable; hiding it made
         // single-kana words like み unreachable through the candidate window.
-        for surface in self
-            .dictionary
-            .candidates(reading)
+        let dictionary_candidates = dictionary_limit.map_or_else(
+            || self.dictionary.candidates(reading),
+            |limit| self.dictionary.candidates_with_limit(reading, limit),
+        );
+        for surface in dictionary_candidates
             .into_iter()
             .map(|candidate| candidate.surface)
         {
@@ -503,6 +549,9 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
+        if self.selected + 1 == self.candidates.len() {
+            self.expand_conversion_candidates_if_needed();
+        }
         self.selected = (self.selected + 1) % self.candidates.len();
         self.update_active_segment_surface();
         if self.candidate_kind == Some(CandidateKind::Completion) {
@@ -516,6 +565,9 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
+        if self.selected == 0 {
+            self.expand_conversion_candidates_if_needed();
+        }
         self.selected = self
             .selected
             .checked_sub(1)
@@ -525,6 +577,24 @@ impl SlimeEngine {
             self.completion_selected = true;
         }
         self.candidate_actions()
+    }
+
+    fn expand_conversion_candidates_if_needed(&mut self) {
+        if self.candidate_kind != Some(CandidateKind::Conversion)
+            || self.conversion_search == ConversionSearch::Expanded
+            || self.reading.chars().count() > MAX_EXPANDED_READING_CHARACTERS
+        {
+            return;
+        }
+        self.conversion_search = ConversionSearch::Expanded;
+
+        let expanded =
+            self.conversion_candidates_for_reading_with_limit(&self.reading, Some(EXPANDED_N_BEST));
+        let mut merged = self.candidates.clone();
+        for candidate in expanded {
+            push_unique(&mut merged, candidate);
+        }
+        self.candidates = merged;
     }
 
     fn select_candidate(&mut self, index: u32) -> Vec<SlimeAction> {
@@ -938,6 +1008,7 @@ impl SlimeEngine {
         self.selected = 0;
         self.candidate_kind = None;
         self.completion_selected = false;
+        self.conversion_search = ConversionSearch::Initial;
         self.segments.clear();
         self.active_segment = 0;
     }
@@ -1257,10 +1328,10 @@ impl Default for SlimeEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateKind, DictionaryPackWord,
-        EnginePreferences, InputEvent, LiveConversionDecision, Phase, SlimeAction, SlimeEngine,
-        TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary, date_time_candidates,
-        katakana_candidate,
+        ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateKind, ConversionSearch,
+        DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision, Phase,
+        SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary,
+        date_time_candidates, katakana_candidate,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2101,8 +2172,8 @@ mod tests {
     }
 
     #[test]
-    fn newly_selected_exact_candidate_beats_an_old_frequent_candidate() {
-        let directory = test_directory("exact-history-reselection");
+    fn one_off_exact_candidate_does_not_replace_an_established_candidate() {
+        let directory = test_directory("exact-history-learning-strength");
         fs::write(
             directory.join("history.tsv"),
             "# slime-history-v1\nかんじ\t漢字\t100\t20\nかんじ\t感じ\t1\t10\n",
@@ -2136,7 +2207,7 @@ mod tests {
         reloaded.set_preferences(preferences);
         type_text(&mut reloaded, "kanji");
         reloaded.handle(InputEvent::Space);
-        assert_eq!(reloaded.snapshot().preedit, "感じ");
+        assert_eq!(reloaded.snapshot().preedit, "漢字");
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2322,6 +2393,40 @@ mod tests {
 
         engine.handle(InputEvent::Space);
         assert_eq!(engine.snapshot().preedit, "ニホン");
+    }
+
+    #[test]
+    fn cycling_past_short_reading_candidates_runs_one_wider_search() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "asairi");
+        engine.handle(InputEvent::Space);
+
+        let initial_count = engine.snapshot().candidates.len();
+        assert!(!engine.snapshot().candidates.contains(&"浅煎り".to_owned()));
+
+        for _ in 0..initial_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.len() > initial_count);
+        assert!(engine.snapshot().candidates.contains(&"浅煎り".to_owned()));
+        assert_eq!(engine.snapshot().selected, Some(initial_count));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn cycling_long_reading_candidates_keeps_the_initial_search_width() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "watashihanihonjin");
+        engine.handle(InputEvent::Space);
+
+        let initial_count = engine.snapshot().candidates.len();
+        for _ in 0..initial_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert_eq!(engine.snapshot().candidates.len(), initial_count);
+        assert_eq!(engine.conversion_search, ConversionSearch::Initial);
     }
 
     #[test]

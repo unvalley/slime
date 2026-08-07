@@ -9,6 +9,14 @@
 
 ## 1. TL;DR
 
+### 2026-08-02 実測による更新
+
+当初の推定後にzenz-v3.1-xsmallでN-best rescoringを実装し、held-out AJIMEEの`acc@1 0.535 → 0.655`（+12pt）を確認した一方、M3 Metalでp95 86.3 msとなり20 ms予算を超えた。ラティスcost差によるconfidence gateは精度を保って18.5%を省略したがp95 56 ms、1MB hashed studentはgold 10,000件学習でheld-out `0.525`、teacher 10,000件蒸留でも固定dev `0.359`に留まった。さらに1.74M parameterの共有bi-encoder studentは固定devを`0.3139 → 0.3331`、採点p95 6.86 msまで改善したが、凍結後のheld-out AJIMEEは現在のbaseline `0.530 → 0.520`、UD news/blog外部devは`0.6405 → 0.5921`へ悪化した。
+
+非ニューラル側では、CC BY-SA 4.0のUD Japanese GSD train 7,050文から作った直前語context bigram（81,266遷移、weight 1500）が同一domainのheld-out testを`0.6966 → 0.7647`（+6.81pt）、候補生成込みp95 0.86 msで改善した。ただしこのhot-path値はモデル読み込みを含まない。無効な遷移表の生成を除いた後でも、同一コマンド3回の中央値は冷起動0.22秒・最大RSS 49.1 MB（モデルなし0.09秒・23.8 MB）だった。JWTD devは-0.25pt、AJIMEE top-1は差なしである。したがって、**LLM/生成は必須ではないが、狭いexact bigramも汎用解ではない**。現在は品質と起動コストの両方からどちらも製品採用No-Goとする。複数domain・約1億語・形態論付きのBCCWJは技術要件に合うが、商用商品化は有償契約、公開UD annotationはCC BY-NC-SAで本文なしである。契約するか、商用条件が明確な別corpusを構築できた場合だけclass backoffとcompact格納を再評価する。詳細な再現値は[evaluation.md](evaluation.md)を参照。
+
+2026-08-03にJWTD trainの固定dev非重複43,605窓を追加し、word=250とGSD context=1500を独立devで凍結して合成した。JWTD devは`0.3139 → 0.3682`、GSD devは`0.6405 → 0.6828`、GSD held-out testは`0.6966 → 0.7090`となったが、AJIMEE held-outが`0.530 → 0.500`へ悪化した。また冷起動中央値1.47秒、最大RSS 204.7 MBである。**複数devの同時改善だけでは採用根拠にならず、複数held-outの主指標がすべて非悪化であることをGo条件に追加する**。
+
 - **第一候補: 文字レベル小型ニューラルLM(≈10〜25Mパラメータ、int8/int4量子化)による N-best リランキング(rescoring専用、生成はしない)**。根拠: (1) acc@10 83.5% が示す通り正解は既に候補内にあり、リランキングだけで理論上限 +30pt の伸び代がある。(2) 同一ベンチマーク(AJIMEE-Bench の元になった JWTD test 由来 200件)で、Zenzai の 26M パラメータモデル(量子化後 19.9MB)ですら生成方式で Acc@1 66.5%(Google日本語入力 54.0%)を達成しており、同音異義語の文脈選択はニューラルLMが最も直接的に解く誤りタイプであることが実証済み [Miwa+ 2025]。(3) rescoring は自己回帰生成と違い prefill(並列評価)のみで済むため、生成方式の 3.5〜6.9ms/文字という遅延制約を回避でき、p95 20ms 予算に収まる見込みが高い。
 - **次点: 語彙化単語bigram(内容語中心) + Stolckeプルーニング + 量子化succinct格納による従来コストへの加点**。純Rust・学習パイプライン最小で +2〜5pt 程度(近接タスクからの推定)。第一候補の前段実装・フォールバックとしても価値がある。
 - 識別モデル(構造化SVM)は BCCWJ 4万文で F値 +4.4pt の実績があるが [Tokunaga+ 2011]、素性が局所(bigram)に留まる限り「長距離の共起で決まる同音異義語」には効きにくいと原著自身が分析しており、本製品の主要残存誤りへの適合度で第一候補に劣る。

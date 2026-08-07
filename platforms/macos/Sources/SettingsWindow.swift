@@ -290,6 +290,7 @@ enum SettingsTab: String {
     case general
     case dictionary
     case history
+    case license
 }
 
 struct SettingsRootView: View {
@@ -311,6 +312,9 @@ struct SettingsRootView: View {
             HistorySettingsView(model: model)
                 .tabItem { Label("入力履歴", systemImage: "clock.arrow.circlepath") }
                 .tag(SettingsTab.history)
+            LicenseSettingsView()
+                .tabItem { Label("ライセンス", systemImage: "key") }
+                .tag(SettingsTab.license)
         }
         .padding(24)
         .frame(minWidth: 680, minHeight: 520)

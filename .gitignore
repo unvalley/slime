@@ -1,4 +1,6 @@
 /target/
+/landing/dist/
+/landing/node_modules/
 .slime-private/
 *.profraw
 *.profdata

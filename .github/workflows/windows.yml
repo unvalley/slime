@@ -1,0 +1,93 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tsf:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust-target: x86_64-pc-windows-msvc
+            cmake-platform: x64
+            architecture: x64
+          - rust-target: i686-pc-windows-msvc
+            cmake-platform: Win32
+            architecture: x86
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - name: Build Rust C ABI
+        run: cargo build --release -p slime-ffi --target ${{ matrix.rust-target }}
+      - name: Configure TSF COM DLL
+        shell: pwsh
+        run: |
+          $release = Resolve-Path "target/${{ matrix.rust-target }}/release"
+          $importLibrary = Get-ChildItem $release -Filter "*slime_ffi*.lib" | Select-Object -First 1
+          if (-not $importLibrary) { throw "slime_ffi import library was not produced" }
+          cmake -S platforms/windows/native `
+            -B "target/windows-${{ matrix.architecture }}" `
+            -A "${{ matrix.cmake-platform }}" `
+            -DSLIME_FFI_LIBRARY="$($importLibrary.FullName)"
+      - name: Build TSF COM DLL
+        run: cmake --build "target/windows-${{ matrix.architecture }}" --config Release
+      - name: Run native tests
+        run: ctest --test-dir "target/windows-${{ matrix.architecture }}" -C Release --output-on-failure
+      - name: Verify DLL exports
+        shell: pwsh
+        run: |
+          $dll = Resolve-Path "target/windows-${{ matrix.architecture }}/Release/SlimeIME.dll"
+          $exports = dumpbin /exports $dll
+          foreach ($name in "DllCanUnloadNow", "DllGetClassObject", "DllRegisterServer", "DllUnregisterServer") {
+            if ($exports -notmatch $name) { throw "missing export: $name" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SlimeIME-${{ matrix.architecture }}-unsigned
+          path: |
+            target/windows-${{ matrix.architecture }}/Release/SlimeIME.dll
+            target/windows-${{ matrix.architecture }}/Release/SlimeIMERegister.exe
+            target/windows-${{ matrix.architecture }}/Release/SlimeSettings.exe
+            target/windows-${{ matrix.architecture }}/Release/slime_ffi.dll
+
+  package:
+    needs: tsf
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SlimeIME-x64-unsigned
+          path: target/package/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: SlimeIME-x86-unsigned
+          path: target/package/x86
+      - name: Install pinned NSIS
+        shell: pwsh
+        run: choco install nsis --version=3.12.0 --yes --no-progress
+      - name: Resolve package version
+        id: version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq "slime-core").version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "unsupported version: $version" }
+          "value=$version" >> $env:GITHUB_OUTPUT
+      - name: Build unsigned offline installer
+        shell: pwsh
+        run: |
+          scripts/build-windows-installer.ps1 `
+            -Version "${{ steps.version.outputs.value }}" `
+            -PayloadX64 target/package/x64 `
+            -PayloadX86 target/package/x86 `
+            -Output "target/package/Slime-${{ steps.version.outputs.value }}-windows-unsigned.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Slime-${{ steps.version.outputs.value }}-windows-unsigned
+          path: target/package/Slime-${{ steps.version.outputs.value }}-windows-unsigned.exe

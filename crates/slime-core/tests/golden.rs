@@ -39,9 +39,9 @@ fn core_conversion_golden_cases() {
 
 /// Conversions the current cost model cannot get right from the reading
 /// alone: each needs word context (漢字/感じ, 精度/制度, 箸/橋 share a noun
-/// class, so connection costs cannot separate them). These stay red until a
-/// context model lands — do not make them pass with cost overrides or by
-/// adding the test sentences to the dictionary.
+/// class, while さがつく has competing literal-kana, 差, and 佐賀 paths).
+/// These stay red until a context/POS phrase model lands — do not make them
+/// pass with cost overrides or by adding the test sentences to the dictionary.
 #[test]
 #[ignore = "requires a context model"]
 fn context_dependent_golden_cases() {
@@ -52,6 +52,7 @@ fn context_dependent_golden_cases() {
             "精度を高める工夫をしていきましょう",
         ),
         ("hashidetaberu", "箸で食べる"),
+        ("sagatsuku", "差がつく"),
     ];
 
     for (input, expected) in cases {

@@ -14,6 +14,16 @@ mkdir -p "$workspace_dir/target/macos"
 
 swiftc \
   -swift-version 5 \
+  -framework AppKit \
+  -framework Security \
+  "$workspace_dir/platforms/macos/Sources/Licensing.swift" \
+  "$workspace_dir/platforms/macos/Tests/LicensingTests.swift" \
+  -o "$workspace_dir/target/macos/licensing-tests"
+
+"$workspace_dir/target/macos/licensing-tests"
+
+swiftc \
+  -swift-version 5 \
   -import-objc-header "$workspace_dir/crates/slime-ffi/include/slime_ffi.h" \
   -L "$workspace_dir/target/release" \
   -lslime_ffi \

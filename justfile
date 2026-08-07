@@ -72,9 +72,21 @@ evaluate-ajimee *args:
 build-devset:
     scripts/build-devset.sh
 
+# JWTD trainの固定dev非重複部分から文脈モデル評価用の注釈コーパスを生成する
+build-jwtd-context-corpus:
+    scripts/build-jwtd-context-corpus.sh
+
 # 開発セットで変換品質を評価する（コスト・モデル調整はこちらで行う）
 evaluate-dev *args:
     scripts/evaluate-dev.sh {{args}}
+
+# UD Japanese GSD (news/blog) から外部ドメイン開発・最終testセットを生成する
+build-balanced-devset:
+    scripts/build-balanced-devset.sh
+
+# 外部ドメインdevで同音異義語の文脈順位を評価する（testはモデル凍結後だけ使う）
+evaluate-balanced-dev *args:
+    scripts/evaluate-balanced-dev.sh {{args}}
 
 # ニューラルrescoring評価用のzenz GGUFモデルを取得する
 fetch-neural-model:
@@ -101,6 +113,18 @@ verify-macos: build-macos
 
 # macOS版をまとめて検証する
 check-macos: check test-macos verify-macos
+
+# Windows TSFアダプターをx64/x86向けに型検査する
+check-windows:
+    scripts/check-windows.sh
+
+# Slime専用Landingを生成し、価格・trial・ホスト境界を検証する
+check-landing:
+    cd landing && pnpm build && pnpm check
+
+# slime.unvalley.meへ静的Landingをdeployする（実Checkout URLが必須）
+deploy-landing:
+    cd landing && pnpm run deploy
 
 # Git管理外の開発用追加辞書をApplication Supportへ配置する
 install-local-dictionary-packs:

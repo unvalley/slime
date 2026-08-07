@@ -17,6 +17,25 @@ typedef struct SlimeBuffer {
   size_t capacity;
 } SlimeBuffer;
 
+typedef struct SlimeStringView {
+  const uint8_t *data;
+  size_t len;
+} SlimeStringView;
+
+typedef struct SlimeActionView {
+  uint32_t kind;
+  SlimeStringView text;
+  const SlimeStringView *candidates;
+  size_t candidate_count;
+  size_t selected;
+  size_t selection_start;
+  size_t selection_length;
+} SlimeActionView;
+
+typedef void (*SlimeActionCallback)(void *context,
+                                    const SlimeActionView *action);
+typedef void (*SlimeStringCallback)(void *context, SlimeStringView value);
+
 enum SlimeEventKind {
   SLIME_EVENT_CHARACTER = 0,
   SLIME_EVENT_SPACE = 1,
@@ -38,11 +57,49 @@ enum SlimeEventKind {
   SLIME_EVENT_SHRINK_SEGMENT = 17,
 };
 
+enum SlimeActionKind {
+  SLIME_ACTION_UPDATE_PREEDIT = 0,
+  SLIME_ACTION_SHOW_CANDIDATES = 1,
+  SLIME_ACTION_HIDE_CANDIDATES = 2,
+  SLIME_ACTION_COMMIT = 3,
+  SLIME_ACTION_CLEAR = 4,
+  SLIME_ACTION_FORWARD_KEY = 5,
+};
+
+enum SlimeStatus {
+  SLIME_STATUS_OK = 0,
+  SLIME_STATUS_NULL_HANDLE = 1,
+  SLIME_STATUS_INVALID_EVENT = 2,
+  SLIME_STATUS_NULL_CALLBACK = 3,
+  SLIME_STATUS_PANIC = 4,
+  SLIME_STATUS_INVALID_UTF8 = 5,
+  SLIME_STATUS_INVALID_CANDIDATE = 6,
+};
+
 SlimeHandle *slime_create(void);
 SlimeHandle *slime_create_with_data_dir(const uint8_t *data_dir,
                                     size_t data_dir_len);
 void slime_destroy(SlimeHandle *handle);
 SlimeBuffer slime_process(SlimeHandle *handle, uint32_t event_kind, uint32_t value);
+/* Calls callback synchronously for each action. All views are borrowed only
+   for that callback; the callback must not retain them, unwind, or re-enter
+   this handle. Existing JSON callers can continue using slime_process. */
+uint32_t slime_process_actions(SlimeHandle *handle, uint32_t event_kind,
+                               uint32_t value, void *context,
+                               SlimeActionCallback callback);
+/* Enumerates candidates synchronously without changing composition state.
+   Views are borrowed for one callback and must not be retained. */
+uint32_t slime_conversion_candidates(const SlimeHandle *handle,
+                                     const uint8_t *reading,
+                                     size_t reading_len, void *context,
+                                     SlimeStringCallback callback);
+/* Learns a selection made by an external candidate consumer. The surface must
+   be one of slime_conversion_candidates for the same reading. */
+uint32_t slime_record_external_selection(SlimeHandle *handle,
+                                         const uint8_t *reading,
+                                         size_t reading_len,
+                                         const uint8_t *surface,
+                                         size_t surface_len);
 SlimeBuffer slime_set_options(SlimeHandle *handle, bool live_conversion,
                           bool history_completion);
 SlimeBuffer slime_set_options_v2(SlimeHandle *handle, bool live_conversion,

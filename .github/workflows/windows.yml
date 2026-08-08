@@ -42,7 +42,14 @@ jobs:
         shell: pwsh
         run: |
           $dll = Resolve-Path "target/windows-${{ matrix.architecture }}/Release/SlimeIME.dll"
-          $exports = dumpbin /exports $dll
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          $installationPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $installationPath) { throw "Visual Studio C++ tools were not found" }
+          $dumpbin = Get-ChildItem "$installationPath/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe was not found" }
+          $exports = & $dumpbin.FullName /exports $dll
           foreach ($name in "DllCanUnloadNow", "DllGetClassObject", "DllRegisterServer", "DllUnregisterServer") {
             if ($exports -notmatch $name) { throw "missing export: $name" }
           }

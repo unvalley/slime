@@ -398,7 +398,8 @@ std::optional<std::string> WideToUtf8(const wchar_t *value,
   if (length == 0) {
     return std::string{};
   }
-  if (value == nullptr || length > std::numeric_limits<int>::max()) {
+  if (value == nullptr ||
+      length > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return std::nullopt;
   }
   const int inputLength = static_cast<int>(length);

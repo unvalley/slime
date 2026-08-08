@@ -323,6 +323,21 @@ fn run_adaptive_context_benchmarks(iterations: u64) {
         query_and_clear(&mut persistent_context, target_reading);
     });
 
+    let mut external_context = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+    black_box(external_context.set_preferences(preferences));
+    external_context.set_external_left_context(&format!("既存文書{previous_surface}"));
+    assert_eq!(
+        external_context
+            .conversion_candidates(target_reading)
+            .first()
+            .map(String::as_str),
+        Some(target_surface),
+        "external context fixture must affect ranking"
+    );
+    run("engine/external_context_500", iterations, || {
+        query_and_clear(&mut external_context, target_reading);
+    });
+
     fs::remove_dir_all(directory).expect("remove context history benchmark directory");
 }
 

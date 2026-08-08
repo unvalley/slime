@@ -133,6 +133,39 @@ impl UserData {
             .collect()
     }
 
+    /// Returns repeated contextual selections whose previous surface is a
+    /// meaningful suffix of text supplied by the input client. The external
+    /// text has no reading, so require at least a two-character surface anchor
+    /// to avoid broad matches such as `人` matching `本人`.
+    #[must_use]
+    pub(crate) fn contextual_history_surfaces_for_external_surface(
+        &self,
+        external_surface: &str,
+        reading: &str,
+    ) -> Vec<&str> {
+        let mut entries: Vec<_> = self
+            .context_history
+            .iter()
+            .filter(|entry| {
+                entry.previous_surface.chars().count() >= 2
+                    && external_surface.ends_with(&entry.previous_surface)
+                    && entry.reading == reading
+                    && entry.count >= MIN_CONTEXT_USE_COUNT
+                    && is_useful_context_anchor(&entry.previous_reading, &entry.previous_surface)
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .collect();
+        sort_context_history(&mut entries);
+
+        let mut surfaces = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if !surfaces.contains(&entry.surface.as_str()) {
+                surfaces.push(entry.surface.as_str());
+            }
+        }
+        surfaces
+    }
+
     #[must_use]
     pub(crate) fn contextual_completion_surfaces(
         &self,
@@ -806,6 +839,35 @@ mod tests {
         let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
         assert!(context.starts_with(CONTEXT_HISTORY_HEADER));
         assert!(context.contains("ぶんしょう\t文章\tかんじ\t漢字\t2\t"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_surface_context_requires_a_specific_repeated_suffix() {
+        let directory = test_directory("external-surface-context");
+        fs::write(
+            directory.join("context_history.tsv"),
+            format!(
+                "{CONTEXT_HISTORY_HEADER}\n\
+                 ひと\t人\tしょうめい\t証明\t20\t30\n\
+                 へや\t部屋\tしょうめい\t照明\t2\t20\n\
+                 しつ\t部屋\tしょうめい\t照明\t5\t10\n\
+                 ほんにん\t本人\tしょうめい\t証明\t1\t40\n"
+            ),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        assert_eq!(
+            data.contextual_history_surfaces_for_external_surface("既存文書の部屋", "しょうめい"),
+            ["照明"]
+        );
+        assert!(
+            data.contextual_history_surfaces_for_external_surface("本人", "しょうめい")
+                .is_empty(),
+            "a one-character anchor or one-off context must not match"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

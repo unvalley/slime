@@ -627,16 +627,10 @@ impl SlimeEngine {
             push_unique(&mut candidates, surface.to_owned());
         }
         if self.history_is_available() {
-            if let Some((previous_reading, previous_surface)) =
-                self.session_history.previous_commit()
+            for surface in
+                self.contextual_history_surfaces_for_reading(reading, explicit_previous_surface)
             {
-                for surface in self.user_data.contextual_history_surfaces(
-                    previous_reading,
-                    previous_surface,
-                    reading,
-                ) {
-                    push_unique(&mut candidates, surface.to_owned());
-                }
+                push_unique(&mut candidates, surface.to_owned());
             }
             for surface in self.user_data.exact_history_surfaces(reading) {
                 push_unique(&mut candidates, surface.to_owned());
@@ -777,6 +771,34 @@ impl SlimeEngine {
 
     fn history_is_available(&self) -> bool {
         self.preferences.history_completion && !self.preferences.private_mode
+    }
+
+    fn contextual_history_surfaces_for_reading(
+        &self,
+        reading: &str,
+        explicit_previous_surface: Option<&str>,
+    ) -> Vec<&str> {
+        if !self.history_is_available() {
+            return Vec::new();
+        }
+        if let Some(previous_surface) = explicit_previous_surface {
+            return self
+                .user_data
+                .contextual_history_surfaces_for_external_surface(previous_surface, reading);
+        }
+        if let Some((previous_reading, previous_surface)) = self.session_history.previous_commit() {
+            return self.user_data.contextual_history_surfaces(
+                previous_reading,
+                previous_surface,
+                reading,
+            );
+        }
+        self.session_history
+            .previous_surface()
+            .map_or_else(Vec::new, |previous_surface| {
+                self.user_data
+                    .contextual_history_surfaces_for_external_surface(previous_surface, reading)
+            })
     }
 
     fn next_candidate(&mut self) -> Vec<SlimeAction> {
@@ -1098,16 +1120,7 @@ impl SlimeEngine {
         } else {
             Vec::new()
         };
-        if self.history_is_available()
-            && let Some((previous_reading, previous_surface)) =
-                self.session_history.previous_commit()
-        {
-            history.extend(self.user_data.contextual_history_surfaces(
-                previous_reading,
-                previous_surface,
-                reading,
-            ));
-        }
+        history.extend(self.contextual_history_surfaces_for_reading(reading, None));
         let mut context = Vec::new();
         if !self.preferences.private_mode
             && let Some(previous_surface) = self.session_history.previous_surface()
@@ -2484,6 +2497,63 @@ mod tests {
     }
 
     #[test]
+    fn external_document_context_reuses_repeated_local_context_history() {
+        let directory = test_directory("external-adaptive-context");
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(preferences);
+
+        for _ in 0..2 {
+            engine.reset_context();
+            convert_and_commit(&mut engine, "heya", "部屋");
+            convert_and_commit(&mut engine, "shoumei", "照明");
+            engine.reset_context();
+            convert_and_commit(&mut engine, "bunshou", "文章");
+            convert_and_commit(&mut engine, "shoumei", "証明");
+        }
+        let context_before = fs::read(directory.join("context_history.tsv")).unwrap();
+
+        let mut baseline = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        baseline.set_preferences(preferences);
+        type_text(&mut baseline, "shoumei");
+        baseline.handle(InputEvent::Space);
+        assert_eq!(baseline.snapshot().preedit, "証明");
+
+        let mut room = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        room.set_preferences(preferences);
+        room.set_external_left_context("既存文書の部屋");
+        type_text(&mut room, "shoumei");
+        let actions = room.handle(InputEvent::Space);
+        assert_eq!(room.snapshot().preedit, "照明");
+        assert_eq!(
+            shown_candidate_details(&actions)[0].annotation,
+            CandidateAnnotation::History
+        );
+        room.handle(InputEvent::Enter);
+        assert_eq!(
+            fs::read(directory.join("context_history.tsv")).unwrap(),
+            context_before,
+            "external document text must not be persisted as a learned edge"
+        );
+
+        let mut document = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        document.set_preferences(preferences);
+        document.set_external_left_context("既存文書の文章");
+        type_text(&mut document, "shoumei");
+        document.handle(InputEvent::Space);
+        assert_eq!(document.snapshot().preedit, "証明");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn private_mode_discards_external_document_context() {
         let directory = test_directory("private-external-document-context");
         write_context_pack(&directory);
@@ -2496,6 +2566,32 @@ mod tests {
         type_text(&mut engine, "kanji");
         engine.handle(InputEvent::Space);
         assert_ne!(engine.snapshot().preedit, "漢字");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn private_mode_ignores_external_adaptive_context_history() {
+        let directory = test_directory("private-external-adaptive-context");
+        fs::write(
+            directory.join("context_history.tsv"),
+            "# slime-context-history-v1\nへや\t部屋\tしょうめい\t照明\t10\t10\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            private_mode: true,
+            ..EnginePreferences::default()
+        });
+
+        assert_eq!(
+            engine.conversion_candidates_with_left_context("既存文書の部屋", "しょうめい"),
+            engine.conversion_candidates("しょうめい")
+        );
+        engine.set_external_left_context("既存文書の部屋");
+        type_text(&mut engine, "shoumei");
+        engine.handle(InputEvent::Space);
+        assert_ne!(engine.snapshot().preedit, "照明");
 
         fs::remove_dir_all(directory).unwrap();
     }

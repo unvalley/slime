@@ -16,6 +16,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$makensisCommand = Get-Command $Makensis -ErrorAction SilentlyContinue
+if ($makensisCommand) {
+    $Makensis = $makensisCommand.Source
+} elseif ($Makensis -eq "makensis.exe") {
+    $installedMakensis = Join-Path ${env:ProgramFiles(x86)} "NSIS/makensis.exe"
+    if (-not (Test-Path -LiteralPath $installedMakensis -PathType Leaf)) {
+        throw "makensis.exe was not found on PATH or in the standard NSIS installation"
+    }
+    $Makensis = $installedMakensis
+} else {
+    throw "makensis executable was not found: $Makensis"
+}
 $repository = Split-Path -Parent $PSScriptRoot
 $installerSource = Join-Path $repository "platforms/windows/installer/Slime.nsi"
 $x64 = (Resolve-Path $PayloadX64).Path

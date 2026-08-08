@@ -11,8 +11,8 @@ use std::time::Instant;
 use serde::Serialize;
 use slime_converter::{Dictionary, DictionaryEntry, DictionaryLayer};
 
-const COMPOUND_ENTRIES_PER_SEGMENT: usize = 4;
-const COMPOUND_CANDIDATE_LIMIT: usize = 16;
+const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
+const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;

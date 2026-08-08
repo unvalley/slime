@@ -35,8 +35,8 @@ pub const ALL_DATE_FORMATS: u32 = date_time_candidates::ALL_FORMATS;
 const EXPANDED_N_BEST: usize = 32;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
 const MAX_COMPOUND_READING_CHARACTERS: usize = 16;
-const COMPOUND_ENTRIES_PER_SEGMENT: usize = 4;
-const COMPOUND_CANDIDATE_LIMIT: usize = 16;
+const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
+const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
@@ -3601,6 +3601,53 @@ mod tests {
         }
 
         assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_deeper_component_and_product_candidates() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [("あいうえお", "左"), ("かきくけこ", "右")] {
+            for index in 0..8 {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{}", index + 1),
+                    index * 100,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let reading = "あいうえおかきくけこ";
+        let old_bound = dictionary.compound_candidates(reading, 4, 16);
+        let wider = dictionary.compound_candidates(reading, 8, 32);
+        let deeper_component = "左5右1".to_owned();
+        let deeper_product = wider
+            .get(20)
+            .expect("the wider product beam should contain at least 21 candidates")
+            .surface
+            .clone();
+        assert!(!old_bound.iter().any(|candidate| {
+            candidate.surface == deeper_component || candidate.surface == deeper_product
+        }));
+        assert!(
+            wider
+                .iter()
+                .any(|candidate| candidate.surface == deeper_component)
+        );
+
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, reading);
+        engine.handle(InputEvent::Space);
+        let initial = engine.snapshot().candidates;
+        assert!(!initial.contains(&deeper_component));
+        assert!(!initial.contains(&deeper_product));
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        let expanded = engine.snapshot().candidates;
+        assert!(expanded.contains(&deeper_component));
+        assert!(expanded.contains(&deeper_product));
         assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
     }
 

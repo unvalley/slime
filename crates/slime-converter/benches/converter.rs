@@ -39,14 +39,14 @@ fn main() {
         black_box(dictionary.candidates_with_limit(black_box("あさいり"), black_box(32)));
     });
     run("converter/short_compound_recall", iterations, || {
-        black_box(dictionary.compound_candidates(black_box("あさいり"), 4, 16));
+        black_box(dictionary.compound_candidates(black_box("あさいり"), 8, 32));
     });
     let three_part_dictionary = three_part_dictionary();
     run("converter/three_part_compound_recall", iterations, || {
         black_box(three_part_dictionary.compound_candidates(
             black_box("あいうえおかきくけ"),
-            4,
-            16,
+            8,
+            32,
         ));
     });
     let one_character_segment_dictionary = one_character_segment_dictionary();
@@ -56,8 +56,8 @@ fn main() {
         || {
             black_box(one_character_segment_dictionary.compound_candidates(
                 black_box("あいうえお"),
-                4,
-                16,
+                8,
+                32,
             ));
         },
     );
@@ -68,8 +68,8 @@ fn main() {
         || {
             black_box(kana_only_segment_dictionary.compound_candidates(
                 black_box("やまだのけんきゅうしつ"),
-                4,
-                16,
+                8,
+                32,
             ));
         },
     );
@@ -77,24 +77,24 @@ fn main() {
     run("converter/four_part_compound_recall", iterations, || {
         black_box(four_part_dictionary.compound_candidates(
             black_box("あいうえおかきくけこさし"),
-            4,
-            16,
+            8,
+            32,
         ));
     });
     let five_part_dictionary = five_part_dictionary();
     run("converter/five_part_compound_recall", iterations, || {
         black_box(five_part_dictionary.compound_candidates(
             black_box("あいうえおかきくけこさしすせそ"),
-            4,
-            16,
+            8,
+            32,
         ));
     });
     let six_part_dictionary = six_part_dictionary();
     run("converter/six_part_compound_recall", iterations, || {
         black_box(six_part_dictionary.compound_candidates(
             black_box("あいうえおかきくけこさし"),
-            4,
-            16,
+            8,
+            32,
         ));
     });
     run("converter/digit_counter_phrase", iterations, || {

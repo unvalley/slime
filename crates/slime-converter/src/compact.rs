@@ -117,6 +117,32 @@ impl CompactDictionary {
         readings
     }
 
+    /// Calls `callback` for dictionary entries whose surface exactly matches
+    /// `surface`, without allocating the reverse readings.
+    pub(crate) fn for_each_surface_entry(
+        &self,
+        surface: &str,
+        mut callback: impl FnMut(CompactEntry),
+    ) {
+        let Some(output) = self.reverse_fst.get(surface.as_bytes()) else {
+            return;
+        };
+        let mut cursor = usize::try_from(output.value()).expect("reverse block offset");
+        let count = read_reverse_varint(&mut cursor);
+        for _ in 0..count {
+            let offset = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
+            let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
+            let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
+                .expect("valid reverse reading UTF-8");
+            cursor += 2;
+            self.for_each_exact(reading, |entry| {
+                if entry.surface == surface {
+                    callback(entry);
+                }
+            });
+        }
+    }
+
     /// Checks a split surface against the reverse index without joining or
     /// allocating either part.
     pub(crate) fn joined_surface_has_reading_suffix(
@@ -248,5 +274,15 @@ mod tests {
         assert!(dictionary.joined_surface_has_reading_suffix("格納", "庫", "こ"));
         assert!(!dictionary.joined_surface_has_reading_suffix("格納", "庫", "こう"));
         assert!(!dictionary.joined_surface_has_reading_suffix("未知", "語", "ご"));
+    }
+
+    #[test]
+    fn reverse_index_visits_matching_surface_entries_without_allocating() {
+        let dictionary = CompactDictionary::bundled();
+        let mut entries = Vec::new();
+        dictionary.for_each_surface_entry("東海", |entry| {
+            entries.push((entry.left_id, entry.right_id));
+        });
+        assert!(entries.contains(&(1924, 1924)), "entries: {entries:?}");
     }
 }

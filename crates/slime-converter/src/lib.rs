@@ -136,6 +136,21 @@ pub struct Dictionary {
 /// lattice; neither changes the dictionary or retains document text.
 struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
+    follows_region_name: bool,
+}
+
+impl<'a> DictionaryDocumentContextRanker<'a> {
+    fn new(dictionary: &'a Dictionary, left_context: &str) -> Self {
+        Self {
+            dictionary,
+            follows_region_name: dictionary.document_context_has_pos_suffix(
+                left_context,
+                &MOZC_REGION_POS_IDS,
+                2,
+                DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS,
+            ),
+        }
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -166,7 +181,17 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             } else {
                 0
             };
-        repeated_cost.saturating_sub(phrase_promotion.max(notation_promotion))
+        let region_line_promotion =
+            if self.follows_region_name && reading == "せん" && conversion.surface == "線" {
+                DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION
+            } else {
+                0
+            };
+        repeated_cost.saturating_sub(
+            phrase_promotion
+                .max(notation_promotion)
+                .max(region_line_promotion),
+        )
     }
 }
 
@@ -208,6 +233,10 @@ const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
 const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 2_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
+const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
+const DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS: usize = 8;
+const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
+const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
 const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
 
@@ -215,15 +244,22 @@ fn structured_notation_matches(left_context: &str, reading: &str, surface: &str)
     match (reading, surface) {
         ("しん", "進") => radix_suffix_matches(left_context),
         ("か" | "にち", "日") => calendar_day_suffix_matches(left_context, reading),
+        ("さい", "歳") => trailing_integer(left_context).is_some_and(|age| age <= 150),
+        ("かこく", "カ国") => {
+            trailing_integer(left_context).is_some_and(|countries| countries <= 999)
+        }
+        ("だい", "台") => trailing_integer(left_context).is_some(),
         _ => false,
     }
 }
 
 fn radix_suffix_matches(left_context: &str) -> bool {
-    split_trailing_decimal(left_context).is_some_and(|(prefix, radix)| {
-        COMMON_RADICES.contains(&radix)
-            && !matches!(prefix.chars().next_back(), Some('.' | '．' | '-' | '−'))
-    })
+    trailing_integer(left_context).is_some_and(|radix| COMMON_RADICES.contains(&radix))
+}
+
+fn trailing_integer(text: &str) -> Option<u32> {
+    let (prefix, value) = split_trailing_decimal(text)?;
+    (!matches!(prefix.chars().next_back(), Some('.' | '．' | '-' | '−'))).then_some(value)
 }
 
 fn calendar_day_suffix_matches(left_context: &str, reading: &str) -> bool {
@@ -719,6 +755,45 @@ impl Dictionary {
         false
     }
 
+    fn document_context_has_pos_suffix(
+        &self,
+        left_context: &str,
+        pos_ids: &[u16],
+        minimum_characters: usize,
+        maximum_characters: usize,
+    ) -> bool {
+        let Some(compact) = self.bundled else {
+            return false;
+        };
+        let context_start = left_context
+            .char_indices()
+            .rev()
+            .nth(maximum_characters.saturating_sub(1))
+            .map_or(0, |(index, _)| index);
+        let context_tail = &left_context[context_start..];
+        let context_characters = context_tail.chars().count();
+        for (position, (index, _)) in context_tail.char_indices().enumerate() {
+            if context_characters - position < minimum_characters {
+                break;
+            }
+            let suffix = &context_tail[index..];
+            let mut best_cost = i32::MAX;
+            let mut best_matching_cost = i32::MAX;
+            compact.for_each_surface_entry(suffix, |entry| {
+                best_cost = best_cost.min(entry.word_cost);
+                if pos_ids.contains(&entry.right_id) {
+                    best_matching_cost = best_matching_cost.min(entry.word_cost);
+                }
+            });
+            if best_matching_cost != i32::MAX
+                && best_matching_cost <= best_cost.saturating_add(DOCUMENT_POS_SURFACE_COST_GAP)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Calls `callback` for every entry whose reading equals `reading`.
     fn for_each_exact<'s>(&'s self, reading: &str, mut callback: impl FnMut(EntryView<'s>)) {
         if let Some(compact) = self.bundled {
@@ -808,7 +883,7 @@ impl Dictionary {
             reading,
             left_context,
             DEFAULT_N_BEST,
-            &DictionaryDocumentContextRanker { dictionary: self },
+            &DictionaryDocumentContextRanker::new(self, left_context),
         )
     }
 
@@ -834,7 +909,7 @@ impl Dictionary {
             reading,
             left_context,
             limit,
-            &DictionaryDocumentContextRanker { dictionary: self },
+            &DictionaryDocumentContextRanker::new(self, left_context),
         )
     }
 
@@ -3028,6 +3103,46 @@ mod tests {
         assert_eq!(
             dictionary.candidates_with_context("にち", "8月1")[0].surface,
             "日時"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_numeric_counter_notation() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("さい")[0].surface, "際");
+        assert_eq!(
+            dictionary.candidates_with_context("さい", "5")[0].surface,
+            "歳"
+        );
+        assert_eq!(dictionary.candidates("かこく")[0].surface, "過酷");
+        assert_eq!(
+            dictionary.candidates_with_context("かこく", "6")[0].surface,
+            "カ国"
+        );
+        assert_eq!(dictionary.candidates("だい")[0].surface, "第");
+        assert_eq!(
+            dictionary.candidates_with_context("だい", "4")[0].surface,
+            "台"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("だい", "1.5")[0].surface,
+            "第"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_bounded_region_phrases() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("せん")[0].surface, "1000");
+        assert_eq!(
+            dictionary.candidates_with_context("せん", "京義・東海")[0].surface,
+            "線"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("せん", "超長距離")[0].surface,
+            "1000"
         );
     }
 

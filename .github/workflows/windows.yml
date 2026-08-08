@@ -50,8 +50,9 @@ jobs:
             Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe was not found" }
           $exports = & $dumpbin.FullName /exports $dll
+          $exportsText = $exports -join [Environment]::NewLine
           foreach ($name in "DllCanUnloadNow", "DllGetClassObject", "DllRegisterServer", "DllUnregisterServer") {
-            if ($exports -notmatch $name) { throw "missing export: $name" }
+            if ($exportsText -notmatch [regex]::Escape($name)) { throw "missing export: $name" }
           }
       - uses: actions/upload-artifact@v4
         with:

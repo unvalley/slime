@@ -153,6 +153,7 @@ enum ConversionSearch {
 struct EditableSegment {
     reading: String,
     surface: String,
+    explicitly_selected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -533,7 +534,7 @@ impl SlimeEngine {
             } else {
                 self.reading.clone()
             };
-            self.record_history(&reading, &committed);
+            self.record_conversion_history(&reading, &committed);
             actions.push(SlimeAction::Commit(committed));
             self.clear_composition();
             actions.push(SlimeAction::HideCandidates);
@@ -912,6 +913,7 @@ impl SlimeEngine {
             let reading = self.segments[self.active_segment].reading.clone();
             let transformed = transform_text(style, &reading, None);
             self.segments[self.active_segment].surface = transformed;
+            self.segments[self.active_segment].explicitly_selected = true;
             self.candidates = vec![self.segments[self.active_segment].surface.clone()];
             self.selected = 0;
             return self.candidate_actions();
@@ -983,6 +985,7 @@ impl SlimeEngine {
                 self.segments.push(EditableSegment {
                     reading: character.to_string(),
                     surface: character.to_string(),
+                    explicitly_selected: false,
                 });
             } else {
                 self.segments[next_index].reading.insert(0, character);
@@ -1012,6 +1015,7 @@ impl SlimeEngine {
                 vec![EditableSegment {
                     reading: self.reading.clone(),
                     surface: selected_surface.clone(),
+                    explicitly_selected: false,
                 }]
             },
             |conversion| {
@@ -1032,6 +1036,7 @@ impl SlimeEngine {
             self.segments = vec![EditableSegment {
                 reading: self.reading.clone(),
                 surface: selected_surface,
+                explicitly_selected: false,
             }];
         }
         self.active_segment = 0;
@@ -1065,6 +1070,7 @@ impl SlimeEngine {
             .into_iter()
             .next()
             .unwrap_or(reading);
+        self.segments[index].explicitly_selected = false;
     }
 
     fn candidate_actions(&self) -> Vec<SlimeAction> {
@@ -1219,7 +1225,7 @@ impl SlimeEngine {
             self.record_completion_history(&reading, &committed);
         } else if used_conversion {
             let learning_reading = self.selected_learning_reading().to_owned();
-            self.record_history(&learning_reading, &committed);
+            self.record_conversion_history(&learning_reading, &committed);
         } else {
             // Live conversion is an implicit presentation decision, not an
             // explicit candidate choice. Learning it would let an unnoticed
@@ -1371,6 +1377,7 @@ impl SlimeEngine {
             && let Some(surface) = self.candidates.get(self.selected)
         {
             segment.surface.clone_from(surface);
+            segment.explicitly_selected = true;
         }
     }
 
@@ -1579,6 +1586,31 @@ impl SlimeEngine {
         self.session_history.record_commit(reading, surface);
     }
 
+    fn record_conversion_history(&mut self, reading: &str, surface: &str) {
+        if self.preferences.history_learning && !self.preferences.private_mode {
+            let selected_segments: Vec<_> = self
+                .segments
+                .iter()
+                .filter(|segment| segment.explicitly_selected)
+                .map(|segment| (segment.reading.clone(), segment.surface.clone()))
+                .collect();
+            let mut recorded = Vec::with_capacity(selected_segments.len());
+            for (segment_reading, segment_surface) in selected_segments {
+                if (segment_reading == reading && segment_surface == surface)
+                    || recorded.iter().any(|(recorded_reading, recorded_surface)| {
+                        recorded_reading == &segment_reading && recorded_surface == &segment_surface
+                    })
+                    || !should_record_history(&segment_reading, &segment_surface)
+                {
+                    continue;
+                }
+                self.user_data.record(&segment_reading, &segment_surface);
+                recorded.push((segment_reading, segment_surface));
+            }
+        }
+        self.record_history(reading, surface);
+    }
+
     fn record_completion_history(&mut self, prefix: &str, surface: &str) {
         if !self.preferences.history_learning || self.preferences.private_mode {
             self.session_history.reset_context();
@@ -1683,6 +1715,7 @@ fn editable_segment(segment: Segment) -> EditableSegment {
     EditableSegment {
         reading: segment.reading,
         surface: segment.surface,
+        explicitly_selected: false,
     }
 }
 
@@ -4012,6 +4045,103 @@ mod tests {
             ]
         ));
         assert_eq!(engine.phase(), Phase::Converting);
+    }
+
+    #[test]
+    fn segmented_selection_is_reused_for_the_word_in_another_phrase() {
+        let directory = test_directory("segmented-word-learning");
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+
+        let mut baseline = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        baseline.set_preferences(preferences);
+        type_text(&mut baseline, "kaitou");
+        baseline.handle(InputEvent::Space);
+        assert_eq!(baseline.snapshot().preedit, "回答");
+
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(preferences);
+        type_text(&mut engine, "kaitouhanihon");
+        engine.handle(InputEvent::Space);
+        engine.handle(InputEvent::PreviousSegment);
+        assert_eq!(engine.segments[0].reading, "かいとう");
+        let selected = engine
+            .snapshot()
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "解答")
+            .expect("segment candidate 解答");
+        engine.handle(InputEvent::SelectCandidate(
+            u32::try_from(selected).unwrap(),
+        ));
+        engine.handle(InputEvent::Enter);
+
+        let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
+        assert!(
+            history
+                .lines()
+                .any(|line| line.starts_with("かいとう\t解答\t")),
+            "explicit segment selection must be learned: {history}"
+        );
+        assert!(
+            !history
+                .lines()
+                .any(|line| line.starts_with("にほん\t日本\t")),
+            "untouched segments must not be learned: {history}"
+        );
+
+        let mut reloaded = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        reloaded.set_preferences(preferences);
+        type_text(&mut reloaded, "kaitou");
+        reloaded.handle(InputEvent::Space);
+        assert_eq!(reloaded.snapshot().preedit, "解答");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn typing_after_segmented_selection_learns_before_starting_new_input() {
+        let directory = test_directory("segmented-word-auto-commit");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+        type_text(&mut engine, "kaitouhanihon");
+        engine.handle(InputEvent::Space);
+        engine.handle(InputEvent::PreviousSegment);
+        let selected = engine
+            .snapshot()
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "解答")
+            .expect("segment candidate 解答");
+        engine.handle(InputEvent::SelectCandidate(
+            u32::try_from(selected).unwrap(),
+        ));
+
+        let actions = engine.handle(InputEvent::Character('a'));
+        assert!(actions.contains(&SlimeAction::Commit("解答は日本".to_owned())));
+        assert_eq!(engine.snapshot().preedit, "あ");
+        let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
+        assert!(
+            history
+                .lines()
+                .any(|line| line.starts_with("かいとう\t解答\t")),
+            "auto-commit must retain the explicit segment selection: {history}"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

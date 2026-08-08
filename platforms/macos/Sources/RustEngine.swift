@@ -57,9 +57,16 @@ final class RustEngine {
         let type: String
         let text: String?
         let candidates: [String]?
+        let candidateDetails: [CandidateDetail]?
         let selected: Int?
         let selectedStart: Int?
         let selectedLength: Int?
+    }
+
+    struct CandidateDetail: Decodable, Equatable {
+        let value: String
+        let annotation: UInt32
+        let detail: String?
     }
 
     enum EngineError: Error, Equatable {
@@ -76,10 +83,49 @@ final class RustEngine {
 
     private let handle: OpaquePointer
 
-    init(dataDirectory: URL = UserDataStore.shared.directoryURL) throws {
+    init(
+        dataDirectory: URL = UserDataStore.shared.directoryURL,
+        dictionaryPackVerificationKeys: String? = nil,
+        dictionaryPackVersionFloors: String? = nil
+    ) throws {
         let path = Array(dataDirectory.path.utf8)
-        let createdHandle = path.withUnsafeBufferPointer { buffer in
-            slime_create_with_data_dir(buffer.baseAddress, buffer.count)
+        let configuredKeys = dictionaryPackVerificationKeys
+            ?? (Bundle.main.object(
+                forInfoDictionaryKey: "SlimeDictionaryPackVerificationKeys"
+            ) as? String)
+        let configuredVersionFloors = dictionaryPackVersionFloors
+            ?? (Bundle.main.object(
+                forInfoDictionaryKey: "SlimeDictionaryPackVersionFloors"
+            ) as? String)
+        let createdHandle: OpaquePointer? = path.withUnsafeBufferPointer { pathBuffer in
+            guard let configuredKeys, !configuredKeys.isEmpty else {
+                guard configuredVersionFloors?.isEmpty != false else {
+                    return nil
+                }
+                return slime_create_with_data_dir(pathBuffer.baseAddress, pathBuffer.count)
+            }
+            let keys = Array(configuredKeys.utf8)
+            return keys.withUnsafeBufferPointer { keyBuffer in
+                guard let configuredVersionFloors, !configuredVersionFloors.isEmpty else {
+                    return slime_create_with_signed_data_dir(
+                        pathBuffer.baseAddress,
+                        pathBuffer.count,
+                        keyBuffer.baseAddress,
+                        keyBuffer.count
+                    )
+                }
+                let versionFloors = Array(configuredVersionFloors.utf8)
+                return versionFloors.withUnsafeBufferPointer { floorBuffer in
+                    slime_create_with_signed_data_dir_and_version_floors(
+                        pathBuffer.baseAddress,
+                        pathBuffer.count,
+                        keyBuffer.baseAddress,
+                        keyBuffer.count,
+                        floorBuffer.baseAddress,
+                        floorBuffer.count
+                    )
+                }
+            }
         }
         guard let handle = createdHandle else {
             throw EngineError.creationFailed
@@ -92,8 +138,22 @@ final class RustEngine {
     }
 
     func process(_ event: Event) throws -> [Action] {
-        let buffer = slime_process(handle, event.rawValue, event.scalar)
-        return try decode(buffer)
+        let collector = TypedActionCollector()
+        let context = Unmanaged.passUnretained(collector).toOpaque()
+        let status = slime_process_actions_v2(
+            handle,
+            event.rawValue,
+            event.scalar,
+            context,
+            collectTypedAction
+        )
+        guard status == SLIME_STATUS_OK.rawValue else {
+            throw EngineError.rejected("process_status_\(status)")
+        }
+        if let unsupportedKind = collector.unsupportedKind {
+            throw EngineError.rejected("unsupported_action_\(unsupportedKind)")
+        }
+        return collector.actions
     }
 
     func setOptions(
@@ -122,6 +182,23 @@ final class RustEngine {
             slime_begin_reconversion(handle, buffer.baseAddress, buffer.count)
         }
         return try decode(buffer)
+    }
+
+    func resetContext() throws {
+        let status = slime_reset_context(handle)
+        guard status == 0 else {
+            throw EngineError.rejected("reset_context_status_\(status)")
+        }
+    }
+
+    func setExternalLeftContext(_ context: String) throws {
+        let bytes = Array(context.utf8)
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            slime_set_external_left_context(handle, buffer.baseAddress, buffer.count)
+        }
+        guard status == 0 else {
+            throw EngineError.rejected("external_left_context_status_\(status)")
+        }
     }
 
     func reloadUserData() throws -> [Action] {
@@ -214,4 +291,116 @@ final class RustEngine {
         }
         return response.actions ?? []
     }
+}
+
+private final class TypedActionCollector {
+    var actions: [RustEngine.Action] = []
+    var unsupportedKind: UInt32?
+}
+
+private func collectTypedAction(
+    context: UnsafeMutableRawPointer?,
+    actionPointer: UnsafePointer<SlimeActionViewV2>?
+) {
+    guard let context, let actionPointer else {
+        return
+    }
+    let collector = Unmanaged<TypedActionCollector>.fromOpaque(context).takeUnretainedValue()
+    let action = actionPointer.pointee
+
+    switch action.kind {
+    case UInt32(SLIME_ACTION_UPDATE_PREEDIT.rawValue):
+        let hasSelection = action.selection_start != .max
+        collector.actions.append(
+            RustEngine.Action(
+                type: "update_preedit",
+                text: copyString(action.text),
+                candidates: nil,
+                candidateDetails: nil,
+                selected: nil,
+                selectedStart: hasSelection ? action.selection_start : nil,
+                selectedLength: hasSelection ? action.selection_length : nil
+            )
+        )
+    case UInt32(SLIME_ACTION_SHOW_CANDIDATES.rawValue):
+        let candidateDetails = (0 ..< action.candidate_count).map { index in
+            let candidate = action.candidates[index]
+            return RustEngine.CandidateDetail(
+                value: copyString(candidate.value),
+                annotation: candidate.annotation,
+                detail: candidate.detail.len == 0 ? nil : copyString(candidate.detail)
+            )
+        }
+        let candidates = (0 ..< action.candidate_count).map { index in
+            copyString(action.candidates[index].display)
+        }
+        collector.actions.append(
+            RustEngine.Action(
+                type: "show_candidates",
+                text: nil,
+                candidates: candidates,
+                candidateDetails: candidateDetails,
+                selected: action.selected,
+                selectedStart: nil,
+                selectedLength: nil
+            )
+        )
+    case UInt32(SLIME_ACTION_HIDE_CANDIDATES.rawValue):
+        collector.actions.append(
+            RustEngine.Action(
+                type: "hide_candidates",
+                text: nil,
+                candidates: nil,
+                candidateDetails: nil,
+                selected: nil,
+                selectedStart: nil,
+                selectedLength: nil
+            )
+        )
+    case UInt32(SLIME_ACTION_COMMIT.rawValue):
+        collector.actions.append(
+            RustEngine.Action(
+                type: "commit",
+                text: copyString(action.text),
+                candidates: nil,
+                candidateDetails: nil,
+                selected: nil,
+                selectedStart: nil,
+                selectedLength: nil
+            )
+        )
+    case UInt32(SLIME_ACTION_CLEAR.rawValue):
+        collector.actions.append(
+            RustEngine.Action(
+                type: "clear",
+                text: nil,
+                candidates: nil,
+                candidateDetails: nil,
+                selected: nil,
+                selectedStart: nil,
+                selectedLength: nil
+            )
+        )
+    case UInt32(SLIME_ACTION_FORWARD_KEY.rawValue):
+        collector.actions.append(
+            RustEngine.Action(
+                type: "forward_key",
+                text: nil,
+                candidates: nil,
+                candidateDetails: nil,
+                selected: nil,
+                selectedStart: nil,
+                selectedLength: nil
+            )
+        )
+    default:
+        collector.unsupportedKind = action.kind
+    }
+}
+
+private func copyString(_ view: SlimeStringView) -> String {
+    String(
+        decoding: UnsafeBufferPointer(start: view.data, count: view.len),
+        as: UTF8.self
+    )
 }

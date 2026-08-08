@@ -4,6 +4,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iterator>
@@ -31,6 +32,7 @@ std::atomic_long g_serverLocks = 0;
 HMODULE g_module = nullptr;
 constexpr TfClientId kInvalidClientId = 0;
 constexpr std::size_t kSearchCandidateLimit = 20;
+constexpr LONG kDocumentContextUtf16Limit = 256;
 constexpr GUID kImmersiveSupportCategory = {
     0x13a016df,
     0x560b,
@@ -790,6 +792,15 @@ private:
                       const EngineAction &action) noexcept;
   void HideCandidates() noexcept;
   void ResetEngineAfterTermination() noexcept;
+  void ResetTransientContext() noexcept;
+  bool GetSelectionCaret(TfEditCookie editCookie, ITfContext *context,
+                         ComPtr<ITfRange> &caret) noexcept;
+  bool SelectionBoundaryChanged(TfEditCookie editCookie,
+                                ITfContext *context) noexcept;
+  void ObserveSelection(TfEditCookie editCookie,
+                        ITfContext *context) noexcept;
+  void SynchronizeExternalDocumentContext(TfEditCookie editCookie,
+                                          ITfContext *context) noexcept;
   void MaybeReloadPreferences(bool force = false) noexcept;
 
   std::atomic_ulong referenceCount_{1};
@@ -813,6 +824,9 @@ private:
   std::wstring preferencesPath_;
   WindowsPreferencesMonitor preferencesMonitor_;
   bool hasSearchQuery_ = false;
+  bool needsExternalDocumentContext_ = true;
+  ComPtr<ITfContext> observedContext_;
+  ComPtr<ITfRange> observedCaret_;
   std::wstring searchQuery_;
   std::wstring searchApplicationId_;
   std::vector<std::wstring> searchCandidates_;
@@ -908,6 +922,7 @@ HRESULT TextService::ActivateEx(ITfThreadMgr *threadManager,
   threadManager_ = threadManager;
   clientId_ = clientId;
   activationFlags_ = flags;
+  ResetTransientContext();
   MaybeReloadPreferences(true);
   ApplyWindowsPreferences(engine_, preferences_,
                           (activationFlags_ & TF_TMAE_SECUREMODE) != 0);
@@ -949,6 +964,7 @@ HRESULT TextService::ActivateEx(ITfThreadMgr *threadManager,
 }
 
 HRESULT TextService::Deactivate() {
+  ResetTransientContext();
   if (functionProviderAdvised_ && threadManager_ != nullptr) {
     ComPtr<ITfSourceSingle> source;
     if (SUCCEEDED(threadManager_->QueryInterface(IID_PPV_ARGS(&source)))) {
@@ -980,6 +996,7 @@ HRESULT TextService::OnSetFocus(const BOOL foreground) {
   if (foreground) {
     MaybeReloadPreferences(true);
   } else {
+    ResetTransientContext();
     HideCandidates();
   }
   return S_OK;
@@ -1549,6 +1566,17 @@ bool TextService::ProcessEvent(const TfEditCookie editCookie, ITfContext *contex
   if (engine_ == nullptr || context == nullptr) {
     return false;
   }
+  if (!hasComposition_ && key.kind == SLIME_EVENT_CHARACTER) {
+    if (SelectionBoundaryChanged(editCookie, context)) {
+      slime_reset_context(engine_);
+      needsExternalDocumentContext_ = true;
+    }
+    if (needsExternalDocumentContext_) {
+      SynchronizeExternalDocumentContext(editCookie, context);
+      needsExternalDocumentContext_ = false;
+    }
+  }
+
   EngineActionCollection collection;
   const std::uint32_t status = slime_process_actions(engine_, key.kind, key.value, &collection,
                                                      CollectAction);
@@ -1558,11 +1586,13 @@ bool TextService::ProcessEvent(const TfEditCookie editCookie, ITfContext *contex
   if (collection.failed) {
     ClearComposition(editCookie);
     ResetEngineAfterTermination();
+    ObserveSelection(editCookie, context);
     return true;
   }
   const auto &actions = collection.actions;
   for (const auto &action : actions) {
     if (action.kind == SLIME_ACTION_FORWARD_KEY) {
+      ObserveSelection(editCookie, context);
       return false;
     }
   }
@@ -1597,18 +1627,121 @@ bool TextService::ProcessEvent(const TfEditCookie editCookie, ITfContext *contex
       // the next key starts from a consistent state.
       ClearComposition(editCookie);
       ResetEngineAfterTermination();
+      ObserveSelection(editCookie, context);
       return true;
     }
+  }
+  if (!hasComposition_) {
+    ObserveSelection(editCookie, context);
   }
   return true;
 }
 
 void TextService::ResetEngineAfterTermination() noexcept {
+  if (engine_ != nullptr) {
+    slime_process_actions(engine_, SLIME_EVENT_ESCAPE, 0, nullptr, IgnoreAction);
+    slime_process_actions(engine_, SLIME_EVENT_ESCAPE, 0, nullptr, IgnoreAction);
+  }
+  ResetTransientContext();
+}
+
+void TextService::ResetTransientContext() noexcept {
+  if (engine_ != nullptr) {
+    slime_reset_context(engine_);
+  }
+  needsExternalDocumentContext_ = true;
+  observedCaret_.Reset();
+  observedContext_.Reset();
+}
+
+bool TextService::GetSelectionCaret(const TfEditCookie editCookie,
+                                    ITfContext *context,
+                                    ComPtr<ITfRange> &caret) noexcept {
+  caret.Reset();
+  if (context == nullptr) {
+    return false;
+  }
+  TF_SELECTION selection{};
+  ULONG fetched = 0;
+  const HRESULT selectionResult = context->GetSelection(
+      editCookie, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+  if (FAILED(selectionResult) || fetched != 1 || selection.range == nullptr) {
+    return false;
+  }
+  caret.Attach(selection.range);
+  if (FAILED(caret->Collapse(editCookie, TF_ANCHOR_START))) {
+    caret.Reset();
+    return false;
+  }
+  return true;
+}
+
+bool TextService::SelectionBoundaryChanged(const TfEditCookie editCookie,
+                                           ITfContext *context) noexcept {
+  ComPtr<ITfRange> currentCaret;
+  if (!GetSelectionCaret(editCookie, context, currentCaret) ||
+      observedContext_.Get() != context || observedCaret_ == nullptr) {
+    return true;
+  }
+  LONG comparison = 0;
+  return FAILED(currentCaret->CompareStart(
+             editCookie, observedCaret_.Get(), TF_ANCHOR_START, &comparison)) ||
+         comparison != 0;
+}
+
+void TextService::ObserveSelection(const TfEditCookie editCookie,
+                                   ITfContext *context) noexcept {
+  ComPtr<ITfRange> currentCaret;
+  if (!GetSelectionCaret(editCookie, context, currentCaret)) {
+    observedCaret_.Reset();
+    observedContext_.Reset();
+    needsExternalDocumentContext_ = true;
+    return;
+  }
+  currentCaret->SetGravity(editCookie, TF_GRAVITY_BACKWARD,
+                           TF_GRAVITY_BACKWARD);
+  observedContext_ = context;
+  observedCaret_ = std::move(currentCaret);
+}
+
+void TextService::SynchronizeExternalDocumentContext(
+    const TfEditCookie editCookie, ITfContext *context) noexcept {
   if (engine_ == nullptr) {
     return;
   }
-  slime_process_actions(engine_, SLIME_EVENT_ESCAPE, 0, nullptr, IgnoreAction);
-  slime_process_actions(engine_, SLIME_EVENT_ESCAPE, 0, nullptr, IgnoreAction);
+  if ((activationFlags_ & TF_TMAE_SECUREMODE) != 0) {
+    slime_reset_context(engine_);
+    return;
+  }
+
+  ComPtr<ITfRange> contextRange;
+  if (!GetSelectionCaret(editCookie, context, contextRange)) {
+    slime_set_external_left_context(engine_, nullptr, 0);
+    return;
+  }
+  LONG shifted = 0;
+  if (FAILED(contextRange->ShiftStart(editCookie, -kDocumentContextUtf16Limit,
+                                      &shifted, nullptr))) {
+    slime_set_external_left_context(engine_, nullptr, 0);
+    return;
+  }
+  std::array<wchar_t,
+             static_cast<std::size_t>(kDocumentContextUtf16Limit)>
+      text{};
+  ULONG length = 0;
+  if (FAILED(contextRange->GetText(editCookie, 0, text.data(),
+                                   static_cast<ULONG>(text.size()), &length))) {
+    slime_set_external_left_context(engine_, nullptr, 0);
+    return;
+  }
+  const auto utf8 = WideToUtf8(text.data(), length);
+  if (!utf8.has_value()) {
+    slime_set_external_left_context(engine_, nullptr, 0);
+    return;
+  }
+  slime_set_external_left_context(
+      engine_, reinterpret_cast<const std::uint8_t *>(utf8->data()),
+      utf8->size());
 }
 
 void TextService::MaybeReloadPreferences(const bool force) noexcept {

@@ -131,6 +131,37 @@ pub struct Dictionary {
     uses_connection_costs: bool,
 }
 
+/// Adds dictionary-backed phrase continuation to the narrower repeated-surface
+/// signal. Both signals only reorder candidates already produced by the
+/// lattice; neither changes the dictionary or retains document text.
+struct DictionaryDocumentContextRanker<'a> {
+    dictionary: &'a Dictionary,
+}
+
+impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
+    fn ranking_cost(&self, _reading: &str, conversion: &Conversion) -> i32 {
+        conversion.cost
+    }
+
+    fn ranking_cost_with_context(
+        &self,
+        reading: &str,
+        left_context: &str,
+        conversion: &Conversion,
+    ) -> i32 {
+        let repeated_cost =
+            DocumentContextRanker.ranking_cost_with_context(reading, left_context, conversion);
+        if self
+            .dictionary
+            .document_phrase_matches(left_context, reading, &conversion.surface)
+        {
+            repeated_cost.saturating_sub(DOCUMENT_PHRASE_PROMOTION)
+        } else {
+            repeated_cost
+        }
+    }
+}
+
 /// A borrowed view of one dictionary entry during lattice construction. The
 /// entry's reading is always the query string itself, so only the surface and
 /// costs are carried.
@@ -165,6 +196,9 @@ const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
 const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_MAX_CANDIDATES: usize = 128;
 const FIXED_SEGMENT_MAX_STATES: usize = 256;
+const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
+const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
+const DOCUMENT_PHRASE_PROMOTION: i32 = 2_500;
 
 fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
     paths.sort_unstable_by(|left, right| {
@@ -580,6 +614,37 @@ impl Dictionary {
         readings.into_iter().map(|(reading, _)| reading).collect()
     }
 
+    fn document_phrase_matches(
+        &self,
+        left_context: &str,
+        reading: &str,
+        candidate_surface: &str,
+    ) -> bool {
+        let Some(compact) = self.bundled else {
+            return false;
+        };
+        let context_start = left_context
+            .char_indices()
+            .rev()
+            .nth(DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS.saturating_sub(1))
+            .map_or(0, |(index, _)| index);
+        let context_tail = &left_context[context_start..];
+        let context_characters = context_tail.chars().count();
+        for (position, (index, _)) in context_tail.char_indices().enumerate() {
+            if context_characters - position < DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS {
+                break;
+            }
+            if compact.joined_surface_has_reading_suffix(
+                &context_tail[index..],
+                candidate_surface,
+                reading,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Calls `callback` for every entry whose reading equals `reading`.
     fn for_each_exact<'s>(&'s self, reading: &str, mut callback: impl FnMut(EntryView<'s>)) {
         if let Some(compact) = self.bundled {
@@ -669,7 +734,7 @@ impl Dictionary {
             reading,
             left_context,
             DEFAULT_N_BEST,
-            &DocumentContextRanker,
+            &DictionaryDocumentContextRanker { dictionary: self },
         )
     }
 
@@ -691,7 +756,12 @@ impl Dictionary {
         left_context: &str,
         limit: usize,
     ) -> Vec<Candidate> {
-        self.candidates_with_context_ranker(reading, left_context, limit, &DocumentContextRanker)
+        self.candidates_with_context_ranker(
+            reading,
+            left_context,
+            limit,
+            &DictionaryDocumentContextRanker { dictionary: self },
+        )
     }
 
     #[must_use]
@@ -2786,6 +2856,26 @@ mod tests {
             dictionary.candidates("あさの")[0].surface,
             "朝の",
             "a transient query must not be retained by the dictionary"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_a_dictionary_backed_phrase_continuation() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("こ")[0].surface, "個");
+        assert_eq!(
+            dictionary.candidates_with_context("こ", "胸部は格納")[0].surface,
+            "庫"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("こ", "無関係な文脈")[0].surface,
+            "個"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("し", "高木守道")[0].surface,
+            "氏",
+            "a one-character homographic prefix must not promote 道士"
         );
     }
 

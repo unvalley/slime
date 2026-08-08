@@ -17,7 +17,7 @@ use corpus_bigram::{
     parse_annotated_corpus_line,
 };
 use serde::{Deserialize, Serialize};
-use slime_converter::{Candidate, CandidateRanker, Dictionary, DocumentContextRanker};
+use slime_converter::{Candidate, CandidateRanker, Dictionary};
 
 /// Mozc-style costs approximate `-scale * ln(probability)`. Used to map
 /// lattice costs onto the neural log-likelihood axis for interpolation.
@@ -799,10 +799,7 @@ fn evaluate(
     options: &Options,
     word_bigram_ranker: Option<&CorpusBigramRanker>,
 ) -> Result<Vec<EvaluationReport>, String> {
-    let ranker = word_bigram_ranker
-        .map_or(&DocumentContextRanker as &dyn CandidateRanker, |ranker| {
-            ranker as &dyn CandidateRanker
-        });
+    let ranker = word_bigram_ranker.map(|ranker| ranker as &dyn CandidateRanker);
     let selected: Vec<_> = items
         .iter()
         .filter(|item| options.context.includes(item))
@@ -890,7 +887,7 @@ fn generate_outcomes<'a>(
     items: &[&'a AjimeeItem],
     search_k: usize,
     top_k: usize,
-    ranker: &dyn CandidateRanker,
+    ranker: Option<&dyn CandidateRanker>,
     progress_label: Option<&str>,
 ) -> Result<Vec<ItemOutcome<'a>>, String> {
     let mut outcomes = Vec::with_capacity(items.len());
@@ -900,11 +897,18 @@ fn generate_outcomes<'a>(
         }
         let reading = katakana_to_hiragana(&item.input);
         let started = Instant::now();
-        let candidates: Vec<_> = dictionary
-            .candidates_with_context_ranker(&reading, &item.context_text, search_k, ranker)
-            .into_iter()
-            .take(top_k)
-            .collect();
+        let generated = match ranker {
+            Some(ranker) => dictionary.candidates_with_context_ranker(
+                &reading,
+                &item.context_text,
+                search_k,
+                ranker,
+            ),
+            None => {
+                dictionary.candidates_with_context_limit(&reading, &item.context_text, search_k)
+            }
+        };
+        let candidates: Vec<_> = generated.into_iter().take(top_k).collect();
         let latency = started.elapsed();
         outcomes.push(ItemOutcome {
             item,
@@ -937,7 +941,7 @@ fn train_discriminative(
     training_path: &Path,
     evaluation_outcomes: &[ItemOutcome<'_>],
     options: &Options,
-    ranker: &dyn CandidateRanker,
+    ranker: Option<&dyn CandidateRanker>,
 ) -> Result<DiscriminativeOutcome, String> {
     let training_items = load_ajimee_items(training_path)?;
     let excluded: HashSet<(Option<&str>, &str)> = evaluation_outcomes
@@ -1298,6 +1302,10 @@ fn compute_report(
     }
 
     let total = usize_to_f64(outcomes.len());
+    let built_in_document_context = word_bigram_diagnostics.is_none()
+        && outcomes
+            .iter()
+            .any(|outcome| !outcome.item.context_text.is_empty());
     EvaluationReport {
         dataset: options
             .dataset_name
@@ -1306,7 +1314,8 @@ fn compute_report(
         dataset_revision: options.dataset_revision.clone(),
         dataset_sha256: options.dataset_sha256.clone(),
         context_filter: options.context,
-        context_used_by_engine: neural.is_some_and(|neural| neural.scored_items > 0)
+        context_used_by_engine: built_in_document_context
+            || neural.is_some_and(|neural| neural.scored_items > 0)
             || discriminative.is_some()
             || word_bigram_diagnostics
                 .and_then(|diagnostics| diagnostics.context)

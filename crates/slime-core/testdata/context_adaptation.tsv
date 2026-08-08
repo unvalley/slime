@@ -1,7 +1,7 @@
 # case_id	expectation	previous_reading	previous_surface	target_reading	expected_surface	competing_previous_reading	competing_previous_surface	competing_surface
 writing_kanji	improve	ぶんしょう	文章	かんじ	漢字	きもち	気持ち	感じ
 feeling_kanji	preserve	きもち	気持ち	かんじ	感じ	ぶんしょう	文章	漢字
-administrative_organization	improve	ぎょうせい	行政	きかん	機関	しけん	試験	期間
+administrative_organization	preserve	ぎょうせい	行政	きかん	機関	しけん	試験	期間
 test_period	preserve	しけん	試験	きかん	期間	ぎょうせい	行政	機関
 document_certification	improve	しょるい	書類	こうしょう	公証	かかく	価格	交渉
 price_negotiation	preserve	かかく	価格	こうしょう	交渉	しょるい	書類	公証

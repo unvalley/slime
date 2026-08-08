@@ -116,6 +116,43 @@ impl CompactDictionary {
         }
         readings
     }
+
+    /// Checks a split surface against the reverse index without joining or
+    /// allocating either part.
+    pub(crate) fn joined_surface_has_reading_suffix(
+        &self,
+        prefix: &str,
+        surface: &str,
+        suffix: &str,
+    ) -> bool {
+        let mut node = self.reverse_fst.root();
+        let mut output = fst::raw::Output::zero();
+        for byte in prefix.bytes().chain(surface.bytes()) {
+            let Some(transition_index) = node.find_input(byte) else {
+                return false;
+            };
+            let transition = node.transition(transition_index);
+            output = output.cat(transition.out);
+            node = self.reverse_fst.node(transition.addr);
+        }
+        if !node.is_final() {
+            return false;
+        }
+        let block = output.cat(node.final_output()).value();
+        let mut cursor = usize::try_from(block).expect("reverse block offset");
+        let count = read_reverse_varint(&mut cursor);
+        for _ in 0..count {
+            let offset = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
+            let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
+            let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
+                .expect("valid reverse reading UTF-8");
+            cursor += 2;
+            if reading.ends_with(suffix) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn read_reverse_varint(cursor: &mut usize) -> u64 {
@@ -203,5 +240,13 @@ mod tests {
     fn reverse_index_returns_ranked_readings() {
         let readings = CompactDictionary::bundled().readings_for_surface("日本");
         assert!(readings.iter().any(|(reading, _)| reading == "にほん"));
+    }
+
+    #[test]
+    fn reverse_index_matches_a_reading_suffix_without_allocating() {
+        let dictionary = CompactDictionary::bundled();
+        assert!(dictionary.joined_surface_has_reading_suffix("格納", "庫", "こ"));
+        assert!(!dictionary.joined_surface_has_reading_suffix("格納", "庫", "こう"));
+        assert!(!dictionary.joined_surface_has_reading_suffix("未知", "語", "ご"));
     }
 }

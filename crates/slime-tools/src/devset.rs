@@ -14,7 +14,6 @@
 //! readings they must match (a kana-kanji misconversion preserves the typed
 //! reading).
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -22,6 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde::{Deserialize, Serialize};
+use slime_tools::surface_annotation::{SurfaceReadingIndex, contains_kanji, hiragana_to_katakana};
 
 fn main() -> ExitCode {
     match run() {
@@ -72,7 +72,7 @@ struct Options {
 
 fn run() -> Result<(), String> {
     let options = parse_options(env::args().skip(1))?;
-    let readings = load_surface_readings(&options.dictionary_path)?;
+    let readings = SurfaceReadingIndex::load(&options.dictionary_path)?;
     eprintln!("loaded {} unambiguous surface readings", readings.len());
 
     let file = fs::File::open(&options.train_path)
@@ -245,36 +245,11 @@ fn write_annotated_corpus(path: &PathBuf, items: &[DevItem]) -> Result<(), Strin
     Ok(())
 }
 
-/// Maps each dictionary surface to its reading when every dictionary entry
-/// for that surface agrees on one reading; ambiguous surfaces map to `None`
-/// so lookups can distinguish "unknown" from "ambiguous".
-fn load_surface_readings(path: &PathBuf) -> Result<HashMap<String, Option<String>>, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let mut readings: HashMap<String, Option<String>> = HashMap::new();
-    for line in content.lines() {
-        let mut columns = line.split('\t');
-        let (Some(reading), Some(surface)) = (columns.next(), columns.next()) else {
-            continue;
-        };
-        readings
-            .entry(surface.to_owned())
-            .and_modify(|existing| {
-                if existing.as_deref() != Some(reading) {
-                    *existing = None;
-                }
-            })
-            .or_insert_with(|| Some(reading.to_owned()));
-    }
-    readings.retain(|_, reading| reading.is_some());
-    Ok(readings)
-}
-
 fn build_item(
     pair: &TrainPair,
     line_number: usize,
     accepted_count: usize,
-    readings: &HashMap<String, Option<String>>,
+    readings: &SurfaceReadingIndex,
 ) -> Option<DevItem> {
     let [diff] = pair.diffs.as_slice() else {
         return None;
@@ -297,11 +272,11 @@ fn build_item(
     let span: String = post[window_start..window_end].iter().collect();
 
     let span_characters = window_end - window_start;
-    if !(6..=60).contains(&span_characters) || !span.chars().any(is_kanji) {
+    if !(6..=60).contains(&span_characters) || !contains_kanji(&span) {
         return None;
     }
 
-    let annotated_tokens = derive_annotated_tokens(&post[window_start..window_end], readings)?;
+    let annotated_tokens = readings.annotate(&span)?;
     let reading = annotated_tokens
         .iter()
         .map(|(_, reading)| reading.as_str())
@@ -310,11 +285,9 @@ fn build_item(
     // A kana-kanji misconversion types the same reading for both surfaces;
     // if the readings of the two variants are derivable and differ, the
     // reading estimate for this span is not trustworthy.
-    let pre_chars: Vec<char> = diff.pre_str.chars().collect();
-    let post_chars: Vec<char> = diff.post_str.chars().collect();
     if let (Some(pre_reading), Some(post_reading)) = (
-        derive_reading(&pre_chars, readings),
-        derive_reading(&post_chars, readings),
+        readings.reading(&diff.pre_str),
+        readings.reading(&diff.post_str),
     ) && pre_reading != post_reading
     {
         return None;
@@ -397,93 +370,6 @@ fn is_clause_boundary(character: char) -> bool {
     )
 }
 
-fn is_kanji(character: char) -> bool {
-    matches!(character, '\u{4e00}'..='\u{9fff}' | '々' | '〆')
-}
-
-fn is_kana(character: char) -> bool {
-    matches!(character, 'ぁ'..='ゖ' | 'ゝ' | 'ゞ' | 'ァ'..='ヶ' | 'ー' | 'ヽ' | 'ヾ')
-}
-
-const MAXIMUM_SURFACE_CHARACTERS: usize = 12;
-
-/// Estimates the reading of `span` by greedy longest-match over unambiguous
-/// dictionary surfaces, falling back to kana and punctuation passthrough.
-/// Returns `None` when any part of the span cannot be read confidently.
-fn derive_reading(span: &[char], readings: &HashMap<String, Option<String>>) -> Option<String> {
-    derive_annotated_tokens(span, readings)
-        .map(|tokens| tokens.into_iter().map(|(_, reading)| reading).collect())
-}
-
-fn derive_annotated_tokens(
-    span: &[char],
-    readings: &HashMap<String, Option<String>>,
-) -> Option<Vec<(String, String)>> {
-    let mut tokens = Vec::new();
-    let mut position = 0;
-    while position < span.len() {
-        let mut matched = false;
-        let longest = MAXIMUM_SURFACE_CHARACTERS.min(span.len() - position);
-        for length in (2..=longest).rev() {
-            let surface: String = span[position..position + length].iter().collect();
-            if let Some(Some(surface_reading)) = readings.get(&surface) {
-                if surface.contains(['/', ' ', '\t']) || surface_reading.contains('/') {
-                    return None;
-                }
-                tokens.push((surface, surface_reading.clone()));
-                position += length;
-                matched = true;
-                break;
-            }
-        }
-        if matched {
-            continue;
-        }
-
-        let character = span[position];
-        if is_kana(character) {
-            tokens.push((
-                character.to_string(),
-                katakana_to_hiragana(character).to_string(),
-            ));
-            position += 1;
-        } else if is_clause_boundary(character) || character == '・' || character == '…' {
-            tokens.push((character.to_string(), character.to_string()));
-            position += 1;
-        } else if let Some(Some(surface_reading)) = readings.get(&character.to_string()) {
-            if surface_reading.contains('/') {
-                return None;
-            }
-            tokens.push((character.to_string(), surface_reading.clone()));
-            position += 1;
-        } else {
-            return None;
-        }
-    }
-    Some(tokens)
-}
-
-fn katakana_to_hiragana(character: char) -> char {
-    match character {
-        'ァ'..='ヶ' | 'ヽ' | 'ヾ' => {
-            char::from_u32(u32::from(character) - 0x60).expect("valid hiragana scalar")
-        }
-        _ => character,
-    }
-}
-
-fn hiragana_to_katakana(reading: &str) -> String {
-    reading
-        .chars()
-        .map(|character| match character {
-            'ぁ'..='ゖ' | 'ゝ' | 'ゞ' => {
-                char::from_u32(u32::from(character) + 0x60).expect("valid katakana scalar")
-            }
-            _ => character,
-        })
-        .collect()
-}
-
 /// Deterministically spreads the selection across the corpus so one Wikipedia
 /// page cannot dominate the set.
 fn sample_evenly(items: Vec<DevItem>, count: usize) -> Vec<DevItem> {
@@ -509,10 +395,7 @@ fn sample_evenly(items: Vec<DevItem>, count: usize) -> Vec<DevItem> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DevItem, derive_annotated_tokens, diff_span, hiragana_to_katakana, partition_items,
-    };
-    use std::collections::HashMap;
+    use super::{DevItem, SurfaceReadingIndex, diff_span, hiragana_to_katakana, partition_items};
 
     #[test]
     fn diff_span_finds_the_changed_region() {
@@ -573,12 +456,11 @@ mod tests {
 
     #[test]
     fn annotated_tokens_preserve_the_derived_reading() {
-        let readings = HashMap::from([
-            ("漢字".to_owned(), Some("かんじ".to_owned())),
-            ("変換".to_owned(), Some("へんかん".to_owned())),
+        let readings = SurfaceReadingIndex::from_pairs([
+            ("漢字".to_owned(), "かんじ".to_owned()),
+            ("変換".to_owned(), "へんかん".to_owned()),
         ]);
-        let span: Vec<_> = "漢字への変換".chars().collect();
-        let tokens = derive_annotated_tokens(&span, &readings).unwrap();
+        let tokens = readings.annotate("漢字への変換").unwrap();
         assert_eq!(
             tokens,
             [

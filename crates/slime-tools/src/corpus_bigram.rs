@@ -228,8 +228,10 @@ impl CorpusBigramRanker {
         word_weight: i32,
         skip_weight: i32,
         context_weight: i32,
+        minimum_count: u32,
     ) -> Result<Self, String> {
         debug_assert!(word_weight > 0 || skip_weight > 0 || context_weight > 0);
+        debug_assert!(minimum_count > 0);
         let mut word_counts = BTreeMap::new();
         let mut skip_counts = BTreeMap::new();
         let mut context_counts = BTreeMap::new();
@@ -250,6 +252,10 @@ impl CorpusBigramRanker {
                 }
             }
         }
+
+        word_counts.retain(|_, count| *count >= minimum_count);
+        skip_counts.retain(|_, count| *count >= minimum_count);
+        context_counts.retain(|_, count| *count >= minimum_count);
 
         Ok(Self {
             word: TransitionTable::new(word_counts, word_weight),
@@ -418,7 +424,7 @@ mod tests {
         ));
         fs::write(&corpus_path, "夏/なつ は/は 暑い/あつい\n").unwrap();
         let ranker =
-            CorpusBigramRanker::load(std::slice::from_ref(&corpus_path), 500, 500, 0).unwrap();
+            CorpusBigramRanker::load(std::slice::from_ref(&corpus_path), 500, 500, 0, 1).unwrap();
         assert_eq!(ranker.word.count(BOS, "", "夏", "なつ"), 1);
         assert_eq!(ranker.skip.count("夏", "なつ", "暑い", "あつい"), 1);
 
@@ -443,7 +449,7 @@ mod tests {
         ));
         fs::write(&corpus_path, "魚/さかな は/は 新鮮/しんせん\n").unwrap();
         let ranker =
-            CorpusBigramRanker::load(std::slice::from_ref(&corpus_path), 0, 0, 500).unwrap();
+            CorpusBigramRanker::load(std::slice::from_ref(&corpus_path), 0, 0, 500, 1).unwrap();
         assert!(ranker.word.entries.is_empty());
         assert!(ranker.skip.entries.is_empty());
         let expected = Conversion {
@@ -469,6 +475,24 @@ mod tests {
                 < ranker.ranking_cost_with_context("しんせん", "昨日の魚は", &alternative)
         );
         assert_eq!(ranker.diagnostics().context.unwrap().matched_transitions, 1);
+        fs::remove_file(corpus_path).unwrap();
+    }
+
+    #[test]
+    fn minimum_count_removes_single_observation_transitions() {
+        let corpus_path = std::env::temp_dir().join(format!(
+            "slime-tools-minimum-bigram-count-{}.txt",
+            std::process::id()
+        ));
+        fs::write(
+            &corpus_path,
+            "夏/なつ は/は 暑い/あつい\n夏/なつ は/は 暑い/あつい\n冬/ふゆ は/は 寒い/さむい\n",
+        )
+        .unwrap();
+        let ranker =
+            CorpusBigramRanker::load(std::slice::from_ref(&corpus_path), 25, 0, 0, 2).unwrap();
+        assert_eq!(ranker.word.count(BOS, "", "夏", "なつ"), 2);
+        assert_eq!(ranker.word.count(BOS, "", "冬", "ふゆ"), 0);
         fs::remove_file(corpus_path).unwrap();
     }
 

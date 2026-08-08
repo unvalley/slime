@@ -45,6 +45,7 @@ fn run() -> Result<(), String> {
                 options.word_bigram_weight,
                 options.skip_bigram_weight,
                 options.context_bigram_weight,
+                options.corpus_bigram_min_count,
             )
         })
         .transpose()?;
@@ -205,6 +206,7 @@ struct Options {
     word_bigram_weight: i32,
     skip_bigram_weight: i32,
     context_bigram_weight: i32,
+    corpus_bigram_min_count: u32,
 }
 
 impl Options {
@@ -244,6 +246,7 @@ impl Options {
             word_bigram_weight: 0,
             skip_bigram_weight: 0,
             context_bigram_weight: 0,
+            corpus_bigram_min_count: 1,
         };
 
         while let Some(argument) = arguments.next() {
@@ -360,6 +363,13 @@ impl Options {
                 | "--context-bigram-weight") => {
                     options.set_ngram_weight(name, arguments.next())?;
                 }
+                "--corpus-bigram-min-count" => {
+                    options.corpus_bigram_min_count = u32::try_from(parse_positive(
+                        "--corpus-bigram-min-count",
+                        arguments.next(),
+                    )?)
+                    .map_err(|_| "--corpus-bigram-min-count is too large".to_owned())?;
+                }
                 "--help" | "-h" => return Err(usage()),
                 _ if !argument.starts_with('-') => {
                     // Keep the original `ajimee items.json` invocation valid;
@@ -450,7 +460,8 @@ fn usage() -> String {
      [--discriminative-dimensions N] [--discriminative-epochs N] \
      [--discriminative-weight X]... \
      [--word-bigram-corpus corpus.txt] [--word-bigram-weight N] \
-     [--skip-bigram-weight N] [--context-bigram-weight N]\n\
+     [--skip-bigram-weight N] [--context-bigram-weight N] \
+     [--corpus-bigram-min-count N]\n\
      --neural-model rescores the N-best with a zenz GGUF model (requires \
      building with --features neural). --neural-max-cost-gap skips neural \
      scoring when the base top-two cost gap exceeds N. --lambda selects \
@@ -769,6 +780,8 @@ struct NbestExportItem {
     index: String,
     context_text: String,
     input: String,
+    input_characters: usize,
+    candidate_generation_ms: f64,
     expected_output: Vec<String>,
     label_index: Option<usize>,
     candidates: Vec<NbestExportCandidate>,
@@ -1035,6 +1048,8 @@ fn export_nbest(
                 index: outcome.item.index.clone(),
                 context_text: outcome.item.context_text.clone(),
                 input: outcome.item.input.clone(),
+                input_characters: outcome.item.input.chars().count(),
+                candidate_generation_ms: duration_to_millis(outcome.latency),
                 expected_output: expected.to_vec(),
                 label_index: outcome
                     .candidates
@@ -1402,6 +1417,9 @@ fn print_report(report: &EvaluationReport) {
         );
         println!("skip bigram match rate: {:.4}", bigram.match_rate);
     }
+    if let Some(bigram) = &report.context_bigram {
+        print_context_report("context bigram", bigram);
+    }
     println!("items: {}", report.items);
     println!("search k: {}", report.search_k);
     println!("acc@1: {:.4}", report.accuracy_at_1);
@@ -1422,6 +1440,18 @@ fn print_report(report: &EvaluationReport) {
             );
         }
     }
+}
+
+fn print_context_report(label: &str, report: &NgramReport) {
+    println!("{label} entries: {}", report.entries);
+    println!("{label} weight: {}", report.weight);
+    println!("{label} candidates scored: {}", report.candidates_scored);
+    println!("{label} transitions scored: {}", report.transitions_scored);
+    println!(
+        "{label} matched transitions: {}",
+        report.matched_transitions
+    );
+    println!("{label} match rate: {:.4}", report.match_rate);
 }
 
 fn print_discriminative_report(report: &DiscriminativeReport) {
@@ -1605,6 +1635,8 @@ mod tests {
                 "250",
                 "--context-bigram-weight",
                 "125",
+                "--corpus-bigram-min-count",
+                "3",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1634,6 +1666,7 @@ mod tests {
         assert_eq!(options.word_bigram_weight, 500);
         assert_eq!(options.skip_bigram_weight, 250);
         assert_eq!(options.context_bigram_weight, 125);
+        assert_eq!(options.corpus_bigram_min_count, 3);
     }
 
     #[test]

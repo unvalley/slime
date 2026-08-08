@@ -13,6 +13,10 @@ enum AdapterTests {
         )
         defer { try? FileManager.default.removeItem(at: testDirectory) }
 
+        try runInputContextTests(
+            in: testDirectory.appendingPathComponent("external-document-context")
+        )
+
         let ordinaryInputOptions = InputRuntimeOptions(
             liveConversion: true,
             historyCompletion: true,

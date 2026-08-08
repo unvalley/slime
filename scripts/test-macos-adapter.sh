@@ -31,9 +31,11 @@ swiftc \
   "$workspace_dir/platforms/macos/Sources/UserDataStore.swift" \
   "$workspace_dir/platforms/macos/Sources/DictionaryImporter.swift" \
   "$workspace_dir/platforms/macos/Sources/InputPrivacy.swift" \
+  "$workspace_dir/platforms/macos/Sources/InputContextBoundary.swift" \
   "$workspace_dir/platforms/macos/Sources/KeyEventMapping.swift" \
   "$workspace_dir/platforms/macos/Sources/TextClientActions.swift" \
   "$workspace_dir/platforms/macos/Sources/CandidatePanel.swift" \
+  "$workspace_dir/platforms/macos/Tests/InputContextTests.swift" \
   "$workspace_dir/platforms/macos/Tests/AdapterTests.swift" \
   -o "$test_binary"
 

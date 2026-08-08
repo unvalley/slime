@@ -17,6 +17,8 @@ final class SlimeController: IMKInputController {
     private var selectedCandidateIndex = 0
     private var appliedOptions: InputRuntimeOptions?
     private var replacementRangeOnNextUpdate: NSRange?
+    private var inputContextBoundary = InputContextBoundary()
+    private var needsExternalDocumentContext = true
 
     override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
         guard let engine = try? RustEngine() else {
@@ -61,11 +63,30 @@ final class SlimeController: IMKInputController {
 
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event, event.type == .keyDown else { return false }
+        guard let inputClient = sender as? (any IMKTextInput & NSObjectProtocol) else {
+            return false
+        }
         guard SlimeAccessController.shared.allowsInput else {
             DispatchQueue.main.async {
                 SettingsWindowController.shared.present(initialTab: .license)
             }
             return true
+        }
+        if !hasComposition,
+           inputContextBoundary.shouldReset(
+               client: inputClient,
+               selectedRange: inputClient.selectedRange()
+           )
+        {
+            resetTransientContext()
+        }
+        defer {
+            if !hasComposition {
+                inputContextBoundary.observe(
+                    client: inputClient,
+                    selectedRange: inputClient.selectedRange()
+                )
+            }
         }
         let deleteSignpostID: OSSignpostID? = if event.keyCode == 51 || event.keyCode == 117 {
             OSSignpostID(log: Self.performanceLog)
@@ -98,6 +119,7 @@ final class SlimeController: IMKInputController {
             keyCode: event.keyCode,
             hasComposition: hasComposition
         ) {
+            resetTransientContext()
             return false
         }
 
@@ -129,6 +151,7 @@ final class SlimeController: IMKInputController {
         let commandModifiers = event.modifierFlags.intersection([.command, .control, .option])
         if !commandModifiers.isEmpty {
             commitIfNeeded(client: sender)
+            resetTransientContext()
             return false
         }
 
@@ -137,6 +160,7 @@ final class SlimeController: IMKInputController {
                 return false
             }
             commitIfNeeded(client: sender)
+            resetTransientContext()
             return false
         }
 
@@ -145,11 +169,18 @@ final class SlimeController: IMKInputController {
 
     override func commitComposition(_ sender: Any!) {
         commitIfNeeded(client: sender)
+        resetTransientContext()
+    }
+
+    override func activateServer(_ sender: Any!) {
+        resetTransientContext()
+        super.activateServer(sender)
     }
 
     override func deactivateServer(_ sender: Any!) {
         hideCandidates()
         commitIfNeeded(client: client())
+        resetTransientContext()
         super.deactivateServer(sender)
     }
 
@@ -167,11 +198,18 @@ final class SlimeController: IMKInputController {
             return false
         }
 
+        if case .character = event, !hasComposition {
+            synchronizeExternalDocumentContextIfNeeded(client: inputClient)
+        }
+
         do {
             let actions = try engine.process(event)
             let forwarded = apply(actions, client: inputClient)
-            if forwarded && hasComposition {
-                commitIfNeeded(client: inputClient)
+            if forwarded {
+                if hasComposition {
+                    commitIfNeeded(client: inputClient)
+                }
+                resetTransientContext()
             }
             return !forwarded
         } catch {
@@ -203,6 +241,7 @@ final class SlimeController: IMKInputController {
         } catch {
             NSLog("Slime: failed to reload user data %@", String(describing: error))
         }
+        resetTransientContext()
     }
 
     private func apply(
@@ -263,6 +302,7 @@ final class SlimeController: IMKInputController {
             return true
         }
 
+        let previousPrivateMode = appliedOptions?.privateMode
         do {
             let actions = try engine.setOptions(
                 liveConversion: options.liveConversion,
@@ -273,6 +313,9 @@ final class SlimeController: IMKInputController {
                 dateFormatMask: options.dateFormatMask
             )
             appliedOptions = options
+            if previousPrivateMode != options.privateMode {
+                needsExternalDocumentContext = true
+            }
             if let inputClient {
                 _ = apply(actions, client: inputClient)
             }
@@ -289,6 +332,7 @@ final class SlimeController: IMKInputController {
     }
 
     private func beginReconversion(client sender: Any!) -> Bool {
+        resetTransientContext()
         guard let inputClient = sender as? (any IMKTextInput & NSObjectProtocol) else {
             return false
         }
@@ -338,10 +382,50 @@ final class SlimeController: IMKInputController {
     }
 
     private func selectCandidate(at index: Int, commit: Bool) {
-        guard candidateValues.indices.contains(index) else { return }
-        _ = process(.selectCandidate(UInt32(index)), client: client())
+        guard candidateValues.indices.contains(index), let inputClient = client() else {
+            return
+        }
+        _ = process(.selectCandidate(UInt32(index)), client: inputClient)
         if commit && !isSegmentedConversion {
-            _ = process(.enter, client: client())
+            _ = process(.enter, client: inputClient)
+        }
+        inputContextBoundary.observe(
+            client: inputClient,
+            selectedRange: inputClient.selectedRange()
+        )
+    }
+
+    private func resetTransientContext() {
+        inputContextBoundary.clear()
+        needsExternalDocumentContext = true
+        do {
+            try engine.resetContext()
+        } catch {
+            NSLog("Slime: failed to reset transient context %@", String(describing: error))
+        }
+    }
+
+    private func synchronizeExternalDocumentContextIfNeeded(
+        client inputClient: any IMKTextInput & NSObjectProtocol
+    ) {
+        guard needsExternalDocumentContext,
+              appliedOptions?.privateMode == false
+        else {
+            return
+        }
+        needsExternalDocumentContext = false
+        let context = precedingDocumentContext(
+            selectedRange: inputClient.selectedRange()
+        ) { range in
+            inputClient.attributedSubstring(from: range)?.string
+        } ?? ""
+        do {
+            try engine.setExternalLeftContext(context)
+        } catch {
+            NSLog(
+                "Slime: failed to set transient document context %@",
+                String(describing: error)
+            )
         }
     }
 

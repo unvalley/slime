@@ -8,6 +8,7 @@ const VOWELS: &[u8] = b"aiueo";
 const MISSING_ONSET_CONSONANTS: &[u8] = b"bcdfghjkmnprstvwxyz";
 const MAX_CORRECTED_READINGS: usize = maximum_variant_count(MAX_RAW_LENGTH);
 const DUPLICATE_DELETION_PRIORITY: u8 = 0;
+const MISSING_SYLLABIC_N_PRIORITY: u8 = DUPLICATE_DELETION_PRIORITY;
 const TRANSPOSITION_PRIORITY: u8 = 1;
 const MISSING_GEMINATE_PRIORITY: u8 = 2;
 const MISSING_VOWEL_PRIORITY: u8 = 3;
@@ -79,6 +80,8 @@ pub(crate) fn corrected_readings(raw: &str, original_reading: &str) -> Vec<Corre
         }
     }
 
+    append_missing_syllabic_n_variants(&mut variants, bytes, original_reading);
+
     for (index, byte) in bytes.iter().copied().enumerate() {
         for replacement in keyboard_neighbors(byte).bytes() {
             let mut variant = bytes.to_vec();
@@ -110,6 +113,25 @@ pub(crate) fn corrected_readings(raw: &str, original_reading: &str) -> Vec<Corre
     });
     variants.truncate(MAX_CORRECTED_READINGS);
     variants
+}
+
+fn append_missing_syllabic_n_variants(
+    variants: &mut Vec<CorrectedReading>,
+    raw: &[u8],
+    original_reading: &str,
+) {
+    for (index, triple) in raw.windows(3).enumerate() {
+        if triple[0] == b'n' && triple[1] == b'n' && (is_vowel(triple[2]) || triple[2] == b'y') {
+            push_inserted_variant(
+                variants,
+                raw,
+                index + 2,
+                b'n',
+                MISSING_SYLLABIC_N_PRIORITY,
+                original_reading,
+            );
+        }
+    }
 }
 
 fn append_missing_vowel_variants(
@@ -252,6 +274,7 @@ const fn maximum_variant_count(raw_length: usize) -> usize {
     let deletions = raw_length;
     let transpositions = raw_length.saturating_sub(1);
     let geminations = raw_length;
+    let syllabic_n_insertions = raw_length.saturating_sub(1);
     let neighbor_substitutions = raw_length * MAX_KEYBOARD_NEIGHBORS_PER_KEY;
     let vowel_insertions = (raw_length + 1) * VOWELS.len();
     let consonant_insertions = if raw_length >= MIN_MISSING_CONSONANT_RAW_LENGTH {
@@ -262,6 +285,7 @@ const fn maximum_variant_count(raw_length: usize) -> usize {
     deletions
         + transpositions
         + geminations
+        + syllabic_n_insertions
         + neighbor_substitutions
         + vowel_insertions
         + consonant_insertions
@@ -311,6 +335,13 @@ mod tests {
             missing_geminate
                 .iter()
                 .any(|candidate| candidate.reading == "けっか" && candidate.edit_priority == 2)
+        );
+
+        let missing_syllabic_n = corrected_readings("konnichiha", "こんいちは");
+        assert!(
+            missing_syllabic_n
+                .iter()
+                .any(|candidate| candidate.reading == "こんにちは" && candidate.edit_priority == 0)
         );
 
         let missing_consonant = corrected_readings("paokon", "ぱおこん");

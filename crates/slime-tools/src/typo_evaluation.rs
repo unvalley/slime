@@ -11,11 +11,12 @@ use std::time::Instant;
 use serde::Serialize;
 use slime_core::{InputEvent, SlimeAction, SlimeEngine};
 
-const EDIT_KINDS: [&str; 7] = [
+const EDIT_KINDS: [&str; 8] = [
     "deletion",
     "duplicate",
     "missing_consonant",
     "missing_geminate",
+    "missing_syllabic_n",
     "missing_vowel",
     "neighbor",
     "transposition",

@@ -17,6 +17,9 @@ kanj	かんじ	漢字	missing_vowel
 densh	でんしゃ	電車	missing_vowel
 keka	けっか	結果	missing_geminate
 kekon	けっこん	結婚	missing_geminate
+konnichiha	こんにちは	今日は	missing_syllabic_n
+danna	だんな	旦那	missing_syllabic_n
+onna	おんな	女	missing_syllabic_n
 hapyou	はっぴょう	発表	missing_geminate
 ipai	いっぱい	一杯	missing_geminate
 paokon	ぱそこん	パソコン	missing_consonant

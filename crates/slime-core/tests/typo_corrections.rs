@@ -67,6 +67,7 @@ fn conservative_typo_fixture_keeps_input_and_labels_every_correction() {
         "duplicate",
         "missing_consonant",
         "missing_geminate",
+        "missing_syllabic_n",
         "missing_vowel",
         "neighbor",
         "transposition",

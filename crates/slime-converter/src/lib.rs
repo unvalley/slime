@@ -151,14 +151,22 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
     ) -> i32 {
         let repeated_cost =
             DocumentContextRanker.ranking_cost_with_context(reading, left_context, conversion);
-        if self
-            .dictionary
-            .document_phrase_matches(left_context, reading, &conversion.surface)
-        {
-            repeated_cost.saturating_sub(DOCUMENT_PHRASE_PROMOTION)
-        } else {
-            repeated_cost
-        }
+        let phrase_promotion =
+            if self
+                .dictionary
+                .document_phrase_matches(left_context, reading, &conversion.surface)
+            {
+                DOCUMENT_PHRASE_PROMOTION
+            } else {
+                0
+            };
+        let notation_promotion =
+            if structured_notation_matches(left_context, reading, &conversion.surface) {
+                DOCUMENT_STRUCTURED_NOTATION_PROMOTION
+            } else {
+                0
+            };
+        repeated_cost.saturating_sub(phrase_promotion.max(notation_promotion))
     }
 }
 
@@ -199,6 +207,72 @@ const FIXED_SEGMENT_MAX_STATES: usize = 256;
 const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
 const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 2_500;
+const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
+const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
+const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
+
+fn structured_notation_matches(left_context: &str, reading: &str, surface: &str) -> bool {
+    match (reading, surface) {
+        ("しん", "進") => radix_suffix_matches(left_context),
+        ("か" | "にち", "日") => calendar_day_suffix_matches(left_context, reading),
+        _ => false,
+    }
+}
+
+fn radix_suffix_matches(left_context: &str) -> bool {
+    split_trailing_decimal(left_context).is_some_and(|(prefix, radix)| {
+        COMMON_RADICES.contains(&radix)
+            && !matches!(prefix.chars().next_back(), Some('.' | '．' | '-' | '−'))
+    })
+}
+
+fn calendar_day_suffix_matches(left_context: &str, reading: &str) -> bool {
+    let Some((before_day, day)) = split_trailing_decimal(left_context) else {
+        return false;
+    };
+    let Some(before_month) = before_day.strip_suffix('月') else {
+        return false;
+    };
+    let Some((_, month)) = split_trailing_decimal(before_month) else {
+        return false;
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return false;
+    }
+
+    match reading {
+        "か" => CALENDAR_KA_ENDING_DAYS.contains(&day),
+        "にち" => day != 1 && !CALENDAR_KA_ENDING_DAYS.contains(&day),
+        _ => false,
+    }
+}
+
+fn split_trailing_decimal(text: &str) -> Option<(&str, u32)> {
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
+        if decimal_digit(character).is_none() {
+            break;
+        }
+        start = index;
+    }
+    if start == text.len() {
+        return None;
+    }
+    let value = text[start..].chars().try_fold(0_u32, |value, character| {
+        value
+            .checked_mul(10)?
+            .checked_add(decimal_digit(character)?)
+    })?;
+    Some((&text[..start], value))
+}
+
+fn decimal_digit(character: char) -> Option<u32> {
+    character.to_digit(10).or_else(|| {
+        ('０'..='９')
+            .contains(&character)
+            .then(|| u32::from(character) - u32::from('０'))
+    })
+}
 
 fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
     paths.sort_unstable_by(|left, right| {
@@ -2876,6 +2950,84 @@ mod tests {
             dictionary.candidates_with_context("し", "高木守道")[0].surface,
             "氏",
             "a one-character homographic prefix must not promote 道士"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_structured_numeric_continuations() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しん", "新", 0),
+            DictionaryEntry::new("しん", "進", 2_500),
+            DictionaryEntry::new("か", "化", 0),
+            DictionaryEntry::new("か", "日", 2_500),
+            DictionaryEntry::new("にち", "日時", 0),
+            DictionaryEntry::new("にち", "日", 2_500),
+        ]);
+
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "16")[0].surface,
+            "進"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "１６")[0].surface,
+            "進"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("か", "8月3")[0].surface,
+            "日"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("にち", "8月12")[0].surface,
+            "日"
+        );
+    }
+
+    #[test]
+    fn document_context_rejects_invalid_numeric_continuations() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しん", "新", 0),
+            DictionaryEntry::new("しん", "進", 2_500),
+            DictionaryEntry::new("か", "化", 0),
+            DictionaryEntry::new("か", "日", 2_500),
+            DictionaryEntry::new("にち", "日時", 0),
+            DictionaryEntry::new("にち", "日", 2_500),
+        ]);
+
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "1")[0].surface,
+            "新"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "3")[0].surface,
+            "新"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "37")[0].surface,
+            "新"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "1.3")[0].surface,
+            "新"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("しん", "10016")[0].surface,
+            "新"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("か", "8月1")[0].surface,
+            "化"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("か", "13月3")[0].surface,
+            "化"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("にち", "8月3")[0].surface,
+            "日時"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("にち", "8月1")[0].surface,
+            "日時"
         );
     }
 

@@ -7,10 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ed25519-dalek = { version = "3.0", default-features = false, features = ["signature"] }
 libc = "0.2"
 slime-converter = { path = "../slime-converter" }
 slime-romaji = { path = "../slime-romaji" }
-sha2 = "0.10"
+sha2 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

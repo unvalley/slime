@@ -19,7 +19,9 @@ use live_conversion::Decision as LiveConversionDecision;
 use session_history::SessionHistory;
 
 pub use dictionary_packs::{
-    DictionaryPackInfo, DictionaryPackLoadError, DictionaryPackWord, validate_dictionary_pack,
+    DictionaryPackInfo, DictionaryPackLoadError, DictionaryPackTrust,
+    DictionaryPackVerificationKey, DictionaryPackVersionFloor, DictionaryPackWord,
+    validate_dictionary_pack,
 };
 pub use domain_dictionaries::{
     ALL_DOMAIN_DICTIONARIES, BUSINESS_DICTIONARY, CREATIVE_DICTIONARY, TECHNOLOGY_DICTIONARY,
@@ -32,6 +34,12 @@ pub const ALL_DATE_FORMATS: u32 = date_time_candidates::ALL_FORMATS;
 
 const EXPANDED_N_BEST: usize = 32;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
+const MAX_COMPOUND_READING_CHARACTERS: usize = 16;
+const COMPOUND_ENTRIES_PER_SEGMENT: usize = 4;
+const COMPOUND_CANDIDATE_LIMIT: usize = 16;
+const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
+const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
+const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -67,12 +75,35 @@ pub enum SlimeAction {
     },
     ShowCandidates {
         candidates: Vec<String>,
+        details: Vec<CandidateDetail>,
         selected: usize,
     },
     HideCandidates,
     Commit(String),
     Clear,
     ForwardKey,
+}
+
+/// Semantic origin of one candidate. Adapters localize these values instead
+/// of embedding explanatory text in the surface that will be committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CandidateAnnotation {
+    None = 0,
+    UserDictionary = 1,
+    History = 2,
+    Correction = 3,
+    Completion = 4,
+    DateTime = 5,
+    Number = 6,
+    Context = 7,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateDetail {
+    pub value: String,
+    pub annotation: CandidateAnnotation,
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +205,7 @@ pub struct SlimeEngine {
     live_preview_suppressed: bool,
     user_data: UserData,
     installed_packs: DictionaryPackStore,
+    dictionary_pack_trust: DictionaryPackTrust,
     session_history: SessionHistory,
     uses_bundled_dictionary: bool,
     /// `(lowercased key, surface)` pairs of ASCII words from the enabled
@@ -204,6 +236,7 @@ impl SlimeEngine {
             live_preview_suppressed: false,
             user_data: UserData::default(),
             installed_packs: DictionaryPackStore::default(),
+            dictionary_pack_trust: DictionaryPackTrust::default(),
             session_history: SessionHistory::default(),
             uses_bundled_dictionary: false,
             ascii_surfaces: Vec::new(),
@@ -229,10 +262,22 @@ impl SlimeEngine {
 
     #[must_use]
     pub fn bundled_with_user_data(user_data: UserData) -> Self {
-        let installed_packs = DictionaryPackStore::load(user_data.directory());
+        Self::bundled_with_user_data_and_pack_trust(user_data, DictionaryPackTrust::default())
+    }
+
+    /// Creates a bundled engine whose installed dictionary packs must satisfy
+    /// the supplied trust policy. The policy is retained across data reloads.
+    #[must_use]
+    pub fn bundled_with_user_data_and_pack_trust(
+        user_data: UserData,
+        dictionary_pack_trust: DictionaryPackTrust,
+    ) -> Self {
+        let installed_packs =
+            DictionaryPackStore::load_with_trust(user_data.directory(), &dictionary_pack_trust);
         let dictionary = bundled_dictionary_with_packs(0, &user_data, &installed_packs);
         let mut engine = Self::with_user_data(dictionary, user_data);
         engine.installed_packs = installed_packs;
+        engine.dictionary_pack_trust = dictionary_pack_trust;
         engine.uses_bundled_dictionary = true;
         engine.rebuild_ascii_surfaces();
         engine
@@ -261,8 +306,14 @@ impl SlimeEngine {
     }
 
     pub fn reload_user_data(&mut self) -> Vec<SlimeAction> {
+        // A reload can remove the commit retained by the current session.
+        // Keeping it would recreate a deleted context edge on the next commit.
+        self.session_history.reset_context();
         self.user_data.reload();
-        self.installed_packs = DictionaryPackStore::load(self.user_data.directory());
+        self.installed_packs = DictionaryPackStore::load_with_trust(
+            self.user_data.directory(),
+            &self.dictionary_pack_trust,
+        );
         if self.uses_bundled_dictionary {
             self.dictionary = bundled_dictionary_with_packs(
                 self.preferences.dictionary_packs,
@@ -275,12 +326,48 @@ impl SlimeEngine {
         self.refresh_completion_actions(true)
     }
 
+    /// Breaks the transient left-context chain after an external caret,
+    /// document, or input-client boundary without deleting persisted history.
+    pub fn reset_context(&mut self) {
+        self.session_history.reset_context();
+    }
+
+    /// Replaces the transient context with committed text owned by the input
+    /// client. This surface is bounded in memory, is never persisted, and is
+    /// not used to learn a contextual history edge because its reading is
+    /// unknown.
+    pub fn set_external_left_context(&mut self, surface: &str) {
+        if self.preferences.private_mode {
+            self.session_history.reset_context();
+        } else {
+            self.session_history.set_external_context(surface);
+        }
+    }
+
     /// Returns conversion candidates without changing the active composition.
     /// Platform search integrations use this path so querying alternatives
     /// cannot move the user's selection or commit text as a side effect.
     #[must_use]
     pub fn conversion_candidates(&self, reading: &str) -> Vec<String> {
         self.conversion_candidates_for_reading(reading)
+    }
+
+    /// Returns conversion candidates for an explicit transient left context.
+    ///
+    /// This query does not mutate the active composition, session history, or
+    /// persisted user data. It is intended for offline pack evaluation and
+    /// platform integrations that already own a trusted committed surface.
+    #[must_use]
+    pub fn conversion_candidates_with_left_context(
+        &self,
+        previous_surface: &str,
+        reading: &str,
+    ) -> Vec<String> {
+        self.conversion_candidates_for_reading_with_limit_and_context(
+            reading,
+            None,
+            Some(previous_surface),
+        )
     }
 
     /// Records a selection made outside the normal composition UI only when
@@ -300,6 +387,9 @@ impl SlimeEngine {
     /// Starts explicit reconversion for a selected committed surface. An
     /// empty action list means the surface has no safe dictionary reading.
     pub fn begin_reconversion(&mut self, surface: &str) -> Vec<SlimeAction> {
+        // The selected text may be anywhere in the document, so the last
+        // composition commit is not a valid left neighbor for reconversion.
+        self.session_history.reset_context();
         let mut readings = self.dictionary.readings_for_surface(surface);
         if readings.is_empty() {
             let hiragana = text_transform::hiragana(surface);
@@ -519,13 +609,34 @@ impl SlimeEngine {
         reading: &str,
         dictionary_limit: Option<usize>,
     ) -> Vec<String> {
+        self.conversion_candidates_for_reading_with_limit_and_context(
+            reading,
+            dictionary_limit,
+            None,
+        )
+    }
+
+    fn conversion_candidates_for_reading_with_limit_and_context(
+        &self,
+        reading: &str,
+        dictionary_limit: Option<usize>,
+        explicit_previous_surface: Option<&str>,
+    ) -> Vec<String> {
         let mut candidates = Vec::new();
         for surface in self.user_data.exact_dictionary_surfaces(reading) {
             push_unique(&mut candidates, surface.to_owned());
         }
         if self.history_is_available() {
-            for surface in self.session_history.exact_surfaces(reading, 9) {
-                push_unique(&mut candidates, surface.to_owned());
+            if let Some((previous_reading, previous_surface)) =
+                self.session_history.previous_commit()
+            {
+                for surface in self.user_data.contextual_history_surfaces(
+                    previous_reading,
+                    previous_surface,
+                    reading,
+                ) {
+                    push_unique(&mut candidates, surface.to_owned());
+                }
             }
             for surface in self.user_data.exact_history_surfaces(reading) {
                 push_unique(&mut candidates, surface.to_owned());
@@ -542,10 +653,30 @@ impl SlimeEngine {
             || self.dictionary.candidates(reading),
             |limit| self.dictionary.candidates_with_limit(reading, limit),
         );
-        for surface in dictionary_candidates
+        let dictionary_surfaces: Vec<_> = dictionary_candidates
             .into_iter()
             .map(|candidate| candidate.surface)
+            .collect();
+        let previous_surface =
+            explicit_previous_surface.or_else(|| self.session_history.previous_surface());
+        if !self.preferences.private_mode
+            && let Some(previous_surface) = previous_surface
         {
+            let mut promoted = 0;
+            self.installed_packs
+                .visit_contextual_surfaces(previous_surface, reading, |surface| {
+                    if dictionary_surfaces
+                        .iter()
+                        .any(|candidate| candidate == surface)
+                        && !candidates.iter().any(|candidate| candidate == surface)
+                    {
+                        candidates.push(surface.to_owned());
+                        promoted += 1;
+                    }
+                    promoted < CONTEXT_RULE_PROMOTION_LIMIT
+                });
+        }
+        for surface in dictionary_surfaces {
             push_unique(&mut candidates, surface);
         }
         insert_visible_katakana_candidate(&mut candidates, reading);
@@ -686,17 +817,37 @@ impl SlimeEngine {
     fn expand_conversion_candidates_if_needed(&mut self) {
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.conversion_search == ConversionSearch::Expanded
-            || self.reading.chars().count() > MAX_EXPANDED_READING_CHARACTERS
         {
             return;
         }
         self.conversion_search = ConversionSearch::Expanded;
 
-        let expanded =
-            self.conversion_candidates_for_reading_with_limit(&self.reading, Some(EXPANDED_N_BEST));
         let mut merged = self.candidates.clone();
-        for candidate in expanded {
-            push_unique(&mut merged, candidate);
+        let reading_length = self.reading.chars().count();
+        if reading_length <= MAX_EXPANDED_READING_CHARACTERS {
+            for candidate in self
+                .conversion_candidates_for_reading_with_limit(&self.reading, Some(EXPANDED_N_BEST))
+            {
+                push_unique(&mut merged, candidate);
+            }
+        }
+        if reading_length <= MAX_COMPOUND_READING_CHARACTERS {
+            for candidate in self.dictionary.compound_candidates(
+                &self.reading,
+                COMPOUND_ENTRIES_PER_SEGMENT,
+                COMPOUND_CANDIDATE_LIMIT,
+            ) {
+                push_unique(&mut merged, candidate.surface);
+            }
+        }
+        if reading_length > MAX_EXPANDED_READING_CHARACTERS {
+            for surface in self.dictionary.fixed_segment_variants(
+                &self.reading,
+                FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
+                FIXED_SEGMENT_CANDIDATE_LIMIT,
+            ) {
+                push_unique(&mut merged, surface);
+            }
         }
         self.candidates = merged;
     }
@@ -712,13 +863,11 @@ impl SlimeEngine {
         if self.candidate_kind == Some(CandidateKind::Completion) {
             self.completion_selected = true;
         }
-        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
-            self.candidate_actions()
-        } else {
-            vec![SlimeAction::UpdatePreedit(
-                self.selected_candidate().to_owned(),
-            )]
-        }
+        // Candidate consumers keep their own highlighted row. Always resend
+        // the selected index together with the preedit so programmatic,
+        // keyboard, number, and pointer selection cannot diverge from the
+        // surface that Enter or Finalize will commit.
+        self.candidate_actions()
     }
 
     fn accept_candidate(&mut self) -> Vec<SlimeAction> {
@@ -908,6 +1057,7 @@ impl SlimeEngine {
         }
         actions.push(SlimeAction::ShowCandidates {
             candidates: self.displayed_candidates(),
+            details: self.candidate_details(),
             selected: self.selected,
         });
         actions
@@ -926,6 +1076,95 @@ impl SlimeEngine {
                     )
             })
             .collect()
+    }
+
+    fn candidate_details(&self) -> Vec<CandidateDetail> {
+        if self.candidate_kind == Some(CandidateKind::Completion) {
+            return self
+                .candidates
+                .iter()
+                .map(|candidate| CandidateDetail {
+                    value: candidate.clone(),
+                    annotation: CandidateAnnotation::Completion,
+                    detail: None,
+                })
+                .collect();
+        }
+
+        let reading = self.active_candidate_reading();
+        let user_dictionary: Vec<_> = self.user_data.exact_dictionary_surfaces(reading).collect();
+        let mut history = if self.history_is_available() {
+            self.user_data.exact_history_surfaces(reading)
+        } else {
+            Vec::new()
+        };
+        if self.history_is_available()
+            && let Some((previous_reading, previous_surface)) =
+                self.session_history.previous_commit()
+        {
+            history.extend(self.user_data.contextual_history_surfaces(
+                previous_reading,
+                previous_surface,
+                reading,
+            ));
+        }
+        let mut context = Vec::new();
+        if !self.preferences.private_mode
+            && let Some(previous_surface) = self.session_history.previous_surface()
+        {
+            self.installed_packs
+                .visit_contextual_surfaces(previous_surface, reading, |surface| {
+                    if self.candidates.iter().any(|candidate| candidate == surface)
+                        && !context.iter().any(|candidate| candidate == surface)
+                    {
+                        context.push(surface.to_owned());
+                    }
+                    context.len() < CONTEXT_RULE_PROMOTION_LIMIT
+                });
+        }
+        let date_time =
+            date_time_candidates::candidates(reading, self.preferences.date_format_mask);
+        let numbers = self.dictionary.generated_number_surfaces(reading);
+        self.candidates
+            .iter()
+            .map(|candidate| {
+                let correction = self
+                    .candidate_corrections
+                    .iter()
+                    .find(|correction| correction.surface == *candidate);
+                let (annotation, detail) = if let Some(correction) = correction {
+                    (
+                        CandidateAnnotation::Correction,
+                        Some(correction.reading.clone()),
+                    )
+                } else if user_dictionary.contains(&candidate.as_str()) {
+                    (CandidateAnnotation::UserDictionary, None)
+                } else if history.contains(&candidate.as_str()) {
+                    (CandidateAnnotation::History, None)
+                } else if context.contains(candidate) {
+                    (CandidateAnnotation::Context, None)
+                } else if date_time.contains(candidate) {
+                    (CandidateAnnotation::DateTime, None)
+                } else if numbers.contains(candidate) {
+                    (CandidateAnnotation::Number, None)
+                } else {
+                    (CandidateAnnotation::None, None)
+                };
+                CandidateDetail {
+                    value: candidate.clone(),
+                    annotation,
+                    detail,
+                }
+            })
+            .collect()
+    }
+
+    fn active_candidate_reading(&self) -> &str {
+        if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
+            &self.segments[self.active_segment].reading
+        } else {
+            &self.reading
+        }
     }
 
     fn selected_learning_reading(&self) -> &str {
@@ -1254,8 +1493,17 @@ impl SlimeEngine {
             push_unique(&mut suggestions, surface);
         }
         if self.history_is_available() && self.reading.chars().count() >= 2 {
-            for surface in self.session_history.completion_surfaces(&self.reading, 9) {
-                push_unique(&mut suggestions, surface.to_owned());
+            if let Some((previous_reading, previous_surface)) =
+                self.session_history.previous_commit()
+            {
+                for surface in self.user_data.contextual_completion_surfaces(
+                    previous_reading,
+                    previous_surface,
+                    &self.reading,
+                    9,
+                ) {
+                    push_unique(&mut suggestions, surface.to_owned());
+                }
             }
             for surface in self.user_data.completion_surfaces(&self.reading, 9) {
                 push_unique(&mut suggestions, surface);
@@ -1278,6 +1526,7 @@ impl SlimeEngine {
             self.completion_selected = false;
             actions.push(SlimeAction::ShowCandidates {
                 candidates: self.candidates.clone(),
+                details: self.candidate_details(),
                 selected: self.selected,
             });
         }
@@ -1288,16 +1537,32 @@ impl SlimeEngine {
     }
 
     fn record_history(&mut self, reading: &str, surface: &str) {
-        if !self.preferences.history_learning || self.preferences.private_mode {
+        if self.preferences.private_mode {
             self.session_history.reset_context();
             return;
         }
-        if !should_record_history(reading, surface) {
+        if !user_data::is_useful_context_anchor(reading, surface) {
             self.session_history.reset_context();
             return;
         }
 
-        self.user_data.record(reading, surface);
+        let previous = self
+            .session_history
+            .previous_commit()
+            .map(|(reading, surface)| (reading.to_owned(), surface.to_owned()));
+        if self.preferences.history_learning {
+            if let Some((previous_reading, previous_surface)) = previous {
+                self.user_data.record_context(
+                    &previous_reading,
+                    &previous_surface,
+                    reading,
+                    surface,
+                );
+            }
+            if should_record_history(reading, surface) {
+                self.user_data.record(reading, surface);
+            }
+        }
         self.session_history.record_commit(reading, surface);
     }
 
@@ -1319,6 +1584,14 @@ impl SlimeEngine {
             }
             return;
         };
+        let previous = self
+            .session_history
+            .previous_commit()
+            .map(|(reading, surface)| (reading.to_owned(), surface.to_owned()));
+        if let Some((previous_reading, previous_surface)) = previous {
+            self.user_data
+                .record_context(&previous_reading, &previous_surface, &reading, surface);
+        }
         self.session_history.record_commit(&reading, surface);
     }
 }
@@ -1470,9 +1743,9 @@ fn normalize_ascii_character(character: char) -> char {
         '~' => '〜',
         ',' => '、',
         '.' => '。',
-        // Every mainstream Japanese IME (Kotoeri, Mozc, ATOK) types the middle
-        // dot here; it has no other key on US layouts, while ／ stays
-        // reachable through conversion candidates or ABC mode.
+        // Japanese input commonly maps this key to the middle dot; it has no
+        // other key on US layouts, while ／ stays reachable through
+        // conversion candidates or ABC mode.
         '/' => '・',
         '[' => '「',
         ']' => '」',
@@ -1491,11 +1764,16 @@ impl Default for SlimeEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateKind, ConversionSearch,
-        DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision, Phase,
-        SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary,
-        date_time_candidates, katakana_candidate,
+        ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateAnnotation, CandidateDetail,
+        CandidateKind, ConversionSearch, DictionaryPackTrust, DictionaryPackVerificationKey,
+        DictionaryPackVersionFloor, DictionaryPackWord, EnginePreferences, InputEvent,
+        LiveConversionDecision, MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine,
+        TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary, date_time_candidates,
+        katakana_candidate,
     };
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    use slime_converter::{Dictionary, DictionaryEntry};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1506,6 +1784,72 @@ mod tests {
         for character in input.chars() {
             engine.handle(InputEvent::Character(character));
         }
+    }
+
+    fn shown_candidate_details(actions: &[SlimeAction]) -> &[CandidateDetail] {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                SlimeAction::ShowCandidates { details, .. } => Some(details.as_slice()),
+                _ => None,
+            })
+            .expect("show candidates action")
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        output
+    }
+
+    fn write_context_pack(directory: &std::path::Path) {
+        let pack_directory = directory.join("dictionary-packs");
+        fs::create_dir_all(&pack_directory).unwrap();
+        let payload = "てすとようご\t試験用語\n\
+ながいぶんしょう\tこれは長い文章\n\
+# context-rules\n\
+文章\tかんじ\t漢字\t0\n\
+文章\tかんじ\t架空候補\t1\n";
+        let digest = lower_hex(&Sha256::digest(payload.as_bytes()));
+        fs::write(
+            pack_directory.join("sample-context.slime-dict"),
+            format!(
+                "# slime-dictionary-pack-v3\n\
+                 # id: sample-context\n\
+                 # name: 文脈サンプル\n\
+                 # version: 2026.08.1\n\
+                 # license: Example-Test-Only\n\
+                 # minimum-slime-version: 0.1.0\n\
+                 # published-at: 2026-08-08\n\
+                 # provenance: fixture/generated/sample-context\n\
+                 # payload-sha256: {digest}\n\
+                 # entries\n\
+                 {payload}"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn sign_context_pack(directory: &std::path::Path, key_id: &str, signing_key: &SigningKey) {
+        let pack_path = directory
+            .join("dictionary-packs")
+            .join("sample-context.slime-dict");
+        let pack_bytes = fs::read(&pack_path).unwrap();
+        let signature = signing_key.sign(&pack_bytes).to_bytes();
+        let encoded = lower_hex(&signature);
+        fs::write(
+            pack_path.with_extension("slime-dict.sig"),
+            format!(
+                "# slime-dictionary-signature-v1\n\
+                 # key-id: {key_id}\n\
+                 # signature-ed25519: {encoded}\n"
+            ),
+        )
+        .unwrap();
     }
 
     fn convert_and_commit(engine: &mut SlimeEngine, input: &str, surface: &str) {
@@ -1848,12 +2192,7 @@ mod tests {
         engine.handle(InputEvent::Enter);
 
         assert!(!directory.join("history.tsv").exists());
-        assert!(
-            engine
-                .session_history
-                .exact_surfaces("にほんご", 1)
-                .is_empty()
-        );
+        assert!(engine.session_history.previous_commit().is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1950,10 +2289,45 @@ mod tests {
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
 
         type_text(&mut engine, "hoge");
-        engine.handle(InputEvent::Space);
+        let actions = engine.handle(InputEvent::Space);
 
         assert_eq!(engine.snapshot().preedit, "HOGE");
+        assert_eq!(
+            shown_candidate_details(&actions)[0].annotation,
+            CandidateAnnotation::UserDictionary
+        );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn candidate_metadata_separates_generated_and_corrected_values() {
+        let mut number_engine = SlimeEngine::bundled();
+        type_text(&mut number_engine, "senkyuuhyakukyuujuuichi");
+        let number_actions = number_engine.handle(InputEvent::Space);
+        let number_details = shown_candidate_details(&number_actions);
+        assert!(number_details.iter().any(|detail| {
+            detail.value == "1991" && detail.annotation == CandidateAnnotation::Number
+        }));
+
+        let mut date_engine = SlimeEngine::bundled();
+        type_text(&mut date_engine, "kyou");
+        let date_actions = date_engine.handle(InputEvent::Space);
+        assert!(
+            shown_candidate_details(&date_actions)
+                .iter()
+                .any(|detail| detail.annotation == CandidateAnnotation::DateTime)
+        );
+
+        let dictionary = Dictionary::new(vec![DictionaryEntry::new("にほん", "日本", 10)]);
+        let mut correction_engine = SlimeEngine::new(dictionary);
+        type_text(&mut correction_engine, "nihpn");
+        let correction_actions = correction_engine.handle(InputEvent::Space);
+        let correction = shown_candidate_details(&correction_actions)
+            .iter()
+            .find(|detail| detail.value == "日本")
+            .expect("corrected candidate");
+        assert_eq!(correction.annotation, CandidateAnnotation::Correction);
+        assert_eq!(correction.detail.as_deref(), Some("にほん"));
     }
 
     #[test]
@@ -1983,11 +2357,11 @@ mod tests {
             pack_directory.join("sample.slime-dict"),
             "\
 # slime-dictionary-pack-v1
-# id: sample-pro
-# name: サンプル Pro
+# id: sample-general
+# name: 一般語彙サンプル
 # version: 2026.07.1
-# license: Proprietary
-すらいむぷろ\tSlime Pro
+# license: Example-Test-Only
+てすとようご\t試験用語
 こまわり\t専門小回り\t6000
 ",
         )
@@ -1995,8 +2369,8 @@ mod tests {
 
         let engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         assert_eq!(
-            engine.dictionary.candidates("すらいむぷろ")[0].surface,
-            "Slime Pro"
+            engine.dictionary.candidates("てすとようご")[0].surface,
+            "試験用語"
         );
         assert_eq!(
             engine.dictionary.candidates("こまわり")[0].surface,
@@ -2011,15 +2385,15 @@ mod tests {
         );
         let infos: Vec<_> = engine.installed_dictionary_packs().collect();
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].id, "sample-pro");
+        assert_eq!(infos[0].id, "sample-general");
         assert_eq!(
             engine
-                .installed_dictionary_pack_words("sample-pro")
+                .installed_dictionary_pack_words("sample-general")
                 .unwrap(),
             [
                 DictionaryPackWord {
-                    reading: "すらいむぷろ".to_owned(),
-                    surface: "Slime Pro".to_owned(),
+                    reading: "てすとようご".to_owned(),
+                    surface: "試験用語".to_owned(),
                 },
                 DictionaryPackWord {
                     reading: "こまわり".to_owned(),
@@ -2029,6 +2403,219 @@ mod tests {
         );
         assert!(engine.dictionary_pack_load_errors().is_empty());
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_context_rules_rank_existing_candidates_without_learning() {
+        let directory = test_directory("installed-context-pack");
+        write_context_pack(&directory);
+
+        let mut baseline = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        type_text(&mut baseline, "kanji");
+        baseline.handle(InputEvent::Space);
+        assert_ne!(baseline.snapshot().preedit, "漢字");
+
+        let mut contextual = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        convert_and_commit(&mut contextual, "nagaibunshou", "これは長い文章");
+        type_text(&mut contextual, "kanji");
+        let contextual_actions = contextual.handle(InputEvent::Space);
+        assert_eq!(contextual.snapshot().preedit, "漢字");
+        assert_eq!(
+            shown_candidate_details(&contextual_actions)
+                .iter()
+                .find(|detail| detail.value == "漢字")
+                .expect("context candidate")
+                .annotation,
+            CandidateAnnotation::Context
+        );
+        assert!(
+            !contextual
+                .snapshot()
+                .candidates
+                .contains(&"架空候補".to_owned())
+        );
+        assert!(!directory.join("history.tsv").exists());
+
+        contextual.handle(InputEvent::Escape);
+        contextual.reset_context();
+        type_text(&mut contextual, "kanji");
+        contextual.handle(InputEvent::Space);
+        assert_ne!(contextual.snapshot().preedit, "漢字");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_context_query_does_not_mutate_session_context() {
+        let directory = test_directory("explicit-context-query");
+        write_context_pack(&directory);
+        let engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+
+        assert_eq!(
+            engine.conversion_candidates_with_left_context("これは長い文章", "かんじ")[0],
+            "漢字"
+        );
+        assert_ne!(engine.conversion_candidates("かんじ")[0], "漢字");
+        assert!(!directory.join("history.tsv").exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_document_context_ranks_without_becoming_learned_history() {
+        let directory = test_directory("external-document-context");
+        write_context_pack(&directory);
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+
+        engine.set_external_left_context("これは長い文章");
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "漢字");
+        engine.handle(InputEvent::Enter);
+
+        assert!(!directory.join("history.tsv").exists());
+        engine.reset_context();
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_ne!(engine.snapshot().preedit, "漢字");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn private_mode_discards_external_document_context() {
+        let directory = test_directory("private-external-document-context");
+        write_context_pack(&directory);
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            private_mode: true,
+            ..EnginePreferences::default()
+        });
+        engine.set_external_left_context("これは長い文章");
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_ne!(engine.snapshot().preedit, "漢字");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn context_only_pack_ranks_bundled_candidates_without_a_word_layer() {
+        let directory = test_directory("context-only-pack");
+        let pack_directory = directory.join("dictionary-packs");
+        fs::create_dir_all(&pack_directory).unwrap();
+        let payload = "# context-rules\n文章\tかんじ\t漢字\t0\n";
+        let digest = lower_hex(&Sha256::digest(payload.as_bytes()));
+        fs::write(
+            pack_directory.join("sample-context-only.slime-dict"),
+            format!(
+                "# slime-dictionary-pack-v3\n\
+                 # id: sample-context-only\n\
+                 # name: 文脈のみのサンプル\n\
+                 # version: 2026.08.1\n\
+                 # license: Example-Test-Only\n\
+                 # minimum-slime-version: 0.1.0\n\
+                 # published-at: 2026-08-08\n\
+                 # provenance: fixture/generated/sample-context-only\n\
+                 # payload-sha256: {digest}\n\
+                 # entries\n\
+                 {payload}"
+            ),
+        )
+        .unwrap();
+
+        let engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        let info = engine.installed_dictionary_packs().next().unwrap();
+        assert_eq!(info.entry_count, 0);
+        assert_eq!(info.context_rule_count, 1);
+        assert_eq!(
+            engine.conversion_candidates_with_left_context("文章", "かんじ")[0],
+            "漢字"
+        );
+        assert!(engine.dictionary_pack_load_errors().is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_context_rules_are_disabled_in_private_mode() {
+        let directory = test_directory("private-installed-context-pack");
+        write_context_pack(&directory);
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        engine.set_preferences(EnginePreferences {
+            private_mode: true,
+            ..EnginePreferences::default()
+        });
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_ne!(engine.snapshot().preedit, "漢字");
+        assert!(!directory.join("history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn signed_pack_policy_survives_reload_and_rejects_tampering() {
+        let directory = test_directory("signed-context-pack-reload");
+        write_context_pack(&directory);
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        sign_context_pack(&directory, "fixture-2026-a", &signing_key);
+        let key = DictionaryPackVerificationKey::new(
+            "fixture-2026-a",
+            signing_key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let trust = DictionaryPackTrust::signed_only_with_version_floors(
+            vec![key],
+            vec![DictionaryPackVersionFloor::new("sample-context", "2026.08.1").unwrap()],
+        )
+        .unwrap();
+        let mut engine =
+            SlimeEngine::bundled_with_user_data_and_pack_trust(UserData::load(&directory), trust);
+
+        assert_eq!(
+            engine.conversion_candidates_with_left_context("文章", "かんじ")[0],
+            "漢字"
+        );
+        let pack_path = directory
+            .join("dictionary-packs")
+            .join("sample-context.slime-dict");
+        let mut tampered = fs::read_to_string(&pack_path).unwrap();
+        tampered.push('\n');
+        fs::write(pack_path, tampered).unwrap();
+
+        engine.reload_user_data();
+        assert_eq!(engine.dictionary_pack_load_errors().len(), 1);
+        assert_eq!(
+            engine.dictionary_pack_load_errors()[0].message,
+            "dictionary pack signature is invalid"
+        );
+        assert_ne!(
+            engine.conversion_candidates_with_left_context("文章", "かんじ")[0],
+            "漢字"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_context_rules_do_not_override_user_history() {
+        let directory = test_directory("history-before-installed-context");
+        write_context_pack(&directory);
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nかんじ\t感じ\t5\t10\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            history_completion: true,
+            ..EnginePreferences::default()
+        });
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "感じ");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2283,6 +2870,12 @@ mod tests {
             reloaded.snapshot().candidates,
             ["パフェ作り", "パフォーマンス"]
         );
+        let completion_actions = reloaded.handle(InputEvent::NextCandidate);
+        assert!(
+            shown_candidate_details(&completion_actions)
+                .iter()
+                .all(|detail| detail.annotation == CandidateAnnotation::Completion)
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2328,9 +2921,13 @@ mod tests {
         });
 
         type_text(&mut engine, "kanji");
-        engine.handle(InputEvent::Space);
+        let actions = engine.handle(InputEvent::Space);
 
         assert_eq!(engine.snapshot().preedit, "感じ");
+        assert_eq!(
+            shown_candidate_details(&actions)[0].annotation,
+            CandidateAnnotation::History
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2376,8 +2973,47 @@ mod tests {
     }
 
     #[test]
-    fn session_context_beats_global_recency_without_persisting_context() {
+    fn repeated_context_beats_global_recency_and_persists() {
         let directory = test_directory("session-context");
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(preferences);
+
+        for _ in 0..2 {
+            convert_and_commit(&mut engine, "bunshou", "文章");
+            convert_and_commit(&mut engine, "kanji", "漢字");
+            convert_and_commit(&mut engine, "kimochi", "気持ち");
+            convert_and_commit(&mut engine, "kanji", "感じ");
+        }
+        convert_and_commit(&mut engine, "bunshou", "文章");
+
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "漢字");
+
+        let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
+        assert!(context.contains("ぶんしょう\t文章\tかんじ\t漢字\t2\t"));
+
+        let mut reloaded = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        reloaded.set_preferences(preferences);
+        convert_and_commit(&mut reloaded, "bunshou", "文章");
+        type_text(&mut reloaded, "kanji");
+        reloaded.handle(InputEvent::Space);
+        assert_eq!(reloaded.snapshot().preedit, "漢字");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn one_off_context_does_not_override_global_history() {
+        let directory = test_directory("one-off-context");
         let preferences = EnginePreferences {
             live_conversion: false,
             history_completion: true,
@@ -2391,30 +3027,22 @@ mod tests {
 
         convert_and_commit(&mut engine, "bunshou", "文章");
         convert_and_commit(&mut engine, "kanji", "漢字");
-        convert_and_commit(&mut engine, "kimochi", "気持ち");
-        convert_and_commit(&mut engine, "kanji", "感じ");
+        for _ in 0..5 {
+            convert_and_commit(&mut engine, "kimochi", "気持ち");
+            convert_and_commit(&mut engine, "kanji", "感じ");
+        }
         convert_and_commit(&mut engine, "bunshou", "文章");
 
         type_text(&mut engine, "kanji");
         engine.handle(InputEvent::Space);
-        assert_eq!(engine.snapshot().preedit, "漢字");
-
-        let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
-        assert!(!history.contains("文章\t漢字"));
-        assert!(!history.contains("文章\t感じ"));
-
-        let mut reloaded = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
-        reloaded.set_preferences(preferences);
-        type_text(&mut reloaded, "kanji");
-        reloaded.handle(InputEvent::Space);
-        assert_eq!(reloaded.snapshot().preedit, "感じ");
+        assert_eq!(engine.snapshot().preedit, "感じ");
 
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn pausing_learning_breaks_session_context_boundary() {
-        let directory = test_directory("session-context-pause");
+    fn pausing_learning_breaks_left_context_boundary() {
+        let directory = test_directory("left-context-pause");
         let learning = EnginePreferences {
             live_conversion: false,
             history_completion: true,
@@ -2445,8 +3073,8 @@ mod tests {
     }
 
     #[test]
-    fn session_context_reranks_prefix_completions() {
-        let directory = test_directory("session-completion-context");
+    fn repeated_context_reranks_prefix_completions_and_persists() {
+        let directory = test_directory("persistent-completion-context");
         fs::write(
             directory.join("history.tsv"),
             "# slime-history-v1\nかんじへんかん\t漢字変換\t5\t10\nかんじょうひょうげん\t感情表現\t5\t20\n",
@@ -2463,14 +3091,22 @@ mod tests {
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
         engine.set_preferences(preferences);
 
-        convert_and_commit(&mut engine, "bunshou", "文章");
-        accept_completion(&mut engine, "kanji", "漢字変換");
-        convert_and_commit(&mut engine, "kimochi", "気持ち");
-        accept_completion(&mut engine, "kanji", "感情表現");
+        for _ in 0..2 {
+            convert_and_commit(&mut engine, "bunshou", "文章");
+            accept_completion(&mut engine, "kanji", "漢字変換");
+            convert_and_commit(&mut engine, "kimochi", "気持ち");
+            accept_completion(&mut engine, "kanji", "感情表現");
+        }
         convert_and_commit(&mut engine, "bunshou", "文章");
 
         type_text(&mut engine, "kanji");
         assert_eq!(engine.snapshot().candidates[0], "漢字変換");
+
+        let mut reloaded = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        reloaded.set_preferences(preferences);
+        convert_and_commit(&mut reloaded, "bunshou", "文章");
+        type_text(&mut reloaded, "kanji");
+        assert_eq!(reloaded.snapshot().candidates[0], "漢字変換");
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2508,6 +3144,37 @@ mod tests {
     }
 
     #[test]
+    fn transient_context_does_not_override_an_established_context() {
+        let directory = test_directory("established-context");
+        fs::write(
+            directory.join("context_history.tsv"),
+            "# slime-context-history-v1\nぶんしょう\t文章\tかんじ\t漢字\t100\t10\n",
+        )
+        .unwrap();
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(preferences);
+
+        for _ in 0..2 {
+            convert_and_commit(&mut engine, "bunshou", "文章");
+            convert_and_commit(&mut engine, "kanji", "感じ");
+        }
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "漢字");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn learning_can_continue_while_history_candidates_are_hidden() {
         let directory = test_directory("suggestions-hidden");
         let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
@@ -2535,6 +3202,104 @@ mod tests {
         type_text(&mut engine, "t'id'yu");
 
         assert_eq!(engine.snapshot().preedit, "てぃでゅ");
+    }
+
+    #[test]
+    fn typo_correction_is_labeled_keeps_the_original_and_learns_the_corrected_reading() {
+        let directory = test_directory("typo-correction");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+
+        type_text(&mut engine, "nihpn");
+        let original = "にhpん".to_owned();
+        let actions = engine.handle(InputEvent::Space);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.preedit, original);
+        assert_eq!(snapshot.candidates.first(), Some(&original));
+        let corrected = snapshot
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "日本")
+            .expect("neighbor-key correction should offer 日本");
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                SlimeAction::ShowCandidates { candidates, .. }
+                    if candidates.iter().any(|candidate| candidate == "日本　（にほんに訂正）")
+            )
+        }));
+
+        engine.handle(InputEvent::SelectCandidate(
+            u32::try_from(corrected).unwrap(),
+        ));
+        assert_eq!(engine.snapshot().preedit, "日本");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("日本".to_owned())));
+
+        let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
+        assert!(history.contains("にほん\t日本\t1\t"));
+        assert!(!history.contains(&format!("{original}\t日本")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn known_reading_does_not_show_typo_annotations() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "nihon");
+        let actions = engine.handle(InputEvent::Space);
+
+        assert!(actions.iter().all(|action| {
+            !matches!(
+                action,
+                SlimeAction::ShowCandidates { candidates, .. }
+                    if candidates.iter().any(|candidate| candidate.contains("に訂正）"))
+            )
+        }));
+        assert_eq!(engine.snapshot().preedit, "日本");
+    }
+
+    #[test]
+    fn typo_correction_labels_a_surface_already_reachable_by_patchwork() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にh", "日", 0),
+            DictionaryEntry::new("pん", "本", 0),
+            DictionaryEntry::new("にほん", "日本", 0),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, "nihpn");
+        let actions = engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().candidates[1], "日本");
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                SlimeAction::ShowCandidates { candidates, .. }
+                    if candidates.get(1).is_some_and(|candidate| candidate == "日本　（にほんに訂正）")
+            )
+        }));
+    }
+
+    #[test]
+    fn typo_correction_recovers_one_missing_vowel() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "nihn");
+
+        let actions = engine.handle(InputEvent::Space);
+        assert!(engine.snapshot().candidates.contains(&"日本".to_owned()));
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                SlimeAction::ShowCandidates { candidates, .. }
+                    if candidates.iter().any(|candidate| candidate == "日本　（にほんに訂正）")
+            )
+        }));
     }
 
     #[test]
@@ -2578,7 +3343,7 @@ mod tests {
     }
 
     #[test]
-    fn cycling_long_reading_candidates_keeps_the_initial_search_width() {
+    fn cycling_long_reading_uses_bounded_compounds_without_wide_n_best() {
         let mut engine = SlimeEngine::bundled();
         type_text(&mut engine, "watashihanihonjin");
         engine.handle(InputEvent::Space);
@@ -2588,8 +3353,286 @@ mod tests {
             engine.handle(InputEvent::NextCandidate);
         }
 
-        assert_eq!(engine.snapshot().candidates.len(), initial_count);
-        assert_eq!(engine.conversion_search, ConversionSearch::Initial);
+        assert!(engine.snapshot().candidates.len() >= initial_count);
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn cycling_long_reading_adds_fixed_segment_variants() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [("あいう", "第一"), ("えおか", "第二"), ("きくけ", "第三")]
+        {
+            for (index, cost) in [10, 20, 30, 40].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let reading = "あいうえおかきくけ";
+        let dictionary = Dictionary::new(entries);
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, reading);
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .fixed_segment_variants(
+                reading,
+                super::FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
+                super::FIXED_SEGMENT_CANDIDATE_LIMIT,
+            )
+            .into_iter()
+            .find(|surface| !initial.contains(surface))
+            .expect("fixed-segment recall should add a candidate beyond N-best 10");
+        let initial_count = initial.len();
+        for _ in 0..initial_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_long_candidates_without_wide_n_best() {
+        let mut entries = Vec::new();
+        for (surface, cost) in [("左一", 0), ("左二", 1), ("左三", 2), ("左四", 3)] {
+            entries.push(DictionaryEntry::new("あいうえお", surface, cost));
+        }
+        for (surface, cost) in [("右一", 0), ("右二", 1), ("右三", 2), ("右四", 3)] {
+            entries.push(DictionaryEntry::new("かきくけこ", surface, cost));
+        }
+        let mut engine = SlimeEngine::new(Dictionary::new(entries));
+        type_text(&mut engine, "あいうえおかきくけこ");
+        engine.handle(InputEvent::Space);
+
+        let target = "左四右四".to_owned();
+        let initial_count = engine.snapshot().candidates.len();
+        assert!(!engine.snapshot().candidates.contains(&target));
+        for _ in 0..initial_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_three_part_candidates_without_wide_n_best() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [("あいう", "左"), ("えおか", "中"), ("きくけ", "右")]
+        {
+            for (index, cost) in [0, 10, 20, 30].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, "あいうえおかきくけ");
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .compound_candidates("あいうえおかきくけ", 4, 16)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| !initial.contains(surface))
+            .expect("three-part recall should add a candidate beyond N-best 10");
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_a_one_character_reading_segment() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [("あい", "左"), ("う", "中"), ("えお", "右")] {
+            for (index, cost) in [0, 10, 20, 30].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, "あいうえお");
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .compound_candidates("あいうえお", 4, 16)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| !initial.contains(surface))
+            .expect("one-character segment recall should add a candidate beyond N-best 10");
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_a_kana_only_segment_without_wide_n_best() {
+        let mut entries = vec![DictionaryEntry::new("の", "の", 5)];
+        for (reading, prefix) in [("あいう", "左"), ("えおか", "中"), ("きくけ", "右")]
+        {
+            for (index, cost) in [0, 10, 20, 30].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let reading = "あいうのえおかきくけ";
+        assert!(reading.chars().count() > MAX_EXPANDED_READING_CHARACTERS);
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, reading);
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .compound_candidates(reading, 4, 16)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| !initial.contains(surface))
+            .expect("kana-only segment recall should add a candidate beyond N-best 10");
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(target.contains('の'));
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_four_part_candidates_without_wide_n_best() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [
+            ("あいう", "一"),
+            ("えおか", "二"),
+            ("きくけ", "三"),
+            ("こさし", "四"),
+        ] {
+            for (index, cost) in [0, 10, 20, 30].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, "あいうえおかきくけこさし");
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .compound_candidates("あいうえおかきくけこさし", 4, 16)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| !initial.contains(surface))
+            .expect("four-part recall should add a candidate beyond N-best 10");
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_five_part_candidates_without_wide_n_best() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [
+            ("あいう", "一"),
+            ("えおか", "二"),
+            ("きくけ", "三"),
+            ("こさし", "四"),
+            ("すせそ", "五"),
+        ] {
+            for (index, cost) in [0, 10, 20, 30].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, "あいうえおかきくけこさしすせそ");
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .compound_candidates("あいうえおかきくけこさしすせそ", 4, 16)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| !initial.contains(surface))
+            .expect("five-part recall should add a candidate beyond N-best 10");
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn bounded_compound_recall_reaches_six_part_candidates_without_wide_n_best() {
+        let mut entries = Vec::new();
+        for (reading, prefix) in [
+            ("あい", "一"),
+            ("うえ", "二"),
+            ("おか", "三"),
+            ("きく", "四"),
+            ("けこ", "五"),
+            ("さし", "六"),
+        ] {
+            for (index, cost) in [0, 10, 20, 30].into_iter().enumerate() {
+                entries.push(DictionaryEntry::new(
+                    reading,
+                    format!("{prefix}{index}"),
+                    cost,
+                ));
+            }
+        }
+        let dictionary = Dictionary::new(entries);
+        let reading = "あいうえおかきくけこさし";
+        let mut engine = SlimeEngine::new(dictionary.clone());
+        type_text(&mut engine, reading);
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let target = dictionary
+            .compound_candidates(reading, 4, 16)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| !initial.contains(surface))
+            .expect("six-part recall should add a candidate beyond N-best 10");
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
     }
 
     #[test]
@@ -2669,7 +3712,17 @@ mod tests {
         let selected = candidates[1].clone();
         let actions = engine.handle(InputEvent::SelectCandidate(1));
 
-        assert_eq!(actions, vec![SlimeAction::UpdatePreedit(selected.clone())]);
+        assert_eq!(
+            actions,
+            vec![
+                SlimeAction::UpdatePreedit(selected.clone()),
+                SlimeAction::ShowCandidates {
+                    candidates: candidates.clone(),
+                    details: engine.candidate_details(),
+                    selected: 1,
+                },
+            ]
+        );
         assert_eq!(engine.snapshot().selected, Some(1));
         assert!(
             engine
@@ -2912,6 +3965,91 @@ mod tests {
             SlimeAction::ShowCandidates { candidates, .. }
                 if candidates.iter().any(|candidate| candidate == "SlimeTest")
         )));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reconversion_does_not_attach_a_selection_elsewhere_to_the_previous_commit() {
+        let directory = test_directory("reconversion-context-boundary");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        assert!(!engine.begin_reconversion("漢字").is_empty());
+        engine.handle(InputEvent::Enter);
+
+        assert!(!directory.join("context_history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_reconversion_still_breaks_the_previous_commit_boundary() {
+        let directory = test_directory("failed-reconversion-context-boundary");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        assert!(engine.begin_reconversion("🫠").is_empty());
+        convert_and_commit(&mut engine, "kanji", "漢字");
+
+        assert!(!directory.join("context_history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reloading_user_data_breaks_the_in_memory_left_context() {
+        let directory = test_directory("reload-context-boundary");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        fs::remove_file(directory.join("history.tsv")).unwrap();
+        engine.reload_user_data();
+        convert_and_commit(&mut engine, "kanji", "漢字");
+
+        assert!(!directory.join("context_history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_context_reset_prevents_learning_across_an_external_caret_move() {
+        let directory = test_directory("explicit-context-boundary");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+
+        convert_and_commit(&mut engine, "bunshou", "文章");
+        engine.reset_context();
+        convert_and_commit(&mut engine, "kanji", "漢字");
+
+        assert!(!directory.join("context_history.tsv").exists());
         fs::remove_dir_all(directory).unwrap();
     }
 

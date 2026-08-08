@@ -6,11 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_DICTIONARY_FILE: &str = "user_dictionary.tsv";
 const HISTORY_FILE: &str = "history.tsv";
+const CONTEXT_HISTORY_FILE: &str = "context_history.tsv";
 const USER_DICTIONARY_HEADER: &str = "# slime-user-dictionary-v1";
 const HISTORY_HEADER: &str = "# slime-history-v1";
+const CONTEXT_HISTORY_HEADER: &str = "# slime-context-history-v1";
 const MAX_HISTORY_ENTRIES: usize = 500;
+const MAX_CONTEXT_HISTORY_ENTRIES: usize = 500;
 const MIN_COMPLETION_REMAINING_CHARS: usize = 2;
 const MIN_ESTABLISHED_HISTORY_COUNT: u32 = 5;
+const MIN_ESTABLISHED_CONTEXT_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
+const MIN_CONTEXT_USE_COUNT: u32 = 2;
 const MIN_COMPLETION_USE_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
 const MAX_HISTORY_READING_CHARS: usize = 64;
 const MAX_HISTORY_SURFACE_CHARS: usize = 128;
@@ -31,12 +36,24 @@ pub struct HistoryEntry {
     pub last_used: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContextHistoryEntry {
+    previous_reading: String,
+    previous_surface: String,
+    reading: String,
+    surface: String,
+    count: u32,
+    last_used: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UserData {
     directory: Option<PathBuf>,
     dictionary: Vec<UserDictionaryEntry>,
     history: Vec<HistoryEntry>,
+    context_history: Vec<ContextHistoryEntry>,
     history_is_writable: bool,
+    context_history_is_writable: bool,
 }
 
 impl UserData {
@@ -55,12 +72,21 @@ impl UserData {
             Ok(history) => (history, true),
             Err(()) => (Vec::new(), false),
         };
+        let context_history_result = read_optional(&directory.join(CONTEXT_HISTORY_FILE))
+            .map_err(|_| ())
+            .and_then(|bytes| bytes.map_or(Ok(Vec::new()), |bytes| parse_context_history(&bytes)));
+        let (context_history, context_history_is_writable) = match context_history_result {
+            Ok(history) => (history, true),
+            Err(()) => (Vec::new(), false),
+        };
 
         Self {
             directory: Some(directory),
             dictionary,
             history,
+            context_history,
             history_is_writable,
+            context_history_is_writable,
         }
     }
 
@@ -80,6 +106,70 @@ impl UserData {
             .iter()
             .filter(move |entry| entry.reading == reading)
             .map(|entry| entry.surface.as_str())
+    }
+
+    #[must_use]
+    pub(crate) fn contextual_history_surfaces(
+        &self,
+        previous_reading: &str,
+        previous_surface: &str,
+        reading: &str,
+    ) -> Vec<&str> {
+        let mut entries: Vec<_> = self
+            .context_history
+            .iter()
+            .filter(|entry| {
+                entry.previous_reading == previous_reading
+                    && entry.previous_surface == previous_surface
+                    && entry.reading == reading
+                    && entry.count >= MIN_CONTEXT_USE_COUNT
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .collect();
+        sort_context_history(&mut entries);
+        entries
+            .into_iter()
+            .map(|entry| entry.surface.as_str())
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn contextual_completion_surfaces(
+        &self,
+        previous_reading: &str,
+        previous_surface: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<&str> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let prefix_length = prefix.chars().count();
+        let mut entries: Vec<_> = self
+            .context_history
+            .iter()
+            .filter(|entry| {
+                entry.previous_reading == previous_reading
+                    && entry.previous_surface == previous_surface
+                    && entry.count >= MIN_CONTEXT_USE_COUNT
+                    && entry.reading.starts_with(prefix)
+                    && entry.reading.chars().count().saturating_sub(prefix_length)
+                        >= MIN_COMPLETION_REMAINING_CHARS
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .collect();
+        sort_context_history(&mut entries);
+
+        let mut surfaces = Vec::with_capacity(limit);
+        for entry in entries {
+            if !surfaces.contains(&entry.surface.as_str()) {
+                surfaces.push(entry.surface.as_str());
+            }
+            if surfaces.len() == limit {
+                break;
+            }
+        }
+        surfaces
     }
 
     pub fn dictionary_entries(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -178,6 +268,57 @@ impl UserData {
             self.history = history;
         }
     }
+
+    pub(crate) fn record_context(
+        &mut self,
+        previous_reading: &str,
+        previous_surface: &str,
+        reading: &str,
+        surface: &str,
+    ) {
+        if !is_useful_context_anchor(previous_reading, previous_surface)
+            || !is_useful_history(reading, surface)
+        {
+            return;
+        }
+
+        let wall_clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let now = next_context_last_used(&self.context_history, wall_clock);
+        update_context_history(
+            &mut self.context_history,
+            previous_reading,
+            previous_surface,
+            reading,
+            surface,
+            now,
+        );
+        trim_context_history(&mut self.context_history);
+
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        if !self.context_history_is_writable {
+            return;
+        }
+
+        let path = directory.join(CONTEXT_HISTORY_FILE);
+        if write_context_history_optimistically(
+            &path,
+            previous_reading,
+            previous_surface,
+            reading,
+            surface,
+            now,
+        )
+        .is_ok()
+            && let Ok(Some(bytes)) = read_optional(&path)
+            && let Ok(history) = parse_context_history(&bytes)
+        {
+            self.context_history = history;
+        }
+    }
 }
 
 fn sort_completions(entries: &mut Vec<&HistoryEntry>) {
@@ -200,11 +341,25 @@ fn sort_history(entries: &mut Vec<&HistoryEntry>) {
     });
 }
 
+fn sort_context_history(entries: &mut Vec<&ContextHistoryEntry>) {
+    entries.sort_unstable_by(|left, right| {
+        context_history_strength(right)
+            .cmp(&context_history_strength(left))
+            .then_with(|| right.last_used.cmp(&left.last_used))
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left.surface.cmp(&right.surface))
+    });
+}
+
 /// A single exceptional selection should not replace an established spelling.
 /// Once both spellings are established, recency remains the deciding signal so
 /// an intentional change in preference can still take effect.
 fn history_strength(entry: &HistoryEntry) -> bool {
     entry.count >= MIN_ESTABLISHED_HISTORY_COUNT
+}
+
+fn context_history_strength(entry: &ContextHistoryEntry) -> bool {
+    entry.count >= MIN_ESTABLISHED_CONTEXT_COUNT
 }
 
 fn update_history(history: &mut Vec<HistoryEntry>, reading: &str, surface: &str, last_used: u64) {
@@ -224,7 +379,45 @@ fn update_history(history: &mut Vec<HistoryEntry>, reading: &str, surface: &str,
     }
 }
 
+fn update_context_history(
+    history: &mut Vec<ContextHistoryEntry>,
+    previous_reading: &str,
+    previous_surface: &str,
+    reading: &str,
+    surface: &str,
+    last_used: u64,
+) {
+    if let Some(entry) = history.iter_mut().find(|entry| {
+        entry.previous_reading == previous_reading
+            && entry.previous_surface == previous_surface
+            && entry.reading == reading
+            && entry.surface == surface
+    }) {
+        entry.count = entry.count.saturating_add(1);
+        entry.last_used = last_used;
+    } else {
+        history.push(ContextHistoryEntry {
+            previous_reading: previous_reading.to_owned(),
+            previous_surface: previous_surface.to_owned(),
+            reading: reading.to_owned(),
+            surface: surface.to_owned(),
+            count: 1,
+            last_used,
+        });
+    }
+}
+
 fn next_last_used(history: &[HistoryEntry], wall_clock: u64) -> u64 {
+    history
+        .iter()
+        .map(|entry| entry.last_used)
+        .max()
+        .map_or(wall_clock, |latest| {
+            wall_clock.max(latest.saturating_add(1))
+        })
+}
+
+fn next_context_last_used(history: &[ContextHistoryEntry], wall_clock: u64) -> u64 {
     history
         .iter()
         .map(|entry| entry.last_used)
@@ -248,11 +441,47 @@ fn trim_history(history: &mut Vec<HistoryEntry>) {
     history.truncate(MAX_HISTORY_ENTRIES);
 }
 
+fn trim_context_history(history: &mut Vec<ContextHistoryEntry>) {
+    history.sort_unstable_by(|left, right| {
+        is_useful_context_anchor(&right.previous_reading, &right.previous_surface)
+            .cmp(&is_useful_context_anchor(
+                &left.previous_reading,
+                &left.previous_surface,
+            ))
+            .then_with(|| {
+                is_useful_history(&right.reading, &right.surface)
+                    .cmp(&is_useful_history(&left.reading, &left.surface))
+            })
+            .then_with(|| {
+                right
+                    .last_used
+                    .cmp(&left.last_used)
+                    .then_with(|| right.count.cmp(&left.count))
+            })
+    });
+    history.truncate(MAX_CONTEXT_HISTORY_ENTRIES);
+}
+
 pub(crate) fn is_useful_history(reading: &str, surface: &str) -> bool {
     let reading_length = reading.chars().count();
     let surface_length = surface.chars().count();
     (3..=MAX_HISTORY_READING_CHARS).contains(&reading_length)
         && (2..=MAX_HISTORY_SURFACE_CHARS).contains(&surface_length)
+        && reading != surface
+        && reading
+            .chars()
+            .any(|character| matches!(character, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'))
+}
+
+/// A committed word may be valuable as the left side of a context edge even
+/// when it is too short to retain as a global conversion preference. The
+/// selected surface disambiguates the anchor, while equality and script checks
+/// continue to reject literal kana, punctuation, and raw ASCII input.
+pub(crate) fn is_useful_context_anchor(reading: &str, surface: &str) -> bool {
+    let reading_length = reading.chars().count();
+    let surface_length = surface.chars().count();
+    (1..=MAX_HISTORY_READING_CHARS).contains(&reading_length)
+        && (1..=MAX_HISTORY_SURFACE_CHARS).contains(&surface_length)
         && reading != surface
         && reading
             .chars()
@@ -303,10 +532,64 @@ fn parse_history(bytes: &[u8]) -> Result<Vec<HistoryEntry>, ()> {
     Ok(entries)
 }
 
+fn parse_context_history(bytes: &[u8]) -> Result<Vec<ContextHistoryEntry>, ()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| ())?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || line == CONTEXT_HISTORY_HEADER {
+            continue;
+        }
+        let mut columns = line.split('\t');
+        let previous_reading = columns.next().ok_or(())?;
+        let previous_surface = columns.next().ok_or(())?;
+        let reading = columns.next().ok_or(())?;
+        let surface = columns.next().ok_or(())?;
+        let count = columns.next().ok_or(())?.parse().map_err(|_| ())?;
+        let last_used = columns.next().ok_or(())?.parse().map_err(|_| ())?;
+        if previous_reading.is_empty()
+            || previous_surface.is_empty()
+            || reading.is_empty()
+            || surface.is_empty()
+            || columns.next().is_some()
+        {
+            return Err(());
+        }
+        entries.push(ContextHistoryEntry {
+            previous_reading: previous_reading.to_owned(),
+            previous_surface: previous_surface.to_owned(),
+            reading: reading.to_owned(),
+            surface: surface.to_owned(),
+            count,
+            last_used,
+        });
+    }
+    Ok(entries)
+}
+
 fn serialize_history(history: &[HistoryEntry]) -> Vec<u8> {
     let mut output = String::from(HISTORY_HEADER);
     output.push('\n');
     for entry in history {
+        output.push_str(&entry.reading);
+        output.push('\t');
+        output.push_str(&entry.surface);
+        output.push('\t');
+        output.push_str(&entry.count.to_string());
+        output.push('\t');
+        output.push_str(&entry.last_used.to_string());
+        output.push('\n');
+    }
+    output.into_bytes()
+}
+
+fn serialize_context_history(history: &[ContextHistoryEntry]) -> Vec<u8> {
+    let mut output = String::from(CONTEXT_HISTORY_HEADER);
+    output.push('\n');
+    for entry in history {
+        output.push_str(&entry.previous_reading);
+        output.push('\t');
+        output.push_str(&entry.previous_surface);
+        output.push('\t');
         output.push_str(&entry.reading);
         output.push('\t');
         output.push_str(&entry.surface);
@@ -343,6 +626,43 @@ fn write_history_optimistically(
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
         "history changed while saving",
+    ))
+}
+
+fn write_context_history_optimistically(
+    path: &Path,
+    previous_reading: &str,
+    previous_surface: &str,
+    reading: &str,
+    surface: &str,
+    last_used: u64,
+) -> io::Result<()> {
+    for _ in 0..3 {
+        let base = read_optional(path)?;
+        let mut history = match base.as_deref() {
+            Some(bytes) => parse_context_history(bytes).map_err(|()| {
+                io::Error::new(io::ErrorKind::InvalidData, "malformed context history")
+            })?,
+            None => Vec::new(),
+        };
+        let last_used = next_context_last_used(&history, last_used);
+        update_context_history(
+            &mut history,
+            previous_reading,
+            previous_surface,
+            reading,
+            surface,
+            last_used,
+        );
+        trim_context_history(&mut history);
+        let proposed = serialize_context_history(&history);
+        if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "context history changed while saving",
     ))
 }
 
@@ -395,7 +715,10 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HISTORY_HEADER, USER_DICTIONARY_HEADER, UserData, atomic_replace_if_unchanged};
+    use super::{
+        CONTEXT_HISTORY_HEADER, HISTORY_HEADER, USER_DICTIONARY_HEADER, UserData,
+        atomic_replace_if_unchanged,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -453,6 +776,122 @@ mod tests {
             String::from_utf8(bytes)
                 .unwrap()
                 .contains("にほん\t日本\t2\t")
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn contextual_history_requires_repetition_and_persists() {
+        let directory = test_directory("context-history");
+        let mut data = UserData::load(&directory);
+
+        data.record_context("ぶんしょう", "文章", "かんじ", "漢字");
+        assert!(
+            data.contextual_history_surfaces("ぶんしょう", "文章", "かんじ")
+                .is_empty()
+        );
+
+        data.record_context("ぶんしょう", "文章", "かんじ", "漢字");
+        assert_eq!(
+            data.contextual_history_surfaces("ぶんしょう", "文章", "かんじ"),
+            ["漢字"]
+        );
+
+        let reloaded = UserData::load(&directory);
+        assert_eq!(
+            reloaded.contextual_history_surfaces("ぶんしょう", "文章", "かんじ"),
+            ["漢字"]
+        );
+        let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
+        assert!(context.starts_with(CONTEXT_HISTORY_HEADER));
+        assert!(context.contains("ぶんしょう\t文章\tかんじ\t漢字\t2\t"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn short_previous_word_can_anchor_context_without_becoming_plain_history() {
+        let directory = test_directory("short-context-anchor");
+        let mut data = UserData::load(&directory);
+
+        data.record("へや", "部屋");
+        assert!(data.exact_history_surfaces("へや").is_empty());
+
+        for _ in 0..2 {
+            data.record_context("へや", "部屋", "しょうめい", "照明");
+        }
+        assert_eq!(
+            data.contextual_history_surfaces("へや", "部屋", "しょうめい"),
+            ["照明"]
+        );
+
+        let reloaded = UserData::load(&directory);
+        assert_eq!(
+            reloaded.contextual_history_surfaces("へや", "部屋", "しょうめい"),
+            ["照明"]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn established_context_outranks_a_recent_transient_context() {
+        let directory = test_directory("context-strength");
+        fs::write(
+            directory.join("context_history.tsv"),
+            format!(
+                "{CONTEXT_HISTORY_HEADER}\nぶんしょう\t文章\tかんじ\t漢字\t100\t10\nぶんしょう\t文章\tかんじ\t感じ\t2\t20\n"
+            ),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        assert_eq!(
+            data.contextual_history_surfaces("ぶんしょう", "文章", "かんじ"),
+            ["漢字", "感じ"]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recency_decides_between_established_contexts() {
+        let directory = test_directory("established-context-recency");
+        fs::write(
+            directory.join("context_history.tsv"),
+            format!(
+                "{CONTEXT_HISTORY_HEADER}\nぶんしょう\t文章\tかんじ\t漢字\t100\t10\nぶんしょう\t文章\tかんじ\t感じ\t5\t20\n"
+            ),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        assert_eq!(
+            data.contextual_history_surfaces("ぶんしょう", "文章", "かんじ"),
+            ["感じ", "漢字"]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn contextual_completion_requires_repetition_and_survives_reload() {
+        let directory = test_directory("context-completion");
+        let mut data = UserData::load(&directory);
+        for _ in 0..2 {
+            data.record_context("ぶんしょう", "文章", "かんじへんかん", "漢字変換");
+        }
+
+        let reloaded = UserData::load(&directory);
+        assert_eq!(
+            reloaded.contextual_completion_surfaces("ぶんしょう", "文章", "かんじ", 9),
+            ["漢字変換"]
+        );
+        assert!(
+            reloaded
+                .contextual_completion_surfaces("ぶんしょう", "文章", "かんじへんか", 9)
+                .is_empty()
         );
 
         fs::remove_dir_all(directory).unwrap();
@@ -605,6 +1044,26 @@ mod tests {
         data.record("にほん", "日本");
 
         assert_eq!(fs::read(path).unwrap(), malformed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_context_history_is_preserved_without_disabling_plain_history() {
+        let directory = test_directory("malformed-context");
+        let path = directory.join("context_history.tsv");
+        let malformed = b"not valid context history\n";
+        fs::write(&path, malformed).unwrap();
+
+        let mut data = UserData::load(&directory);
+        data.record("にほん", "日本");
+        data.record_context("ぶんしょう", "文章", "かんじ", "漢字");
+
+        assert_eq!(fs::read(path).unwrap(), malformed);
+        assert!(
+            fs::read_to_string(directory.join("history.tsv"))
+                .unwrap()
+                .contains("にほん\t日本\t1\t")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

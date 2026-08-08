@@ -8,7 +8,10 @@ use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
-use slime_core::{EnginePreferences, InputEvent, SlimeAction, SlimeEngine, UserData};
+use slime_core::{
+    CandidateAnnotation, DictionaryPackTrust, DictionaryPackVerificationKey,
+    DictionaryPackVersionFloor, EnginePreferences, InputEvent, SlimeAction, SlimeEngine, UserData,
+};
 
 pub const EVENT_CHARACTER: u32 = 0;
 pub const EVENT_SPACE: u32 = 1;
@@ -35,6 +38,15 @@ pub const ACTION_HIDE_CANDIDATES: u32 = 2;
 pub const ACTION_COMMIT: u32 = 3;
 pub const ACTION_CLEAR: u32 = 4;
 pub const ACTION_FORWARD_KEY: u32 = 5;
+
+pub const CANDIDATE_ANNOTATION_NONE: u32 = CandidateAnnotation::None as u32;
+pub const CANDIDATE_ANNOTATION_USER_DICTIONARY: u32 = CandidateAnnotation::UserDictionary as u32;
+pub const CANDIDATE_ANNOTATION_HISTORY: u32 = CandidateAnnotation::History as u32;
+pub const CANDIDATE_ANNOTATION_CORRECTION: u32 = CandidateAnnotation::Correction as u32;
+pub const CANDIDATE_ANNOTATION_COMPLETION: u32 = CandidateAnnotation::Completion as u32;
+pub const CANDIDATE_ANNOTATION_DATE_TIME: u32 = CandidateAnnotation::DateTime as u32;
+pub const CANDIDATE_ANNOTATION_NUMBER: u32 = CandidateAnnotation::Number as u32;
+pub const CANDIDATE_ANNOTATION_CONTEXT: u32 = CandidateAnnotation::Context as u32;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_NULL_HANDLE: u32 = 1;
@@ -79,7 +91,29 @@ pub struct SlimeActionView {
     pub selection_length: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SlimeCandidateViewV2 {
+    pub value: SlimeStringView,
+    pub display: SlimeStringView,
+    pub annotation: u32,
+    pub detail: SlimeStringView,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct SlimeActionViewV2 {
+    pub kind: u32,
+    pub text: SlimeStringView,
+    pub candidates: *const SlimeCandidateViewV2,
+    pub candidate_count: usize,
+    pub selected: usize,
+    pub selection_start: usize,
+    pub selection_length: usize,
+}
+
 pub type SlimeActionCallback = unsafe extern "C" fn(*mut c_void, *const SlimeActionView);
+pub type SlimeActionCallbackV2 = unsafe extern "C" fn(*mut c_void, *const SlimeActionViewV2);
 pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView);
 
 pub struct SlimeHandle {
@@ -148,6 +182,131 @@ pub unsafe extern "C" fn slime_create_with_data_dir(
         Ok(Some(handle)) => Box::into_raw(Box::new(handle)),
         Ok(None) | Err(_) => ptr::null_mut(),
     }
+}
+
+/// Creates an engine that rejects every installed dictionary pack without a
+/// valid signature from one of the supplied Ed25519 public keys.
+///
+/// `verification_keys` is UTF-8 with one
+/// `lowercase-key-id<TAB>64-lowercase-hex-public-key` row per trusted key.
+///
+/// # Safety
+///
+/// Both pointers must reference readable byte slices of their corresponding
+/// lengths for this call. A null pointer is accepted only when its length is
+/// zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_create_with_signed_data_dir(
+    data_dir: *const u8,
+    data_dir_len: usize,
+    verification_keys: *const u8,
+    verification_keys_len: usize,
+) -> *mut SlimeHandle {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let data_dir = unsafe { utf8_from_raw_parts(data_dir, data_dir_len) }?;
+        let verification_keys =
+            unsafe { utf8_from_raw_parts(verification_keys, verification_keys_len) }?;
+        let trust = parse_dictionary_pack_trust(verification_keys)?;
+        Some(SlimeHandle {
+            engine: SlimeEngine::bundled_with_user_data_and_pack_trust(
+                UserData::load(data_dir),
+                trust,
+            ),
+        })
+    }));
+
+    match result {
+        Ok(Some(handle)) => Box::into_raw(Box::new(handle)),
+        Ok(None) | Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Creates a signed-pack engine that also rejects configured pack IDs below
+/// their minimum accepted versions.
+///
+/// `version_floors` is UTF-8 with one
+/// `lowercase-pack-id<TAB>MAJOR.MINOR.PATCH` row per protected pack.
+///
+/// # Safety
+///
+/// All pointers must reference readable byte slices of their corresponding
+/// lengths for this call. A null pointer is accepted only when its length is
+/// zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_create_with_signed_data_dir_and_version_floors(
+    data_dir: *const u8,
+    data_dir_len: usize,
+    verification_keys: *const u8,
+    verification_keys_len: usize,
+    version_floors: *const u8,
+    version_floors_len: usize,
+) -> *mut SlimeHandle {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let data_dir = unsafe { utf8_from_raw_parts(data_dir, data_dir_len) }?;
+        let verification_keys =
+            unsafe { utf8_from_raw_parts(verification_keys, verification_keys_len) }?;
+        let version_floors = unsafe { utf8_from_raw_parts(version_floors, version_floors_len) }?;
+        let keys = parse_dictionary_pack_verification_keys(verification_keys)?;
+        let floors = parse_dictionary_pack_version_floors(version_floors)?;
+        let trust = DictionaryPackTrust::signed_only_with_version_floors(keys, floors).ok()?;
+        Some(SlimeHandle {
+            engine: SlimeEngine::bundled_with_user_data_and_pack_trust(
+                UserData::load(data_dir),
+                trust,
+            ),
+        })
+    }));
+
+    match result {
+        Ok(Some(handle)) => Box::into_raw(Box::new(handle)),
+        Ok(None) | Err(_) => ptr::null_mut(),
+    }
+}
+
+unsafe fn utf8_from_raw_parts<'a>(data: *const u8, len: usize) -> Option<&'a str> {
+    if data.is_null() && len != 0 {
+        return None;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller promises a readable byte slice for this call.
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    std::str::from_utf8(bytes).ok()
+}
+
+fn parse_dictionary_pack_trust(source: &str) -> Option<DictionaryPackTrust> {
+    DictionaryPackTrust::signed_only(parse_dictionary_pack_verification_keys(source)?).ok()
+}
+
+fn parse_dictionary_pack_verification_keys(
+    source: &str,
+) -> Option<Vec<DictionaryPackVerificationKey>> {
+    let mut keys = Vec::new();
+    for line in source.lines() {
+        let (id, encoded_key) = line.split_once('\t')?;
+        if encoded_key.contains('\t') {
+            return None;
+        }
+        keys.push(DictionaryPackVerificationKey::from_lower_hex(id, encoded_key).ok()?);
+    }
+    Some(keys)
+}
+
+fn parse_dictionary_pack_version_floors(source: &str) -> Option<Vec<DictionaryPackVersionFloor>> {
+    if source.is_empty() {
+        return None;
+    }
+    let mut floors = Vec::new();
+    for line in source.lines() {
+        let (id, minimum_version) = line.split_once('\t')?;
+        if minimum_version.contains('\t') {
+            return None;
+        }
+        floors.push(DictionaryPackVersionFloor::new(id, minimum_version).ok()?);
+    }
+    Some(floors)
 }
 
 /// Destroys a handle returned by [`slime_create`].
@@ -236,6 +395,45 @@ pub unsafe extern "C" fn slime_process_actions(
         let actions = unsafe { &mut *handle }.engine.handle(event);
         for action in &actions {
             visit_action(action, context, callback);
+        }
+        STATUS_OK
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
+/// Processes one event and visits typed actions with candidate metadata.
+///
+/// The v1 callback remains available for adapters that only need display
+/// strings. v2 separates each candidate's committed value, legacy display,
+/// semantic annotation, and optional detail so native UIs can localize labels
+/// without parsing or modifying the committed text.
+///
+/// # Safety
+///
+/// The same borrowing and re-entry rules as [`slime_process_actions`] apply.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_process_actions_v2(
+    handle: *mut SlimeHandle,
+    event_kind: u32,
+    value: u32,
+    context: *mut c_void,
+    callback: Option<SlimeActionCallbackV2>,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        let Some(callback) = callback else {
+            return STATUS_NULL_CALLBACK;
+        };
+        let Ok(event) = decode_event(event_kind, value) else {
+            return STATUS_INVALID_EVENT;
+        };
+
+        // SAFETY: The caller promises a live, exclusively accessed handle.
+        let actions = unsafe { &mut *handle }.engine.handle(event);
+        for action in &actions {
+            visit_action_v2(action, context, callback);
         }
         STATUS_OK
     }));
@@ -485,6 +683,57 @@ pub unsafe extern "C" fn slime_begin_reconversion(
     unsafe { engine_control(handle, |engine| engine.begin_reconversion(surface)) }
 }
 
+/// Breaks transient left context after an external caret, document, or input
+/// client boundary without deleting persisted history.
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed pointer returned by an IME
+/// creation function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_reset_context(handle: *mut SlimeHandle) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        // SAFETY: The caller promises a live, exclusively accessed handle.
+        unsafe { &mut (*handle).engine }.reset_context();
+        STATUS_OK
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
+/// Supplies bounded committed text immediately before the platform caret.
+///
+/// The context is transient, is not persisted, and cannot create a learned
+/// contextual-history edge because the platform does not know its reading.
+/// Private mode discards it.
+///
+/// # Safety
+///
+/// `handle` must be live and exclusively accessed. `surface` must point to
+/// `surface_len` readable bytes for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_set_external_left_context(
+    handle: *mut SlimeHandle,
+    surface: *const u8,
+    surface_len: usize,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        // SAFETY: The caller promises readable bytes for the duration of the call.
+        let Some(surface) = (unsafe { decode_utf8_argument(surface, surface_len) }) else {
+            return STATUS_INVALID_UTF8;
+        };
+        // SAFETY: This function's contract requires a live, exclusive handle.
+        unsafe { &mut (*handle).engine }.set_external_left_context(surface);
+        STATUS_OK
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
 /// Reloads user dictionary and history files from the configured data folder.
 ///
 /// # Safety
@@ -562,8 +811,16 @@ pub unsafe extern "C" fn slime_installed_dictionary_packs(
             write_optional_json_string(&mut output, pack.provenance.as_deref());
             output.push_str(",\"entriesSHA256\":");
             write_optional_json_string(&mut output, pack.entries_sha256.as_deref());
-            write!(output, ",\"entryCount\":{}}}", pack.entry_count)
-                .expect("writing to String cannot fail");
+            output.push_str(",\"payloadSHA256\":");
+            write_optional_json_string(&mut output, pack.payload_sha256.as_deref());
+            output.push_str(",\"packSHA256\":");
+            write_json_string(&mut output, &pack.pack_sha256);
+            write!(
+                output,
+                ",\"entryCount\":{},\"contextRuleCount\":{}}}",
+                pack.entry_count, pack.context_rule_count
+            )
+            .expect("writing to String cannot fail");
         }
         output.push_str("],\"errors\":[");
         for (index, error) in engine.dictionary_pack_load_errors().iter().enumerate() {
@@ -732,6 +989,7 @@ fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActio
         SlimeAction::ShowCandidates {
             candidates,
             selected,
+            ..
         } => {
             candidate_views.extend(
                 candidates
@@ -767,8 +1025,91 @@ fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActio
     unsafe { callback(context, &raw const view) };
 }
 
+fn visit_action_v2(action: &SlimeAction, context: *mut c_void, callback: SlimeActionCallbackV2) {
+    let mut candidate_views = Vec::new();
+    let view = match action {
+        SlimeAction::UpdatePreedit(text) => SlimeActionViewV2 {
+            kind: ACTION_UPDATE_PREEDIT,
+            text: SlimeStringView::new(text),
+            candidates: ptr::null(),
+            candidate_count: 0,
+            selected: usize::MAX,
+            selection_start: usize::MAX,
+            selection_length: 0,
+        },
+        SlimeAction::UpdateSegmentedPreedit {
+            text,
+            selection_start,
+            selection_length,
+        } => SlimeActionViewV2 {
+            kind: ACTION_UPDATE_PREEDIT,
+            text: SlimeStringView::new(text),
+            candidates: ptr::null(),
+            candidate_count: 0,
+            selected: usize::MAX,
+            selection_start: *selection_start,
+            selection_length: *selection_length,
+        },
+        SlimeAction::ShowCandidates {
+            candidates,
+            details,
+            selected,
+        } => {
+            debug_assert_eq!(candidates.len(), details.len());
+            candidate_views.extend(candidates.iter().zip(details).map(|(display, detail)| {
+                SlimeCandidateViewV2 {
+                    value: SlimeStringView::new(&detail.value),
+                    display: SlimeStringView::new(display),
+                    annotation: detail.annotation as u32,
+                    detail: detail
+                        .detail
+                        .as_deref()
+                        .map_or_else(SlimeStringView::empty, SlimeStringView::new),
+                }
+            }));
+            SlimeActionViewV2 {
+                kind: ACTION_SHOW_CANDIDATES,
+                text: SlimeStringView::empty(),
+                candidates: candidate_views.as_ptr(),
+                candidate_count: candidate_views.len(),
+                selected: *selected,
+                selection_start: usize::MAX,
+                selection_length: 0,
+            }
+        }
+        SlimeAction::HideCandidates => action_without_payload_v2(ACTION_HIDE_CANDIDATES),
+        SlimeAction::Commit(text) => SlimeActionViewV2 {
+            kind: ACTION_COMMIT,
+            text: SlimeStringView::new(text),
+            candidates: ptr::null(),
+            candidate_count: 0,
+            selected: usize::MAX,
+            selection_start: usize::MAX,
+            selection_length: 0,
+        },
+        SlimeAction::Clear => action_without_payload_v2(ACTION_CLEAR),
+        SlimeAction::ForwardKey => action_without_payload_v2(ACTION_FORWARD_KEY),
+    };
+
+    // SAFETY: The public function contract requires a callback that remains
+    // valid for the call and does not retain the borrowed view.
+    unsafe { callback(context, &raw const view) };
+}
+
 const fn action_without_payload(kind: u32) -> SlimeActionView {
     SlimeActionView {
+        kind,
+        text: SlimeStringView::empty(),
+        candidates: ptr::null(),
+        candidate_count: 0,
+        selected: usize::MAX,
+        selection_start: usize::MAX,
+        selection_length: 0,
+    }
+}
+
+const fn action_without_payload_v2(kind: u32) -> SlimeActionViewV2 {
+    SlimeActionViewV2 {
         kind,
         text: SlimeStringView::empty(),
         candidates: ptr::null(),
@@ -801,6 +1142,7 @@ fn write_action(output: &mut String, action: &SlimeAction) {
         }
         SlimeAction::ShowCandidates {
             candidates,
+            details,
             selected,
         } => {
             output.push_str("{\"type\":\"show_candidates\",\"selected\":");
@@ -811,6 +1153,20 @@ fn write_action(output: &mut String, action: &SlimeAction) {
                     output.push(',');
                 }
                 write_json_string(output, candidate);
+            }
+            output.push_str("],\"candidateDetails\":[");
+            for (index, detail) in details.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str("{\"value\":");
+                write_json_string(output, &detail.value);
+                output.push_str(",\"annotation\":");
+                write!(output, "{}", detail.annotation as u32)
+                    .expect("writing to String cannot fail");
+                output.push_str(",\"detail\":");
+                write_optional_json_string(output, detail.detail.as_deref());
+                output.push('}');
             }
             output.push_str("]}");
         }
@@ -864,14 +1220,19 @@ fn write_optional_json_string(output: &mut String, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_SHOW_CANDIDATES, ACTION_UPDATE_PREEDIT, EVENT_CHARACTER, EVENT_ENTER,
-        EVENT_PREVIOUS_SEGMENT, EVENT_SPACE, STATUS_INVALID_CANDIDATE, STATUS_INVALID_UTF8,
-        STATUS_OK, SlimeActionView, SlimeBuffer, SlimeStringView, slime_begin_reconversion,
-        slime_buffer_destroy, slime_conversion_candidates, slime_create,
-        slime_create_with_data_dir, slime_destroy, slime_domain_dictionary_words,
-        slime_installed_dictionary_pack_words, slime_installed_dictionary_packs, slime_process,
-        slime_process_actions, slime_record_external_selection, slime_set_options,
-        slime_set_options_v2, slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
+        ACTION_COMMIT, ACTION_SHOW_CANDIDATES, ACTION_UPDATE_PREEDIT,
+        CANDIDATE_ANNOTATION_CORRECTION, CANDIDATE_ANNOTATION_NUMBER, EVENT_ACCEPT_CANDIDATE,
+        EVENT_CHARACTER, EVENT_ENTER, EVENT_NEXT_CANDIDATE, EVENT_PREVIOUS_SEGMENT,
+        EVENT_SELECT_CANDIDATE, EVENT_SPACE, STATUS_INVALID_CANDIDATE, STATUS_INVALID_UTF8,
+        STATUS_NULL_HANDLE, STATUS_OK, SlimeActionView, SlimeActionViewV2, SlimeBuffer,
+        SlimeStringView, slime_begin_reconversion, slime_buffer_destroy,
+        slime_conversion_candidates, slime_create, slime_create_with_data_dir,
+        slime_create_with_signed_data_dir, slime_create_with_signed_data_dir_and_version_floors,
+        slime_destroy, slime_domain_dictionary_words, slime_installed_dictionary_pack_words,
+        slime_installed_dictionary_packs, slime_process, slime_process_actions,
+        slime_process_actions_v2, slime_record_external_selection, slime_reset_context,
+        slime_set_external_left_context, slime_set_options, slime_set_options_v2,
+        slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
     };
     use std::ffi::c_void;
     use std::fs;
@@ -885,7 +1246,56 @@ mod tests {
     #[derive(Default)]
     struct TypedCapture {
         last_preedit: String,
+        last_commit: String,
         candidate_count: usize,
+        candidates: Vec<String>,
+        selected: usize,
+    }
+
+    #[derive(Default)]
+    struct TypedCaptureV2 {
+        values: Vec<String>,
+        displays: Vec<String>,
+        annotations: Vec<u32>,
+        details: Vec<Option<String>>,
+    }
+
+    unsafe fn copy_view(value: SlimeStringView) -> String {
+        // SAFETY: The caller passes a borrowed callback view containing UTF-8.
+        let bytes = unsafe { std::slice::from_raw_parts(value.data, value.len) };
+        std::str::from_utf8(bytes).unwrap().to_owned()
+    }
+
+    unsafe extern "C" fn collect_typed_action_v2(
+        context: *mut c_void,
+        action: *const SlimeActionViewV2,
+    ) {
+        // SAFETY: The test passes live pointers for the synchronous callback.
+        let capture = unsafe { &mut *context.cast::<TypedCaptureV2>() };
+        // SAFETY: The callback contract supplies a live action view.
+        let action = unsafe { &*action };
+        if action.kind != ACTION_SHOW_CANDIDATES {
+            return;
+        }
+        capture.values.clear();
+        capture.displays.clear();
+        capture.annotations.clear();
+        capture.details.clear();
+        for index in 0..action.candidate_count {
+            // SAFETY: The action exposes `candidate_count` borrowed views.
+            let candidate = unsafe { &*action.candidates.add(index) };
+            // SAFETY: Candidate value and display are valid UTF-8 callback views.
+            capture.values.push(unsafe { copy_view(candidate.value) });
+            // SAFETY: Candidate value and display are valid UTF-8 callback views.
+            capture
+                .displays
+                .push(unsafe { copy_view(candidate.display) });
+            capture.annotations.push(candidate.annotation);
+            capture.details.push((candidate.detail.len > 0).then(|| {
+                // SAFETY: A non-empty detail is a valid UTF-8 callback view.
+                unsafe { copy_view(candidate.detail) }
+            }));
+        }
     }
 
     unsafe extern "C" fn collect_typed_action(
@@ -900,8 +1310,24 @@ mod tests {
             // SAFETY: Text is borrowed for the callback and contains UTF-8.
             let bytes = unsafe { std::slice::from_raw_parts(action.text.data, action.text.len) };
             capture.last_preedit = std::str::from_utf8(bytes).unwrap().to_owned();
+        } else if action.kind == ACTION_COMMIT {
+            // SAFETY: Text is borrowed for the callback and contains UTF-8.
+            let bytes = unsafe { std::slice::from_raw_parts(action.text.data, action.text.len) };
+            capture.last_commit = std::str::from_utf8(bytes).unwrap().to_owned();
         } else if action.kind == ACTION_SHOW_CANDIDATES {
             capture.candidate_count = action.candidate_count;
+            capture.selected = action.selected;
+            capture.candidates.clear();
+            for index in 0..action.candidate_count {
+                // SAFETY: The action view exposes `candidate_count` live views
+                // for the duration of this callback.
+                let candidate = unsafe { &*action.candidates.add(index) };
+                // SAFETY: Candidate text is valid borrowed UTF-8.
+                let bytes = unsafe { std::slice::from_raw_parts(candidate.data, candidate.len) };
+                capture
+                    .candidates
+                    .push(std::str::from_utf8(bytes).unwrap().to_owned());
+            }
         }
     }
 
@@ -912,6 +1338,63 @@ mod tests {
         // SAFETY: The callback contract guarantees readable UTF-8 bytes.
         let bytes = unsafe { std::slice::from_raw_parts(value.data, value.len) };
         candidates.push(std::str::from_utf8(bytes).unwrap().to_owned());
+    }
+
+    fn process_typed_event(
+        handle: *mut super::SlimeHandle,
+        event: u32,
+        value: u32,
+        capture: &mut TypedCapture,
+    ) {
+        // SAFETY: The handle and capture remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    event,
+                    value,
+                    std::ptr::from_mut::<TypedCapture>(capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+    }
+
+    fn type_ascii(handle: *mut super::SlimeHandle, input: &str, capture: &mut TypedCapture) {
+        for character in input.chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), capture);
+        }
+    }
+
+    fn convert_and_accept_typed(
+        handle: *mut super::SlimeHandle,
+        input: &str,
+        expected_surface: &str,
+        capture: &mut TypedCapture,
+    ) {
+        capture.last_commit.clear();
+        type_ascii(handle, input, capture);
+        process_typed_event(handle, EVENT_SPACE, 0, capture);
+        let index = capture
+            .candidates
+            .iter()
+            .position(|candidate| candidate == expected_surface)
+            .unwrap_or_else(|| {
+                panic!(
+                    "typed candidates for {input:?} should contain {expected_surface:?}: {:?}",
+                    capture.candidates
+                )
+            });
+        process_typed_event(
+            handle,
+            EVENT_SELECT_CANDIDATE,
+            u32::try_from(index).unwrap(),
+            capture,
+        );
+        assert_eq!(capture.last_preedit, expected_surface);
+        process_typed_event(handle, EVENT_ACCEPT_CANDIDATE, 0, capture);
+        assert_eq!(capture.last_commit, expected_surface);
     }
 
     #[test]
@@ -1050,6 +1533,345 @@ mod tests {
     }
 
     #[test]
+    fn typo_annotation_crosses_json_and_typed_action_boundaries() {
+        let json_handle = slime_create();
+        for character in "nihpn".chars() {
+            // SAFETY: The handle is live and used serially.
+            let buffer = unsafe { slime_process(json_handle, EVENT_CHARACTER, character.into()) };
+            // SAFETY: The returned buffer is released exactly once.
+            unsafe { slime_buffer_destroy(buffer) };
+        }
+        // SAFETY: The handle is live and used serially.
+        let buffer = unsafe { slime_process(json_handle, EVENT_SPACE, 0) };
+        // SAFETY: The buffer remains live while copied.
+        let json = unsafe { copy_buffer(&buffer) };
+        assert!(json.contains("日本　（にほんに訂正）"), "{json}");
+        assert!(
+            json.contains("{\"value\":\"日本\",\"annotation\":3,\"detail\":\"にほん\"}"),
+            "{json}"
+        );
+        // SAFETY: Both resources are live and released exactly once.
+        unsafe {
+            slime_buffer_destroy(buffer);
+            slime_destroy(json_handle);
+        }
+
+        let typed_handle = slime_create();
+        let mut capture = TypedCapture::default();
+        for character in "nihpn".chars() {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            let status = unsafe {
+                slime_process_actions(
+                    typed_handle,
+                    EVENT_CHARACTER,
+                    character.into(),
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            };
+            assert_eq!(status, STATUS_OK);
+        }
+        // SAFETY: Pointers remain live for the synchronous callback.
+        let status = unsafe {
+            slime_process_actions(
+                typed_handle,
+                EVENT_SPACE,
+                0,
+                (&raw mut capture).cast(),
+                Some(collect_typed_action),
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        assert!(
+            capture
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "日本　（にほんに訂正）")
+        );
+        let corrected_index = capture
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "日本　（にほんに訂正）")
+            .expect("typed candidates should contain the correction label");
+        // SAFETY: Pointers remain live for the synchronous callback.
+        let status = unsafe {
+            slime_process_actions(
+                typed_handle,
+                EVENT_SELECT_CANDIDATE,
+                u32::try_from(corrected_index).unwrap(),
+                (&raw mut capture).cast(),
+                Some(collect_typed_action),
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(capture.last_preedit, "日本");
+        assert_eq!(capture.selected, corrected_index);
+        assert_eq!(
+            capture.candidates[corrected_index],
+            "日本　（にほんに訂正）"
+        );
+        // SAFETY: Pointers remain live for the synchronous callback.
+        let status = unsafe {
+            slime_process_actions(
+                typed_handle,
+                EVENT_ACCEPT_CANDIDATE,
+                0,
+                (&raw mut capture).cast(),
+                Some(collect_typed_action),
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(capture.last_commit, "日本");
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(typed_handle) };
+    }
+
+    #[test]
+    fn correction_metadata_crosses_v2_typed_actions() {
+        let handle = slime_create();
+        let mut capture = TypedCaptureV2::default();
+        for character in "nihpn".chars() {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions_v2(
+                        handle,
+                        EVENT_CHARACTER,
+                        character.into(),
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action_v2),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions_v2(
+                    handle,
+                    EVENT_SPACE,
+                    0,
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action_v2),
+                )
+            },
+            STATUS_OK
+        );
+        let index = capture
+            .values
+            .iter()
+            .position(|value| value == "日本")
+            .expect("v2 correction value");
+        assert_eq!(capture.displays[index], "日本　（にほんに訂正）");
+        assert_eq!(capture.annotations[index], CANDIDATE_ANNOTATION_CORRECTION);
+        assert_eq!(capture.details[index].as_deref(), Some("にほん"));
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[test]
+    fn numeric_candidate_annotation_crosses_v2_typed_actions() {
+        let handle = slime_create();
+        let mut capture = TypedCaptureV2::default();
+        for character in "senkyuuhyakukyuujuuichi".chars() {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions_v2(
+                        handle,
+                        EVENT_CHARACTER,
+                        character.into(),
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action_v2),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions_v2(
+                    handle,
+                    EVENT_SPACE,
+                    0,
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action_v2),
+                )
+            },
+            STATUS_OK
+        );
+        let index = capture
+            .values
+            .iter()
+            .position(|value| value == "1991")
+            .expect("numeric candidate");
+        assert_eq!(capture.annotations[index], CANDIDATE_ANNOTATION_NUMBER);
+        assert_eq!(capture.details[index], None);
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[test]
+    fn expanded_recall_candidate_crosses_typed_actions_and_commits_by_index() {
+        let handle = slime_create();
+        let mut capture = TypedCapture::default();
+        for character in "asairi".chars() {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions(
+                        handle,
+                        EVENT_CHARACTER,
+                        character.into(),
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_SPACE,
+                    0,
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+        let initial_count = capture.candidate_count;
+        assert!(
+            !capture
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "浅煎り")
+        );
+
+        for _ in 0..initial_count {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions(
+                        handle,
+                        EVENT_NEXT_CANDIDATE,
+                        0,
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        let expanded_index = capture
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "浅煎り")
+            .expect("typed candidates should expose expanded recall");
+        assert!(capture.candidate_count > initial_count);
+
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_SELECT_CANDIDATE,
+                    u32::try_from(expanded_index).unwrap(),
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(capture.selected, expanded_index);
+        assert_eq!(capture.last_preedit, "浅煎り");
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_ACCEPT_CANDIDATE,
+                    0,
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(capture.last_commit, "浅煎り");
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[test]
+    fn short_left_context_learning_crosses_typed_actions_and_persists() {
+        let directory =
+            std::env::temp_dir().join(format!("slime-ffi-short-context-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.to_string_lossy();
+        // SAFETY: `path` remains readable for the duration of the creation call.
+        let handle = unsafe { slime_create_with_data_dir(path.as_ptr(), path.len()) };
+        assert!(!handle.is_null());
+        // SAFETY: `handle` is live and exclusively accessed in this test.
+        let options = unsafe {
+            slime_set_options_v5(
+                handle,
+                false,
+                true,
+                true,
+                0,
+                false,
+                slime_core::ALL_DATE_FORMATS,
+            )
+        };
+        // SAFETY: `options` is the original live buffer.
+        unsafe { slime_buffer_destroy(options) };
+
+        let mut capture = TypedCapture::default();
+        for _ in 0..2 {
+            convert_and_accept_typed(handle, "heya", "部屋", &mut capture);
+            convert_and_accept_typed(handle, "shoumei", "照明", &mut capture);
+            convert_and_accept_typed(handle, "hon'nin", "本人", &mut capture);
+            convert_and_accept_typed(handle, "shoumei", "証明", &mut capture);
+        }
+        // SAFETY: The handle is live and released once before reloading its data.
+        unsafe { slime_destroy(handle) };
+
+        // SAFETY: `path` remains readable for the duration of the creation call.
+        let reloaded = unsafe { slime_create_with_data_dir(path.as_ptr(), path.len()) };
+        assert!(!reloaded.is_null());
+        // SAFETY: `reloaded` is live and exclusively accessed in this test.
+        let options = unsafe {
+            slime_set_options_v5(
+                reloaded,
+                false,
+                true,
+                true,
+                0,
+                false,
+                slime_core::ALL_DATE_FORMATS,
+            )
+        };
+        // SAFETY: `options` is the original live buffer.
+        unsafe { slime_buffer_destroy(options) };
+
+        convert_and_accept_typed(reloaded, "heya", "部屋", &mut capture);
+        type_ascii(reloaded, "shoumei", &mut capture);
+        process_typed_event(reloaded, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(capture.candidates.first().map(String::as_str), Some("照明"));
+        assert_eq!(capture.last_preedit, "照明");
+
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(reloaded) };
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn reconversion_and_segment_selection_cross_the_c_boundary() {
         let handle = slime_create();
         let surface = "日本";
@@ -1114,6 +1936,66 @@ mod tests {
     }
 
     #[test]
+    fn signed_data_directory_constructor_requires_valid_trusted_keys() {
+        let directory = "/tmp/slime-signed-data-dir-constructor-fixture";
+        let keys =
+            "fixture-2026-a\td75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n";
+        // SAFETY: Both UTF-8 byte slices remain readable for this call.
+        let handle = unsafe {
+            slime_create_with_signed_data_dir(
+                directory.as_ptr(),
+                directory.len(),
+                keys.as_ptr(),
+                keys.len(),
+            )
+        };
+        assert!(!handle.is_null());
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(handle) };
+
+        // SAFETY: Empty key input is a valid byte slice but not a valid policy.
+        let invalid = unsafe {
+            slime_create_with_signed_data_dir(
+                directory.as_ptr(),
+                directory.len(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(invalid.is_null());
+
+        let floors = "sample-general\t2026.08.1\n";
+        // SAFETY: Every UTF-8 byte slice remains readable for this call.
+        let rollback_protected = unsafe {
+            slime_create_with_signed_data_dir_and_version_floors(
+                directory.as_ptr(),
+                directory.len(),
+                keys.as_ptr(),
+                keys.len(),
+                floors.as_ptr(),
+                floors.len(),
+            )
+        };
+        assert!(!rollback_protected.is_null());
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(rollback_protected) };
+
+        let invalid_floor = "sample-general\t2026.08\n";
+        // SAFETY: Every UTF-8 byte slice remains readable for this call.
+        let invalid = unsafe {
+            slime_create_with_signed_data_dir_and_version_floors(
+                directory.as_ptr(),
+                directory.len(),
+                keys.as_ptr(),
+                keys.len(),
+                invalid_floor.as_ptr(),
+                invalid_floor.len(),
+            )
+        };
+        assert!(invalid.is_null());
+    }
+
+    #[test]
     fn null_handle_is_an_error() {
         // SAFETY: A null handle is explicitly accepted and reported as an error.
         let buffer = unsafe { slime_process(std::ptr::null_mut(), EVENT_SPACE, 0) };
@@ -1122,6 +2004,50 @@ mod tests {
         assert_eq!(json, "{\"ok\":false,\"error\":\"null_handle\"}");
         // SAFETY: `buffer` has not previously been released.
         unsafe { slime_buffer_destroy(buffer) };
+    }
+
+    #[test]
+    fn context_reset_reports_live_and_null_handles() {
+        let handle = slime_create();
+        // SAFETY: `handle` is live and exclusively accessed.
+        assert_eq!(unsafe { slime_reset_context(handle) }, STATUS_OK);
+        // SAFETY: A null handle is explicitly accepted and reported as an error.
+        assert_eq!(
+            unsafe { slime_reset_context(std::ptr::null_mut()) },
+            STATUS_NULL_HANDLE
+        );
+        // SAFETY: `handle` is live and has not previously been released.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[test]
+    fn external_left_context_reports_invalid_inputs_without_panicking() {
+        let handle = slime_create();
+        let context = "直前の文章";
+        // SAFETY: The UTF-8 bytes and handle remain live for the call.
+        assert_eq!(
+            unsafe { slime_set_external_left_context(handle, context.as_ptr(), context.len(),) },
+            STATUS_OK
+        );
+        let invalid = [0xff];
+        // SAFETY: The byte is readable but deliberately invalid UTF-8.
+        assert_eq!(
+            unsafe { slime_set_external_left_context(handle, invalid.as_ptr(), invalid.len()) },
+            STATUS_INVALID_UTF8
+        );
+        // SAFETY: A null handle is explicitly accepted and reported.
+        assert_eq!(
+            unsafe {
+                slime_set_external_left_context(
+                    std::ptr::null_mut(),
+                    context.as_ptr(),
+                    context.len(),
+                )
+            },
+            STATUS_NULL_HANDLE
+        );
+        // SAFETY: The handle is live and has not previously been released.
+        unsafe { slime_destroy(handle) };
     }
 
     #[test]
@@ -1285,12 +2211,19 @@ mod tests {
         fs::write(
             pack_directory.join("sample.slime-dict"),
             "\
-# slime-dictionary-pack-v1
-# id: sample-pro
-# name: サンプル Pro
-# version: 2026.07.1
-# license: Proprietary
-すらいむぷろ\tSlime Pro
+# slime-dictionary-pack-v3
+# id: sample-general
+# name: 一般語彙サンプル
+# version: 2026.08.1
+# license: Example-Test-Only
+# minimum-slime-version: 0.1.0
+# published-at: 2026-08-08
+# provenance: fixture/generated/sample-general
+# payload-sha256: dba7dcf657c74cd788ee904f95b5d2dd54d6fd16925e2ec88c96a13d19e4a0b6
+# entries
+てすとようご\t試験用語
+# context-rules
+文章\tかんじ\t漢字\t0
 ",
         )
         .unwrap();
@@ -1302,19 +2235,30 @@ mod tests {
         let catalog = unsafe { slime_installed_dictionary_packs(handle) };
         // SAFETY: `catalog` is live until the destroy call below.
         let json = unsafe { copy_buffer(&catalog) };
-        assert!(json.contains("\"id\":\"sample-pro\""), "{json}");
-        assert!(json.contains("\"formatVersion\":1"), "{json}");
-        assert!(json.contains("\"provenance\":null"), "{json}");
+        assert!(json.contains("\"id\":\"sample-general\""), "{json}");
+        assert!(json.contains("\"formatVersion\":3"), "{json}");
+        assert!(
+            json.contains("\"provenance\":\"fixture/generated/sample-general\""),
+            "{json}"
+        );
+        assert!(
+            json.contains(
+                "\"payloadSHA256\":\"dba7dcf657c74cd788ee904f95b5d2dd54d6fd16925e2ec88c96a13d19e4a0b6\""
+            ),
+            "{json}"
+        );
         assert!(json.contains("\"entryCount\":1"), "{json}");
+        assert!(json.contains("\"contextRuleCount\":1"), "{json}");
+        assert!(json.contains("\"packSHA256\":"), "{json}");
         // SAFETY: `catalog` has not previously been released.
         unsafe { slime_buffer_destroy(catalog) };
 
-        let id = b"sample-pro";
+        let id = b"sample-general";
         // SAFETY: `handle` and `id` are live and readable for this call.
         let words = unsafe { slime_installed_dictionary_pack_words(handle, id.as_ptr(), id.len()) };
         // SAFETY: `words` is live until the destroy call below.
         let json = unsafe { copy_buffer(&words) };
-        assert!(json.contains("Slime Pro"), "{json}");
+        assert!(json.contains("試験用語"), "{json}");
         // SAFETY: Resources are live and each is destroyed exactly once.
         unsafe {
             slime_buffer_destroy(words);

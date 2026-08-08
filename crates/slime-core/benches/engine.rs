@@ -1,10 +1,14 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
 use slime_core::{
-    ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, EnginePreferences, InputEvent, SlimeEngine, UserData,
+    ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, DictionaryPackTrust, DictionaryPackVerificationKey,
+    EnginePreferences, InputEvent, SlimeEngine, UserData,
 };
 
 fn main() {
@@ -75,7 +79,8 @@ fn main() {
     });
 
     run_history_benchmarks((iterations / 10).clamp(1_000, 5_000));
-    run_session_context_benchmarks((iterations / 10).clamp(1_000, 5_000));
+    run_adaptive_context_benchmarks((iterations / 10).clamp(1_000, 5_000));
+    run_static_context_pack_benchmarks((iterations / 10).clamp(1_000, 5_000));
 
     let live_iterations = (iterations / 100).clamp(100, 500);
     let source = "seidowotakamerukufuuwoshiteikimashou".repeat(3);
@@ -103,7 +108,151 @@ fn main() {
     }
 }
 
-fn run_session_context_benchmarks(iterations: u64) {
+fn run_static_context_pack_benchmarks(iterations: u64) {
+    let directory = std::env::temp_dir().join(format!(
+        "slime-static-context-benchmark-{}",
+        std::process::id()
+    ));
+    let pack_path = write_static_context_benchmark_pack(&directory);
+
+    let baseline = SlimeEngine::bundled();
+    let engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+    assert_eq!(
+        engine
+            .conversion_candidates_with_left_context("これは長い文章", "かんじ")
+            .first()
+            .map(String::as_str),
+        Some("漢字"),
+        "static context benchmark rule must affect ranking"
+    );
+    let matching_context = format!("{}文章", "長".repeat(126));
+    let missing_context = "長".repeat(128);
+
+    run("engine/static_context_baseline_no_pack", iterations, || {
+        black_box(baseline.conversion_candidates_with_left_context(
+            black_box(&matching_context),
+            black_box("かんじ"),
+        ));
+    });
+    run("engine/static_context_miss_10001_rules", iterations, || {
+        black_box(engine.conversion_candidates_with_left_context(
+            black_box(&missing_context),
+            black_box("かんじ"),
+        ));
+    });
+    run(
+        "engine/static_context_exact_10001_rules",
+        iterations,
+        || {
+            black_box(
+                engine.conversion_candidates_with_left_context(
+                    black_box("文章"),
+                    black_box("かんじ"),
+                ),
+            );
+        },
+    );
+    run(
+        "engine/static_context_suffix_10001_rules",
+        iterations,
+        || {
+            black_box(engine.conversion_candidates_with_left_context(
+                black_box(&matching_context),
+                black_box("かんじ"),
+            ));
+        },
+    );
+
+    let trust = sign_static_context_benchmark_pack(&pack_path);
+    let load_iterations = (iterations / 10).clamp(100, 500);
+    run(
+        "engine/static_context_pack_load_unsigned_10001_rules",
+        load_iterations,
+        || {
+            black_box(SlimeEngine::bundled_with_user_data(UserData::load(
+                black_box(&directory),
+            )));
+        },
+    );
+    run(
+        "engine/static_context_pack_load_signed_10001_rules",
+        load_iterations,
+        || {
+            black_box(SlimeEngine::bundled_with_user_data_and_pack_trust(
+                UserData::load(black_box(&directory)),
+                black_box(trust.clone()),
+            ));
+        },
+    );
+
+    fs::remove_dir_all(directory).expect("remove static context benchmark directory");
+}
+
+fn write_static_context_benchmark_pack(directory: &Path) -> PathBuf {
+    const RULE_COUNT: usize = 10_000;
+
+    let pack_directory = directory.join("dictionary-packs");
+    fs::create_dir_all(&pack_directory).expect("create static context benchmark directory");
+    let mut payload = String::from("てすとようご\t試験用語\n# context-rules\n");
+    for index in 0..RULE_COUNT {
+        writeln!(payload, "前提{index}\tかんじ\t漢字\t100")
+            .expect("write static context benchmark rule");
+    }
+    payload.push_str("文章\tかんじ\t漢字\t0\n");
+    let digest = lower_hex(&Sha256::digest(payload.as_bytes()));
+    let source = format!(
+        "# slime-dictionary-pack-v3\n\
+         # id: static-context-benchmark\n\
+         # name: 文脈性能試験\n\
+         # version: 2026.08.1\n\
+         # license: Example-Test-Only\n\
+         # minimum-slime-version: 0.1.0\n\
+         # published-at: 2026-08-08\n\
+         # provenance: fixture/generated/static-context-benchmark\n\
+         # payload-sha256: {digest}\n\
+         # entries\n\
+         {payload}"
+    );
+    let pack_path = pack_directory.join("static-context-benchmark.slime-dict");
+    fs::write(&pack_path, source).expect("write static context benchmark pack");
+    pack_path
+}
+
+fn sign_static_context_benchmark_pack(pack_path: &Path) -> DictionaryPackTrust {
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let pack_bytes = fs::read(pack_path).expect("read static context benchmark pack");
+    let signature = signing_key.sign(&pack_bytes).to_bytes();
+    fs::write(
+        pack_path.with_extension("slime-dict.sig"),
+        format!(
+            "# slime-dictionary-signature-v1\n\
+             # key-id: fixture-benchmark\n\
+             # signature-ed25519: {}\n",
+            lower_hex(&signature)
+        ),
+    )
+    .expect("write static context benchmark signature");
+    DictionaryPackTrust::signed_only(vec![
+        DictionaryPackVerificationKey::new(
+            "fixture-benchmark",
+            signing_key.verifying_key().to_bytes(),
+        )
+        .expect("valid static context benchmark key"),
+    ])
+    .expect("valid static context benchmark trust")
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn run_adaptive_context_benchmarks(iterations: u64) {
     let entries = domain_entries();
     assert!(entries.len() >= 128);
     let (previous_reading, previous_surface) = entries[0];
@@ -119,7 +268,7 @@ fn run_session_context_benchmarks(iterations: u64) {
 
     let mut empty_context = SlimeEngine::bundled();
     black_box(empty_context.set_preferences(preferences));
-    run("engine/session_context_empty", iterations, || {
+    run("engine/adaptive_context_empty", iterations, || {
         query_and_clear(&mut empty_context, target_reading);
     });
 
@@ -127,14 +276,54 @@ fn run_session_context_benchmarks(iterations: u64) {
     black_box(full_context.set_preferences(preferences));
     commit_reading(&mut full_context, previous_reading, previous_surface);
     commit_reading(&mut full_context, target_reading, target_surface);
+    commit_reading(&mut full_context, previous_reading, previous_surface);
+    commit_reading(&mut full_context, target_reading, target_surface);
     for &(reading, surface) in &entries[2..128] {
         commit_reading(&mut full_context, reading, surface);
     }
     commit_reading(&mut full_context, previous_reading, previous_surface);
 
-    run("engine/session_context_128", iterations, || {
+    run("engine/adaptive_context_128", iterations, || {
         query_and_clear(&mut full_context, target_reading);
     });
+
+    let directory = std::env::temp_dir().join(format!(
+        "slime-context-history-benchmark-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).expect("create context history benchmark directory");
+    let mut fixture = String::from("# slime-context-history-v1\n");
+    for index in 0..499 {
+        writeln!(
+            fixture,
+            "ぶんみゃく{index}\t文脈{index}\tこうほ{index}\t候補{index}\t2\t{index}"
+        )
+        .expect("write context history benchmark row");
+    }
+    writeln!(
+        fixture,
+        "{previous_reading}\t{previous_surface}\t{target_reading}\t{target_surface}\t2\t1000"
+    )
+    .expect("write matching context history benchmark row");
+    fs::write(directory.join("context_history.tsv"), fixture)
+        .expect("write context history benchmark fixture");
+
+    let mut persistent_context = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+    black_box(persistent_context.set_preferences(preferences));
+    commit_reading(&mut persistent_context, previous_reading, previous_surface);
+    assert_eq!(
+        persistent_context
+            .conversion_candidates(target_reading)
+            .first()
+            .map(String::as_str),
+        Some(target_surface),
+        "persistent context fixture must affect ranking"
+    );
+    run("engine/persistent_context_500", iterations, || {
+        query_and_clear(&mut persistent_context, target_reading);
+    });
+
+    fs::remove_dir_all(directory).expect("remove context history benchmark directory");
 }
 
 fn domain_entries() -> Vec<(&'static str, &'static str)> {
@@ -244,6 +433,9 @@ fn iterations(default: u64) -> u64 {
 }
 
 fn run(name: &str, iterations: u64, mut operation: impl FnMut()) {
+    if std::env::var("SLIME_BENCH_FILTER").is_ok_and(|filter| !name.contains(&filter)) {
+        return;
+    }
     let warmup_iterations = std::env::var("SLIME_BENCH_WARMUP_ITERATIONS")
         .ok()
         .and_then(|value| value.parse().ok())

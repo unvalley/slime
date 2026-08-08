@@ -1,5 +1,5 @@
-//! A small, deterministic kana-kanji conversion baseline backed by a reduced
-//! Mozc OSS dictionary.
+//! A small, deterministic kana-kanji conversion baseline backed by a compact
+//! dictionary.
 
 mod compact;
 mod ranking;
@@ -142,6 +142,64 @@ struct EntryView<'a> {
     word_cost: i32,
 }
 
+#[derive(Clone, Debug)]
+struct CompoundPath {
+    surface: String,
+    cost: i32,
+    right_id: u16,
+}
+
+#[derive(Clone, Debug)]
+struct FixedSegmentPath {
+    surface: String,
+    changed_segments: usize,
+    relative_cost: i64,
+}
+
+const COMPOUND_MAX_SEGMENTS: usize = 6;
+const COMPOUND_MAX_READING_CHARACTERS: usize = 16;
+const COMPOUND_MAX_ENTRIES_PER_SEGMENT: usize = 8;
+const COMPOUND_MAX_CANDIDATES: usize = 64;
+const FIXED_SEGMENT_MAX_READING_CHARACTERS: usize = 128;
+const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
+const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
+const FIXED_SEGMENT_MAX_CANDIDATES: usize = 128;
+const FIXED_SEGMENT_MAX_STATES: usize = 256;
+
+fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
+    paths.sort_unstable_by(|left, right| {
+        left.surface
+            .cmp(&right.surface)
+            .then_with(|| left.right_id.cmp(&right.right_id))
+            .then_with(|| left.cost.cmp(&right.cost))
+    });
+    paths.dedup_by(|left, right| left.surface == right.surface && left.right_id == right.right_id);
+    paths.sort_unstable_by(|left, right| {
+        left.cost
+            .cmp(&right.cost)
+            .then_with(|| left.surface.cmp(&right.surface))
+            .then_with(|| left.right_id.cmp(&right.right_id))
+    });
+    paths.truncate(limit);
+}
+
+fn trim_fixed_segment_paths(paths: &mut Vec<FixedSegmentPath>, limit: usize) {
+    paths.sort_unstable_by(|left, right| {
+        left.surface
+            .cmp(&right.surface)
+            .then(left.changed_segments.cmp(&right.changed_segments))
+            .then(left.relative_cost.cmp(&right.relative_cost))
+    });
+    paths.dedup_by(|left, right| left.surface == right.surface);
+    paths.sort_unstable_by(|left, right| {
+        left.changed_segments
+            .cmp(&right.changed_segments)
+            .then(left.relative_cost.cmp(&right.relative_cost))
+            .then(left.surface.cmp(&right.surface))
+    });
+    paths.truncate(limit);
+}
+
 impl Dictionary {
     #[must_use]
     pub fn new(entries: Vec<DictionaryEntry>) -> Self {
@@ -191,6 +249,313 @@ impl Dictionary {
         let mut found = false;
         self.for_each_exact(reading, |_| found = true);
         found
+    }
+
+    /// Returns low-cost two- to six-part compounds assembled from exact
+    /// dictionary entries. This is a bounded recall path for explicit "more
+    /// candidates" actions; it does not replace the normal N-best ordering.
+    #[must_use]
+    pub fn compound_candidates(
+        &self,
+        reading: &str,
+        entries_per_segment: usize,
+        limit: usize,
+    ) -> Vec<Candidate> {
+        let character_count = reading.chars().count();
+        if entries_per_segment == 0
+            || limit == 0
+            || !(4..=COMPOUND_MAX_READING_CHARACTERS).contains(&character_count)
+        {
+            return Vec::new();
+        }
+
+        let entries_per_segment = entries_per_segment.min(COMPOUND_MAX_ENTRIES_PER_SEGMENT);
+        let limit = limit.min(COMPOUND_MAX_CANDIDATES);
+        let state_limit = limit
+            .saturating_mul(entries_per_segment)
+            .min(COMPOUND_MAX_CANDIDATES * COMPOUND_MAX_ENTRIES_PER_SEGMENT);
+        let connection = self.uses_connection_costs.then(ConnectionMatrix::bundled);
+        let mut boundaries = reading
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.push(reading.len());
+        let final_position = boundaries.len() - 1;
+        let mut states =
+            vec![vec![Vec::<CompoundPath>::new(); boundaries.len()]; COMPOUND_MAX_SEGMENTS + 1];
+        states[0][0].push(CompoundPath {
+            surface: String::new(),
+            cost: 0,
+            right_id: BOS_EOS_POS_ID,
+        });
+
+        for segment_count in 0..COMPOUND_MAX_SEGMENTS {
+            for start_position in 0..final_position {
+                let preceding = states[segment_count][start_position].clone();
+                if preceding.is_empty() {
+                    continue;
+                }
+                for end_position in (start_position + 1)..=final_position {
+                    let segment_reading =
+                        &reading[boundaries[start_position]..boundaries[end_position]];
+                    let entries = self.exact_compound_entries(segment_reading, entries_per_segment);
+                    if entries.is_empty() {
+                        continue;
+                    }
+
+                    let destination = &mut states[segment_count + 1][end_position];
+                    for path in &preceding {
+                        for entry in &entries {
+                            let mut surface = String::with_capacity(
+                                path.surface.len().saturating_add(entry.surface.len()),
+                            );
+                            surface.push_str(&path.surface);
+                            surface.push_str(entry.surface);
+                            let transition_cost = connection
+                                .map_or(0, |matrix| matrix.cost(path.right_id, entry.left_id));
+                            destination.push(CompoundPath {
+                                surface,
+                                cost: path
+                                    .cost
+                                    .saturating_add(transition_cost)
+                                    .saturating_add(entry.word_cost),
+                                right_id: entry.right_id,
+                            });
+                        }
+                    }
+                    trim_compound_paths(destination, state_limit);
+                }
+            }
+        }
+
+        let mut candidates = Vec::<Candidate>::new();
+        for paths in states
+            .iter()
+            .take(COMPOUND_MAX_SEGMENTS + 1)
+            .skip(2)
+            .map(|segments| &segments[final_position])
+        {
+            for path in paths {
+                if path.surface == reading {
+                    continue;
+                }
+                let cost = path.cost.saturating_add(
+                    connection.map_or(0, |matrix| matrix.cost(path.right_id, BOS_EOS_POS_ID)),
+                );
+                if let Some(existing) = candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.surface == path.surface)
+                {
+                    existing.cost = existing.cost.min(cost);
+                } else {
+                    candidates.push(Candidate {
+                        surface: path.surface.clone(),
+                        cost,
+                    });
+                }
+            }
+        }
+        candidates.sort_unstable_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| left.surface.cmp(&right.surface))
+        });
+        candidates.truncate(limit);
+        candidates
+    }
+
+    /// Reports whether `surface` can be aligned to two to six exact dictionary
+    /// entries over `reading`, without applying the product candidate beam.
+    ///
+    /// This offline diagnostic distinguishes missing component vocabulary from
+    /// a known-component phrase that needs stronger phrase knowledge. It uses
+    /// the same literal-segment eligibility as [`Self::compound_candidates`]
+    /// but does not rank or return alternative surfaces.
+    #[must_use]
+    pub fn is_exact_compound_surface(&self, reading: &str, surface: &str) -> bool {
+        let character_count = reading.chars().count();
+        if surface.is_empty() || !(4..=COMPOUND_MAX_READING_CHARACTERS).contains(&character_count) {
+            return false;
+        }
+
+        let mut boundaries = reading
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.push(reading.len());
+        let final_position = boundaries.len() - 1;
+        let mut states =
+            vec![vec![Vec::<usize>::new(); boundaries.len()]; COMPOUND_MAX_SEGMENTS + 1];
+        states[0][0].push(0);
+
+        for segment_count in 0..COMPOUND_MAX_SEGMENTS {
+            for start_position in 0..final_position {
+                let surface_positions = states[segment_count][start_position].clone();
+                if surface_positions.is_empty() {
+                    continue;
+                }
+                for end_position in (start_position + 1)..=final_position {
+                    let segment_reading =
+                        &reading[boundaries[start_position]..boundaries[end_position]];
+                    let entries = self.exact_compound_entries(segment_reading, usize::MAX);
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    let destination = &mut states[segment_count + 1][end_position];
+                    for &surface_position in &surface_positions {
+                        let Some(remaining_surface) = surface.get(surface_position..) else {
+                            continue;
+                        };
+                        for entry in &entries {
+                            if remaining_surface.starts_with(entry.surface) {
+                                let next_position = surface_position + entry.surface.len();
+                                if !destination.contains(&next_position) {
+                                    destination.push(next_position);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        states
+            .iter()
+            .take(COMPOUND_MAX_SEGMENTS + 1)
+            .skip(2)
+            .any(|segments| segments[final_position].contains(&surface.len()))
+    }
+
+    /// Returns alternatives that preserve the best path's segment boundaries.
+    ///
+    /// This is a bounded recall path for explicit "more candidates" actions on
+    /// long readings. It avoids a wider whole-reading N-best search by changing
+    /// only the candidate surface inside each already-selected segment.
+    #[must_use]
+    pub fn fixed_segment_variants(
+        &self,
+        reading: &str,
+        entries_per_segment: usize,
+        limit: usize,
+    ) -> Vec<String> {
+        let character_count = reading.chars().count();
+        if entries_per_segment == 0
+            || limit == 0
+            || character_count > FIXED_SEGMENT_MAX_READING_CHARACTERS
+        {
+            return Vec::new();
+        }
+        let Some(best) = self.convert_best(reading) else {
+            return Vec::new();
+        };
+        if !(2..=FIXED_SEGMENT_MAX_SEGMENTS).contains(&best.segments.len()) {
+            return Vec::new();
+        }
+
+        let entries_per_segment = entries_per_segment.min(FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT);
+        let limit = limit.min(FIXED_SEGMENT_MAX_CANDIDATES);
+        let state_limit = limit
+            .saturating_mul(entries_per_segment)
+            .min(FIXED_SEGMENT_MAX_STATES);
+        let unchanged_surface = best.surface;
+        let mut states = vec![FixedSegmentPath {
+            surface: String::new(),
+            changed_segments: 0,
+            relative_cost: 0,
+        }];
+
+        for segment in best.segments {
+            let mut alternatives = self
+                .candidates_with_limit(&segment.reading, entries_per_segment)
+                .into_iter()
+                .take(entries_per_segment)
+                .filter(|candidate| candidate.surface != segment.reading)
+                .map(|candidate| (candidate.surface, i64::from(candidate.cost)))
+                .collect::<Vec<_>>();
+            alternatives
+                .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+            alternatives.dedup_by(|left, right| left.0 == right.0);
+            alternatives
+                .sort_unstable_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+            let minimum_cost = alternatives
+                .iter()
+                .filter(|(surface, _)| surface != &segment.surface)
+                .map(|(_, cost)| *cost)
+                .min()
+                .unwrap_or(0);
+            if !alternatives
+                .iter()
+                .any(|(surface, _)| surface == &segment.surface)
+            {
+                alternatives.push((segment.surface.clone(), minimum_cost));
+            }
+
+            let mut next = Vec::with_capacity(states.len().saturating_mul(alternatives.len()));
+            for state in &states {
+                for (surface, cost) in &alternatives {
+                    let changed = surface != &segment.surface;
+                    let mut combined =
+                        String::with_capacity(state.surface.len().saturating_add(surface.len()));
+                    combined.push_str(&state.surface);
+                    combined.push_str(surface);
+                    next.push(FixedSegmentPath {
+                        surface: combined,
+                        changed_segments: state.changed_segments + usize::from(changed),
+                        relative_cost: state.relative_cost.saturating_add(if changed {
+                            cost.saturating_sub(minimum_cost)
+                        } else {
+                            0
+                        }),
+                    });
+                }
+            }
+            trim_fixed_segment_paths(&mut next, state_limit);
+            states = next;
+        }
+
+        states.retain(|state| state.surface != unchanged_surface);
+        trim_fixed_segment_paths(&mut states, limit);
+        states.into_iter().map(|state| state.surface).collect()
+    }
+
+    fn exact_compound_entries<'s>(&'s self, reading: &str, limit: usize) -> Vec<EntryView<'s>> {
+        let mut entries = Vec::new();
+        let mut literal_entries = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading {
+                literal_entries.push(entry);
+            } else {
+                entries.push(entry);
+            }
+        });
+        // A dictionary-backed kana-only segment can connect names, particles,
+        // and content words in productive compounds. Use it only when that
+        // segment has no converted surface, so literal variants cannot evict
+        // useful converted entries from the per-segment bound.
+        if entries.is_empty() {
+            entries = literal_entries;
+        }
+        entries.sort_unstable_by(|left, right| {
+            left.surface
+                .cmp(right.surface)
+                .then_with(|| left.left_id.cmp(&right.left_id))
+                .then_with(|| left.right_id.cmp(&right.right_id))
+                .then_with(|| left.word_cost.cmp(&right.word_cost))
+        });
+        entries.dedup_by(|left, right| {
+            left.surface == right.surface
+                && left.left_id == right.left_id
+                && left.right_id == right.right_id
+        });
+        entries.sort_unstable_by(|left, right| {
+            left.word_cost
+                .cmp(&right.word_cost)
+                .then_with(|| left.surface.cmp(right.surface))
+                .then_with(|| left.left_id.cmp(&right.left_id))
+                .then_with(|| left.right_id.cmp(&right.right_id))
+        });
+        entries.truncate(limit);
+        entries
     }
 
     /// Returns exact dictionary readings for a committed surface, ordered by
@@ -399,6 +764,33 @@ impl Dictionary {
         candidates.sort_unstable_by_key(|candidate| candidate.cost);
         symbol_candidates::append_for_reading(reading, &mut candidates);
         candidates
+    }
+
+    /// Returns numeral surfaces generated from the complete reading.
+    ///
+    /// Candidate UIs use this bounded query to identify generated numeric
+    /// alternatives without duplicating the converter's numeral grammar or
+    /// inferring provenance from the rendered surface.
+    #[must_use]
+    pub fn generated_number_surfaces(&self, reading: &str) -> Vec<String> {
+        if reading.is_empty() {
+            return Vec::new();
+        }
+        let arena = Bump::new();
+        let mut entries = Vec::new();
+        push_digit_run_entry(reading, 0, &mut entries);
+        push_number_entries(reading, 0, &arena, &mut entries);
+        let mut surfaces = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.end == reading.len()
+                && !surfaces
+                    .iter()
+                    .any(|surface: &String| surface == entry.surface)
+            {
+                surfaces.push(entry.surface.to_owned());
+            }
+        }
+        surfaces
     }
 
     /// Returns complete conversion paths ordered by their lattice cost.
@@ -624,17 +1016,19 @@ impl Dictionary {
         let synthetic_arena = Bump::new();
         let synthetic_by_start = synthetic_entries_by_start(reading, &synthetic_arena);
         let mut arena = Vec::<NBestNode<'_>>::with_capacity(n_best_arena_capacity(reading, limit));
-        let mut lattice: Vec<Vec<usize>> = (0..=reading.len()).map(|_| Vec::new()).collect();
+        let mut lattice: Vec<NBestBucket> = (0..=reading.len())
+            .map(|_| NBestBucket::default())
+            .collect();
 
         for start in reading
             .char_indices()
             .map(|(index, _)| index)
             .chain(std::iter::once(reading.len()))
         {
-            if start == reading.len() || (start > 0 && lattice[start].is_empty()) {
+            if start == reading.len() || (start > 0 && lattice[start].states.is_empty()) {
                 continue;
             }
-            let predecessors = lattice[start].clone();
+            let predecessors = lattice[start].states.clone();
             let suffix = &reading[start..];
 
             self.for_each_prefix(suffix, |relative_end, entry| {
@@ -679,6 +1073,7 @@ impl Dictionary {
         }
 
         let mut completed: Vec<_> = lattice[reading.len()]
+            .states
             .iter()
             .map(|&node| {
                 (
@@ -695,17 +1090,19 @@ impl Dictionary {
 
     fn convert_n_best_heuristic(&self, reading: &str, limit: usize) -> Vec<Conversion> {
         let mut arena = Vec::<NBestNode<'_>>::with_capacity(n_best_arena_capacity(reading, limit));
-        let mut lattice: Vec<Vec<usize>> = (0..=reading.len()).map(|_| Vec::new()).collect();
+        let mut lattice: Vec<NBestBucket> = (0..=reading.len())
+            .map(|_| NBestBucket::default())
+            .collect();
 
         for start in reading
             .char_indices()
             .map(|(index, _)| index)
             .chain(std::iter::once(reading.len()))
         {
-            if start == reading.len() || (start > 0 && lattice[start].is_empty()) {
+            if start == reading.len() || (start > 0 && lattice[start].states.is_empty()) {
                 continue;
             }
-            let predecessors = lattice[start].clone();
+            let predecessors = lattice[start].states.clone();
             let suffix = &reading[start..];
 
             self.for_each_prefix(suffix, |relative_end, entry| {
@@ -763,6 +1160,7 @@ impl Dictionary {
         }
 
         let mut completed: Vec<_> = lattice[reading.len()]
+            .states
             .iter()
             .map(|&node| (node, arena[node].total_cost))
             .collect();
@@ -887,6 +1285,12 @@ struct NBestNode<'a> {
     total_cost: i32,
 }
 
+#[derive(Debug, Default)]
+struct NBestBucket {
+    states: Vec<usize>,
+    worst_total_cost: Option<i32>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NodeIndex(NonZeroUsize);
 
@@ -909,7 +1313,7 @@ fn insert_connected_unknown<'a>(
     start: usize,
     predecessors: &[usize],
     arena: &mut Vec<NBestNode<'a>>,
-    lattice: &mut [Vec<usize>],
+    lattice: &mut [NBestBucket],
     connection: ConnectionMatrix,
     limit: usize,
 ) {
@@ -968,7 +1372,7 @@ fn insert_heuristic_unknown<'a>(
     start: usize,
     predecessors: &[usize],
     arena: &mut Vec<NBestNode<'a>>,
-    lattice: &mut [Vec<usize>],
+    lattice: &mut [NBestBucket],
     limit: usize,
 ) {
     let Some(character) = reading[start..].chars().next() else {
@@ -1018,7 +1422,7 @@ fn insert_heuristic_unknown<'a>(
 #[allow(clippy::too_many_arguments)]
 fn insert_connected_word<'a>(
     arena: &mut Vec<NBestNode<'a>>,
-    states: &mut Vec<usize>,
+    states: &mut NBestBucket,
     predecessors: &[usize],
     connection: ConnectionMatrix,
     start: usize,
@@ -1075,17 +1479,26 @@ fn insert_connected_word<'a>(
 
 fn insert_n_best_node<'a>(
     arena: &mut Vec<NBestNode<'a>>,
-    states: &mut Vec<usize>,
+    bucket: &mut NBestBucket,
     candidate: NBestNode<'a>,
     limit_per_state: usize,
 ) {
     // Every target bucket is finalized before it becomes a predecessor. A
     // replacement can therefore reuse its arena slot without invalidating a
     // path which has already captured that index.
+    let beam_size = limit_per_state.saturating_mul(N_BEST_BEAM_FACTOR);
+    if bucket.states.len() >= beam_size
+        && bucket
+            .worst_total_cost
+            .is_some_and(|worst_cost| candidate.total_cost >= worst_cost)
+    {
+        return;
+    }
+
     let mut same_state_count = 0;
     let mut worst_same_state = None;
     let mut worst_global = None;
-    for (position, &existing_index) in states.iter().enumerate() {
+    for (position, &existing_index) in bucket.states.iter().enumerate() {
         let existing = &arena[existing_index];
         if existing.right_id == candidate.right_id
             && existing.start == candidate.start
@@ -1094,7 +1507,11 @@ fn insert_n_best_node<'a>(
             && existing.surface == candidate.surface
         {
             if candidate.total_cost < existing.total_cost {
+                let replaced_worst = bucket.worst_total_cost == Some(existing.total_cost);
                 arena[existing_index] = candidate;
+                if replaced_worst {
+                    refresh_worst_n_best_cost(arena, bucket);
+                }
             }
             return;
         }
@@ -1111,22 +1528,28 @@ fn insert_n_best_node<'a>(
     }
 
     if same_state_count < limit_per_state {
-        let beam_size = limit_per_state.saturating_mul(N_BEST_BEAM_FACTOR);
-        if states.len() >= beam_size {
+        if bucket.states.len() >= beam_size {
             let Some((worst_position, worst_cost)) = worst_global else {
                 return;
             };
             if candidate.total_cost >= worst_cost {
                 return;
             }
-            let worst_index = states[worst_position];
+            let worst_index = bucket.states[worst_position];
             arena[worst_index] = candidate;
+            refresh_worst_n_best_cost(arena, bucket);
             return;
         }
 
         let index = arena.len();
+        let total_cost = candidate.total_cost;
         arena.push(candidate);
-        states.push(index);
+        bucket.states.push(index);
+        bucket.worst_total_cost = Some(
+            bucket
+                .worst_total_cost
+                .map_or(total_cost, |worst_cost| worst_cost.max(total_cost)),
+        );
         return;
     }
 
@@ -1134,9 +1557,21 @@ fn insert_n_best_node<'a>(
         return;
     };
     if candidate.total_cost < worst_cost {
-        let worst_index = states[worst_position];
+        let worst_index = bucket.states[worst_position];
+        let replaced_worst = bucket.worst_total_cost == Some(arena[worst_index].total_cost);
         arena[worst_index] = candidate;
+        if replaced_worst {
+            refresh_worst_n_best_cost(arena, bucket);
+        }
     }
+}
+
+fn refresh_worst_n_best_cost(arena: &[NBestNode<'_>], bucket: &mut NBestBucket) {
+    bucket.worst_total_cost = bucket
+        .states
+        .iter()
+        .map(|&index| arena[index].total_cost)
+        .max();
 }
 
 fn reconstruct_n_best_conversions(
@@ -1790,8 +2225,9 @@ fn push_katakana_entries<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
-        DictionaryEntry, DictionaryLayer, UNKNOWN_POS_ID,
+        Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
+        DictionaryEntry, DictionaryLayer, NBestBucket, NBestNode, UNKNOWN_POS_ID,
+        insert_n_best_node,
     };
 
     struct PreferSurface<'a>(&'a str);
@@ -1852,6 +2288,89 @@ mod tests {
     }
 
     #[test]
+    fn full_n_best_bucket_rejects_worse_costs_and_refreshes_its_bound() {
+        let mut arena = Vec::new();
+        let mut bucket = NBestBucket::default();
+        for (right_id, total_cost, surface) in [
+            (1, 10, "one"),
+            (2, 20, "two"),
+            (3, 30, "three"),
+            (4, 40, "four"),
+            (5, 50, "five"),
+            (6, 60, "six"),
+            (7, 70, "seven"),
+            (8, 80, "eight"),
+        ] {
+            insert_n_best_node(
+                &mut arena,
+                &mut bucket,
+                NBestNode {
+                    start: 0,
+                    predecessor: None,
+                    reading: "a",
+                    surface,
+                    segment_cost: total_cost,
+                    right_id,
+                    total_cost,
+                },
+                1,
+            );
+        }
+
+        assert_eq!(bucket.states.len(), 8);
+        assert_eq!(bucket.worst_total_cost, Some(80));
+        insert_n_best_node(
+            &mut arena,
+            &mut bucket,
+            NBestNode {
+                start: 0,
+                predecessor: None,
+                reading: "a",
+                surface: "worse",
+                segment_cost: 80,
+                right_id: 9,
+                total_cost: 80,
+            },
+            1,
+        );
+        assert_eq!(arena.len(), 8);
+        assert_eq!(bucket.worst_total_cost, Some(80));
+
+        insert_n_best_node(
+            &mut arena,
+            &mut bucket,
+            NBestNode {
+                start: 0,
+                predecessor: None,
+                reading: "a",
+                surface: "better",
+                segment_cost: 5,
+                right_id: 9,
+                total_cost: 5,
+            },
+            1,
+        );
+        assert_eq!(bucket.worst_total_cost, Some(70));
+
+        insert_n_best_node(
+            &mut arena,
+            &mut bucket,
+            NBestNode {
+                start: 0,
+                predecessor: None,
+                reading: "a",
+                surface: "seven replacement",
+                segment_cost: 60,
+                right_id: 7,
+                total_cost: 60,
+            },
+            1,
+        );
+        assert_eq!(bucket.states.len(), 8);
+        assert_eq!(bucket.worst_total_cost, Some(60));
+    }
+
+    #[test]
     fn exact_candidates_are_ordered_by_connected_cost() {
         let dictionary = Dictionary::bundled();
         let candidates = dictionary.candidates("にほん");
@@ -1864,6 +2383,251 @@ mod tests {
         assert!(surfaces.contains(&"二本"), "surfaces: {surfaces:?}");
         assert!(surfaces.contains(&"ニホン"), "surfaces: {surfaces:?}");
         assert_eq!(candidates.last().unwrap().surface, "にほん");
+    }
+
+    #[test]
+    fn bounded_compound_recall_combines_lower_ranked_exact_entries() {
+        let dictionary = Dictionary::bundled();
+        let candidates = dictionary.compound_candidates("あさいり", 4, 16);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.surface == "浅煎り"),
+            "{candidates:?}"
+        );
+        assert!(candidates.len() <= 16);
+    }
+
+    #[test]
+    fn exact_compound_diagnostic_distinguishes_known_components() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(dictionary.is_exact_compound_surface("こうなんりょうよう", "硬軟両様"));
+        assert!(!dictionary.is_exact_compound_surface("こうなんりょうよう", "未知表層"));
+        assert!(!dictionary.is_exact_compound_surface("こうなん", "硬軟"));
+    }
+
+    #[test]
+    fn bounded_compound_recall_combines_three_exact_segments() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("うえ", "第二", 20),
+            DictionaryEntry::new("おか", "第三", 30),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("あいうえおか", 4, 16),
+            vec![Candidate {
+                surface: "第一第二第三".to_owned(),
+                cost: 60,
+            }]
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_includes_a_one_character_reading_segment() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("う", "中", 20),
+            DictionaryEntry::new("えお", "第三", 30),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("あいうえお", 4, 16),
+            vec![Candidate {
+                surface: "第一中第三".to_owned(),
+                cost: 60,
+            }]
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_combines_four_exact_segments() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("うえ", "第二", 20),
+            DictionaryEntry::new("おか", "第三", 30),
+            DictionaryEntry::new("きく", "第四", 40),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("あいうえおかきく", 4, 16),
+            vec![Candidate {
+                surface: "第一第二第三第四".to_owned(),
+                cost: 100,
+            }]
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_combines_five_exact_segments() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("うえ", "第二", 20),
+            DictionaryEntry::new("おか", "第三", 30),
+            DictionaryEntry::new("きく", "第四", 40),
+            DictionaryEntry::new("けこ", "第五", 50),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("あいうえおかきくけこ", 4, 16),
+            vec![Candidate {
+                surface: "第一第二第三第四第五".to_owned(),
+                cost: 150,
+            }]
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_combines_six_exact_segments() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("うえ", "第二", 20),
+            DictionaryEntry::new("おか", "第三", 30),
+            DictionaryEntry::new("きく", "第四", 40),
+            DictionaryEntry::new("けこ", "第五", 50),
+            DictionaryEntry::new("さし", "第六", 60),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("あいうえおかきくけこさし", 4, 16),
+            vec![Candidate {
+                surface: "第一第二第三第四第五第六".to_owned(),
+                cost: 210,
+            }]
+        );
+    }
+
+    #[test]
+    fn fixed_segment_variants_change_surfaces_within_best_boundaries() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("あい", "別一", 20),
+            DictionaryEntry::new("うえ", "第二", 10),
+            DictionaryEntry::new("うえ", "別二", 20),
+            DictionaryEntry::new("おか", "第三", 10),
+            DictionaryEntry::new("おか", "別三", 20),
+        ]);
+
+        let variants = dictionary.fixed_segment_variants("あいうえおか", 2, 8);
+
+        assert_eq!(variants.len(), 7);
+        assert!(variants.contains(&"別一第二第三".to_owned()));
+        assert!(variants.contains(&"第一別二第三".to_owned()));
+        assert!(variants.contains(&"第一第二別三".to_owned()));
+        assert!(variants.contains(&"別一別二別三".to_owned()));
+        assert!(!variants.contains(&"第一第二第三".to_owned()));
+    }
+
+    #[test]
+    fn fixed_segment_variants_obey_input_and_output_bounds() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("あい", "別一", 20),
+            DictionaryEntry::new("うえ", "第二", 10),
+            DictionaryEntry::new("うえ", "別二", 20),
+        ]);
+
+        assert_eq!(
+            dictionary
+                .fixed_segment_variants("あいうえ", usize::MAX, usize::MAX)
+                .len(),
+            3
+        );
+        assert!(
+            dictionary
+                .fixed_segment_variants("あいうえ", 0, 8)
+                .is_empty()
+        );
+        assert!(
+            dictionary
+                .fixed_segment_variants("あいうえ", 8, 0)
+                .is_empty()
+        );
+        assert!(
+            dictionary
+                .fixed_segment_variants(&"あ".repeat(129), 8, 8)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_combines_a_name_and_affiliation() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("やまだ", "山田", 10),
+            DictionaryEntry::new("たろう", "太郎", 20),
+            DictionaryEntry::new("だいに", "第二", 25),
+            DictionaryEntry::new("けんきゅう", "研究", 30),
+            DictionaryEntry::new("しつ", "室", 40),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("やまだたろうだいにけんきゅうしつ", 4, 16),
+            vec![Candidate {
+                surface: "山田太郎第二研究室".to_owned(),
+                cost: 125,
+            }]
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_connects_a_kana_only_dictionary_segment() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("やまだ", "山田", 10),
+            DictionaryEntry::new("の", "の", 20),
+            DictionaryEntry::new("けんきゅう", "研究", 30),
+            DictionaryEntry::new("しつ", "室", 40),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("やまだのけんきゅうしつ", 4, 16),
+            vec![Candidate {
+                surface: "山田の研究室".to_owned(),
+                cost: 100,
+            }]
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_does_not_return_all_literal_or_prefer_literal_variants() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "あい", 1),
+            DictionaryEntry::new("あい", "第一", 10),
+            DictionaryEntry::new("うえ", "うえ", 1),
+            DictionaryEntry::new("うえ", "第二", 20),
+        ]);
+
+        assert_eq!(
+            dictionary.compound_candidates("あいうえ", 4, 16),
+            vec![Candidate {
+                surface: "第一第二".to_owned(),
+                cost: 30,
+            }]
+        );
+
+        let literal_only = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "あい", 1),
+            DictionaryEntry::new("うえ", "うえ", 1),
+        ]);
+        assert!(
+            literal_only
+                .compound_candidates("あいうえ", 4, 16)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_compound_recall_rejects_unbounded_inputs() {
+        let dictionary = Dictionary::new(vec![DictionaryEntry::new("あい", "第一", 10)]);
+
+        assert!(dictionary.compound_candidates("あいうえ", 0, 16).is_empty());
+        assert!(dictionary.compound_candidates("あいうえ", 4, 0).is_empty());
+        assert!(
+            dictionary
+                .compound_candidates("あいうえおかきくけこさしすせそたち", 4, 16)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2029,6 +2793,18 @@ mod tests {
             Some("1億2345万")
         );
         assert_eq!(super::mixed_numeral(1_991), None);
+    }
+
+    #[test]
+    fn reports_generated_number_surfaces_for_candidate_metadata() {
+        let dictionary = Dictionary::new(Vec::new());
+
+        assert_eq!(
+            dictionary.generated_number_surfaces("せんきゅうひゃくきゅうじゅういち"),
+            ["１９９１", "千九百九十一", "1991"]
+        );
+        assert_eq!(dictionary.generated_number_surfaces("１２３"), ["１２３"]);
+        assert!(dictionary.generated_number_surfaces("にほん").is_empty());
     }
 
     #[test]

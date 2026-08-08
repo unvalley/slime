@@ -6,7 +6,7 @@ use crate::UserData;
 pub(crate) const MINIMUM_READING_CHARACTERS: usize = 2;
 
 /// The best lattice path must clearly beat the runner-up before live
-/// conversion changes the text under the user's cursor. Mozc-style costs are
+/// conversion changes the text under the user's cursor. Dictionary costs are
 /// approximately negative log probabilities scaled by 500, so this requires
 /// roughly a 2.7:1 advantage. Explicit Space conversion remains unrestricted.
 const MINIMUM_COST_MARGIN: i32 = 500;

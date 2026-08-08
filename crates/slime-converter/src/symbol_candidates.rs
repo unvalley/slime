@@ -1,14 +1,13 @@
 use super::{Candidate, LITERAL_CANDIDATE_COST};
 
-/// Candidate alternatives normally supplied by Mozc's symbol rewriter rather
-/// than its system dictionary. Keep these out of the lattice: they are useful
-/// for an explicitly converted punctuation mark, but not as extra branches in
-/// ordinary sentence conversion.
+/// Candidate alternatives that do not belong in the conversion lattice. They
+/// are useful for an explicitly converted punctuation mark, but not as extra
+/// branches in ordinary sentence conversion.
 pub(super) fn append_for_reading(reading: &str, candidates: &mut Vec<Candidate>) {
     let surfaces: &[&str] = match reading {
-        // Mozc symbol readings for `。`, plus its half-width transliteration.
+        // Full-width period alternatives and half-width transliteration.
         "。" => &["．", ".", "｡", "…", "‥", "⋮", "⋯", "⋰", "⋱"],
-        // Mozc symbol readings for `・`, plus its half-width transliteration.
+        // Middle-dot alternatives and half-width transliteration.
         "・" => &[
             "／", "/", "･", "＼", "\\", "÷", "…", "‥", "︙", "︰", "⋮", "⋯", "⋰", "⋱",
         ],

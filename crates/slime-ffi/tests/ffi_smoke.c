@@ -16,6 +16,12 @@ typedef struct CandidateCapture {
   bool found_nihon;
 } CandidateCapture;
 
+typedef struct TypedActionsV2 {
+  size_t candidate_count;
+  bool saw_show_candidates;
+  bool saw_separate_candidate_value;
+} TypedActionsV2;
+
 static void collect_action(void *context, const SlimeActionView *action) {
   TypedActions *collected = context;
   assert(action != NULL);
@@ -50,7 +56,52 @@ static void collect_candidate(void *context, SlimeStringView value) {
   }
 }
 
+static void collect_action_v2(void *context, const SlimeActionViewV2 *action) {
+  TypedActionsV2 *collected = context;
+  assert(action != NULL);
+  if (action->kind != SLIME_ACTION_SHOW_CANDIDATES) {
+    return;
+  }
+  assert(action->candidates != NULL);
+  assert(action->candidate_count > 0);
+  for (size_t index = 0; index < action->candidate_count; ++index) {
+    const SlimeCandidateViewV2 *candidate = &action->candidates[index];
+    assert(candidate->value.data != NULL);
+    assert(candidate->value.len > 0);
+    assert(candidate->display.data != NULL);
+    assert(candidate->display.len > 0);
+    assert(candidate->annotation <= SLIME_CANDIDATE_ANNOTATION_CONTEXT);
+  }
+  collected->candidate_count = action->candidate_count;
+  collected->saw_show_candidates = true;
+  collected->saw_separate_candidate_value = true;
+}
+
 int main(void) {
+  const char *signed_data_dir = "/tmp/slime-signed-data-dir-c-smoke";
+  const char *verification_keys =
+      "fixture-2026-a\t"
+      "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n";
+  SlimeHandle *signed_handle = slime_create_with_signed_data_dir(
+      (const uint8_t *)signed_data_dir, strlen(signed_data_dir),
+      (const uint8_t *)verification_keys, strlen(verification_keys));
+  assert(signed_handle != NULL);
+  slime_destroy(signed_handle);
+  assert(slime_create_with_signed_data_dir(
+             (const uint8_t *)signed_data_dir, strlen(signed_data_dir), NULL,
+             0) == NULL);
+  const char *version_floors = "sample-general\t2026.08.1\n";
+  signed_handle = slime_create_with_signed_data_dir_and_version_floors(
+      (const uint8_t *)signed_data_dir, strlen(signed_data_dir),
+      (const uint8_t *)verification_keys, strlen(verification_keys),
+      (const uint8_t *)version_floors, strlen(version_floors));
+  assert(signed_handle != NULL);
+  slime_destroy(signed_handle);
+  assert(slime_create_with_signed_data_dir_and_version_floors(
+             (const uint8_t *)signed_data_dir, strlen(signed_data_dir),
+             (const uint8_t *)verification_keys, strlen(verification_keys),
+             NULL, 0) == NULL);
+
   SlimeHandle *handle = slime_create();
   assert(handle != NULL);
 
@@ -91,6 +142,34 @@ int main(void) {
                                collect_action) == SLIME_STATUS_NULL_HANDLE);
   assert(slime_process_actions(handle, SLIME_EVENT_SPACE, 0, &actions, NULL) ==
          SLIME_STATUS_NULL_CALLBACK);
+  assert(slime_reset_context(handle) == SLIME_STATUS_OK);
+  assert(slime_reset_context(NULL) == SLIME_STATUS_NULL_HANDLE);
+  const char *left_context = "直前の文章";
+  assert(slime_set_external_left_context(
+             handle, (const uint8_t *)left_context, strlen(left_context)) ==
+         SLIME_STATUS_OK);
+  const uint8_t invalid_context[] = {0xff};
+  assert(slime_set_external_left_context(handle, invalid_context,
+                                         sizeof(invalid_context)) ==
+         SLIME_STATUS_INVALID_UTF8);
+  assert(slime_set_external_left_context(NULL, (const uint8_t *)left_context,
+                                         strlen(left_context)) ==
+         SLIME_STATUS_NULL_HANDLE);
+  slime_destroy(handle);
+
+  handle = slime_create();
+  assert(handle != NULL);
+  TypedActionsV2 actions_v2 = {0};
+  for (size_t index = 0; input[index] != '\0'; ++index) {
+    assert(slime_process_actions_v2(handle, SLIME_EVENT_CHARACTER,
+                                    (uint32_t)input[index], &actions_v2,
+                                    collect_action_v2) == SLIME_STATUS_OK);
+  }
+  assert(slime_process_actions_v2(handle, SLIME_EVENT_SPACE, 0, &actions_v2,
+                                  collect_action_v2) == SLIME_STATUS_OK);
+  assert(actions_v2.saw_show_candidates);
+  assert(actions_v2.saw_separate_candidate_value);
+  assert(actions_v2.candidate_count > 0);
   slime_destroy(handle);
 
   handle = slime_create();

@@ -41,3 +41,7 @@ path = "src/dictionary_pack.rs"
 [[bin]]
 name = "slime-dictionary-coverage"
 path = "src/dictionary_coverage.rs"
+
+[[bin]]
+name = "slime-typo-evaluate"
+path = "src/typo_evaluation.rs"

@@ -19,6 +19,43 @@ fn main() {
         black_box(engine.handle(InputEvent::Enter));
     });
 
+    run("engine/typo_correction_neighbor", iterations, || {
+        let mut engine = SlimeEngine::bundled();
+        for character in black_box("nihpn").chars() {
+            black_box(engine.handle(InputEvent::Character(character)));
+        }
+        black_box(engine.handle(InputEvent::Space));
+    });
+    run("engine/typo_correction_missing_vowel", iterations, || {
+        let mut engine = SlimeEngine::bundled();
+        for character in black_box("nihn").chars() {
+            black_box(engine.handle(InputEvent::Character(character)));
+        }
+        black_box(engine.handle(InputEvent::Space));
+    });
+    run(
+        "engine/typo_correction_missing_geminate",
+        iterations,
+        || {
+            let mut engine = SlimeEngine::bundled();
+            for character in black_box("keka").chars() {
+                black_box(engine.handle(InputEvent::Character(character)));
+            }
+            black_box(engine.handle(InputEvent::Space));
+        },
+    );
+    run(
+        "engine/typo_correction_missing_consonant",
+        iterations,
+        || {
+            let mut engine = SlimeEngine::bundled();
+            for character in black_box("paokon").chars() {
+                black_box(engine.handle(InputEvent::Character(character)));
+            }
+            black_box(engine.handle(InputEvent::Space));
+        },
+    );
+
     let mut all_packs_engine = SlimeEngine::bundled();
     black_box(all_packs_engine.set_preferences(EnginePreferences {
         live_conversion: false,

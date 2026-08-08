@@ -186,6 +186,13 @@ impl Dictionary {
         usize::from(self.bundled.is_some()) + self.layers.len()
     }
 
+    #[must_use]
+    pub fn has_exact_reading(&self, reading: &str) -> bool {
+        let mut found = false;
+        self.for_each_exact(reading, |_| found = true);
+        found
+    }
+
     /// Returns exact dictionary readings for a committed surface, ordered by
     /// word cost. This lookup is used only for explicit reconversion.
     #[must_use]

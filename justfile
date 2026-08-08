@@ -35,6 +35,10 @@ test-ffi:
 check: fmt-check lint test test-ffi
     @echo "All checks passed."
 
+# 外部fixtureで入力ミス訂正の回収・誤訂正・遅延を集計する
+evaluate-typos positive negative *args:
+    cargo run --release --quiet -p slime-tools --bin slime-typo-evaluate -- --positive "{{positive}}" --negative "{{negative}}" {{args}}
+
 # debugビルドする
 build:
     cargo build --workspace

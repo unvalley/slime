@@ -10,6 +10,7 @@ mod english_reverse;
 mod live_conversion;
 mod session_history;
 mod text_transform;
+mod typo_correction;
 mod user_data;
 
 use dictionary_packs::DictionaryPackStore;
@@ -130,6 +131,12 @@ struct LivePreview {
     surface: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateCorrection {
+    surface: String,
+    reading: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransformStyle {
     Hiragana,
@@ -154,6 +161,7 @@ pub struct SlimeEngine {
     reading: String,
     raw_input: String,
     candidates: Vec<String>,
+    candidate_corrections: Vec<CandidateCorrection>,
     selected: usize,
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
@@ -183,6 +191,7 @@ impl SlimeEngine {
             reading: String::new(),
             raw_input: String::new(),
             candidates: Vec::new(),
+            candidate_corrections: Vec::new(),
             selected: 0,
             candidate_kind: None,
             completion_selected: false,
@@ -429,7 +438,11 @@ impl SlimeEngine {
         let had_completions = self.candidate_kind == Some(CandidateKind::Completion);
         if self.phase() == Phase::Converting || self.transformed_surface.is_some() {
             let committed = self.committed_surface();
-            let reading = self.reading.clone();
+            let reading = if self.phase() == Phase::Converting {
+                self.selected_learning_reading().to_owned()
+            } else {
+                self.reading.clone()
+            };
             self.record_history(&reading, &committed);
             actions.push(SlimeAction::Commit(committed));
             self.clear_composition();
@@ -486,7 +499,10 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
-        self.candidates = self.conversion_candidates_for_reading(&self.reading);
+        let (candidates, corrections) =
+            self.conversion_candidates_with_corrections(&self.reading, &self.raw_input);
+        self.candidates = candidates;
+        self.candidate_corrections = corrections;
         self.selected = 0;
         self.candidate_kind = Some(CandidateKind::Conversion);
         self.completion_selected = false;
@@ -538,6 +554,94 @@ impl SlimeEngine {
             date_time_candidates::candidates(reading, self.preferences.date_format_mask),
         );
         candidates
+    }
+
+    fn conversion_candidates_with_corrections(
+        &self,
+        reading: &str,
+        raw_input: &str,
+    ) -> (Vec<String>, Vec<CandidateCorrection>) {
+        let ordinary = self.conversion_candidates_for_reading(reading);
+        if self.dictionary.has_exact_reading(reading)
+            || self
+                .user_data
+                .exact_dictionary_surfaces(reading)
+                .next()
+                .is_some()
+            || (self.history_is_available()
+                && !self.user_data.exact_history_surfaces(reading).is_empty())
+            || self.ascii_surfaces.iter().any(|(key, _)| {
+                english_reverse::reverse_match(reading, key) == Some(ReverseMatch::Exact)
+            })
+        {
+            return (ordinary, Vec::new());
+        }
+
+        let mut ranked_corrections: Vec<(CandidateCorrection, (u8, i32))> = Vec::new();
+        for corrected in typo_correction::corrected_readings(raw_input, reading) {
+            let has_user_entry = self
+                .user_data
+                .exact_dictionary_surfaces(&corrected.reading)
+                .next()
+                .is_some();
+            if !has_user_entry && !self.dictionary.has_exact_reading(&corrected.reading) {
+                continue;
+            }
+
+            for (surface, candidate_cost) in self
+                .user_data
+                .exact_dictionary_surfaces(&corrected.reading)
+                .map(|surface| (surface.to_owned(), i32::MIN))
+                .chain(
+                    self.dictionary
+                        .candidates_with_limit(&corrected.reading, 3)
+                        .into_iter()
+                        .map(|candidate| (candidate.surface, candidate.cost)),
+                )
+            {
+                if surface == corrected.reading {
+                    continue;
+                }
+                let rank = (corrected.edit_priority, candidate_cost);
+                let correction = CandidateCorrection {
+                    surface,
+                    reading: corrected.reading.clone(),
+                };
+                if let Some((existing, existing_rank)) = ranked_corrections
+                    .iter_mut()
+                    .find(|(existing, _)| existing.surface == correction.surface)
+                {
+                    if rank < *existing_rank {
+                        *existing = correction;
+                        *existing_rank = rank;
+                    }
+                } else {
+                    ranked_corrections.push((correction, rank));
+                }
+            }
+        }
+
+        ranked_corrections.sort_unstable_by(|(left, left_rank), (right, right_rank)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.reading.cmp(&right.reading))
+                .then_with(|| left.surface.cmp(&right.surface))
+        });
+        let corrections = select_candidate_corrections(ranked_corrections, 3);
+
+        if corrections.is_empty() {
+            return (ordinary, corrections);
+        }
+
+        let mut candidates = Vec::with_capacity(ordinary.len() + corrections.len() + 1);
+        push_unique(&mut candidates, reading.to_owned());
+        for correction in &corrections {
+            push_unique(&mut candidates, correction.surface.clone());
+        }
+        for candidate in ordinary {
+            push_unique(&mut candidates, candidate);
+        }
+        (candidates, corrections)
     }
 
     fn history_is_available(&self) -> bool {
@@ -769,6 +873,7 @@ impl SlimeEngine {
         let segment = &self.segments[self.active_segment];
         let reading = segment.reading.clone();
         let surface = segment.surface.clone();
+        self.candidate_corrections.clear();
         self.candidates = self.conversion_candidates_for_reading(&reading);
         if let Some(index) = self
             .candidates
@@ -802,10 +907,35 @@ impl SlimeEngine {
             ));
         }
         actions.push(SlimeAction::ShowCandidates {
-            candidates: self.candidates.clone(),
+            candidates: self.displayed_candidates(),
             selected: self.selected,
         });
         actions
+    }
+
+    fn displayed_candidates(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .map(|candidate| {
+                self.candidate_corrections
+                    .iter()
+                    .find(|correction| correction.surface == *candidate)
+                    .map_or_else(
+                        || candidate.clone(),
+                        |correction| format!("{candidate}　（{}に訂正）", correction.reading),
+                    )
+            })
+            .collect()
+    }
+
+    fn selected_learning_reading(&self) -> &str {
+        let selected = self.selected_candidate();
+        self.candidate_corrections
+            .iter()
+            .find(|correction| correction.surface == selected)
+            .map_or(self.reading.as_str(), |correction| {
+                correction.reading.as_str()
+            })
     }
 
     fn commit(&mut self) -> Vec<SlimeAction> {
@@ -836,7 +966,8 @@ impl SlimeEngine {
         if used_completion {
             self.record_completion_history(&reading, &committed);
         } else if used_conversion {
-            self.record_history(&reading, &committed);
+            let learning_reading = self.selected_learning_reading().to_owned();
+            self.record_history(&learning_reading, &committed);
         } else {
             // Live conversion is an implicit presentation decision, not an
             // explicit candidate choice. Learning it would let an unnoticed
@@ -1005,6 +1136,7 @@ impl SlimeEngine {
 
     fn clear_candidates(&mut self) {
         self.candidates.clear();
+        self.candidate_corrections.clear();
         self.selected = 0;
         self.candidate_kind = None;
         self.completion_selected = false;
@@ -1207,6 +1339,37 @@ fn bundled_dictionary_with_packs(
         layers.push(user_layer);
     }
     Dictionary::bundled_with_layers(layers)
+}
+
+fn select_candidate_corrections(
+    ranked: Vec<(CandidateCorrection, (u8, i32))>,
+    limit: usize,
+) -> Vec<CandidateCorrection> {
+    let mut selected = Vec::with_capacity(limit);
+    for (correction, _) in &ranked {
+        let same_reading = selected
+            .iter()
+            .filter(|existing: &&CandidateCorrection| existing.reading == correction.reading)
+            .count();
+        if same_reading < 2 {
+            selected.push(correction.clone());
+        }
+        if selected.len() == limit {
+            return selected;
+        }
+    }
+    for (correction, _) in ranked {
+        if selected
+            .iter()
+            .all(|existing| existing.surface != correction.surface)
+        {
+            selected.push(correction);
+        }
+        if selected.len() == limit {
+            break;
+        }
+    }
+    selected
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {

@@ -1591,11 +1591,47 @@ impl SlimeEngine {
             let selected_segments: Vec<_> = self
                 .segments
                 .iter()
-                .filter(|segment| segment.explicitly_selected)
-                .map(|segment| (segment.reading.clone(), segment.surface.clone()))
+                .enumerate()
+                .filter(|(_, segment)| segment.explicitly_selected)
+                .map(|(index, segment)| {
+                    (
+                        segment.reading.clone(),
+                        segment.surface.clone(),
+                        self.segment_context_before(index),
+                    )
+                })
                 .collect();
             let mut recorded = Vec::with_capacity(selected_segments.len());
-            for (segment_reading, segment_surface) in selected_segments {
+            let mut recorded_contexts = Vec::with_capacity(selected_segments.len());
+            for (segment_reading, segment_surface, context) in selected_segments {
+                if let Some((previous_reading, previous_surface)) = context
+                    && !recorded_contexts.iter().any(
+                        |(
+                            recorded_previous_reading,
+                            recorded_previous_surface,
+                            recorded_reading,
+                            recorded_surface,
+                        )| {
+                            recorded_previous_reading == &previous_reading
+                                && recorded_previous_surface == &previous_surface
+                                && recorded_reading == &segment_reading
+                                && recorded_surface == &segment_surface
+                        },
+                    )
+                {
+                    self.user_data.record_context(
+                        &previous_reading,
+                        &previous_surface,
+                        &segment_reading,
+                        &segment_surface,
+                    );
+                    recorded_contexts.push((
+                        previous_reading,
+                        previous_surface,
+                        segment_reading.clone(),
+                        segment_surface.clone(),
+                    ));
+                }
                 if (segment_reading == reading && segment_surface == surface)
                     || recorded.iter().any(|(recorded_reading, recorded_surface)| {
                         recorded_reading == &segment_reading && recorded_surface == &segment_surface
@@ -1609,6 +1645,26 @@ impl SlimeEngine {
             }
         }
         self.record_history(reading, surface);
+    }
+
+    fn segment_context_before(&self, index: usize) -> Option<(String, String)> {
+        // Prefer the shortest useful suffix. A particle-only segment such as
+        // `の` is not an anchor by itself, so include the preceding converted
+        // segment and retain the discriminating surface `日本の`.
+        for start in (0..index).rev() {
+            let reading: String = self.segments[start..index]
+                .iter()
+                .map(|segment| segment.reading.as_str())
+                .collect();
+            let surface: String = self.segments[start..index]
+                .iter()
+                .map(|segment| segment.surface.as_str())
+                .collect();
+            if user_data::is_useful_context_anchor(&reading, &surface) {
+                return Some((reading, surface));
+            }
+        }
+        None
     }
 
     fn record_completion_history(&mut self, prefix: &str, surface: &str) {
@@ -4140,6 +4196,83 @@ mod tests {
                 .any(|line| line.starts_with("かいとう\t解答\t")),
             "auto-commit must retain the explicit segment selection: {history}"
         );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repeated_segment_selection_learns_its_local_phrase_context() {
+        let directory = test_directory("segmented-context-learning");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nかいとう\t回答\t100\t10\n",
+        )
+        .unwrap();
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(preferences);
+
+        for repetition in 0..2 {
+            engine.reset_context();
+            type_text(&mut engine, "nihonnnokaitouhanihon");
+            engine.handle(InputEvent::Space);
+            engine.handle(InputEvent::PreviousSegment);
+            let segment_index = engine
+                .segments
+                .iter()
+                .position(|segment| segment.reading == "かいとう")
+                .unwrap_or_else(|| panic!("かいとう segment: {:?}", engine.segments));
+            while engine.active_segment < segment_index {
+                engine.handle(InputEvent::NextSegment);
+            }
+            let selected = engine
+                .snapshot()
+                .candidates
+                .iter()
+                .position(|candidate| candidate == "解答")
+                .expect("segment candidate 解答");
+            engine.handle(InputEvent::SelectCandidate(
+                u32::try_from(selected).unwrap(),
+            ));
+            engine.handle(InputEvent::Enter);
+
+            if repetition == 0 {
+                let mut one_off = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+                one_off.set_preferences(preferences);
+                one_off.set_external_left_context("これは日本の");
+                type_text(&mut one_off, "kaitou");
+                one_off.handle(InputEvent::Space);
+                assert_eq!(one_off.snapshot().preedit, "回答");
+            }
+        }
+
+        let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
+        assert!(
+            context
+                .lines()
+                .any(|line| line.starts_with("にほんの\t日本の\tかいとう\t解答\t2\t")),
+            "the shortest useful segment-prefix context must be learned: {context}"
+        );
+
+        let mut baseline = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        baseline.set_preferences(preferences);
+        type_text(&mut baseline, "kaitou");
+        baseline.handle(InputEvent::Space);
+        assert_eq!(baseline.snapshot().preedit, "回答");
+
+        let mut contextual = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        contextual.set_preferences(preferences);
+        contextual.set_external_left_context("これは日本の");
+        type_text(&mut contextual, "kaitou");
+        contextual.handle(InputEvent::Space);
+        assert_eq!(contextual.snapshot().preedit, "解答");
 
         fs::remove_dir_all(directory).unwrap();
     }

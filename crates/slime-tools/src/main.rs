@@ -17,7 +17,7 @@ use corpus_bigram::{
     parse_annotated_corpus_line,
 };
 use serde::{Deserialize, Serialize};
-use slime_converter::{Candidate, CandidateRanker, CostOnlyRanker, Dictionary};
+use slime_converter::{Candidate, CandidateRanker, Dictionary, DocumentContextRanker};
 
 /// Mozc-style costs approximate `-scale * ln(probability)`. Used to map
 /// lattice costs onto the neural log-likelihood axis for interpolation.
@@ -799,9 +799,10 @@ fn evaluate(
     options: &Options,
     word_bigram_ranker: Option<&CorpusBigramRanker>,
 ) -> Result<Vec<EvaluationReport>, String> {
-    let ranker = word_bigram_ranker.map_or(&CostOnlyRanker as &dyn CandidateRanker, |ranker| {
-        ranker as &dyn CandidateRanker
-    });
+    let ranker = word_bigram_ranker
+        .map_or(&DocumentContextRanker as &dyn CandidateRanker, |ranker| {
+            ranker as &dyn CandidateRanker
+        });
     let selected: Vec<_> = items
         .iter()
         .filter(|item| options.context.includes(item))

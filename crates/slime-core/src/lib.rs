@@ -624,6 +624,11 @@ impl SlimeEngine {
         explicit_previous_surface: Option<&str>,
     ) -> Vec<String> {
         let mut candidates = Vec::new();
+        let previous_surface = if self.preferences.private_mode {
+            None
+        } else {
+            explicit_previous_surface.or_else(|| self.session_history.previous_surface())
+        };
         for surface in self.user_data.exact_dictionary_surfaces(reading) {
             push_unique(&mut candidates, surface.to_owned());
         }
@@ -644,19 +649,19 @@ impl SlimeEngine {
         }
         // The literal hiragana reading stays selectable; hiding it made
         // single-kana words like み unreachable through the candidate window.
-        let dictionary_candidates = dictionary_limit.map_or_else(
-            || self.dictionary.candidates(reading),
-            |limit| self.dictionary.candidates_with_limit(reading, limit),
-        );
+        let dictionary_candidates = match (dictionary_limit, previous_surface) {
+            (Some(limit), Some(context)) => self
+                .dictionary
+                .candidates_with_context_limit(reading, context, limit),
+            (None, Some(context)) => self.dictionary.candidates_with_context(reading, context),
+            (Some(limit), None) => self.dictionary.candidates_with_limit(reading, limit),
+            (None, None) => self.dictionary.candidates(reading),
+        };
         let dictionary_surfaces: Vec<_> = dictionary_candidates
             .into_iter()
             .map(|candidate| candidate.surface)
             .collect();
-        let previous_surface =
-            explicit_previous_surface.or_else(|| self.session_history.previous_surface());
-        if !self.preferences.private_mode
-            && let Some(previous_surface) = previous_surface
-        {
+        if let Some(previous_surface) = previous_surface {
             let mut promoted = 0;
             self.installed_packs
                 .visit_contextual_surfaces(previous_surface, reading, |surface| {
@@ -2586,6 +2591,25 @@ mod tests {
     }
 
     #[test]
+    fn external_document_context_reuses_a_visible_dictionary_surface() {
+        let directory = test_directory("external-document-surface-repeat");
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+
+        assert_eq!(engine.conversion_candidates("あさの")[0], "朝の");
+        engine.set_external_left_context("同社では浅野木材工業の");
+        type_text(&mut engine, "asano");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "浅野");
+        engine.handle(InputEvent::Enter);
+
+        assert!(!directory.join("history.tsv").exists());
+        engine.reset_context();
+        assert_eq!(engine.conversion_candidates("あさの")[0], "朝の");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn external_document_context_reuses_repeated_local_context_history() {
         let directory = test_directory("external-adaptive-context");
         let preferences = EnginePreferences {
@@ -2655,6 +2679,10 @@ mod tests {
         type_text(&mut engine, "kanji");
         engine.handle(InputEvent::Space);
         assert_ne!(engine.snapshot().preedit, "漢字");
+        assert_eq!(
+            engine.conversion_candidates_with_left_context("既存文書の浅野", "あさの")[0],
+            "朝の"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

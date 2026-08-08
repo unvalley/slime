@@ -5,7 +5,7 @@ mod compact;
 mod ranking;
 mod symbol_candidates;
 
-pub use ranking::{CandidateRanker, CostOnlyRanker};
+pub use ranking::{CandidateRanker, CostOnlyRanker, DocumentContextRanker};
 
 use bumpalo::{Bump, collections::String as BumpString};
 use compact::CompactDictionary;
@@ -165,22 +165,6 @@ const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
 const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_MAX_CANDIDATES: usize = 128;
 const FIXED_SEGMENT_MAX_STATES: usize = 256;
-// For short content words, a whole-reading dictionary entry is a stronger
-// lexical signal than an accidentally cheap sequence of fragments (for
-// example, 浅野 versus 朝+の). Two-character inflections and long phrases are
-// deliberately excluded: broad application regresses ordinary compositions.
-const SHORT_READING_COHESION_MIN_CHARACTERS: usize = 3;
-const SHORT_READING_COHESION_MAX_CHARACTERS: usize = 6;
-const SHORT_READING_ADDITIONAL_SEGMENT_COST: i32 = 800;
-
-fn short_reading_cohesion_cost(enabled: bool, conversion: &Conversion) -> i32 {
-    if !enabled {
-        return 0;
-    }
-    let additional_segments = conversion.segments.len().saturating_sub(1);
-    SHORT_READING_ADDITIONAL_SEGMENT_COST
-        .saturating_mul(i32::try_from(additional_segments).unwrap_or(i32::MAX))
-}
 
 fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
     paths.sort_unstable_by(|left, right| {
@@ -677,6 +661,18 @@ impl Dictionary {
         self.candidates_with_ranker(reading, DEFAULT_N_BEST, &CostOnlyRanker)
     }
 
+    /// Returns candidates ranked with bounded, input-client-supplied document
+    /// context. No context is retained by the dictionary.
+    #[must_use]
+    pub fn candidates_with_context(&self, reading: &str, left_context: &str) -> Vec<Candidate> {
+        self.candidates_with_context_ranker(
+            reading,
+            left_context,
+            DEFAULT_N_BEST,
+            &DocumentContextRanker,
+        )
+    }
+
     /// Returns cost-ranked candidates using an explicit N-best search width.
     ///
     /// Interactive callers can keep the default search on the initial key
@@ -685,6 +681,17 @@ impl Dictionary {
     #[must_use]
     pub fn candidates_with_limit(&self, reading: &str, limit: usize) -> Vec<Candidate> {
         self.candidates_with_ranker(reading, limit, &CostOnlyRanker)
+    }
+
+    /// Context-aware counterpart of [`Self::candidates_with_limit`].
+    #[must_use]
+    pub fn candidates_with_context_limit(
+        &self,
+        reading: &str,
+        left_context: &str,
+        limit: usize,
+    ) -> Vec<Candidate> {
+        self.candidates_with_context_ranker(reading, left_context, limit, &DocumentContextRanker)
     }
 
     #[must_use]
@@ -707,9 +714,6 @@ impl Dictionary {
     ) -> Vec<Candidate> {
         let mut candidates = Vec::<Candidate>::new();
         let mut conversions = Vec::new();
-        let use_short_reading_cohesion = (SHORT_READING_COHESION_MIN_CHARACTERS
-            ..=SHORT_READING_COHESION_MAX_CHARACTERS)
-            .contains(&reading.chars().count());
         let connection = self.uses_connection_costs.then(ConnectionMatrix::bundled);
         self.for_each_exact(reading, |entry| {
             let cost = if entry.surface == reading {
@@ -755,12 +759,7 @@ impl Dictionary {
             let cost = if conversion.surface == reading {
                 LITERAL_CANDIDATE_COST
             } else {
-                ranker
-                    .ranking_cost_with_context(reading, left_context, &conversion)
-                    .saturating_add(short_reading_cohesion_cost(
-                        use_short_reading_cohesion,
-                        &conversion,
-                    ))
+                ranker.ranking_cost_with_context(reading, left_context, &conversion)
             };
             if let Some(existing) = candidates
                 .iter_mut()
@@ -2746,35 +2745,6 @@ mod tests {
     }
 
     #[test]
-    fn short_reading_cohesion_prefers_a_lexicalized_whole_entry() {
-        let dictionary = Dictionary::new(vec![
-            DictionaryEntry::new("あさの", "浅野", 2_500),
-            DictionaryEntry::new("あさ", "朝", 0),
-            DictionaryEntry::new("の", "の", 0),
-        ]);
-
-        assert_eq!(dictionary.convert_n_best("あさの", 3)[0].surface, "朝の");
-        assert_eq!(dictionary.candidates("あさの")[0].surface, "浅野");
-    }
-
-    #[test]
-    fn short_reading_cohesion_excludes_two_character_and_long_readings() {
-        let inflection = Dictionary::new(vec![
-            DictionaryEntry::new("きの", "機能", 2_500),
-            DictionaryEntry::new("き", "木", 0),
-            DictionaryEntry::new("の", "の", 0),
-        ]);
-        assert_eq!(inflection.candidates("きの")[0].surface, "木の");
-
-        let phrase = Dictionary::new(vec![
-            DictionaryEntry::new("あいうえおかき", "全体語", 2_500),
-            DictionaryEntry::new("あいう", "前半", 0),
-            DictionaryEntry::new("えおかき", "後半", 0),
-        ]);
-        assert_eq!(phrase.candidates("あいうえおかき")[0].surface, "前半後半");
-    }
-
-    #[test]
     fn candidate_ranker_receives_left_context_without_changing_the_legacy_api() {
         let dictionary = Dictionary::new(vec![
             DictionaryEntry::new("あ", "亜", 10),
@@ -2792,6 +2762,30 @@ mod tests {
         assert_eq!(
             dictionary.candidates_with_context_ranker("あ", "文脈", 5, &ranker)[0].surface,
             "阿"
+        );
+    }
+
+    #[test]
+    fn document_context_reuses_a_repeated_multi_character_surface() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あさの", "浅野", 2_500),
+            DictionaryEntry::new("あさ", "朝", 0),
+            DictionaryEntry::new("の", "の", 0),
+        ]);
+
+        assert_eq!(dictionary.candidates("あさの")[0].surface, "朝の");
+        assert_eq!(
+            dictionary.candidates_with_context("あさの", "浅野木材工業の")[0].surface,
+            "浅野"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("あさの", "無関係な文脈")[0].surface,
+            "朝の"
+        );
+        assert_eq!(
+            dictionary.candidates("あさの")[0].surface,
+            "朝の",
+            "a transient query must not be retained by the dictionary"
         );
     }
 

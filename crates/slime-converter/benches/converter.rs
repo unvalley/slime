@@ -12,6 +12,7 @@ fn main() {
     run("converter/candidate_window_single_word", iterations, || {
         black_box(dictionary.candidates(black_box("にほん")));
     });
+    run_document_context_benchmark(&dictionary, iterations);
     run("converter/segmented_phrase", iterations, || {
         black_box(dictionary.convert_best(black_box("わたしはにほん")));
     });
@@ -105,6 +106,15 @@ fn main() {
     });
     run("converter/short_dictionary_layer", iterations, || {
         black_box(short_dictionary_layer());
+    });
+}
+
+fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run("converter/document_context_candidates", iterations, || {
+        black_box(dictionary.candidates_with_context(
+            black_box("あさの"),
+            black_box("同社の不燃木材は浅野木材工業の"),
+        ));
     });
 }
 

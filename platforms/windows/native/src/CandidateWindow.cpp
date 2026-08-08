@@ -1,5 +1,8 @@
 #include "CandidateWindow.h"
 
+// Declare COM base interfaces before the generated accessibility providers.
+#include <unknwn.h>
+#include <oaidl.h>
 #include <UIAutomation.h>
 #include <windowsx.h>
 

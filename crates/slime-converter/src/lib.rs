@@ -165,6 +165,22 @@ const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
 const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_MAX_CANDIDATES: usize = 128;
 const FIXED_SEGMENT_MAX_STATES: usize = 256;
+// For short content words, a whole-reading dictionary entry is a stronger
+// lexical signal than an accidentally cheap sequence of fragments (for
+// example, 浅野 versus 朝+の). Two-character inflections and long phrases are
+// deliberately excluded: broad application regresses ordinary compositions.
+const SHORT_READING_COHESION_MIN_CHARACTERS: usize = 3;
+const SHORT_READING_COHESION_MAX_CHARACTERS: usize = 6;
+const SHORT_READING_ADDITIONAL_SEGMENT_COST: i32 = 800;
+
+fn short_reading_cohesion_cost(enabled: bool, conversion: &Conversion) -> i32 {
+    if !enabled {
+        return 0;
+    }
+    let additional_segments = conversion.segments.len().saturating_sub(1);
+    SHORT_READING_ADDITIONAL_SEGMENT_COST
+        .saturating_mul(i32::try_from(additional_segments).unwrap_or(i32::MAX))
+}
 
 fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
     paths.sort_unstable_by(|left, right| {
@@ -691,6 +707,9 @@ impl Dictionary {
     ) -> Vec<Candidate> {
         let mut candidates = Vec::<Candidate>::new();
         let mut conversions = Vec::new();
+        let use_short_reading_cohesion = (SHORT_READING_COHESION_MIN_CHARACTERS
+            ..=SHORT_READING_COHESION_MAX_CHARACTERS)
+            .contains(&reading.chars().count());
         let connection = self.uses_connection_costs.then(ConnectionMatrix::bundled);
         self.for_each_exact(reading, |entry| {
             let cost = if entry.surface == reading {
@@ -736,7 +755,12 @@ impl Dictionary {
             let cost = if conversion.surface == reading {
                 LITERAL_CANDIDATE_COST
             } else {
-                ranker.ranking_cost_with_context(reading, left_context, &conversion)
+                ranker
+                    .ranking_cost_with_context(reading, left_context, &conversion)
+                    .saturating_add(short_reading_cohesion_cost(
+                        use_short_reading_cohesion,
+                        &conversion,
+                    ))
             };
             if let Some(existing) = candidates
                 .iter_mut()
@@ -2719,6 +2743,35 @@ mod tests {
         let candidates = dictionary.candidates_with_ranker("あい", 5, &PreferSurface("阿伊"));
 
         assert_eq!(candidates[0].surface, "阿伊");
+    }
+
+    #[test]
+    fn short_reading_cohesion_prefers_a_lexicalized_whole_entry() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あさの", "浅野", 2_500),
+            DictionaryEntry::new("あさ", "朝", 0),
+            DictionaryEntry::new("の", "の", 0),
+        ]);
+
+        assert_eq!(dictionary.convert_n_best("あさの", 3)[0].surface, "朝の");
+        assert_eq!(dictionary.candidates("あさの")[0].surface, "浅野");
+    }
+
+    #[test]
+    fn short_reading_cohesion_excludes_two_character_and_long_readings() {
+        let inflection = Dictionary::new(vec![
+            DictionaryEntry::new("きの", "機能", 2_500),
+            DictionaryEntry::new("き", "木", 0),
+            DictionaryEntry::new("の", "の", 0),
+        ]);
+        assert_eq!(inflection.candidates("きの")[0].surface, "木の");
+
+        let phrase = Dictionary::new(vec![
+            DictionaryEntry::new("あいうえおかき", "全体語", 2_500),
+            DictionaryEntry::new("あいう", "前半", 0),
+            DictionaryEntry::new("えおかき", "後半", 0),
+        ]);
+        assert_eq!(phrase.candidates("あいうえおかき")[0].surface, "前半後半");
     }
 
     #[test]

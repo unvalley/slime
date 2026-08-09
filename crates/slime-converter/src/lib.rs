@@ -138,6 +138,7 @@ pub struct Dictionary {
 struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
+    right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
@@ -164,6 +165,11 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         Self {
             dictionary,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
+            right_phrase_promotions: dictionary.document_right_phrase_promotions(
+                reading,
+                left_context,
+                right_context,
+            ),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
             follows_region_name: is_document_region_suffix_reading(reading)
@@ -195,6 +201,17 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         let phrase_promotion =
             self.dictionary
                 .document_phrase_promotion(left_context, reading, &conversion.surface);
+        let right_phrase_promotion = self
+            .right_phrase_promotions
+            .iter()
+            .filter(|promotion| {
+                conversion.segments.len() == 1
+                    && promotion.surface == conversion.surface
+                    && promotion.isolated_cost == conversion.cost
+            })
+            .map(|promotion| promotion.promotion)
+            .max()
+            .unwrap_or(0);
         let notation_promotion =
             if structured_notation_matches(left_context, reading, &conversion.surface) {
                 DOCUMENT_STRUCTURED_NOTATION_PROMOTION
@@ -247,6 +264,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         repeated_cost
             .saturating_add(boundary_adjustment)
             .saturating_sub(specialized_promotion)
+            .saturating_sub(right_phrase_promotion)
             .saturating_sub(right_inflection_promotion)
     }
 }
@@ -299,10 +317,13 @@ const FIXED_SEGMENT_MAX_CANDIDATES: usize = 128;
 const FIXED_SEGMENT_MAX_STATES: usize = 256;
 const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
 const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
+const DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS: usize = 8;
 // A lower-cost whole compound is stronger evidence than a marginal one. The
 // cap bounds how far dictionary evidence can move an existing N-best item.
 const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
+const DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING: i32 = 6_300;
+const DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
@@ -1095,6 +1116,94 @@ impl Dictionary {
             ) {
                 best_promotion = best_promotion.max(
                     DOCUMENT_PHRASE_COST_CEILING
+                        .saturating_sub(word_cost)
+                        .min(DOCUMENT_PHRASE_PROMOTION),
+                );
+            }
+        }
+        best_promotion
+    }
+
+    fn document_right_phrase_promotions<'s>(
+        &'s self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+    ) -> Vec<DocumentBoundaryPromotion<'s>> {
+        if !self.uses_connection_costs || trailing_numeric_surface(left_context).is_some() {
+            return Vec::new();
+        }
+        let mut has_left_phrase_evidence = false;
+        self.for_each_exact(reading, |entry| {
+            has_left_phrase_evidence |=
+                self.document_phrase_promotion(left_context, reading, entry.surface) > 0;
+        });
+        if has_left_phrase_evidence {
+            return Vec::new();
+        }
+        let connection = ConnectionMatrix::bundled();
+        let mut promotions = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            let promotion =
+                self.document_right_phrase_promotion(reading, entry.surface, right_context);
+            if entry.surface != reading && promotion > 0 {
+                promotions.push(DocumentBoundaryPromotion {
+                    surface: entry.surface,
+                    isolated_cost: whole_reading_entry_cost(Some(connection), &entry),
+                    promotion,
+                });
+            }
+        });
+        promotions
+    }
+
+    fn document_right_phrase_promotion(
+        &self,
+        reading: &str,
+        candidate_surface: &str,
+        right_context: &str,
+    ) -> i32 {
+        let Some(compact) = self.bundled else {
+            return 0;
+        };
+        let Some(first) = right_context.chars().next() else {
+            return 0;
+        };
+        if !candidate_surface
+            .chars()
+            .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+            || !matches!(first, '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}')
+        {
+            return 0;
+        }
+        let context_end = right_context
+            .char_indices()
+            .nth(DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS)
+            .map_or(right_context.len(), |(index, _)| index);
+        let context_head = &right_context[..context_end];
+        let mut best_promotion = 0;
+        for end in context_head
+            .char_indices()
+            .skip(1)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(context_head.len()))
+        {
+            if let Some(word_cost) = compact.joined_surface_reading_prefix_cost(
+                candidate_surface,
+                &context_head[..end],
+                reading,
+                &[
+                    MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                    MOZC_PERSONAL_SURNAME_POS_ID,
+                ],
+            ) {
+                let cost_ceiling = if context_head[..end].chars().count() >= 2 {
+                    DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING
+                } else {
+                    DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING
+                };
+                best_promotion = best_promotion.max(
+                    cost_ceiling
                         .saturating_sub(word_cost)
                         .min(DOCUMENT_PHRASE_PROMOTION),
                 );
@@ -3901,6 +4010,48 @@ mod tests {
             dictionary.candidates_with_surrounding_context("ぶ", "第三", "まで")[0].surface,
             dictionary.candidates_with_context("ぶ", "第三")[0].surface,
             "まで is a particle and must not be mistaken for the polite auxiliary"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_dictionary_compounds_to_the_right() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_context("まち", "患者と患者の")[0].surface,
+            "街"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("まち", "患者と患者の", "時間は少ない")
+                [0]
+            .surface,
+            "待ち"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("わ", "古典演奏から", "楽器を")[0]
+                .surface,
+            "和"
+        );
+    }
+
+    #[test]
+    fn right_compound_evidence_respects_stronger_left_boundaries() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("けん", "福岡都市", "内外から")[0]
+                .surface,
+            "圏"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("かん", "第1", "冒頭では")[0].surface,
+            "巻"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("あき", "現在は", "名跡となっている")[0]
+                .surface,
+            dictionary.candidates_with_context("あき", "現在は")[0].surface,
+            "a surname-only compound must not become document phrase evidence"
         );
     }
 

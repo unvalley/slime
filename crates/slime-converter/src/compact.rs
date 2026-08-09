@@ -180,6 +180,58 @@ impl CompactDictionary {
         }
         best_cost
     }
+
+    /// Returns the lowest reverse-index word cost whose reading starts with
+    /// `prefix` for the split `surface + suffix` surface.
+    pub(crate) fn joined_surface_reading_prefix_cost(
+        &self,
+        surface: &str,
+        suffix: &str,
+        prefix: &str,
+        excluded_pos_ids: &[u16],
+    ) -> Option<i32> {
+        let mut node = self.reverse_fst.root();
+        let mut output = fst::raw::Output::zero();
+        for byte in surface.bytes().chain(suffix.bytes()) {
+            let transition_index = node.find_input(byte)?;
+            let transition = node.transition(transition_index);
+            output = output.cat(transition.out);
+            node = self.reverse_fst.node(transition.addr);
+        }
+        if !node.is_final() {
+            return None;
+        }
+        let block = output.cat(node.final_output()).value();
+        let mut cursor = usize::try_from(block).expect("reverse block offset");
+        let count = read_reverse_varint(&mut cursor);
+        let mut best_cost = None;
+        for _ in 0..count {
+            let offset = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
+            let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
+            let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
+                .expect("valid reverse reading UTF-8");
+            cursor += 2;
+            if reading.starts_with(prefix) {
+                self.for_each_exact(reading, |entry| {
+                    let entry_surface = entry.surface.as_bytes();
+                    let joined_length = surface.len().saturating_add(suffix.len());
+                    let matches_joined_surface = entry_surface.len() == joined_length
+                        && entry_surface.get(..surface.len()) == Some(surface.as_bytes())
+                        && entry_surface.get(surface.len()..) == Some(suffix.as_bytes());
+                    if matches_joined_surface
+                        && !excluded_pos_ids.contains(&entry.left_id)
+                        && !excluded_pos_ids.contains(&entry.right_id)
+                    {
+                        best_cost = Some(
+                            best_cost
+                                .map_or(entry.word_cost, |best: i32| best.min(entry.word_cost)),
+                        );
+                    }
+                });
+            }
+        }
+        best_cost
+    }
 }
 
 fn read_reverse_varint(cursor: &mut usize) -> u64 {
@@ -297,6 +349,21 @@ mod tests {
             dictionary.joined_surface_reading_suffix_cost("アイランドセンター", "駅", "えき"),
             None,
             "long proper-name stems must stay outside the context index"
+        );
+    }
+
+    #[test]
+    fn reverse_index_matches_a_reading_prefix_without_allocating() {
+        let dictionary = CompactDictionary::bundled();
+
+        assert!(
+            dictionary
+                .joined_surface_reading_prefix_cost("圏", "内", "けん", &[])
+                .is_some()
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_prefix_cost("圏", "内", "かん", &[]),
+            None
         );
     }
 

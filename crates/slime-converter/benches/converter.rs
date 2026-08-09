@@ -160,6 +160,16 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             dictionary.candidates_with_context(black_box("のめ"), black_box("うまいコーヒーが")),
         );
     });
+    run("converter/right_compound_candidates", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("まち"),
+            black_box("患者と患者の"),
+            black_box("時間は少ない"),
+        ));
+    });
+    run("converter/right_compound_left_only", iterations, || {
+        black_box(dictionary.candidates_with_context(black_box("まち"), black_box("患者と患者の")));
+    });
 }
 
 fn run_fixed_segment_benchmark(dictionary: &Dictionary, iterations: u64) {

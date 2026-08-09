@@ -2914,6 +2914,17 @@ mod tests {
     }
 
     #[test]
+    fn external_right_context_ranks_a_dictionary_compound_prefix() {
+        let mut engine = SlimeEngine::bundled();
+
+        engine.set_external_context("患者と患者の", "時間は少ない");
+        type_text(&mut engine, "machi");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "待ち");
+    }
+
+    #[test]
     fn private_mode_ignores_external_right_context() {
         let mut engine = SlimeEngine::bundled();
         engine.set_preferences(EnginePreferences {

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
+use slime_converter::Dictionary;
 
 const MINIMUM_TOKENS: usize = 2;
 const MAXIMUM_TOKENS: usize = 6;
@@ -29,6 +30,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let mut phrases = Vec::new();
     let mut seen = HashSet::new();
     let mut stats = Stats::default();
+    let dictionary = Dictionary::bundled();
 
     for input in &options.inputs {
         let file = fs::File::open(input)
@@ -47,7 +49,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
                 continue;
             };
             for run in phonetic_runs(&tokens) {
-                collect_phrases(run, &mut seen, &mut phrases, &mut stats);
+                collect_phrases(run, &dictionary, &mut seen, &mut phrases, &mut stats);
             }
         }
     }
@@ -145,10 +147,12 @@ fn phonetic_runs(tokens: &[Token]) -> impl Iterator<Item = &[Token]> {
 
 fn collect_phrases(
     tokens: &[Token],
+    dictionary: &Dictionary,
     seen: &mut HashSet<String>,
     phrases: &mut Vec<Phrase>,
     stats: &mut Stats,
 ) {
+    let suspicious_administrative_tokens = suspicious_administrative_tokens(tokens, dictionary);
     for start in 0..tokens.len() {
         let maximum_end = (start + MAXIMUM_TOKENS).min(tokens.len());
         for end in start + MINIMUM_TOKENS..=maximum_end {
@@ -156,6 +160,13 @@ fn collect_phrases(
             let window = &tokens[start..end];
             if !window.iter().all(is_compound_element) {
                 stats.non_compound_elements += 1;
+                continue;
+            }
+            if suspicious_administrative_tokens[start..end]
+                .iter()
+                .any(|suspicious| *suspicious)
+            {
+                stats.suspicious_administrative_windows += 1;
                 continue;
             }
             if window
@@ -187,6 +198,30 @@ fn collect_phrases(
             phrases.push(Phrase { reading, surface });
         }
     }
+}
+
+fn suspicious_administrative_tokens(tokens: &[Token], dictionary: &Dictionary) -> Vec<bool> {
+    let mut suspicious = vec![false; tokens.len()];
+    let mut previous_region = None;
+    for (index, token) in tokens.iter().enumerate() {
+        if dictionary.has_exact_region_surface(&token.reading, &token.surface) {
+            previous_region = Some(index);
+        } else if has_administrative_suffix(&token.surface)
+            && let Some(region_index) = previous_region
+        {
+            suspicious[region_index..=index].fill(true);
+        }
+    }
+    suspicious
+}
+
+fn has_administrative_suffix(surface: &str) -> bool {
+    surface.chars().last().is_some_and(|suffix| {
+        matches!(
+            suffix,
+            '都' | '道' | '府' | '県' | '市' | '区' | '町' | '村' | '郡'
+        )
+    })
 }
 
 fn sample_evenly(phrases: &[Phrase], limit: usize) -> Vec<&Phrase> {
@@ -257,6 +292,7 @@ struct Stats {
     invalid_lines: usize,
     windows: usize,
     non_compound_elements: usize,
+    suspicious_administrative_windows: usize,
     insufficient_kanji_elements: usize,
     outside_reading_length: usize,
     duplicates: usize,
@@ -266,6 +302,8 @@ struct Stats {
 
 #[cfg(test)]
 mod tests {
+    use slime_converter::{Dictionary, DictionaryEntry};
+
     use super::{Phrase, Stats, collect_phrases, parse_tokens, phonetic_runs, sample_evenly};
     use std::collections::HashSet;
 
@@ -278,8 +316,9 @@ mod tests {
         let mut phrases = Vec::new();
         let mut seen = HashSet::new();
         let mut stats = Stats::default();
+        let dictionary = Dictionary::new(Vec::new());
         for run in phonetic_runs(&tokens) {
-            collect_phrases(run, &mut seen, &mut phrases, &mut stats);
+            collect_phrases(run, &dictionary, &mut seen, &mut phrases, &mut stats);
         }
         assert!(phrases.contains(&Phrase {
             reading: "しんきしょうひん".to_owned(),
@@ -304,9 +343,49 @@ mod tests {
         let mut phrases = Vec::new();
         let mut seen = HashSet::new();
         let mut stats = Stats::default();
-        collect_phrases(&tokens, &mut seen, &mut phrases, &mut stats);
+        collect_phrases(
+            &tokens,
+            &Dictionary::new(Vec::new()),
+            &mut seen,
+            &mut phrases,
+            &mut stats,
+        );
         assert!(phrases.is_empty());
         assert!(stats.non_compound_elements > 0);
+    }
+
+    #[test]
+    fn rejects_misread_administrative_segments_after_a_region_anchor() {
+        const REGION_POS_ID: u16 = 1924;
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("おきなわけん", "沖縄県", REGION_POS_ID, REGION_POS_ID, 100),
+            DictionaryEntry::with_pos("ぎのざむら", "宜野座村", REGION_POS_ID, REGION_POS_ID, 100),
+        ]);
+        let tokens = parse_tokens("沖縄県/おきなわけん 宜野/よしの 座村/ざむら").unwrap();
+        let mut phrases = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stats = Stats::default();
+
+        collect_phrases(&tokens, &dictionary, &mut seen, &mut phrases, &mut stats);
+
+        assert!(!phrases.iter().any(|phrase| {
+            phrase.reading == "おきなわけんよしのざむら" && phrase.surface == "沖縄県宜野座村"
+        }));
+        assert!(stats.suspicious_administrative_windows > 0);
+
+        let correct = parse_tokens("沖縄県/おきなわけん 宜野座村/ぎのざむら").unwrap();
+        let mut correct_phrases = Vec::new();
+        collect_phrases(
+            &correct,
+            &dictionary,
+            &mut HashSet::new(),
+            &mut correct_phrases,
+            &mut Stats::default(),
+        );
+        assert!(correct_phrases.contains(&Phrase {
+            reading: "おきなわけんぎのざむら".to_owned(),
+            surface: "沖縄県宜野座村".to_owned(),
+        }));
     }
 
     #[test]

@@ -581,6 +581,20 @@ impl Dictionary {
         found
     }
 
+    /// Reports whether an exact reading and surface pair carries Mozc's region
+    /// proper-noun POS. Evaluation tools use this to reject tokenizer splits
+    /// that accidentally reinterpret pieces of an administrative place name.
+    #[must_use]
+    pub fn has_exact_region_surface(&self, reading: &str, surface: &str) -> bool {
+        let mut found = false;
+        self.for_each_exact(reading, |entry| {
+            found |= entry.surface == surface
+                && (MOZC_REGION_POS_IDS.contains(&entry.left_id)
+                    || MOZC_REGION_POS_IDS.contains(&entry.right_id));
+        });
+        found
+    }
+
     /// Returns low-cost two- to six-part compounds assembled from exact
     /// dictionary entries. This is a bounded recall path for explicit "more
     /// candidates" actions; it does not replace the normal N-best ordering.
@@ -2953,7 +2967,7 @@ mod tests {
     use super::{
         Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
         DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
-        MOZC_PERSONAL_SURNAME_POS_ID, NBestBucket, NBestNode, UNKNOWN_POS_ID,
+        MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, NBestBucket, NBestNode, UNKNOWN_POS_ID,
         document_region_suffix_promotion, insert_n_best_node,
     };
 
@@ -3811,6 +3825,19 @@ mod tests {
         }
         assert_eq!(document_region_suffix_promotion("し", "氏"), 0);
         assert_eq!(document_region_suffix_promotion("まち", "街"), 0);
+    }
+
+    #[test]
+    fn exact_region_surface_requires_matching_reading_surface_and_pos() {
+        let region_pos_id = MOZC_REGION_POS_IDS[0];
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("おきなわけん", "沖縄県", region_pos_id, region_pos_id, 100),
+            DictionaryEntry::new("とし", "都市", 100),
+        ]);
+
+        assert!(dictionary.has_exact_region_surface("おきなわけん", "沖縄県"));
+        assert!(!dictionary.has_exact_region_surface("おきなわけん", "沖縄市"));
+        assert!(!dictionary.has_exact_region_surface("とし", "都市"));
     }
 
     #[test]

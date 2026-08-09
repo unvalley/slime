@@ -37,7 +37,7 @@ else
   echo "Signing with: $codesign_identity"
 fi
 
-cargo_features=()
+neural_enabled=false
 if [[ -n "$neural_model" ]]; then
   if [[ ! -f "$neural_model" ]]; then
     echo "Neural model not found: $neural_model" >&2
@@ -47,17 +47,25 @@ if [[ -n "$neural_model" ]]; then
     echo "SLIME_NEURAL_MODEL_LICENSE must name the model's redistributable license" >&2
     exit 1
   fi
-  cargo_features=(--features neural)
+  neural_enabled=true
 elif [[ -n "$neural_model_license" ]]; then
   echo "SLIME_NEURAL_MODEL_LICENSE requires SLIME_NEURAL_MODEL" >&2
   exit 1
 fi
 
-MACOSX_DEPLOYMENT_TARGET=13.0 cargo build \
-  --manifest-path "$workspace_dir/Cargo.toml" \
-  --release \
-  -p slime-ffi \
-  "${cargo_features[@]}"
+build_slime_ffi() {
+  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build \
+    --manifest-path "$workspace_dir/Cargo.toml" \
+    --release \
+    -p slime-ffi \
+    "$@"
+}
+
+if [[ "$neural_enabled" == true ]]; then
+  build_slime_ffi --features neural
+else
+  build_slime_ffi
+fi
 
 rm -rf "$bundle_dir"
 mkdir -p "$macos_dir" "$frameworks_dir" "$resources_dir"

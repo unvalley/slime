@@ -116,6 +116,9 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             black_box("同社の不燃木材は浅野木材工業の"),
         ));
     });
+    run("converter/boundary_context_candidates", iterations, || {
+        black_box(dictionary.candidates_with_context(black_box("いせき"), black_box("オランダへ")));
+    });
     run("converter/numeric_context_candidates", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });

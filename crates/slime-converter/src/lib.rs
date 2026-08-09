@@ -131,19 +131,29 @@ pub struct Dictionary {
     uses_connection_costs: bool,
 }
 
-/// Adds dictionary-backed phrase continuation to the narrower repeated-surface
-/// signal. Both signals only reorder candidates already produced by the
-/// lattice; neither changes the dictionary or retains document text.
+/// Adds dictionary-backed phrase and word-boundary evidence to the narrower
+/// repeated-surface signal. Every signal only reorders candidates already
+/// produced by the lattice; none changes the dictionary or retains document
+/// text.
 struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
+    boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DocumentBoundaryPromotion<'a> {
+    surface: &'a str,
+    isolated_cost: i32,
+    promotion: i32,
 }
 
 impl<'a> DictionaryDocumentContextRanker<'a> {
     fn new(dictionary: &'a Dictionary, reading: &str, left_context: &str) -> Self {
         Self {
             dictionary,
+            boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
             follows_region_name: dictionary.document_context_has_pos_suffix(
                 left_context,
                 &MOZC_REGION_POS_IDS,
@@ -189,12 +199,31 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             } else {
                 0
             };
-        repeated_cost.saturating_sub(
-            phrase_promotion
-                .max(notation_promotion)
-                .max(numeric_counter_promotion)
-                .max(region_line_promotion),
-        )
+        let specialized_promotion = phrase_promotion
+            .max(notation_promotion)
+            .max(numeric_counter_promotion)
+            .max(region_line_promotion);
+        let boundary_adjustment = if specialized_promotion > 0 {
+            0
+        } else {
+            // A post-hoc boundary score is exact only when the complete
+            // candidate is one dictionary word. Multi-segment paths would
+            // need the context transition inside the lattice search.
+            self.boundary_promotions
+                .iter()
+                .filter(|promotion| {
+                    conversion.segments.len() == 1
+                        && promotion.surface == conversion.surface
+                        && promotion.isolated_cost == conversion.cost
+                })
+                .map(|promotion| promotion.promotion)
+                .max()
+                .unwrap_or(0)
+                .saturating_neg()
+        };
+        repeated_cost
+            .saturating_add(boundary_adjustment)
+            .saturating_sub(specialized_promotion)
     }
 }
 
@@ -244,6 +273,8 @@ const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
 const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
 const DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
+const DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS: usize = 8;
+const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
 const MOZC_COUNTER_POS_ID: u16 = 2011;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
@@ -904,6 +935,121 @@ impl Dictionary {
             }
         }
         false
+    }
+
+    fn document_context_boundary_right_ids(&self, left_context: &str) -> Vec<u16> {
+        let context_start = left_context
+            .char_indices()
+            .rev()
+            .nth(DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS.saturating_sub(1))
+            .map_or(0, |(index, _)| index);
+        let context_tail = &left_context[context_start..];
+        let mut boundaries = context_tail
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.reverse();
+        let mut pos_costs = Vec::<(u16, i32)>::new();
+
+        for index in boundaries {
+            let suffix = &context_tail[index..];
+            // Without a reading boundary, a multi-character kana tail can be
+            // an arbitrary slice through an inflection. Fall back to its final
+            // one-character grammar entry instead of inventing a word split.
+            if suffix.chars().count() > 1
+                && suffix
+                    .chars()
+                    .all(|character| matches!(character, '\u{3040}'..='\u{30ff}'))
+            {
+                continue;
+            }
+            pos_costs.clear();
+            self.for_each_exact(suffix, |entry| {
+                if entry.surface == suffix {
+                    pos_costs.push((entry.right_id, entry.word_cost));
+                }
+            });
+            if let Some(compact) = self.bundled {
+                compact.for_each_surface_entry(suffix, |entry| {
+                    pos_costs.push((entry.right_id, entry.word_cost));
+                });
+            }
+            for layer in self.layers.iter() {
+                for entry in layer.entries.iter().filter(|entry| entry.surface == suffix) {
+                    pos_costs.push((entry.right_id, entry.word_cost));
+                }
+            }
+            let Some(best_cost) = pos_costs.iter().map(|(_, word_cost)| *word_cost).min() else {
+                continue;
+            };
+            let mut right_ids = Vec::new();
+            for &(right_id, word_cost) in &pos_costs {
+                if word_cost <= best_cost.saturating_add(DOCUMENT_POS_SURFACE_COST_GAP)
+                    && !right_ids.contains(&right_id)
+                {
+                    right_ids.push(right_id);
+                }
+            }
+            return right_ids;
+        }
+        Vec::new()
+    }
+
+    fn document_boundary_promotions<'s>(
+        &'s self,
+        reading: &str,
+        left_context: &str,
+    ) -> Vec<DocumentBoundaryPromotion<'s>> {
+        // Numeric notation and verbatim reuse have stronger dedicated rules.
+        // Boundary connection is deliberately a one-way, capped promotion:
+        // uncertain context must never evict an otherwise visible candidate.
+        if !self.uses_connection_costs || trailing_numeric_surface(left_context).is_some() {
+            return Vec::new();
+        }
+        let mut has_repeated_surface = false;
+        self.for_each_exact(reading, |entry| {
+            if entry.surface != reading
+                && entry.surface.chars().count() >= 2
+                && left_context.contains(entry.surface)
+            {
+                has_repeated_surface = true;
+            }
+        });
+        if has_repeated_surface {
+            return Vec::new();
+        }
+        let boundary_right_ids = self.document_context_boundary_right_ids(left_context);
+        if boundary_right_ids.is_empty() {
+            return Vec::new();
+        }
+        let connection = ConnectionMatrix::bundled();
+        let mut promotions = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading {
+                return;
+            }
+            let isolated_cost = whole_reading_entry_cost(Some(connection), &entry);
+            let adjustment = boundary_right_ids
+                .iter()
+                .map(|right_id| {
+                    connection
+                        .cost(*right_id, entry.left_id)
+                        .saturating_sub(connection.cost(BOS_EOS_POS_ID, entry.left_id))
+                })
+                .min()
+                .unwrap_or(0);
+            let promotion = adjustment
+                .saturating_neg()
+                .clamp(0, DOCUMENT_BOUNDARY_PROMOTION_CAP);
+            if promotion > 0 {
+                promotions.push(DocumentBoundaryPromotion {
+                    surface: entry.surface,
+                    isolated_cost,
+                    promotion,
+                });
+            }
+        });
+        promotions
     }
 
     fn document_numeric_counter_promotions(
@@ -3203,6 +3349,37 @@ mod tests {
             dictionary.candidates_with_context("ひろし", "渡辺")[0].surface,
             "博"
         );
+    }
+
+    #[test]
+    fn document_context_uses_connection_cost_at_a_single_word_boundary() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("いせき")[0].surface, "遺跡");
+        assert_eq!(
+            dictionary.candidates_with_context("いせき", "オランダへ")[0].surface,
+            "移籍"
+        );
+        assert_eq!(dictionary.candidates("みせ")[0].surface, "見せ");
+        assert_eq!(
+            dictionary.candidates_with_context("みせ", "教育が残念な")[0].surface,
+            "店"
+        );
+        assert_eq!(dictionary.candidates("いか")[0].surface, "以下");
+        assert_eq!(
+            dictionary.candidates_with_context("いか", "病院に")[0].surface,
+            "行か"
+        );
+    }
+
+    #[test]
+    fn document_boundary_connection_does_not_reorder_long_conversions() {
+        let dictionary = Dictionary::bundled();
+        let reading = "かんじをわくんにあてているゆらい";
+        let baseline = dictionary.candidates_with_limit(reading, 10);
+        let contextual = dictionary.candidates_with_context_limit(reading, "「飛鳥」の", 10);
+
+        assert_eq!(contextual, baseline);
     }
 
     #[test]

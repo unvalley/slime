@@ -242,7 +242,7 @@ const MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST: u16 = 7_500;
 // Admit a narrow band of lower-frequency all-kanji common nouns as context
 // evidence only. This keeps names and kana-mixed spellings out of the bundled
 // reverse index and does not add conversion candidates or alter word costs.
-const MAX_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST: u16 = 7_000;
+const MAX_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST: u16 = 7_200;
 const MAX_SIBLING_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST: u16 = 8_000;

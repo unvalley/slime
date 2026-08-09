@@ -239,6 +239,26 @@ fn run_general_noun_context_benchmark(dictionary: &Dictionary, iterations: u64) 
             black_box(dictionary.candidates_with_context(black_box("そ"), black_box("線形")));
         },
     );
+    run(
+        "converter/lower_frequency_general_noun_left_candidates",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("おき"), black_box("太平洋の三陸")),
+            );
+        },
+    );
+    run(
+        "converter/lower_frequency_general_noun_right_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("くん"),
+                black_box("叙正三位"),
+                black_box("一等授瑞宝章。"),
+            ));
+        },
+    );
 }
 
 fn run_numeric_right_compound_benchmark(dictionary: &Dictionary, iterations: u64) {

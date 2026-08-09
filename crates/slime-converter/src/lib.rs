@@ -4275,6 +4275,25 @@ mod tests {
             dictionary.candidates_with_context("そ", "線形")[0].surface,
             "素"
         );
+        assert_eq!(
+            dictionary.candidates_with_context("おき", "太平洋の三陸")[0].surface,
+            "沖"
+        );
+        assert_ne!(
+            dictionary.candidates_with_context("おき", "太平洋")[0].surface,
+            "沖"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("くん", "叙正三位", "一等授瑞宝章。",)
+                [0]
+            .surface,
+            "勲"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context("くん", "叙正三位", "を授与した")[0]
+                .surface,
+            "勲"
+        );
     }
 
     #[test]

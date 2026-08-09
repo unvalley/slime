@@ -54,6 +54,10 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
             let context_phrase_entry = (entry.word_cost <= MAX_CONTEXT_PHRASE_WORD_COST
                 && (MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START..=MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END)
                     .contains(&entry.right_id))
+                || (entry.word_cost <= MAX_IDEOGRAPHIC_SUFFIX_CONTEXT_PHRASE_WORD_COST
+                    && entry.left_id == MOZC_VERBAL_NOUN_POS_ID
+                    && entry.right_id == MOZC_GENERAL_NOUN_SUFFIX_POS_ID
+                    && is_three_character_ideographic_compound(&entry.surface))
                 || (entry.word_cost <= MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST
                     && is_bounded_katakana_stem_compound(
                         &entry.surface,
@@ -239,6 +243,10 @@ const MAX_RECONVERSION_WORD_COST: u16 = 6_500;
 // class. This covers forms such as foreign terms plus 体/機 without indexing
 // the broad person-name, region-name, and long proper-name classes.
 const MAX_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
+// Three-character verbal-noun compounds with Mozc's general noun suffix remain
+// useful phrase evidence at slightly lower frequency. Keep this separate from
+// the broad suffix band so other suffix classes and proper names stay out.
+const MAX_IDEOGRAPHIC_SUFFIX_CONTEXT_PHRASE_WORD_COST: u16 = 7_550;
 const MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST: u16 = 7_700;
 const MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST: u16 = 7_500;
 // Admit a narrow band of lower-frequency all-kanji common nouns as context
@@ -250,6 +258,7 @@ const MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST: u16 = 8_000;
 const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
+const MOZC_GENERAL_NOUN_SUFFIX_POS_ID: u16 = 1_949;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START: u16 = 1_936;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END: u16 = 1_998;
 
@@ -257,6 +266,11 @@ fn is_bounded_ideographic_compound(surface: &str) -> bool {
     let mut characters = surface.chars();
     let count = characters.clone().take(9).count();
     (3..=8).contains(&count) && characters.all(is_cjk_ideograph)
+}
+
+fn is_three_character_ideographic_compound(surface: &str) -> bool {
+    let mut characters = surface.chars();
+    characters.clone().count() == 3 && characters.all(is_cjk_ideograph)
 }
 
 fn is_bounded_sibling_compound(surface: &str) -> bool {

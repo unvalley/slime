@@ -301,6 +301,25 @@ trainでは`夜こと → 寄ること`、`得こと → 解くこと`、`近い
 
 Apple M3、Release、50,000回、warmup 1,000回を旧新交互に5組測定した。対象経路`right_function_word_candidates`の中央値は106.383→110.333 µs/op（+3.950 µs）、非該当経路`right_function_word_nonmatch`は109.050→108.894 µs/op（-0.156 µs、測定誤差内）だった。文法語のPOSは変換ごとの辞書検索ではなく、同梱Mozc接続行列と同じ名前付きIDスライスから取得する。
 
+#### サ変名詞に続く一文字の一般名詞接尾語
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)が重視する文法と単語のつながり、[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)が使う左右接続IDを参考に、Mozc辞書にある完全な三文字複合語を文脈証拠として使う範囲を広げた。対象は全て漢字、左POSがサ変名詞、右POSが一般名詞接尾語、辞書cost 7,550以下を同時に満たすentryだけである。候補やword costは追加せず、文脈用の逆引き索引だけを拡張する。
+
+この境界により`大勢の信者が傍聴｜けん`を`権 → 券`へ修正した。根拠となる辞書entryは`ぼうちょうけん / 傍聴券 / 1841 / 1949 / 7502`である。一般名詞接尾語をcost 8,000まで広げる案はartifactを約193 KB増やし、三文字漢字・サ変名詞へ絞ってもcost 7,850ではheld-outの誤候補`監査員`を`監査院`に対して強めた。7,550なら`傍聴券`を残しつつ、`罵倒語`（7,820）と`監査員`（7,589）を索引へ入れないため、この最小帯で固定した。
+
+助詞の右POS接続も先に比較した。`が・を・に・へ`などを広く使う案はGSD trainで10件改善・5件悪化、対象を狭めても6件改善・2件悪化し、`下記をご覧 → 書きをご覧`、`件について → 県について`、`追うが → 王が`などを起こした。助詞は文法的に接続できる意味候補が多く、品詞だけでは選べないため採用していない。
+
+| dataset | 変更前 acc@1 / MRR@10 | 接尾語帯追加後 acc@1 / MRR@10 | 候補配列の変化 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7134 / 0.8083 | **0.7139 / 0.8086** | 1件 | 1 / 0 |
+| GSD dev (331) | 0.8671 / 0.9104 | 0.8671 / 0.9104 | 0件 | 0 / 0 |
+| GSD test (323) | 0.8854 / 0.9246 | 0.8854 / 0.9246 | 0件 | 0 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 0件 | 0 / 0 |
+
+逆引きartifactは5,516 bytes増えた。Apple M3、Release、10,000回、warmup 2,000回を旧新の順序も反転して10組測定した中央値は、一致経路が169.158→170.139 µs/op（+0.981 µs、+0.58%）、非一致経路が162.978→164.388 µs/op（+1.410 µs、+0.87%）だった。変換品質を最優先する現在の方針では許容するが、1%未満でも継続して性能予算へ記録する。
+
 #### 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)は数値表記を通常語とは別の入力支援として扱う。[azooKey](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)も桁区切り、日時、時刻などを独立したSpecial Conversionとして実装する。Slimeでも一般の`たい`候補costを変えず、左末尾と右先頭がともに整数である`1｜たい｜1`型だけを構造化表記として扱う。

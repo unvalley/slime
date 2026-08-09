@@ -4414,6 +4414,11 @@ mod tests {
         let dictionary = Dictionary::bundled();
 
         assert_eq!(dictionary.candidates("こ")[0].surface, "個");
+        assert_ne!(dictionary.candidates("けん")[0].surface, "券");
+        assert_eq!(
+            dictionary.candidates_with_context("けん", "大勢の信者が傍聴")[0].surface,
+            "券"
+        );
         assert_eq!(
             dictionary.candidates_with_context("こ", "胸部は格納")[0].surface,
             "庫"

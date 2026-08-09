@@ -170,6 +170,12 @@ GSD trainで`敵視して`を1件、診断済みのGSD testで`長居して`、`
 
 丁寧助動詞前の活用形補正も安全な範囲で強め、GSD trainの`寄ること`、`解くこと`、`誓います`、`飽きません`を4件、GSD testの`通うこと`を1件修正した。train/dev/testでtop-1悪化0、AJIMEE、JWTD、PUDは候補配列まで不変だった。汎用補正2,500は`診察です → 新札です`を起こしたため採用していない。Release測定の中央値差は対象経路+3.950 µs、非該当経路は測定誤差内だった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: サ変名詞に続く一文字の一般名詞接尾語
+
+[ATOKの変換エンジン](https://atok.com/info/features/engine.html)、[azooKeyの左右接続ID](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)、[Mozcの品詞定義](https://github.com/google/mozc/blob/master/src/data/dictionary_oss/id.def)に沿い、完全なMozc辞書語を文脈証拠として使う。全て漢字の三文字語、左POSがサ変名詞、右POSが一般名詞接尾語、cost 7,550以下の場合だけ文脈用逆引き索引へ加える。候補生成とword costは変えない。
+
+これによりGSD trainの`傍聴｜けん`を`権 → 券`へ1件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分は5,516 bytesだった。より広いcost帯はheld-outの誤候補`監査員`を強め、助詞への一般化も複数のtop-1回帰を起こしたため採用していない。Release測定の中央値差は一致経路+0.981 µs、非一致経路+1.410 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

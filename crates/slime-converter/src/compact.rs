@@ -370,6 +370,15 @@ mod tests {
             None
         );
         assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("傍聴", "券", "けん"),
+            Some(7_502)
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("罵倒", "語", "ご"),
+            None,
+            "the lower-frequency ideographic suffix band must remain bounded"
+        );
+        assert_eq!(
             dictionary.joined_surface_reading_suffix_cost("未知", "語", "ご"),
             None
         );

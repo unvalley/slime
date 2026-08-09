@@ -147,6 +147,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });
     run_general_noun_context_benchmark(dictionary, iterations);
+    run_ideographic_suffix_context_benchmark(dictionary, iterations);
     run_genitive_context_benchmark(dictionary, iterations);
     run_numeric_right_compound_benchmark(dictionary, iterations);
     run_numeric_score_notation_benchmark(dictionary, iterations);
@@ -222,6 +223,29 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_ideographic_suffix_context_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/ideographic_suffix_context_candidates",
+        iterations,
+        || {
+            black_box(
+                dictionary
+                    .candidates_with_context(black_box("けん"), black_box("大勢の信者が傍聴")),
+            );
+        },
+    );
+    run(
+        "converter/ideographic_suffix_context_without_match",
+        iterations,
+        || {
+            black_box(
+                dictionary
+                    .candidates_with_context(black_box("けん"), black_box("大勢の信者が集合")),
+            );
         },
     );
 }

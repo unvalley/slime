@@ -62,7 +62,9 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
                 || (entry.word_cost <= MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST
                     && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
                     && entry.right_id == MOZC_VERBAL_NOUN_POS_ID
-                    && is_bounded_ideographic_compound(&entry.surface));
+                    && is_bounded_ideographic_compound(&entry.surface))
+                || (entry.word_cost <= MAX_SIBLING_CONTEXT_PHRASE_WORD_COST
+                    && is_bounded_sibling_compound(&entry.surface));
             if entry.surface == *reading
                 || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)
             {
@@ -225,6 +227,7 @@ const MAX_RECONVERSION_WORD_COST: u16 = 6_500;
 const MAX_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST: u16 = 7_700;
 const MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST: u16 = 7_500;
+const MAX_SIBLING_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START: u16 = 1_936;
@@ -234,6 +237,16 @@ fn is_bounded_ideographic_compound(surface: &str) -> bool {
     let mut characters = surface.chars();
     let count = characters.clone().take(9).count();
     (3..=8).contains(&count) && characters.all(is_cjk_ideograph)
+}
+
+fn is_bounded_sibling_compound(surface: &str) -> bool {
+    let mut characters = surface.chars();
+    let count = characters.clone().take(9).count();
+    (2..=8).contains(&count)
+        && characters.clone().all(is_cjk_ideograph)
+        && characters
+            .next_back()
+            .is_some_and(|suffix| matches!(suffix, '兄' | '姉' | '弟' | '妹'))
 }
 
 fn is_bounded_katakana_stem_compound(

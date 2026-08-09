@@ -360,6 +360,20 @@ fn is_safe_hiragana_right_phrase_entry(entry: compact::CompactEntry, suffix: &st
         && (MOZC_INDEPENDENT_VERB_POS_ID_START..=MOZC_INDEPENDENT_VERB_POS_ID_END)
             .contains(&entry.left_id)
 }
+
+fn is_sibling_right_phrase_suffix(suffix: &str, right_context: &str) -> bool {
+    if !matches!(suffix, "兄" | "姉" | "弟" | "妹") {
+        return false;
+    }
+    match right_context
+        .strip_prefix(suffix)
+        .and_then(|remainder| remainder.chars().next())
+    {
+        Some(next) => !matches!(next, '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'),
+        None => true,
+    }
+}
+
 const FIXED_SEGMENT_MAX_READING_CHARACTERS: usize = 128;
 const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
 const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
@@ -373,6 +387,7 @@ const DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS: usize = 8;
 const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
 const DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING: i32 = 6_300;
+const DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING: i32 = 7_500;
 const DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING: i32 = 7_000;
 const DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
@@ -1269,7 +1284,9 @@ impl Dictionary {
                 if !accepted {
                     return;
                 }
-                let cost_ceiling = if suffix == "的" {
+                let cost_ceiling = if is_sibling_right_phrase_suffix(suffix, right_context) {
+                    DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING
+                } else if suffix == "的" {
                     DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING
                 } else if suffix.chars().count() >= 2 {
                     DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING
@@ -4318,6 +4335,17 @@ mod tests {
             )[0]
             .surface,
             "死"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("いぼ", "劉裕の", "弟にあたる")[0]
+                .surface,
+            "異母"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("いぼ", "皮膚の", "弟子にあたる")[0]
+                .surface,
+            dictionary.candidates_with_context("いぼ", "皮膚の")[0].surface,
+            "a sibling character inside a longer noun is not a word boundary"
         );
     }
 

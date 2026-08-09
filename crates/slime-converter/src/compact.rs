@@ -284,6 +284,20 @@ mod tests {
             dictionary.joined_surface_reading_suffix_cost("未知", "語", "ご"),
             None
         );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("ナスタアリーク", "体", "たい"),
+            Some(7_602)
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("アイスクリーム", "屋", "や"),
+            None,
+            "the katakana compound cost band must remain bounded"
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("アイランドセンター", "駅", "えき"),
+            None,
+            "long proper-name stems must stay outside the context index"
+        );
     }
 
     #[test]

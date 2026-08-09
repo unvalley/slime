@@ -119,6 +119,15 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
     run("converter/boundary_context_candidates", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("いせき"), black_box("オランダへ")));
     });
+    run(
+        "converter/katakana_compound_context_candidates",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("たい"), black_box("ナスタアリーク")),
+            );
+        },
+    );
     run("converter/numeric_context_candidates", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });

@@ -38,12 +38,27 @@ fn main() {
 }
 
 fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Path) {
+    let productive_single_character_suffixes = by_reading
+        .values()
+        .flatten()
+        .filter(|entry| {
+            entry.surface.chars().count() == 1
+                && (MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START..=MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END)
+                    .contains(&entry.right_id)
+        })
+        .filter_map(|entry| entry.surface.chars().next())
+        .collect::<HashSet<_>>();
     let mut by_surface = BTreeMap::<&str, Vec<(&str, u16)>>::new();
     for (reading, entries) in by_reading {
         for entry in entries {
-            let context_phrase_entry = entry.word_cost <= MAX_CONTEXT_PHRASE_WORD_COST
+            let context_phrase_entry = (entry.word_cost <= MAX_CONTEXT_PHRASE_WORD_COST
                 && (MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START..=MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END)
-                    .contains(&entry.right_id);
+                    .contains(&entry.right_id))
+                || (entry.word_cost <= MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST
+                    && is_bounded_katakana_stem_compound(
+                        &entry.surface,
+                        &productive_single_character_suffixes,
+                    ));
             if entry.surface == *reading
                 || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)
             {
@@ -198,11 +213,48 @@ const REVERSE_HEADER_BYTES: usize = 8;
 // indexed at runtime regardless of this bundled cutoff.
 const MAX_RECONVERSION_WORD_COST: u16 = 6_500;
 // Preserve one additional bounded cost band for dictionary-backed compound
-// evidence. Mozc IDs 1936..=1998 are productive noun suffixes; person names,
-// counters, region suffixes, and other broad proper-name classes stay out.
+// evidence. Mozc IDs 1936..=1998 are productive noun suffixes. A narrower
+// 200-cost extension admits only 2..=8-character katakana stems followed by a
+// single ideograph which independently belongs to that productive suffix
+// class. This covers forms such as foreign terms plus 体/機 without indexing
+// the broad person-name, region-name, and long proper-name classes.
 const MAX_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
+const MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST: u16 = 7_700;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START: u16 = 1_936;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END: u16 = 1_998;
+
+fn is_bounded_katakana_stem_compound(
+    surface: &str,
+    productive_single_character_suffixes: &HashSet<char>,
+) -> bool {
+    let mut characters = surface.chars().collect::<Vec<_>>();
+    let Some(suffix) = characters.pop() else {
+        return false;
+    };
+    if !is_cjk_ideograph(suffix)
+        || !productive_single_character_suffixes.contains(&suffix)
+        || !(2..=8).contains(&characters.len())
+    {
+        return false;
+    }
+    let mut letters = 0;
+    for character in characters {
+        if !matches!(character, '\u{30a0}'..='\u{30ff}') {
+            return false;
+        }
+        if !matches!(character, 'ー' | '・') {
+            letters += 1;
+        }
+    }
+    letters >= 2
+}
+
+fn is_cjk_ideograph(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+    )
+}
 
 fn push_varint(output: &mut Vec<u8>, mut value: u64) {
     loop {

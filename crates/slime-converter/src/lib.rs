@@ -3349,6 +3349,10 @@ mod tests {
             dictionary.candidates_with_context("ひろし", "渡辺")[0].surface,
             "博"
         );
+        assert_eq!(
+            dictionary.candidates_with_context("たい", "ナスタアリーク")[0].surface,
+            "体"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //!   ID, u16 word cost), sorted by cost.
 //! - `mozc-surfaces.bin`: deduplicated concatenated UTF-8 surfaces.
 //! - `mozc-reverse.fst` / `mozc-reverse.bin`: exact surface-to-reading index
-//!   used only for explicit reconversion.
+//!   used for explicit reconversion and bounded document-phrase evidence.
 //!
 //! Parsing 44 MB of TSV at every process start took ~390 ms and duplicated
 //! every string on the heap; the compiled form loads by pointer cast.
@@ -41,7 +41,12 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
     let mut by_surface = BTreeMap::<&str, Vec<(&str, u16)>>::new();
     for (reading, entries) in by_reading {
         for entry in entries {
-            if entry.surface == *reading || entry.word_cost > MAX_RECONVERSION_WORD_COST {
+            let context_phrase_entry = entry.word_cost <= MAX_CONTEXT_PHRASE_WORD_COST
+                && (MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START..=MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END)
+                    .contains(&entry.right_id);
+            if entry.surface == *reading
+                || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)
+            {
                 continue;
             }
             by_surface
@@ -192,6 +197,12 @@ const REVERSE_HEADER_BYTES: usize = 8;
 // the full Mozc source size. User and installed dictionaries are always
 // indexed at runtime regardless of this bundled cutoff.
 const MAX_RECONVERSION_WORD_COST: u16 = 6_500;
+// Preserve one additional bounded cost band for dictionary-backed compound
+// evidence. Mozc IDs 1936..=1998 are productive noun suffixes; person names,
+// counters, region suffixes, and other broad proper-name classes stay out.
+const MAX_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
+const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START: u16 = 1_936;
+const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END: u16 = 1_998;
 
 fn push_varint(output: &mut Vec<u8>, mut value: u64) {
     loop {

@@ -170,14 +170,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         let repeated_cost =
             DocumentContextRanker.ranking_cost_with_context(reading, left_context, conversion);
         let phrase_promotion =
-            if self
-                .dictionary
-                .document_phrase_matches(left_context, reading, &conversion.surface)
-            {
-                DOCUMENT_PHRASE_PROMOTION
-            } else {
-                0
-            };
+            self.dictionary
+                .document_phrase_promotion(left_context, reading, &conversion.surface);
         let notation_promotion =
             if structured_notation_matches(left_context, reading, &conversion.surface) {
                 DOCUMENT_STRUCTURED_NOTATION_PROMOTION
@@ -240,7 +234,10 @@ const FIXED_SEGMENT_MAX_CANDIDATES: usize = 128;
 const FIXED_SEGMENT_MAX_STATES: usize = 256;
 const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
 const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
-const DOCUMENT_PHRASE_PROMOTION: i32 = 2_500;
+// A lower-cost whole compound is stronger evidence than a marginal one. The
+// cap bounds how far dictionary evidence can move an existing N-best item.
+const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
+const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
@@ -834,14 +831,14 @@ impl Dictionary {
         readings.into_iter().map(|(reading, _)| reading).collect()
     }
 
-    fn document_phrase_matches(
+    fn document_phrase_promotion(
         &self,
         left_context: &str,
         reading: &str,
         candidate_surface: &str,
-    ) -> bool {
+    ) -> i32 {
         let Some(compact) = self.bundled else {
-            return false;
+            return 0;
         };
         let context_start = left_context
             .char_indices()
@@ -850,19 +847,24 @@ impl Dictionary {
             .map_or(0, |(index, _)| index);
         let context_tail = &left_context[context_start..];
         let context_characters = context_tail.chars().count();
+        let mut best_promotion = 0;
         for (position, (index, _)) in context_tail.char_indices().enumerate() {
             if context_characters - position < DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS {
                 break;
             }
-            if compact.joined_surface_has_reading_suffix(
+            if let Some(word_cost) = compact.joined_surface_reading_suffix_cost(
                 &context_tail[index..],
                 candidate_surface,
                 reading,
             ) {
-                return true;
+                best_promotion = best_promotion.max(
+                    DOCUMENT_PHRASE_COST_CEILING
+                        .saturating_sub(word_cost)
+                        .min(DOCUMENT_PHRASE_PROMOTION),
+                );
             }
         }
-        false
+        best_promotion
     }
 
     fn document_context_has_pos_suffix(
@@ -3177,6 +3179,30 @@ mod tests {
             "氏",
             "a one-character homographic prefix must not promote 道士"
         );
+        assert_eq!(
+            dictionary.candidates_with_context("やく", "経済の牽引")[0].surface,
+            "役"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ひ", "予算の調査")[0].surface,
+            "費"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("き", "循環")[0].surface,
+            "器"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("かん", "価値")[0].surface,
+            "観"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("せん", "宇宙")[0].surface,
+            "船"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ひろし", "渡辺")[0].surface,
+            "博"
+        );
     }
 
     #[test]
@@ -3327,7 +3353,7 @@ mod tests {
         );
         assert_eq!(
             dictionary.candidates_with_context("せん", "超長距離")[0].surface,
-            "1000"
+            "戦"
         );
     }
 

@@ -143,18 +143,6 @@ impl CompactDictionary {
         }
     }
 
-    /// Checks a split surface against the reverse index without joining or
-    /// allocating either part.
-    pub(crate) fn joined_surface_has_reading_suffix(
-        &self,
-        prefix: &str,
-        surface: &str,
-        suffix: &str,
-    ) -> bool {
-        self.joined_surface_reading_suffix_cost(prefix, surface, suffix)
-            .is_some()
-    }
-
     /// Returns the lowest reverse-index word cost whose reading ends with
     /// `suffix` for the split `prefix + surface` surface.
     pub(crate) fn joined_surface_reading_suffix_cost(
@@ -284,9 +272,18 @@ mod tests {
     #[test]
     fn reverse_index_matches_a_reading_suffix_without_allocating() {
         let dictionary = CompactDictionary::bundled();
-        assert!(dictionary.joined_surface_has_reading_suffix("格納", "庫", "こ"));
-        assert!(!dictionary.joined_surface_has_reading_suffix("格納", "庫", "こう"));
-        assert!(!dictionary.joined_surface_has_reading_suffix("未知", "語", "ご"));
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("格納", "庫", "こ"),
+            Some(5_996)
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("格納", "庫", "こう"),
+            None
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("未知", "語", "ご"),
+            None
+        );
     }
 
     #[test]

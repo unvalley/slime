@@ -195,6 +195,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
         black_box(dictionary.candidates_with_context(black_box("まち"), black_box("患者と患者の")));
     });
     run_right_coordination_phrase_benchmark(dictionary, iterations);
+    run_right_genitive_phrase_benchmark(dictionary, iterations);
     run_measured_reach_benchmark(dictionary, iterations);
     run(
         "converter/right_inflectional_phrase_candidates",
@@ -240,6 +241,29 @@ fn run_right_coordination_phrase_benchmark(dictionary: &Dictionary, iterations: 
                     black_box("かた"),
                     black_box("デスクワークで固まった"),
                 ),
+            );
+        },
+    );
+}
+
+fn run_right_genitive_phrase_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/right_genitive_phrase_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("みち"),
+                black_box("人間の心、"),
+                black_box("の世界を探究する"),
+            ));
+        },
+    );
+    run(
+        "converter/right_genitive_phrase_left_only",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("みち"), black_box("人間の心、")),
             );
         },
     );

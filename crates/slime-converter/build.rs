@@ -68,7 +68,11 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
                 || (entry.word_cost <= MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST
                     && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
                     && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
-                    && is_bounded_coordination_phrase(&entry.surface));
+                    && is_bounded_coordination_phrase(&entry.surface))
+                || (entry.word_cost <= MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST
+                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+                    && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+                    && is_bounded_genitive_phrase(&entry.surface));
             if entry.surface == *reading
                 || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)
             {
@@ -233,6 +237,7 @@ const MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST: u16 = 7_700;
 const MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST: u16 = 7_500;
 const MAX_SIBLING_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
+const MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START: u16 = 1_936;
@@ -272,6 +277,23 @@ fn is_bounded_coordination_phrase(surface: &str) -> bool {
             .copied()
             .all(is_cjk_ideograph)
         && characters[connector + 1..]
+            .iter()
+            .copied()
+            .all(is_cjk_ideograph)
+}
+
+fn is_bounded_genitive_phrase(surface: &str) -> bool {
+    let characters = surface.chars().collect::<Vec<_>>();
+    if !(3..=8).contains(&characters.len()) {
+        return false;
+    }
+    let Some(particle) = characters.iter().position(|character| *character == 'の') else {
+        return false;
+    };
+    particle > 0
+        && particle + 1 < characters.len()
+        && characters[..particle].iter().copied().all(is_cjk_ideograph)
+        && characters[particle + 1..]
             .iter()
             .copied()
             .all(is_cjk_ideograph)

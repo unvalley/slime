@@ -381,15 +381,39 @@ fn is_bounded_coordination_suffix(suffix: &str) -> bool {
     remainder_characters > 0
 }
 
-fn is_coordination_right_phrase_suffix(suffix: &str, right_context: &str) -> bool {
-    if !is_bounded_coordination_suffix(suffix) {
+fn is_bounded_genitive_suffix(suffix: &str) -> bool {
+    let mut characters = suffix.chars();
+    if characters.next() != Some('の') {
         return false;
     }
+    let mut remainder_characters = 0;
+    for character in characters {
+        if !matches!(
+            character,
+            '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+        ) {
+            return false;
+        }
+        remainder_characters += 1;
+        if remainder_characters > 7 {
+            return false;
+        }
+    }
+    remainder_characters > 0
+}
+
+fn right_phrase_suffix_has_boundary(suffix: &str, right_context: &str) -> bool {
     match right_context
         .strip_prefix(suffix)
         .and_then(|remainder| remainder.chars().next())
     {
-        Some(next) => !matches!(next, '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'),
+        Some(next) => !matches!(
+            next,
+            '\u{30a0}'..='\u{30ff}'
+                | '\u{3400}'..='\u{4dbf}'
+                | '\u{4e00}'..='\u{9fff}'
+                | '\u{f900}'..='\u{faff}'
+        ),
         None => true,
     }
 }
@@ -398,7 +422,9 @@ fn is_safe_hiragana_right_phrase_entry(entry: compact::CompactEntry, suffix: &st
     if entry.left_id != entry.right_id {
         return false;
     }
-    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID && is_bounded_coordination_suffix(suffix) {
+    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+        && (is_bounded_coordination_suffix(suffix) || is_bounded_genitive_suffix(suffix))
+    {
         return true;
     }
     let suffix_characters = suffix.chars().count();
@@ -1362,6 +1388,8 @@ impl Dictionary {
             reading,
             DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS,
             |suffix, entry| {
+                let bounded_nominal_suffix =
+                    is_bounded_coordination_suffix(suffix) || is_bounded_genitive_suffix(suffix);
                 let accepted = !matches!(
                     entry.left_id,
                     MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
@@ -1369,11 +1397,13 @@ impl Dictionary {
                     entry.right_id,
                     MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
                 ) && (!starts_with_hiragana
-                    || is_safe_hiragana_right_phrase_entry(entry, suffix));
+                    || is_safe_hiragana_right_phrase_entry(entry, suffix))
+                    && (!bounded_nominal_suffix
+                        || right_phrase_suffix_has_boundary(suffix, right_context));
                 if !accepted {
                     return;
                 }
-                let cost_ceiling = if is_coordination_right_phrase_suffix(suffix, right_context) {
+                let cost_ceiling = if is_bounded_coordination_suffix(suffix) {
                     DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING
                 } else if is_sibling_right_phrase_suffix(suffix, right_context) {
                     DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING
@@ -4450,9 +4480,8 @@ mod tests {
                 "かた",
                 "デスクワークで固まった",
                 "や背中合わせの配置"
-            )[0]
-            .surface,
-            dictionary.candidates_with_context("かた", "デスクワークで固まった")[0].surface,
+            ),
+            dictionary.candidates_with_context("かた", "デスクワークで固まった"),
             "a coordination phrase inside a longer noun is not a word boundary"
         );
         assert_eq!(
@@ -4465,6 +4494,38 @@ mod tests {
                 .surface,
             dictionary.candidates_with_context("いぼ", "皮膚の")[0].surface,
             "a sibling character inside a longer noun is not a word boundary"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_bounded_genitive_phrases() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            ("しん", "だがワールドヒーローズの", "の目的とは", "真"),
+            ("みち", "人間の心、", "の世界を探究する", "未知"),
+            ("い", "たとえば唇が腫れるのは", "の調子が悪い現れ", "胃"),
+            ("す", "コンサートや記者会見ではなく、", "の状態だった", "素"),
+        ] {
+            assert_eq!(
+                dictionary.candidates_with_surrounding_context(
+                    reading,
+                    left_context,
+                    right_context
+                )[0]
+                .surface,
+                expected
+            );
+        }
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "みち",
+                "人間の心、",
+                "の世界観を探究する"
+            ),
+            dictionary.candidates_with_context("みち", "人間の心、"),
+            "a genitive phrase inside a longer noun is not a word boundary"
         );
     }
 

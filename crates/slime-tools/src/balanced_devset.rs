@@ -55,6 +55,7 @@ struct Token {
 struct EvaluationItem {
     source_split: String,
     index: String,
+    target_upos: String,
     context_text: String,
     right_context_text: String,
     input: String,
@@ -280,6 +281,7 @@ fn build_items(
         items.push(EvaluationItem {
             source_split: source_split.to_owned(),
             index: format!("{}:{}", sentence.id, token.id),
+            target_upos: token.upos.clone(),
             context_text: context
                 .chars()
                 .rev()
@@ -351,6 +353,7 @@ mod tests {
         )]);
         let items = build_items(&sentences, &dictionary, "test");
         assert_eq!(items.len(), 1);
+        assert_eq!(items[0].target_upos, "NOUN");
         assert_eq!(items[0].context_text, "私は");
         assert_eq!(items[0].right_context_text, "を食べる。");
         assert_eq!(items[0].input, "サカナ");

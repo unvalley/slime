@@ -252,10 +252,22 @@ struct FixedSegmentPath {
     relative_cost: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PersonalNameRole {
+    Surname,
+    GivenName,
+}
+
 const COMPOUND_MAX_SEGMENTS: usize = 6;
 const COMPOUND_MAX_READING_CHARACTERS: usize = 16;
 const COMPOUND_MAX_ENTRIES_PER_SEGMENT: usize = 8;
 const COMPOUND_MAX_CANDIDATES: usize = 64;
+const PERSONAL_NAME_MIN_READING_CHARACTERS: usize = 2;
+const PERSONAL_NAME_MAX_READING_CHARACTERS: usize = 16;
+const PERSONAL_NAME_MAX_ENTRIES_PER_PART: usize = 64;
+const PERSONAL_NAME_MAX_CANDIDATES: usize = 128;
+const MOZC_PERSONAL_GIVEN_NAME_POS_ID: u16 = 1922;
+const MOZC_PERSONAL_SURNAME_POS_ID: u16 = 1923;
 const FIXED_SEGMENT_MAX_READING_CHARACTERS: usize = 128;
 const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
 const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
@@ -469,6 +481,21 @@ fn decimal_digit(character: char) -> Option<u32> {
     })
 }
 
+fn retain_best_candidates(candidates: &mut Vec<Candidate>, limit: usize) {
+    candidates.sort_unstable_by(|left, right| {
+        left.surface
+            .cmp(&right.surface)
+            .then_with(|| left.cost.cmp(&right.cost))
+    });
+    candidates.dedup_by(|left, right| left.surface == right.surface);
+    candidates.sort_unstable_by(|left, right| {
+        left.cost
+            .cmp(&right.cost)
+            .then_with(|| left.surface.cmp(&right.surface))
+    });
+    candidates.truncate(limit);
+}
+
 fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
     paths.sort_unstable_by(|left, right| {
         left.surface
@@ -667,6 +694,85 @@ impl Dictionary {
         candidates
     }
 
+    /// Returns bounded personal-name alternatives for an explicit candidate
+    /// expansion. Two-part surname + given-name paths are composed from exact
+    /// dictionary entries in the corresponding personal-name POS classes,
+    /// independently of their rank in the general N-best search.
+    ///
+    /// This intentionally stays outside normal and live conversion. Personal
+    /// names have many legitimate spellings for one reading, so promoting the
+    /// wider set without an explicit user action would create false top-1
+    /// changes.
+    #[must_use]
+    pub fn personal_name_candidates(
+        &self,
+        reading: &str,
+        entries_per_part: usize,
+        limit: usize,
+    ) -> Vec<Candidate> {
+        let character_count = reading.chars().count();
+        if entries_per_part == 0
+            || limit == 0
+            || !(PERSONAL_NAME_MIN_READING_CHARACTERS..=PERSONAL_NAME_MAX_READING_CHARACTERS)
+                .contains(&character_count)
+        {
+            return Vec::new();
+        }
+
+        let entries_per_part = entries_per_part.min(PERSONAL_NAME_MAX_ENTRIES_PER_PART);
+        let limit = limit.min(PERSONAL_NAME_MAX_CANDIDATES);
+        let connection = self.uses_connection_costs.then(ConnectionMatrix::bundled);
+        let mut candidates = Vec::new();
+
+        for (boundary, _) in reading.char_indices().skip(1) {
+            let surname_reading = &reading[..boundary];
+            let given_name_reading = &reading[boundary..];
+            let surnames = self.exact_personal_name_entries(
+                surname_reading,
+                PersonalNameRole::Surname,
+                entries_per_part,
+            );
+            if surnames.is_empty() {
+                continue;
+            }
+            let given_names = self.exact_personal_name_entries(
+                given_name_reading,
+                PersonalNameRole::GivenName,
+                entries_per_part,
+            );
+            for surname in &surnames {
+                for given_name in &given_names {
+                    let mut surface = String::with_capacity(
+                        surname
+                            .surface
+                            .len()
+                            .saturating_add(given_name.surface.len()),
+                    );
+                    surface.push_str(surname.surface);
+                    surface.push_str(given_name.surface);
+                    let cost =
+                        connection
+                            .map_or(0, |matrix| matrix.cost(BOS_EOS_POS_ID, surname.left_id))
+                            .saturating_add(surname.word_cost)
+                            .saturating_add(connection.map_or(0, |matrix| {
+                                matrix.cost(surname.right_id, given_name.left_id)
+                            }))
+                            .saturating_add(given_name.word_cost)
+                            .saturating_add(connection.map_or(0, |matrix| {
+                                matrix.cost(given_name.right_id, BOS_EOS_POS_ID)
+                            }));
+                    candidates.push(Candidate { surface, cost });
+                }
+            }
+            // Once a surface falls below the global output bound it cannot
+            // return to the final top set; a cheaper duplicate at a later
+            // boundary is inserted again and considered normally.
+            retain_best_candidates(&mut candidates, limit);
+        }
+
+        candidates
+    }
+
     /// Reports whether `surface` can be aligned to two to six exact dictionary
     /// entries over `reading`, without applying the product candidate beam.
     ///
@@ -838,6 +944,45 @@ impl Dictionary {
         if entries.is_empty() {
             entries = literal_entries;
         }
+        entries.sort_unstable_by(|left, right| {
+            left.surface
+                .cmp(right.surface)
+                .then_with(|| left.left_id.cmp(&right.left_id))
+                .then_with(|| left.right_id.cmp(&right.right_id))
+                .then_with(|| left.word_cost.cmp(&right.word_cost))
+        });
+        entries.dedup_by(|left, right| {
+            left.surface == right.surface
+                && left.left_id == right.left_id
+                && left.right_id == right.right_id
+        });
+        entries.sort_unstable_by(|left, right| {
+            left.word_cost
+                .cmp(&right.word_cost)
+                .then_with(|| left.surface.cmp(right.surface))
+                .then_with(|| left.left_id.cmp(&right.left_id))
+                .then_with(|| left.right_id.cmp(&right.right_id))
+        });
+        entries.truncate(limit);
+        entries
+    }
+
+    fn exact_personal_name_entries<'s>(
+        &'s self,
+        reading: &str,
+        role: PersonalNameRole,
+        limit: usize,
+    ) -> Vec<EntryView<'s>> {
+        let mut entries = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            let is_personal_name = match role {
+                PersonalNameRole::Surname => entry.right_id == MOZC_PERSONAL_SURNAME_POS_ID,
+                PersonalNameRole::GivenName => entry.left_id == MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+            };
+            if is_personal_name && entry.surface != reading {
+                entries.push(entry);
+            }
+        });
         entries.sort_unstable_by(|left, right| {
             left.surface
                 .cmp(right.surface)
@@ -2807,7 +2952,8 @@ fn push_katakana_entries<'a>(
 mod tests {
     use super::{
         Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
-        DictionaryEntry, DictionaryLayer, NBestBucket, NBestNode, UNKNOWN_POS_ID,
+        DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+        MOZC_PERSONAL_SURNAME_POS_ID, NBestBucket, NBestNode, UNKNOWN_POS_ID,
         document_region_suffix_promotion, insert_n_best_node,
     };
 
@@ -2990,6 +3136,48 @@ mod tests {
         assert!(dictionary.is_exact_compound_surface("こうなんりょうよう", "硬軟両様"));
         assert!(!dictionary.is_exact_compound_surface("こうなんりょうよう", "未知表層"));
         assert!(!dictionary.is_exact_compound_surface("こうなん", "硬軟"));
+    }
+
+    #[test]
+    fn personal_name_recall_combines_a_surname_with_deep_given_names() {
+        let mut entries = vec![DictionaryEntry::with_pos(
+            "やまだ",
+            "山田",
+            MOZC_PERSONAL_SURNAME_POS_ID,
+            MOZC_PERSONAL_SURNAME_POS_ID,
+            100,
+        )];
+        entries.extend((0_i32..48).map(|index| {
+            DictionaryEntry::with_pos(
+                "ふかな",
+                format!("候補{index:02}"),
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                index,
+            )
+        }));
+        entries.push(DictionaryEntry::with_pos(
+            "ふかな",
+            "深名",
+            MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+            MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+            5_000,
+        ));
+        let dictionary = Dictionary::new(entries);
+
+        assert!(
+            dictionary
+                .compound_candidates("やまだふかな", 8, 64)
+                .iter()
+                .all(|candidate| candidate.surface != "山田深名")
+        );
+        let personal_names = dictionary.personal_name_candidates("やまだふかな", 64, 64);
+        assert!(
+            personal_names
+                .iter()
+                .any(|candidate| candidate.surface == "山田深名")
+        );
+        assert!(personal_names.len() <= 64);
     }
 
     #[test]

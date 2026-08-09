@@ -38,6 +38,8 @@ const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
 const MAX_COMPOUND_READING_CHARACTERS: usize = 16;
 const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
 const COMPOUND_CANDIDATE_LIMIT: usize = 32;
+const PERSONAL_NAME_ENTRIES_PER_PART: usize = 64;
+const PERSONAL_NAME_CANDIDATE_LIMIT: usize = 64;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
@@ -1089,6 +1091,13 @@ impl SlimeEngine {
                 &self.reading,
                 COMPOUND_ENTRIES_PER_SEGMENT,
                 COMPOUND_CANDIDATE_LIMIT,
+            ) {
+                push_unique(&mut merged, candidate.surface);
+            }
+            for candidate in self.dictionary.personal_name_candidates(
+                &self.reading,
+                PERSONAL_NAME_ENTRIES_PER_PART,
+                PERSONAL_NAME_CANDIDATE_LIMIT,
             ) {
                 push_unique(&mut merged, candidate.surface);
             }
@@ -4457,6 +4466,50 @@ mod tests {
 
         assert!(engine.snapshot().candidates.contains(&target));
         assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn explicit_expansion_reaches_deep_personal_name_spellings() {
+        const GIVEN_NAME_POS_ID: u16 = 1922;
+        const SURNAME_POS_ID: u16 = 1923;
+
+        let mut entries = vec![DictionaryEntry::with_pos(
+            "やまだ",
+            "山田",
+            SURNAME_POS_ID,
+            SURNAME_POS_ID,
+            100,
+        )];
+        entries.extend((0_i32..48).map(|index| {
+            DictionaryEntry::with_pos(
+                "ふかな",
+                format!("候補{index:02}"),
+                GIVEN_NAME_POS_ID,
+                GIVEN_NAME_POS_ID,
+                index,
+            )
+        }));
+        entries.push(DictionaryEntry::with_pos(
+            "ふかな",
+            "深名",
+            GIVEN_NAME_POS_ID,
+            GIVEN_NAME_POS_ID,
+            5_000,
+        ));
+        let mut engine = SlimeEngine::new(Dictionary::new(entries));
+        type_text(&mut engine, "yamadahukana");
+        engine.handle(InputEvent::Space);
+
+        let initial = engine.snapshot().candidates;
+        let initial_top = initial[0].clone();
+        assert!(!initial.contains(&"山田深名".to_owned()));
+        for _ in 0..initial.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        let expanded = engine.snapshot().candidates;
+        assert!(expanded.contains(&"山田深名".to_owned()));
+        assert_eq!(expanded[0], initial_top);
     }
 
     #[test]

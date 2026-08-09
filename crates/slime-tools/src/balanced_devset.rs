@@ -1,4 +1,5 @@
-//! Builds an external-domain kana-kanji ranking benchmark from UD Japanese GSD.
+//! Builds an external-domain kana-kanji ranking benchmark from a UD Japanese
+//! treebank carrying `UniDic` pronunciation metadata.
 //!
 //! The source corpus contains news/blog sentences, manual token boundaries,
 //! `UniDic` part-of-speech tags, and surface pronunciations. For each sentence,
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde::Serialize;
+use slime_tools::surface_annotation::{SurfaceReadingIndex, hiragana_to_katakana};
 
 fn main() -> ExitCode {
     match run() {
@@ -33,6 +35,7 @@ struct Options {
     source_split: String,
     count: Option<usize>,
     annotated_output: Option<PathBuf>,
+    phrase_windows: bool,
 }
 
 #[derive(Debug, Default)]
@@ -66,13 +69,20 @@ struct EvaluationItem {
 fn run() -> Result<(), String> {
     let options = parse_options(env::args().skip(1))?;
     let dictionary = load_reading_surfaces(&options.dictionary_path)?;
+    let surface_readings = SurfaceReadingIndex::load(&options.dictionary_path)?;
     let source = fs::read_to_string(&options.conllu_path)
         .map_err(|error| format!("failed to read {}: {error}", options.conllu_path.display()))?;
     let sentences = parse_conllu(&source);
     if let Some(path) = &options.annotated_output {
         write_annotated_corpus(path, &sentences)?;
     }
-    let mut items = build_items(&sentences, &dictionary, &options.source_split);
+    let mut items = build_items(
+        &sentences,
+        &dictionary,
+        &options.source_split,
+        options.phrase_windows,
+        &surface_readings,
+    );
     let accepted = items.len();
     if let Some(count) = options.count {
         items = sample_evenly(items, count);
@@ -92,13 +102,14 @@ fn run() -> Result<(), String> {
 
 fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options, String> {
     let usage = "usage: slime-balanced-devset <input.conllu> <mozc-basic.tsv> <output.json> \
-                 --source-split NAME [--count N] [--annotated-output PATH]";
+                 --source-split NAME [--count N] [--annotated-output PATH] [--phrase-windows]";
     let conllu_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let dictionary_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let output_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let mut source_split = None;
     let mut count = None;
     let mut annotated_output = None;
+    let mut phrase_windows = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--source-split" => {
@@ -122,6 +133,7 @@ fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options,
                         .ok_or("--annotated-output requires a value")?,
                 ));
             }
+            "--phrase-windows" => phrase_windows = true,
             _ => return Err(format!("unknown argument {argument:?}\n{usage}")),
         }
     }
@@ -132,6 +144,7 @@ fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options,
         source_split: source_split.ok_or("--source-split is required")?,
         count,
         annotated_output,
+        phrase_windows,
     })
 }
 
@@ -230,6 +243,8 @@ fn build_items(
     sentences: &[Sentence],
     dictionary: &HashMap<String, HashSet<String>>,
     source_split: &str,
+    phrase_windows: bool,
+    surface_readings: &SurfaceReadingIndex,
 ) -> Vec<EvaluationItem> {
     let mut items = Vec::new();
     let mut seen = HashSet::new();
@@ -258,7 +273,7 @@ fn build_items(
                 context.push(' ');
             }
         }
-        let Some((_, token_index, token, context)) = candidates
+        let Some((_, token_index, token, _)) = candidates
             .into_iter()
             .max_by_key(|(ambiguity, _, _, context)| (*ambiguity, context.chars().count()))
         else {
@@ -268,21 +283,28 @@ fn build_items(
         if !seen.insert(identity) {
             continue;
         }
-        let mut right_context = String::new();
-        if token.space_after {
-            right_context.push(' ');
-        }
-        for following in sentence.tokens.iter().skip(token_index + 1) {
-            right_context.push_str(&following.surface);
-            if following.space_after {
-                right_context.push(' ');
-            }
-        }
+        let (window_start, window_end) = if phrase_windows {
+            let Some(bounds) = phrase_window_bounds(&sentence.tokens, token_index) else {
+                continue;
+            };
+            bounds
+        } else {
+            (token_index, token_index + 1)
+        };
+        let window = &sentence.tokens[window_start..window_end];
+        let context_text = render_surface(&sentence.tokens[..window_start]);
+        let right_context_text = render_surface(&sentence.tokens[window_end..]);
+        let input = if phrase_windows {
+            phrase_window_reading(window, surface_readings)
+        } else {
+            token.pronunciation.clone()
+        };
+        let expected = render_surface(window);
         items.push(EvaluationItem {
             source_split: source_split.to_owned(),
             index: format!("{}:{}", sentence.id, token.id),
             target_upos: token.upos.clone(),
-            context_text: context
+            context_text: context_text
                 .chars()
                 .rev()
                 .take(40)
@@ -290,13 +312,73 @@ fn build_items(
                 .into_iter()
                 .rev()
                 .collect(),
-            right_context_text: right_context.chars().take(40).collect(),
-            input: token.pronunciation.clone(),
-            expected_output: vec![token.surface.clone()],
+            right_context_text: right_context_text.chars().take(40).collect(),
+            input,
+            expected_output: vec![expected],
             original_text: sentence.text.clone(),
         });
     }
     items
+}
+
+const PHRASE_MINIMUM_READING_CHARACTERS: usize = 6;
+const PHRASE_MAXIMUM_READING_CHARACTERS: usize = 20;
+
+fn phrase_window_bounds(tokens: &[Token], target: usize) -> Option<(usize, usize)> {
+    let mut start = target;
+    let mut end = target + 1;
+    let mut reading_characters = tokens[target].pronunciation.chars().count();
+    while reading_characters < PHRASE_MINIMUM_READING_CHARACTERS {
+        let left = start.checked_sub(1).filter(|index| {
+            !is_phrase_boundary(&tokens[*index])
+                && reading_characters + tokens[*index].pronunciation.chars().count()
+                    <= PHRASE_MAXIMUM_READING_CHARACTERS
+        });
+        let right = (end < tokens.len()).then_some(end).filter(|index| {
+            !is_phrase_boundary(&tokens[*index])
+                && reading_characters + tokens[*index].pronunciation.chars().count()
+                    <= PHRASE_MAXIMUM_READING_CHARACTERS
+        });
+        let Some(index) = left.or(right) else {
+            break;
+        };
+        reading_characters += tokens[index].pronunciation.chars().count();
+        if index < start {
+            start = index;
+        } else {
+            end = index + 1;
+        }
+    }
+    (PHRASE_MINIMUM_READING_CHARACTERS..=PHRASE_MAXIMUM_READING_CHARACTERS)
+        .contains(&reading_characters)
+        .then_some((start, end))
+}
+
+fn is_phrase_boundary(token: &Token) -> bool {
+    matches!(token.upos.as_str(), "PUNCT" | "SYM")
+}
+
+fn render_surface(tokens: &[Token]) -> String {
+    let mut surface = String::new();
+    for token in tokens {
+        surface.push_str(&token.surface);
+        if token.space_after {
+            surface.push(' ');
+        }
+    }
+    surface
+}
+
+fn phrase_window_reading(tokens: &[Token], surface_readings: &SurfaceReadingIndex) -> String {
+    tokens
+        .iter()
+        .map(|token| {
+            surface_readings.reading(&token.surface).map_or_else(
+                || token.pronunciation.clone(),
+                |reading| hiragana_to_katakana(&reading),
+            )
+        })
+        .collect()
 }
 
 fn is_content_word(upos: &str) -> bool {
@@ -351,12 +433,34 @@ mod tests {
             "さかな".to_owned(),
             HashSet::from(["魚".to_owned(), "肴".to_owned()]),
         )]);
-        let items = build_items(&sentences, &dictionary, "test");
+        let surface_readings = SurfaceReadingIndex::from_pairs([]);
+        let items = build_items(&sentences, &dictionary, "test", false, &surface_readings);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].target_upos, "NOUN");
         assert_eq!(items[0].context_text, "私は");
         assert_eq!(items[0].right_context_text, "を食べる。");
         assert_eq!(items[0].input, "サカナ");
         assert_eq!(items[0].expected_output, ["魚"]);
+    }
+
+    #[test]
+    fn creates_a_long_phrase_window_without_crossing_punctuation() {
+        let source = "# sent_id = test-1\n# text = 私は魚を食べる。\n1\t私\t私\tPRON\t代名詞\t_\t3\tnsubj\t_\tSpaceAfter=No|UnidicInfo=ワタシ,私,私,私,ワタシ\n2\tは\tは\tADP\t助詞\t_\t1\tcase\t_\tSpaceAfter=No|UnidicInfo=ハ,は,は,は,ワ\n3\t魚\t魚\tNOUN\t名詞\t_\t5\tobj\t_\tSpaceAfter=No|UnidicInfo=サカナ,魚,魚,魚,サカナ\n4\tを\tを\tADP\t助詞\t_\t3\tcase\t_\tSpaceAfter=No|UnidicInfo=ヲ,を,を,を,オ\n5\t食べる\t食べる\tVERB\t動詞\t_\t0\troot\t_\tSpaceAfter=No|UnidicInfo=タベル,食べる,食べ,食べる,タベル\n6\t。\t。\tPUNCT\t補助記号\t_\t5\tpunct\t_\tSpaceAfter=No\n\n";
+        let sentences = parse_conllu(source);
+        let dictionary = HashMap::from([(
+            "さかな".to_owned(),
+            HashSet::from(["魚".to_owned(), "肴".to_owned()]),
+        )]);
+        let surface_readings = SurfaceReadingIndex::from_pairs([
+            ("私".to_owned(), "わたし".to_owned()),
+            ("魚".to_owned(), "さかな".to_owned()),
+        ]);
+        let items = build_items(&sentences, &dictionary, "test", true, &surface_readings);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].context_text, "");
+        assert_eq!(items[0].right_context_text, "を食べる。");
+        assert_eq!(items[0].input, "ワタシハサカナ");
+        assert_eq!(items[0].expected_output, ["私は魚"]);
     }
 }

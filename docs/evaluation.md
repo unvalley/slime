@@ -470,6 +470,19 @@ JWTD train先頭10,000件とGSD train 1,940件を5回反復した19,700件（正
 
 学習スクリプトは最終epochを無条件に保存せず、devのacc@1、MRR、より小さいweightの順で最良checkpointを保存する。既存の非空outputも上書きしない。JWTD/AJIMEEは[CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)、GSDは[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)のShareAlike条件を持つデータに由来する。いずれも商用利用自体は許すが、将来モデルを配布する場合は帰属・同一条件をアプリ本体とは分けて確認する。現時点のartifactは評価専用で、商用bundleには含めない。
 
+#### 独立held-out: UD Japanese PUD
+
+6文字以上のgateをAJIMEE確認後に選んだ汚染を解消するため、設定を変更する前に[UD Japanese PUD](https://universaldependencies.org/treebanks/ja_pud/index.html) r2.18（commit `4abd575c57bfa125dd4bc564f2ceb8973bbbf422`）を独立held-outとして固定した。PUDはGSDと別のnews/wiki 1,000文で構成され、公式に全体がtest split、ライセンスはCC BY-SA 3.0とされている。学習、epoch選択、weight・入力長gateの調整には使用しない。
+
+```sh
+just build-pud-heldout
+just evaluate-pud-heldout --json
+```
+
+取得するCoNLL-UはSHA-256 `7ac51383189bdf5513102f9f8ac7ee1b967d5449f8c2dc1a9108fa21a8f1a688`へ固定する。単語単位では455件を抽出できたが、読みが全て5文字以下で6文字gateを一度も通らないため、cross-encoderの採否には使わない。代わりに各曖昧語を含み句読点をまたがない6〜20文字の連続句を決定的に切り出す。かな・記号は原文表層、辞書で一意に読める語は辞書読み、残りはUniDic表層発音を使い、入力長だけを満たすための不自然な読みを作らない。
+
+長文held-outは446件すべてが6文字gate対象で、現行辞書baselineは`acc@1 0.6547`、`acc@10 0.8744`、`MRR@10 0.7390`だった。390件は正解候補がN-best内にあり、未知domainの長文順位付けと候補生成を分けて報告できる。データは`target/evaluation`だけに保存し、製品bundleへ含めない。
+
 ## UD Japanese GSD 外部ドメイン評価
 
 [UD Japanese GSD](https://universaldependencies.org/treebanks/ja_gsd/index.html) r2.18（commit `33e7310b58308e85fd2b33a2fc3ef3e434f821c7`）を、CC BY-SA 4.0の評価専用キャッシュとして追加した。Wikipedia修正履歴ではなくnews/blogを原文とし、手動由来の短単位語境界、UniDic品詞、表層発音を持つ。製品bundleには含めない。

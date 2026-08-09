@@ -92,6 +92,14 @@ build-balanced-devset:
 evaluate-balanced-dev *args:
     scripts/evaluate-balanced-dev.sh {{args}}
 
+# UD Japanese PUD (news/wiki) から独立held-outを生成する
+build-pud-heldout:
+    scripts/build-pud-heldout.sh
+
+# 凍結済みモデルをUD Japanese PUD独立held-outで最終評価する
+evaluate-pud-heldout *args:
+    scripts/evaluate-pud-heldout.sh {{args}}
+
 # ニューラルrescoring評価用のzenz GGUFモデルを取得する
 fetch-neural-model:
     scripts/fetch-neural-model.sh

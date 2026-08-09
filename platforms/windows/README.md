@@ -4,7 +4,17 @@ This directory is the Windows Text Services Framework (TSF) adapter boundary.
 `native/` contains the in-process C++ COM shell based on Microsoft's TSF
 contracts and calls the platform-independent Rust engine through the typed
 callback C ABI. The same C ABI path has key-by-key regression coverage on every
-development host.
+development host. The Windows native test binary also drives the typed ABI,
+selects an annotated correction, and commits it through the
+`AcceptCandidate` event used by TSF candidate consumers.
+
+The Rust boundary also exports `slime_process_actions_v2`, which keeps the
+existing callback ABI intact while separating a candidate's committed value,
+legacy display string, semantic annotation, and optional detail. The Windows
+adapter uses v2 without changing index-based selection: the desktop popup draws
+the committed value and annotation separately, while UILess and UI Automation
+consumers receive a combined accessible name. A real-system Narrator check is
+still required before treating that source-level contract as release evidence.
 
 The native shell currently implements `ITfTextInputProcessorEx` (including the
 legacy `ITfTextInputProcessor` contract and activation-mode flags),

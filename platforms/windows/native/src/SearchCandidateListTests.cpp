@@ -3,13 +3,17 @@
 #include "WindowsPreferences.h"
 #include "SlimeIdentifiers.h"
 #include "TsfCandidateCompat.h"
+#include "slime_ffi.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -23,6 +27,175 @@ namespace {
 #define CHECK(expression)                                                       \
   ((expression) ? static_cast<void>(0)                                         \
                 : CheckFailed(#expression, __FILE__, __LINE__))
+
+std::string Utf8(const std::u8string_view value) {
+  return {reinterpret_cast<const char *>(value.data()), value.size()};
+}
+
+std::string CopyUtf8(const SlimeStringView value) {
+  if (value.data == nullptr || value.len == 0) {
+    return {};
+  }
+  return {reinterpret_cast<const char *>(value.data), value.len};
+}
+
+struct TypedActionCapture {
+  std::string preedit;
+  std::string commit;
+  std::vector<std::string> candidates;
+  std::size_t selected = std::numeric_limits<std::size_t>::max();
+  bool failed = false;
+};
+
+struct TypedCandidateV2 {
+  std::string value;
+  std::string display;
+  std::uint32_t annotation = SLIME_CANDIDATE_ANNOTATION_NONE;
+  std::string detail;
+};
+
+struct TypedActionCaptureV2 {
+  std::vector<TypedCandidateV2> candidates;
+  bool failed = false;
+};
+
+void CaptureTypedAction(void *context, const SlimeActionView *action) noexcept {
+  if (context == nullptr || action == nullptr) {
+    return;
+  }
+  auto &capture = *static_cast<TypedActionCapture *>(context);
+  try {
+    switch (action->kind) {
+    case SLIME_ACTION_UPDATE_PREEDIT:
+      capture.preedit = CopyUtf8(action->text);
+      break;
+    case SLIME_ACTION_SHOW_CANDIDATES:
+      capture.candidates.clear();
+      capture.candidates.reserve(action->candidate_count);
+      for (std::size_t index = 0; index < action->candidate_count; ++index) {
+        capture.candidates.push_back(CopyUtf8(action->candidates[index]));
+      }
+      capture.selected = action->selected;
+      break;
+    case SLIME_ACTION_COMMIT:
+      capture.commit = CopyUtf8(action->text);
+      break;
+    default:
+      break;
+    }
+  } catch (...) {
+    capture.failed = true;
+  }
+}
+
+void CaptureTypedActionV2(void *context,
+                          const SlimeActionViewV2 *action) noexcept {
+  if (context == nullptr || action == nullptr ||
+      action->kind != SLIME_ACTION_SHOW_CANDIDATES) {
+    return;
+  }
+  auto &capture = *static_cast<TypedActionCaptureV2 *>(context);
+  try {
+    capture.candidates.clear();
+    capture.candidates.reserve(action->candidate_count);
+    for (std::size_t index = 0; index < action->candidate_count; ++index) {
+      const auto &candidate = action->candidates[index];
+      capture.candidates.push_back(
+          {CopyUtf8(candidate.value), CopyUtf8(candidate.display),
+           candidate.annotation, CopyUtf8(candidate.detail)});
+    }
+  } catch (...) {
+    capture.failed = true;
+  }
+}
+
+void ProcessTyped(SlimeHandle *handle, TypedActionCapture &capture,
+                  const std::uint32_t event, const std::uint32_t value = 0) {
+  CHECK(handle != nullptr);
+  CHECK(slime_process_actions(handle, event, value, &capture,
+                              CaptureTypedAction) == SLIME_STATUS_OK);
+  CHECK(!capture.failed);
+}
+
+void TypeAscii(SlimeHandle *handle, TypedActionCapture &capture,
+               const std::string_view text) {
+  for (const unsigned char character : text) {
+    ProcessTyped(handle, capture, SLIME_EVENT_CHARACTER, character);
+  }
+}
+
+std::size_t CandidateIndex(const TypedActionCapture &capture,
+                           const std::string_view expected) {
+  const auto found = std::find(capture.candidates.begin(),
+                               capture.candidates.end(), expected);
+  CHECK(found != capture.candidates.end());
+  return static_cast<std::size_t>(
+      std::distance(capture.candidates.begin(), found));
+}
+
+void TestTypedCorrectionSelectionAndAcceptance() {
+  SlimeHandle *handle = slime_create();
+  CHECK(handle != nullptr);
+  TypedActionCapture capture;
+  TypeAscii(handle, capture, "nihpn");
+  ProcessTyped(handle, capture, SLIME_EVENT_SPACE);
+
+  const std::string label = Utf8(u8"日本　（にほんに訂正）");
+  const std::size_t index = CandidateIndex(capture, label);
+  CHECK(index <= std::numeric_limits<std::uint32_t>::max());
+  ProcessTyped(handle, capture, SLIME_EVENT_SELECT_CANDIDATE,
+               static_cast<std::uint32_t>(index));
+  CHECK(capture.selected == index);
+  CHECK(capture.candidates[index] == label);
+  CHECK(capture.preedit == Utf8(u8"日本"));
+
+  ProcessTyped(handle, capture, SLIME_EVENT_ACCEPT_CANDIDATE);
+  CHECK(capture.commit == Utf8(u8"日本"));
+  slime_destroy(handle);
+}
+
+void TestTypedCorrectionPresentationV2() {
+  SlimeHandle *handle = slime_create();
+  CHECK(handle != nullptr);
+  TypedActionCaptureV2 capture;
+  for (const unsigned char character : std::string_view("nihpn")) {
+    CHECK(slime_process_actions_v2(handle, SLIME_EVENT_CHARACTER, character,
+                                   &capture, CaptureTypedActionV2) ==
+          SLIME_STATUS_OK);
+  }
+  CHECK(slime_process_actions_v2(handle, SLIME_EVENT_SPACE, 0, &capture,
+                                 CaptureTypedActionV2) == SLIME_STATUS_OK);
+  CHECK(!capture.failed);
+
+  const auto found = std::find_if(
+      capture.candidates.begin(), capture.candidates.end(),
+      [](const TypedCandidateV2 &candidate) {
+        return candidate.value == Utf8(u8"日本") &&
+               candidate.annotation == SLIME_CANDIDATE_ANNOTATION_CORRECTION;
+      });
+  CHECK(found != capture.candidates.end());
+  CHECK(found->display == Utf8(u8"日本　（にほんに訂正）"));
+  CHECK(found->detail == Utf8(u8"にほん"));
+
+  const CandidatePresentation presentation = BuildCandidatePresentation(
+      L"日本", found->annotation, L"にほん");
+  CHECK(presentation.value == L"日本");
+  CHECK(presentation.annotation == L"にほんに訂正");
+  CHECK(presentation.accessibleName == L"日本、にほんに訂正");
+  slime_destroy(handle);
+}
+
+void TestCandidatePresentationLabels() {
+  CHECK(BuildCandidatePresentation(L"候補",
+                                   SLIME_CANDIDATE_ANNOTATION_NONE, L"")
+            .accessibleName == L"候補");
+  CHECK(BuildCandidatePresentation(L"候補",
+                                   SLIME_CANDIDATE_ANNOTATION_HISTORY, L"")
+            .accessibleName == L"候補、履歴");
+  CHECK(BuildCandidatePresentation(L"2026年8月8日",
+                                   SLIME_CANDIDATE_ANNOTATION_DATE_TIME, L"")
+            .annotation == L"日付・時刻");
+}
 
 std::wstring CandidateValue(ITfCandidateString *candidate) {
   CHECK(candidate != nullptr);
@@ -221,6 +394,9 @@ void TestTextServiceFunctionProvider() {
 } // namespace
 
 int wmain() {
+  TestTypedCorrectionSelectionAndAcceptance();
+  TestTypedCorrectionPresentationV2();
+  TestCandidatePresentationLabels();
   TestSearchFiltering();
   TestCandidateList();
   TestCandidateAutomationLifetime();

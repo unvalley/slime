@@ -1,4 +1,5 @@
 #include "CandidateWindow.h"
+#include "slime_ffi.h"
 
 // Declare COM base interfaces before the generated accessibility providers.
 #include <unknwn.h>
@@ -19,6 +20,7 @@ namespace {
 constexpr wchar_t kWindowClassName[] = L"SlimeIME.CandidateWindow";
 constexpr int kHorizontalPadding = 10;
 constexpr int kVerticalPadding = 4;
+constexpr int kAnnotationGap = 16;
 constexpr int kMinimumContentWidth = 180;
 constexpr UINT kAutomationSelectMessage = WM_APP + 0x534c;
 constexpr HRESULT kElementNotAvailable =
@@ -29,6 +31,28 @@ constexpr HRESULT kInvalidOperation =
     static_cast<HRESULT>(UIA_E_INVALIDOPERATION);
 
 std::atomic_long g_candidateAutomationObjectCount{0};
+
+std::wstring CandidateAnnotationText(const std::uint32_t annotation,
+                                     const std::wstring &detail) {
+  switch (annotation) {
+  case SLIME_CANDIDATE_ANNOTATION_USER_DICTIONARY:
+    return L"ユーザー辞書";
+  case SLIME_CANDIDATE_ANNOTATION_HISTORY:
+    return L"履歴";
+  case SLIME_CANDIDATE_ANNOTATION_CORRECTION:
+    return detail.empty() ? L"訂正" : detail + L"に訂正";
+  case SLIME_CANDIDATE_ANNOTATION_COMPLETION:
+    return L"補完";
+  case SLIME_CANDIDATE_ANNOTATION_DATE_TIME:
+    return L"日付・時刻";
+  case SLIME_CANDIDATE_ANNOTATION_NUMBER:
+    return L"数値";
+  case SLIME_CANDIDATE_ANNOTATION_CONTEXT:
+    return L"文脈";
+  default:
+    return {};
+  }
+}
 
 std::array<wchar_t, 4> CandidatePrefix(const std::size_t candidateIndex,
                                        const std::size_t pageStart) noexcept {
@@ -78,6 +102,19 @@ HRESULT SetVariantBool(VARIANT *value, const bool enabled) noexcept {
 
 } // namespace
 
+CandidatePresentation BuildCandidatePresentation(
+    std::wstring value, const std::uint32_t annotation, std::wstring detail) {
+  CandidatePresentation presentation;
+  presentation.value = std::move(value);
+  presentation.annotation = CandidateAnnotationText(annotation, detail);
+  presentation.accessibleName = presentation.value;
+  if (!presentation.annotation.empty()) {
+    presentation.accessibleName += L"、";
+    presentation.accessibleName += presentation.annotation;
+  }
+  return presentation;
+}
+
 class CandidateAutomationItem;
 
 class CandidateAutomationRoot final : public IRawElementProviderSimple,
@@ -119,7 +156,8 @@ public:
   HRESULT STDMETHODCALLTYPE get_CanSelectMultiple(BOOL *multiple) override;
   HRESULT STDMETHODCALLTYPE get_IsSelectionRequired(BOOL *required) override;
 
-  void Update(HWND window, const std::vector<std::wstring> &candidates,
+  void Update(HWND window,
+              const std::vector<CandidatePresentation> &candidates,
               std::size_t selected, std::size_t pageStart, UINT rowHeight,
               int contentWidth) noexcept;
   void SetVisible(bool visible) noexcept;
@@ -627,13 +665,17 @@ HRESULT CandidateAutomationRoot::get_IsSelectionRequired(BOOL *required) {
 }
 
 void CandidateAutomationRoot::Update(
-    HWND window, const std::vector<std::wstring> &candidates,
+    HWND window, const std::vector<CandidatePresentation> &candidates,
     const std::size_t selected, const std::size_t pageStart,
     const UINT rowHeight, const int contentWidth) noexcept {
   try {
     std::lock_guard lock(mutex_);
     window_ = window;
-    candidates_ = candidates;
+    candidates_.clear();
+    candidates_.reserve(candidates.size());
+    for (const auto &candidate : candidates) {
+      candidates_.push_back(candidate.accessibleName);
+    }
     selected_ =
         candidates_.empty() ? 0 : std::min(selected, candidates_.size() - 1);
     pageStart_ = pageStart;
@@ -883,7 +925,7 @@ bool CandidateWindow::EnsureWindow(HWND owner) noexcept {
 }
 
 bool CandidateWindow::Update(HWND owner, const RECT &anchor,
-                             const std::vector<std::wstring> &candidates,
+                             const std::vector<CandidatePresentation> &candidates,
                              const std::size_t selected) noexcept {
   try {
     if (candidates.empty()) {
@@ -895,7 +937,8 @@ bool CandidateWindow::Update(HWND owner, const RECT &anchor,
     }
     const std::size_t previousSelected = selected_;
     const std::wstring previousSelection =
-        selected_ < candidates_.size() ? candidates_[selected_] : std::wstring{};
+        selected_ < candidates_.size() ? candidates_[selected_].accessibleName
+                                       : std::wstring{};
     candidates_ = candidates;
     selected_ = std::min(selected, candidates_.size() - 1);
     pageStart_ =
@@ -918,13 +961,23 @@ bool CandidateWindow::Update(HWND owner, const RECT &anchor,
       const auto prefix = CandidatePrefix(index, pageStart_);
       SIZE prefixExtent{};
       SIZE candidateExtent{};
+      SIZE annotationExtent{};
       if (GetTextExtentPoint32W(device, prefix.data(), 3, &prefixExtent) &&
           GetTextExtentPoint32W(
-              device, candidates_[index].data(),
-              static_cast<int>(candidates_[index].size()), &candidateExtent)) {
+              device, candidates_[index].value.data(),
+              static_cast<int>(candidates_[index].value.size()),
+              &candidateExtent) &&
+          GetTextExtentPoint32W(
+              device, candidates_[index].annotation.data(),
+              static_cast<int>(candidates_[index].annotation.size()),
+              &annotationExtent)) {
+        const int annotationWidth = candidates_[index].annotation.empty()
+                                        ? 0
+                                        : kAnnotationGap + annotationExtent.cx;
         contentWidth_ =
             std::max(contentWidth_,
                      static_cast<int>(prefixExtent.cx + candidateExtent.cx) +
+                         annotationWidth +
                          kHorizontalPadding * 2);
       }
     }
@@ -939,7 +992,7 @@ bool CandidateWindow::Update(HWND owner, const RECT &anchor,
     Position(anchor);
     if (visible_ && automationProvider_ != nullptr &&
         (previousSelected != selected_ ||
-         previousSelection != candidates_[selected_])) {
+         previousSelection != candidates_[selected_].accessibleName)) {
       automationProvider_->RaiseSelectionChanged();
     }
     InvalidateRect(window_, nullptr, FALSE);
@@ -1063,8 +1116,24 @@ void CandidateWindow::Paint() noexcept {
              prefix.data(), 3);
     GetTextExtentPoint32W(device, prefix.data(), 3, &prefixExtent);
     TextOutW(device, kHorizontalPadding + prefixExtent.cx,
-             rowRect.top + kVerticalPadding, candidates_[index].data(),
-             static_cast<int>(candidates_[index].size()));
+             rowRect.top + kVerticalPadding, candidates_[index].value.data(),
+             static_cast<int>(candidates_[index].value.size()));
+    if (!candidates_[index].annotation.empty()) {
+      SIZE annotationExtent{};
+      if (GetTextExtentPoint32W(
+              device, candidates_[index].annotation.data(),
+              static_cast<int>(candidates_[index].annotation.size()),
+              &annotationExtent)) {
+        if (!selected) {
+          SetTextColor(device, GetSysColor(COLOR_GRAYTEXT));
+        }
+        TextOutW(device,
+                 contentWidth_ - kHorizontalPadding - annotationExtent.cx,
+                 rowRect.top + kVerticalPadding,
+                 candidates_[index].annotation.data(),
+                 static_cast<int>(candidates_[index].annotation.size()));
+      }
+    }
   }
   if (oldFont != nullptr) {
     SelectObject(device, oldFont);

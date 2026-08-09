@@ -78,6 +78,9 @@ target_compile_options(SlimeNativeTests PRIVATE /W4 /WX /permissive- /utf-8)
 target_include_directories(SlimeIME PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../crates/slime-ffi/include"
 )
+target_include_directories(SlimeNativeTests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../crates/slime-ffi/include"
+)
 target_link_libraries(SlimeIME PRIVATE
   "${SLIME_FFI_LIBRARY}"
   advapi32
@@ -91,12 +94,14 @@ target_link_libraries(SlimeIME PRIVATE
 target_link_libraries(SlimeIMERegister PRIVATE shlwapi)
 target_link_libraries(SlimeSettings PRIVATE gdi32 user32)
 target_link_libraries(SlimeNativeTests PRIVATE
+  "${SLIME_FFI_LIBRARY}"
   gdi32
   oleaut32
   uiautomationcore
   user32
   uuid
 )
+add_dependencies(SlimeNativeTests SlimeIME)
 
 add_custom_command(TARGET SlimeIME POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different

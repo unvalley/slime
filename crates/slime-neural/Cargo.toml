@@ -1,0 +1,20 @@
+[package]
+name = "slime-neural"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/unvalley/slime"
+
+[dependencies]
+llama-cpp-2 = "=0.1.151"
+# The safe wrapper's dependency is semver-wide; keep its generated bindings
+# paired with the exact llama.cpp revision used by the wrapper.
+llama-cpp-sys-2 = "=0.1.151"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

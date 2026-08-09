@@ -104,6 +104,10 @@ enum SlimeStatus {
   SLIME_STATUS_PANIC = 4,
   SLIME_STATUS_INVALID_UTF8 = 5,
   SLIME_STATUS_INVALID_CANDIDATE = 6,
+  SLIME_STATUS_NEURAL_UNAVAILABLE = 7,
+  SLIME_STATUS_NEURAL_LOAD_FAILED = 8,
+  SLIME_STATUS_NEURAL_MODEL_CONFLICT = 9,
+  SLIME_STATUS_NEURAL_PREPARING = 10,
 };
 
 SlimeHandle *slime_create(void);
@@ -122,6 +126,12 @@ SlimeHandle *slime_create_with_signed_data_dir_and_version_floors(
     const uint8_t *verification_keys, size_t verification_keys_len,
     const uint8_t *version_floors, size_t version_floors_len);
 void slime_destroy(SlimeHandle *handle);
+/* Enables an optional process-wide model for this handle. The first successful
+   path wins; subsequent handles must use the same model. */
+uint32_t slime_enable_neural_rescoring(SlimeHandle *handle,
+                                       const uint8_t *model_path,
+                                       size_t model_path_len);
+uint32_t slime_neural_rescoring_status(void);
 SlimeBuffer slime_process(SlimeHandle *handle, uint32_t event_kind, uint32_t value);
 /* Calls callback synchronously for each action. All views are borrowed only
    for that callback; the callback must not retain them, unwind, or re-enter

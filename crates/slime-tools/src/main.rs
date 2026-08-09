@@ -3,7 +3,7 @@
 mod corpus_bigram;
 mod discriminative;
 #[cfg(feature = "neural")]
-mod neural;
+use slime_neural as neural;
 
 use std::collections::HashSet;
 use std::env;

@@ -11,6 +11,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 slime-core = { path = "../slime-core" }
+slime-neural = { path = "../slime-neural", optional = true }
+
+[features]
+neural = ["dep:slime-neural"]
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }

@@ -86,7 +86,8 @@ final class RustEngine {
     init(
         dataDirectory: URL = UserDataStore.shared.directoryURL,
         dictionaryPackVerificationKeys: String? = nil,
-        dictionaryPackVersionFloors: String? = nil
+        dictionaryPackVersionFloors: String? = nil,
+        neuralModelURL: URL? = nil
     ) throws {
         let path = Array(dataDirectory.path.utf8)
         let configuredKeys = dictionaryPackVerificationKeys
@@ -129,6 +130,18 @@ final class RustEngine {
         }
         guard let handle = createdHandle else {
             throw EngineError.creationFailed
+        }
+        let configuredNeuralModel = neuralModelURL
+            ?? Bundle.main.url(forResource: "SlimeNeuralModel", withExtension: "gguf")
+        if let configuredNeuralModel {
+            let modelPath = Array(configuredNeuralModel.path.utf8)
+            let status = modelPath.withUnsafeBufferPointer { buffer in
+                slime_enable_neural_rescoring(handle, buffer.baseAddress, buffer.count)
+            }
+            guard status == SLIME_STATUS_OK.rawValue else {
+                slime_destroy(handle)
+                throw EngineError.rejected("neural_model_status_\(status)")
+            }
         }
         self.handle = handle
     }

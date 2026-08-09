@@ -9,6 +9,8 @@ frameworks_dir="$contents_dir/Frameworks"
 resources_dir="$contents_dir/Resources"
 executable="$macos_dir/Slime"
 codesign_identity="${SLIME_CODESIGN_IDENTITY:-}"
+neural_model="${SLIME_NEURAL_MODEL:-}"
+neural_model_license="${SLIME_NEURAL_MODEL_LICENSE:-}"
 production_polar_organization_id="6a332eb2-129e-4a1b-92fe-8ec7777780df"
 production_polar_benefit_id="e014726e-23a8-4a99-a212-e44adc349c1e"
 production_polar_checkout_url="https://buy.polar.sh/polar_cl_asAsYJgLTkAhiius7JmEbgTIPRpEb4r4H8Unz2x9us2"
@@ -35,7 +37,27 @@ else
   echo "Signing with: $codesign_identity"
 fi
 
-MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p slime-ffi
+cargo_features=()
+if [[ -n "$neural_model" ]]; then
+  if [[ ! -f "$neural_model" ]]; then
+    echo "Neural model not found: $neural_model" >&2
+    exit 1
+  fi
+  if [[ -z "$neural_model_license" || ! -f "$neural_model_license" ]]; then
+    echo "SLIME_NEURAL_MODEL_LICENSE must name the model's redistributable license" >&2
+    exit 1
+  fi
+  cargo_features=(--features neural)
+elif [[ -n "$neural_model_license" ]]; then
+  echo "SLIME_NEURAL_MODEL_LICENSE requires SLIME_NEURAL_MODEL" >&2
+  exit 1
+fi
+
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo build \
+  --manifest-path "$workspace_dir/Cargo.toml" \
+  --release \
+  -p slime-ffi \
+  "${cargo_features[@]}"
 
 rm -rf "$bundle_dir"
 mkdir -p "$macos_dir" "$frameworks_dir" "$resources_dir"
@@ -102,6 +124,10 @@ cp "$workspace_dir/platforms/macos/Resources/PkgInfo" "$contents_dir/PkgInfo"
 # The Mozc-derived dictionary notices must accompany binary redistributions.
 cp "$workspace_dir/crates/slime-converter/data/MOZC_DICTIONARY_LICENSE.txt" "$resources_dir/"
 cp "$workspace_dir/LICENSE" "$resources_dir/LICENSE.txt"
+if [[ -n "$neural_model" ]]; then
+  cp "$neural_model" "$resources_dir/SlimeNeuralModel.gguf"
+  cp "$neural_model_license" "$resources_dir/SlimeNeuralModel-LICENSE.txt"
+fi
 swift "$workspace_dir/platforms/macos/GenerateIcon.swift" "$resources_dir/InputMethodIcon.tiff"
 for localization_dir in "$workspace_dir"/platforms/macos/Resources/*.lproj; do
   cp -R "$localization_dir" "$resources_dir/"

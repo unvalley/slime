@@ -6,7 +6,14 @@
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(feature = "neural")]
+use std::path::{Path, PathBuf};
 use std::ptr;
+#[cfg(feature = "neural")]
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use slime_core::{
     CandidateAnnotation, DictionaryPackTrust, DictionaryPackVerificationKey,
@@ -55,6 +62,10 @@ pub const STATUS_NULL_CALLBACK: u32 = 3;
 pub const STATUS_PANIC: u32 = 4;
 pub const STATUS_INVALID_UTF8: u32 = 5;
 pub const STATUS_INVALID_CANDIDATE: u32 = 6;
+pub const STATUS_NEURAL_UNAVAILABLE: u32 = 7;
+pub const STATUS_NEURAL_LOAD_FAILED: u32 = 8;
+pub const STATUS_NEURAL_MODEL_CONFLICT: u32 = 9;
+pub const STATUS_NEURAL_PREPARING: u32 = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -118,6 +129,26 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 
 pub struct SlimeHandle {
     engine: SlimeEngine,
+    neural_enabled: bool,
+}
+
+#[cfg(feature = "neural")]
+struct NeuralService {
+    rescorer: slime_neural::Rescorer,
+}
+
+#[cfg(feature = "neural")]
+static NEURAL_SERVICE: OnceLock<&'static Mutex<NeuralService>> = OnceLock::new();
+#[cfg(feature = "neural")]
+static NEURAL_MODEL_PATH: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "neural")]
+static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn new_handle(engine: SlimeEngine) -> SlimeHandle {
+    SlimeHandle {
+        engine,
+        neural_enabled: false,
+    }
 }
 
 #[repr(C)]
@@ -143,9 +174,7 @@ impl SlimeBuffer {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn slime_create() -> *mut SlimeHandle {
-    match catch_unwind(|| SlimeHandle {
-        engine: SlimeEngine::bundled(),
-    }) {
+    match catch_unwind(|| new_handle(SlimeEngine::bundled())) {
         Ok(handle) => Box::into_raw(Box::new(handle)),
         Err(_) => ptr::null_mut(),
     }
@@ -173,9 +202,9 @@ pub unsafe extern "C" fn slime_create_with_data_dir(
             unsafe { std::slice::from_raw_parts(data_dir, data_dir_len) }
         };
         let path = std::str::from_utf8(bytes).ok()?;
-        Some(SlimeHandle {
-            engine: SlimeEngine::bundled_with_user_data(UserData::load(path)),
-        })
+        Some(new_handle(SlimeEngine::bundled_with_user_data(
+            UserData::load(path),
+        )))
     }));
 
     match result {
@@ -207,12 +236,9 @@ pub unsafe extern "C" fn slime_create_with_signed_data_dir(
         let verification_keys =
             unsafe { utf8_from_raw_parts(verification_keys, verification_keys_len) }?;
         let trust = parse_dictionary_pack_trust(verification_keys)?;
-        Some(SlimeHandle {
-            engine: SlimeEngine::bundled_with_user_data_and_pack_trust(
-                UserData::load(data_dir),
-                trust,
-            ),
-        })
+        Some(new_handle(
+            SlimeEngine::bundled_with_user_data_and_pack_trust(UserData::load(data_dir), trust),
+        ))
     }));
 
     match result {
@@ -249,12 +275,9 @@ pub unsafe extern "C" fn slime_create_with_signed_data_dir_and_version_floors(
         let keys = parse_dictionary_pack_verification_keys(verification_keys)?;
         let floors = parse_dictionary_pack_version_floors(version_floors)?;
         let trust = DictionaryPackTrust::signed_only_with_version_floors(keys, floors).ok()?;
-        Some(SlimeHandle {
-            engine: SlimeEngine::bundled_with_user_data_and_pack_trust(
-                UserData::load(data_dir),
-                trust,
-            ),
-        })
+        Some(new_handle(
+            SlimeEngine::bundled_with_user_data_and_pack_trust(UserData::load(data_dir), trust),
+        ))
     }));
 
     match result {
@@ -323,6 +346,165 @@ pub unsafe extern "C" fn slime_destroy(handle: *mut SlimeHandle) {
     }
 }
 
+/// Enables process-wide neural candidate rescoring for this handle.
+///
+/// The first successful call starts loading one model shared by every engine
+/// in the input-method process. Loading happens off the caller's thread; base
+/// ranking remains active until the service is ready. Later calls must name
+/// the same path. Default builds return [`STATUS_NEURAL_UNAVAILABLE`].
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed IME handle. `model_path`
+/// must reference readable UTF-8 bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_enable_neural_rescoring(
+    handle: *mut SlimeHandle,
+    model_path: *const u8,
+    model_path_len: usize,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        // SAFETY: The caller promises readable bytes for this call.
+        let Some(model_path) = (unsafe { utf8_from_raw_parts(model_path, model_path_len) }) else {
+            return STATUS_INVALID_UTF8;
+        };
+        if model_path.is_empty() {
+            return STATUS_INVALID_UTF8;
+        }
+
+        #[cfg(not(feature = "neural"))]
+        {
+            let _ = model_path;
+            STATUS_NEURAL_UNAVAILABLE
+        }
+
+        #[cfg(feature = "neural")]
+        {
+            let model_path = Path::new(model_path);
+            let status = prepare_neural_service(model_path);
+            if status == STATUS_OK {
+                // SAFETY: The caller promises a live, exclusively accessed handle.
+                unsafe { &mut *handle }.neural_enabled = true;
+            }
+            status
+        }
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
+#[cfg(feature = "neural")]
+fn prepare_neural_service(model_path: &Path) -> u32 {
+    if let Some(configured_path) = NEURAL_MODEL_PATH.get() {
+        return if configured_path == model_path {
+            STATUS_OK
+        } else {
+            STATUS_NEURAL_MODEL_CONFLICT
+        };
+    }
+    let owned_path = model_path.to_path_buf();
+    if NEURAL_MODEL_PATH.set(owned_path.clone()).is_err() {
+        return NEURAL_MODEL_PATH
+            .get()
+            .map_or(STATUS_NEURAL_LOAD_FAILED, |configured_path| {
+                if configured_path == model_path {
+                    STATUS_OK
+                } else {
+                    STATUS_NEURAL_MODEL_CONFLICT
+                }
+            });
+    }
+    let spawn = std::thread::Builder::new()
+        .name("slime-neural-loader".to_owned())
+        .spawn(move || load_neural_service(owned_path));
+    if spawn.is_err() {
+        NEURAL_LOAD_FAILED.store(true, Ordering::Release);
+        return STATUS_NEURAL_LOAD_FAILED;
+    }
+    STATUS_OK
+}
+
+#[cfg(feature = "neural")]
+fn load_neural_service(model_path: PathBuf) {
+    let Ok(rescorer) = slime_neural::Rescorer::load_bounded(&model_path, 3, 1_024) else {
+        NEURAL_LOAD_FAILED.store(true, Ordering::Release);
+        return;
+    };
+    let service = NeuralService { rescorer };
+    // llama.cpp owns process-wide Metal resources whose destructor order is
+    // outside Rust's control. The input method uses one model for its entire
+    // process lifetime, so retain the service until process exit and avoid a
+    // late device teardown after the Metal residency-set singleton is gone.
+    let service = Box::leak(Box::new(Mutex::new(service)));
+    assert!(
+        NEURAL_SERVICE.set(service).is_ok(),
+        "neural initialization lock permits only one writer"
+    );
+}
+
+/// Reports whether the optional neural service is unavailable, preparing,
+/// ready, or failed. The model path itself is never exposed.
+#[unsafe(no_mangle)]
+pub extern "C" fn slime_neural_rescoring_status() -> u32 {
+    #[cfg(not(feature = "neural"))]
+    {
+        STATUS_NEURAL_UNAVAILABLE
+    }
+    #[cfg(feature = "neural")]
+    {
+        if NEURAL_SERVICE.get().is_some() {
+            STATUS_OK
+        } else if NEURAL_LOAD_FAILED.load(Ordering::Acquire) {
+            STATUS_NEURAL_LOAD_FAILED
+        } else if NEURAL_MODEL_PATH.get().is_some() {
+            STATUS_NEURAL_PREPARING
+        } else {
+            STATUS_NEURAL_UNAVAILABLE
+        }
+    }
+}
+
+fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction> {
+    let actions = handle.engine.handle(event);
+    if !handle.neural_enabled {
+        return actions;
+    }
+
+    #[cfg(feature = "neural")]
+    if let Some(request) = handle.engine.candidate_rescore_request()
+        && let Some(service) = NEURAL_SERVICE.get()
+        && let Ok(service) = service.lock()
+    {
+        let score_request = slime_neural::ScoreRequest {
+            context: request.context,
+            input_katakana: full_katakana(&request.reading),
+            candidates: request.candidates,
+        };
+        if let Ok(scored) = service.rescorer.score_all(&[score_request])
+            && let Some(scored) = scored.first()
+            && let Some(rescored_actions) =
+                handle.engine.apply_candidate_rescore(&scored.logliks, 0.7)
+        {
+            return rescored_actions;
+        }
+    }
+    actions
+}
+
+#[cfg(feature = "neural")]
+fn full_katakana(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\u{3041}'..='\u{3096}' | '\u{309d}'..='\u{309e}' => {
+                char::from_u32(u32::from(character) + 0x60).expect("hiragana has katakana pair")
+            }
+            _ => character,
+        })
+        .collect()
+}
+
 /// Processes one input event and returns a UTF-8 JSON action list.
 ///
 /// `value` is a Unicode scalar for [`EVENT_CHARACTER`] and a zero-based index
@@ -351,7 +533,7 @@ pub unsafe extern "C" fn slime_process(
 
         // SAFETY: The caller promises a live, exclusively accessed handle.
         let handle = unsafe { &mut *handle };
-        let actions = handle.engine.handle(event);
+        let actions = process_event(handle, event);
         success_response(&actions)
     }));
 
@@ -392,7 +574,7 @@ pub unsafe extern "C" fn slime_process_actions(
         };
 
         // SAFETY: The caller promises a live, exclusively accessed handle.
-        let actions = unsafe { &mut *handle }.engine.handle(event);
+        let actions = process_event(unsafe { &mut *handle }, event);
         for action in &actions {
             visit_action(action, context, callback);
         }
@@ -431,7 +613,7 @@ pub unsafe extern "C" fn slime_process_actions_v2(
         };
 
         // SAFETY: The caller promises a live, exclusively accessed handle.
-        let actions = unsafe { &mut *handle }.engine.handle(event);
+        let actions = process_event(unsafe { &mut *handle }, event);
         for action in &actions {
             visit_action_v2(action, context, callback);
         }
@@ -1228,8 +1410,9 @@ mod tests {
         SlimeStringView, slime_begin_reconversion, slime_buffer_destroy,
         slime_conversion_candidates, slime_create, slime_create_with_data_dir,
         slime_create_with_signed_data_dir, slime_create_with_signed_data_dir_and_version_floors,
-        slime_destroy, slime_domain_dictionary_words, slime_installed_dictionary_pack_words,
-        slime_installed_dictionary_packs, slime_process, slime_process_actions,
+        slime_destroy, slime_domain_dictionary_words, slime_enable_neural_rescoring,
+        slime_installed_dictionary_pack_words, slime_installed_dictionary_packs,
+        slime_neural_rescoring_status, slime_process, slime_process_actions,
         slime_process_actions_v2, slime_record_external_selection, slime_reset_context,
         slime_set_external_left_context, slime_set_options, slime_set_options_v2,
         slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
@@ -1241,6 +1424,89 @@ mod tests {
         // SAFETY: Tests read a live buffer before handing it back to its destructor.
         let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) };
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[cfg(not(feature = "neural"))]
+    #[test]
+    fn default_build_reports_neural_rescoring_as_unavailable() {
+        let handle = slime_create();
+        let path = b"model.gguf";
+        // SAFETY: The handle and path are live for this synchronous call.
+        let status = unsafe { slime_enable_neural_rescoring(handle, path.as_ptr(), path.len()) };
+        assert_eq!(status, super::STATUS_NEURAL_UNAVAILABLE);
+        assert_eq!(
+            slime_neural_rescoring_status(),
+            super::STATUS_NEURAL_UNAVAILABLE
+        );
+        // SAFETY: The handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
+    #[test]
+    #[ignore = "requires SLIME_NEURAL_TEST_MODEL"]
+    fn neural_feature_loads_and_processes_an_explicit_conversion() {
+        let model = std::env::var("SLIME_NEURAL_TEST_MODEL")
+            .expect("SLIME_NEURAL_TEST_MODEL must name a compatible GGUF model");
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        let status = unsafe { slime_enable_neural_rescoring(handle, model.as_ptr(), model.len()) };
+        assert_eq!(status, STATUS_OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while slime_neural_rescoring_status() == super::STATUS_NEURAL_PREPARING {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "neural model did not finish loading"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(slime_neural_rescoring_status(), STATUS_OK);
+        for character in "koutei".chars() {
+            // SAFETY: The handle is live and each buffer is released once.
+            unsafe {
+                slime_buffer_destroy(slime_process(handle, EVENT_CHARACTER, character.into()))
+            };
+        }
+        // SAFETY: The handle is live and each buffer is released once.
+        let conversion = unsafe { slime_process(handle, EVENT_SPACE, 0) };
+        // SAFETY: The conversion buffer remains live here.
+        let json = unsafe { copy_buffer(&conversion) };
+        assert!(json.contains("show_candidates"), "{json}");
+        assert!(json.contains("\"candidates\":[\"皇帝\""), "{json}");
+        unsafe {
+            slime_buffer_destroy(conversion);
+            slime_buffer_destroy(slime_process(handle, EVENT_ENTER, 0));
+        }
+
+        let mut latencies = Vec::with_capacity(50);
+        for _ in 0..50 {
+            for character in "koutei".chars() {
+                // SAFETY: The handle is live and each buffer is released once.
+                unsafe {
+                    slime_buffer_destroy(slime_process(handle, EVENT_CHARACTER, character.into()))
+                };
+            }
+            let started = std::time::Instant::now();
+            // SAFETY: The handle is live and each buffer is released once.
+            let conversion = unsafe { slime_process(handle, EVENT_SPACE, 0) };
+            latencies.push(started.elapsed());
+            // SAFETY: The handle is live and each buffer is released once.
+            unsafe {
+                slime_buffer_destroy(conversion);
+                slime_buffer_destroy(slime_process(handle, EVENT_ENTER, 0));
+            }
+        }
+        latencies.sort_unstable();
+        eprintln!(
+            "ffi neural explicit conversion: p50={:.3}ms p95={:.3}ms max={:.3}ms",
+            latencies[25].as_secs_f64() * 1_000.0,
+            latencies[47].as_secs_f64() * 1_000.0,
+            latencies[49].as_secs_f64() * 1_000.0
+        );
+        // SAFETY: The handle is released exactly once.
+        unsafe {
+            slime_destroy(handle);
+        }
     }
 
     #[derive(Default)]

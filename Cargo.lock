@@ -590,7 +590,16 @@ name = "slime-ffi"
 version = "0.1.0"
 dependencies = [
  "slime-core",
+ "slime-neural",
  "winresource",
+]
+
+[[package]]
+name = "slime-neural"
+version = "0.1.0"
+dependencies = [
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
 ]
 
 [[package]]
@@ -602,12 +611,12 @@ name = "slime-tools"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
- "llama-cpp-2",
  "serde",
  "serde_json",
  "sha2",
  "slime-converter",
  "slime-core",
+ "slime-neural",
 ]
 
 [[package]]

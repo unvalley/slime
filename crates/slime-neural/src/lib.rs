@@ -1,4 +1,4 @@
-//! Neural N-best rescoring with a zenz GGUF model (Phase 2 feasibility).
+//! Neural N-best rescoring with a zenz GGUF model.
 //!
 //! Scores each existing candidate as `log P(candidate, EOS | context, reading)`
 //! under a character-level conditional LM. Rescoring is prefill-only and
@@ -19,16 +19,17 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 
 /// Maximum characters of left context fed to the model. Zenzai truncates the
 /// context similarly; unbounded context would dominate prefill latency.
 const MAX_CONTEXT_CHARACTERS: usize = 40;
 
 /// Candidates scored in parallel as independent sequences in one decode call.
-const MAX_PARALLEL_CANDIDATES: usize = 16;
+const DEFAULT_MAX_PARALLEL_CANDIDATES: usize = 16;
 
 /// Total KV cells: shared prefix + one suffix per parallel candidate.
-const KV_CELLS: u32 = 4096;
+const DEFAULT_KV_CELLS: u32 = 4096;
 
 /// zenz is trained with 1024 positions; skip items that would exceed it.
 const MAX_POSITIONS: usize = 1024;
@@ -53,10 +54,42 @@ pub struct ScoredItem {
 pub struct Rescorer {
     backend: LlamaBackend,
     model: LlamaModel,
+    max_parallel_candidates: usize,
+    kv_cells: u32,
 }
 
 impl Rescorer {
+    /// Loads a model with the wider evaluation-time runtime bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the llama backend, model, or runtime context
+    /// cannot be initialized.
     pub fn load(model_path: &Path) -> Result<Self, String> {
+        Self::load_bounded(
+            model_path,
+            DEFAULT_MAX_PARALLEL_CANDIDATES,
+            DEFAULT_KV_CELLS,
+        )
+    }
+
+    /// Loads a model with bounded runtime buffers for an interactive caller.
+    /// The configured parallel count should match the caller's candidate cap;
+    /// evaluation keeps the wider defaults through [`Self::load`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero bounds or when the llama backend or model
+    /// cannot be initialized.
+    pub fn load_bounded(
+        model_path: &Path,
+        max_parallel_candidates: usize,
+        kv_cells: u32,
+    ) -> Result<Self, String> {
+        if max_parallel_candidates == 0 || kv_cells == 0 {
+            return Err("neural runtime bounds must be positive".to_owned());
+        }
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
         let backend = LlamaBackend::init()
             .map_err(|error| format!("failed to initialize llama backend: {error}"))?;
         let mut model_params = LlamaModelParams::default();
@@ -65,17 +98,33 @@ impl Rescorer {
         }
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .map_err(|error| format!("failed to load model {}: {error}", model_path.display()))?;
-        Ok(Self { backend, model })
+        Ok(Self {
+            backend,
+            model,
+            max_parallel_candidates,
+            kv_cells,
+        })
     }
 
     /// Scores every request. One llama context is created for the whole run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when context creation, tokenization, batching, or
+    /// model decoding fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if llama.cpp returns an invalid negative token ID or a
+    /// configured token position exceeds `i32`, both of which violate the
+    /// validated model and bounded-context contract.
     pub fn score_all(&self, requests: &[ScoreRequest]) -> Result<Vec<ScoredItem>, String> {
-        let sequence_count =
-            u32::try_from(MAX_PARALLEL_CANDIDATES).expect("parallel candidates fit u32");
+        let sequence_count = u32::try_from(self.max_parallel_candidates)
+            .map_err(|_| "parallel candidate count does not fit u32".to_owned())?;
         let context_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(KV_CELLS))
-            .with_n_batch(KV_CELLS)
-            .with_n_ubatch(KV_CELLS)
+            .with_n_ctx(std::num::NonZeroU32::new(self.kv_cells))
+            .with_n_batch(self.kv_cells)
+            .with_n_ubatch(self.kv_cells)
             .with_n_seq_max(sequence_count)
             .with_kv_unified(true);
         let mut context = self
@@ -83,8 +132,9 @@ impl Rescorer {
             .new_context(&self.backend, context_params)
             .map_err(|error| format!("failed to create llama context: {error}"))?;
         let mut batch = LlamaBatch::new(
-            usize::try_from(KV_CELLS).expect("kv cells fit usize"),
-            i32::try_from(MAX_PARALLEL_CANDIDATES).expect("parallel candidates fit i32"),
+            usize::try_from(self.kv_cells).expect("kv cells fit usize"),
+            i32::try_from(self.max_parallel_candidates)
+                .map_err(|_| "parallel candidate count does not fit i32".to_owned())?,
         );
         let mut timing = Timing::default();
         let scored: Result<Vec<ScoredItem>, String> = requests
@@ -137,7 +187,7 @@ impl Rescorer {
         // into the parallel sequences: the prefix tokens are shared by every
         // sequence and each candidate continues its own sequence. Metal decode
         // has a large fixed launch overhead, so decode calls are minimized.
-        let sequences: Vec<i32> = (0..MAX_PARALLEL_CANDIDATES)
+        let sequences: Vec<i32> = (0..self.max_parallel_candidates)
             .map(|sequence| i32::try_from(sequence).expect("sequence id fits i32"))
             .collect();
         context.clear_kv_cache();
@@ -157,7 +207,10 @@ impl Rescorer {
         let eos = self.model.token_eos();
         let mut logliks = Vec::with_capacity(candidate_tokens.len());
         let mut first_token_scores: Option<LogDistribution> = None;
-        for (chunk_index, chunk) in candidate_tokens.chunks(MAX_PARALLEL_CANDIDATES).enumerate() {
+        for (chunk_index, chunk) in candidate_tokens
+            .chunks(self.max_parallel_candidates)
+            .enumerate()
+        {
             let merged_prefix = chunk_index == 0;
             if !merged_prefix {
                 // Trim per-sequence suffixes left over from the previous chunk.

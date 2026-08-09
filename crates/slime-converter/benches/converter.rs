@@ -13,6 +13,7 @@ fn main() {
         black_box(dictionary.candidates(black_box("にほん")));
     });
     run_document_context_benchmark(&dictionary, iterations);
+    run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run("converter/segmented_phrase", iterations, || {
         black_box(dictionary.convert_best(black_box("わたしはにほん")));
     });
@@ -221,6 +222,25 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_superlative_prefix_context_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/superlative_prefix_context_candidates",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("かい"), black_box("もうひとつは最")),
+            );
+        },
+    );
+    run(
+        "converter/ordinary_single_character_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_context(black_box("き"), black_box("大正")));
         },
     );
 }

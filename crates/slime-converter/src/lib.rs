@@ -146,6 +146,7 @@ struct DictionaryDocumentContextRanker<'a> {
     surrounding_notation_surface: Option<&'static str>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
+    allows_single_character_phrase_prefix: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +173,10 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         left_context: &str,
         right_context: &str,
     ) -> Self {
+        // Mozc gives 最 its own productive superlative-prefix POS. Checking
+        // the surface here avoids a reverse-dictionary scan on every
+        // conversion while keeping ordinary one-character word endings out.
+        let allows_single_character_phrase_prefix = left_context.ends_with('最');
         Self {
             dictionary,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
@@ -179,6 +184,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 reading,
                 left_context,
                 right_context,
+                allows_single_character_phrase_prefix,
             ),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
@@ -202,7 +208,17 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 ),
             numeric_counter_promotions: dictionary
                 .document_numeric_counter_promotions(reading, left_context),
+            allows_single_character_phrase_prefix,
         }
+    }
+
+    fn phrase_promotion(&self, reading: &str, left_context: &str, surface: &str) -> i32 {
+        self.dictionary.document_phrase_promotion(
+            left_context,
+            reading,
+            surface,
+            self.allows_single_character_phrase_prefix,
+        )
     }
 }
 
@@ -219,9 +235,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
     ) -> i32 {
         let repeated_cost =
             DocumentContextRanker.ranking_cost_with_context(reading, left_context, conversion);
-        let phrase_promotion =
-            self.dictionary
-                .document_phrase_promotion(left_context, reading, &conversion.surface);
+        let phrase_promotion = self.phrase_promotion(reading, left_context, &conversion.surface);
         let right_phrase_promotion = self
             .right_phrase_promotions
             .iter()
@@ -1338,6 +1352,7 @@ impl Dictionary {
         left_context: &str,
         reading: &str,
         candidate_surface: &str,
+        allows_single_character_prefix: bool,
     ) -> i32 {
         let Some(compact) = self.bundled else {
             return 0;
@@ -1351,7 +1366,10 @@ impl Dictionary {
         let context_characters = context_tail.chars().count();
         let mut best_promotion = 0;
         for (position, (index, _)) in context_tail.char_indices().enumerate() {
-            if context_characters - position < DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS {
+            let prefix_characters = context_characters - position;
+            if prefix_characters < DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS
+                && (prefix_characters != 1 || !allows_single_character_prefix)
+            {
                 break;
             }
             if let Some(word_cost) = compact.joined_surface_reading_suffix_cost(
@@ -1374,6 +1392,7 @@ impl Dictionary {
         reading: &str,
         left_context: &str,
         right_context: &str,
+        allows_single_character_phrase_prefix: bool,
     ) -> Vec<DocumentBoundaryPromotion<'s>> {
         if !self.uses_connection_costs {
             return Vec::new();
@@ -1387,8 +1406,12 @@ impl Dictionary {
         }
         let mut has_left_phrase_evidence = false;
         self.for_each_exact(reading, |entry| {
-            has_left_phrase_evidence |=
-                self.document_phrase_promotion(left_context, reading, entry.surface) > 0;
+            has_left_phrase_evidence |= self.document_phrase_promotion(
+                left_context,
+                reading,
+                entry.surface,
+                allows_single_character_phrase_prefix,
+            ) > 0;
         });
         if has_left_phrase_evidence {
             return Vec::new();
@@ -4238,6 +4261,21 @@ mod tests {
             dictionary.candidates_with_context("し", "高木守道")[0].surface,
             "氏",
             "a one-character homographic prefix must not promote 道士"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("かい", "もうひとつは最")[0].surface,
+            "下位",
+            "Mozc's dedicated superlative prefix may complete 最下位"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("き", "大正")[0].surface,
+            "期",
+            "an ordinary final kanji must not reinterpret 大正 as 正気"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("じ", "第一")[0].surface,
+            "次",
+            "a numeric final kanji must not reinterpret 第一 as 一時"
         );
         assert_eq!(
             dictionary.candidates_with_context("やく", "経済の牽引")[0].surface,

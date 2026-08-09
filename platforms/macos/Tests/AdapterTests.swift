@@ -142,6 +142,47 @@ enum AdapterTests {
             "commit actions should replace AppKit marked text with the selected candidate"
         )
 
+        let typoEngine = try RustEngine(dataDirectory: testDirectory)
+        let typoTextView = NSTextView(frame: .zero)
+        for scalar in "nihpn".unicodeScalars {
+            for action in try typoEngine.process(.character(scalar)) {
+                _ = applyTextMutation(action, client: typoTextView)
+            }
+        }
+        let typoActions = try typoEngine.process(.space)
+        let typoCandidates = try expectValue(
+            typoActions.first(where: { $0.type == "show_candidates" })?.candidates,
+            "typo correction candidates should cross the Swift bridge"
+        )
+        let typoDetails = try expectValue(
+            typoActions.first(where: { $0.type == "show_candidates" })?.candidateDetails,
+            "typed candidate metadata should cross the Swift bridge"
+        )
+        let correctionLabel = "日本　（にほんに訂正）"
+        let correctionIndex = try expectValue(
+            typoCandidates.firstIndex(of: correctionLabel),
+            "typo correction candidate should have a selectable index"
+        )
+        try expect(
+            typoDetails[correctionIndex].value == "日本"
+                && typoDetails[correctionIndex].annotation
+                    == UInt32(SLIME_CANDIDATE_ANNOTATION_CORRECTION.rawValue)
+                && typoDetails[correctionIndex].detail == "にほん"
+                && candidateAnnotationText(typoDetails[correctionIndex]) == "にほんに訂正",
+            "candidate metadata should separate the committed value from correction guidance"
+        )
+        let typoSelection = try typoEngine.process(.selectCandidate(UInt32(correctionIndex)))
+        for action in typoSelection {
+            _ = applyTextMutation(action, client: typoTextView)
+        }
+        for action in try typoEngine.process(.enter) {
+            _ = applyTextMutation(action, client: typoTextView)
+        }
+        try expect(
+            typoTextView.string == "日本" && typoTextView.markedRange().length == 0,
+            "committing correction guidance should insert only the corrected surface"
+        )
+
         let transformEngine = try RustEngine(dataDirectory: testDirectory)
         for scalar in "nihongo".unicodeScalars {
             _ = try transformEngine.process(.character(scalar))

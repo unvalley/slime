@@ -271,6 +271,7 @@ final class SlimeController: IMKInputController {
             case "show_candidates":
                 showCandidates(
                     action.candidates ?? [],
+                    details: action.candidateDetails,
                     selected: action.selected ?? 0,
                     client: inputClient
                 )
@@ -358,21 +359,38 @@ final class SlimeController: IMKInputController {
 
     private func showCandidates(
         _ candidates: [String],
+        details: [RustEngine.CandidateDetail]?,
         selected: Int,
         client inputClient: any IMKTextInput & NSObjectProtocol
     ) {
-        guard !candidates.isEmpty else {
+        let items = candidatePanelItems(candidates: candidates, details: details)
+        guard !items.isEmpty else {
             hideCandidates()
             return
         }
 
-        candidateValues = candidates
+        candidateValues = items.map(\.value)
         selectedCandidateIndex = selected
         candidatePanel.show(
-            candidates: candidates,
+            candidates: items,
             selected: selected,
             anchor: candidateAnchorRect(client: inputClient)
         )
+    }
+
+    private func candidatePanelItems(
+        candidates: [String],
+        details: [RustEngine.CandidateDetail]?
+    ) -> [CandidatePanelItem] {
+        guard let details, details.count == candidates.count else {
+            return candidates.map { CandidatePanelItem(value: $0, annotation: nil) }
+        }
+        return details.map { detail in
+            CandidatePanelItem(
+                value: detail.value,
+                annotation: candidateAnnotationText(detail)
+            )
+        }
     }
 
     private func hideCandidates() {

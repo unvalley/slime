@@ -1,5 +1,17 @@
 import AppKit
 
+struct CandidatePanelItem: Equatable {
+    let value: String
+    let annotation: String?
+}
+
+func candidateAnnotationText(_ detail: RustEngine.CandidateDetail) -> String? {
+    guard detail.annotation == UInt32(SLIME_CANDIDATE_ANNOTATION_CORRECTION.rawValue) else {
+        return nil
+    }
+    return detail.detail.map { "\($0)に訂正" } ?? "訂正"
+}
+
 func candidatePanelFrame(
     anchor: NSRect,
     preferredWidth: CGFloat,
@@ -56,7 +68,7 @@ final class CandidatePanel {
         panel.contentView = candidateView
     }
 
-    func show(candidates: [String], selected: Int, anchor: NSRect) {
+    func show(candidates: [CandidatePanelItem], selected: Int, anchor: NSRect) {
         candidateView.update(candidates: candidates, selected: selected)
 
         if panel.isVisible {
@@ -89,7 +101,7 @@ private final class CandidateListView: NSView {
 
     private let rowHeight: CGFloat
     private let pageSize: Int
-    private var candidates: [String] = []
+    private var candidates: [CandidatePanelItem] = []
     private var selected = 0
     private var pageStart = 0
 
@@ -110,14 +122,24 @@ private final class CandidateListView: NSView {
     override var isFlipped: Bool { true }
 
     var preferredWidth: CGFloat {
-        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 15)]
+        let valueAttributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 15)]
+        let annotationAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10),
+        ]
         let textWidth = candidates
-            .map { ($0 as NSString).size(withAttributes: attributes).width }
+            .map { candidate in
+                let valueWidth = (candidate.value as NSString)
+                    .size(withAttributes: valueAttributes).width
+                let annotationWidth = candidate.annotation.map {
+                    ($0 as NSString).size(withAttributes: annotationAttributes).width + 12
+                } ?? 0
+                return valueWidth + annotationWidth
+            }
             .max() ?? 0
         return max(112, ceil(textWidth) + 54)
     }
 
-    func update(candidates: [String], selected: Int) {
+    func update(candidates: [CandidatePanelItem], selected: Int) {
         self.candidates = candidates
         self.selected = candidates.indices.contains(selected) ? selected : 0
         pageStart = (self.selected / pageSize) * pageSize
@@ -146,17 +168,42 @@ private final class CandidateListView: NSView {
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
                 .foregroundColor: isSelected ? NSColor.white : NSColor.secondaryLabelColor,
             ]
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byTruncatingTail
             let candidateAttributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 15),
                 .foregroundColor: isSelected ? NSColor.white : NSColor.labelColor,
+                .paragraphStyle: paragraph,
+            ]
+            let annotationAttributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: isSelected
+                    ? NSColor.white.withAlphaComponent(0.82)
+                    : NSColor.secondaryLabelColor,
             ]
 
             String(visibleRow + 1).draw(
                 at: NSPoint(x: 10, y: rowRect.minY + 6),
                 withAttributes: numberAttributes
             )
-            candidates[index].draw(
-                at: NSPoint(x: 30, y: rowRect.minY + 3),
+            var valueMaxX = rowRect.maxX - 8
+            if let annotation = candidates[index].annotation {
+                let annotationSize = (annotation as NSString)
+                    .size(withAttributes: annotationAttributes)
+                let annotationX = rowRect.maxX - annotationSize.width - 8
+                annotation.draw(
+                    at: NSPoint(x: annotationX, y: rowRect.minY + 7),
+                    withAttributes: annotationAttributes
+                )
+                valueMaxX = annotationX - 8
+            }
+            candidates[index].value.draw(
+                in: NSRect(
+                    x: 30,
+                    y: rowRect.minY + 3,
+                    width: max(0, valueMaxX - 30),
+                    height: rowRect.height
+                ),
                 withAttributes: candidateAttributes
             )
         }

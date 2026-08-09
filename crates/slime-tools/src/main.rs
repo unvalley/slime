@@ -67,7 +67,13 @@ fn run() -> Result<(), String> {
         println!("ranking parameter sweep:");
         for report in &reports {
             let parameter = report.discriminative_weight.map_or_else(
-                || format!("lambda={:.2}", report.lambda.unwrap_or(0.0)),
+                || {
+                    format!(
+                        "lambda={:.2} min_margin={:.2}",
+                        report.lambda.unwrap_or(0.0),
+                        report.neural_min_margin.unwrap_or(0.0)
+                    )
+                },
                 |weight| format!("discriminative_weight={weight:.3}"),
             );
             println!(
@@ -193,6 +199,7 @@ struct Options {
     neural_max_cost_gap: Option<i32>,
     neural_max_candidates: Option<usize>,
     lambdas: Vec<f64>,
+    neural_min_margins: Vec<f64>,
     discriminative_train: Option<PathBuf>,
     discriminative_teacher_model: Option<PathBuf>,
     discriminative_teacher_lambda: f64,
@@ -234,6 +241,7 @@ impl Options {
             neural_max_cost_gap: None,
             neural_max_candidates: None,
             lambdas: Vec::new(),
+            neural_min_margins: Vec::new(),
             discriminative_train: None,
             discriminative_teacher_model: None,
             discriminative_teacher_lambda: 0.8,
@@ -313,6 +321,10 @@ impl Options {
                     options.neural_max_candidates = Some(maximum);
                 }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
+                "--neural-min-margin" => options.neural_min_margins.push(parse_non_negative_f64(
+                    "--neural-min-margin",
+                    arguments.next(),
+                )?),
                 "--discriminative-train" => {
                     let value = arguments
                         .next()
@@ -403,10 +415,12 @@ impl Options {
         if options.uses_corpus_ranker() && options.word_bigram_corpora.is_empty() {
             return Err("n-gram weights require --word-bigram-corpus".to_owned());
         }
-        if (options.neural_max_cost_gap.is_some() || options.neural_max_candidates.is_some())
+        if (options.neural_max_cost_gap.is_some()
+            || options.neural_max_candidates.is_some()
+            || !options.neural_min_margins.is_empty())
             && options.neural_model.is_none()
         {
-            return Err("neural limits require --neural-model".to_owned());
+            return Err("neural limits and margins require --neural-model".to_owned());
         }
         if options.neural_model.is_some() && options.discriminative_train.is_some() {
             return Err(
@@ -436,6 +450,9 @@ impl Options {
             options.lambdas.push(0.95);
             options.lambdas.sort_by(f64::total_cmp);
         }
+        if options.neural_min_margins.is_empty() {
+            options.neural_min_margins.push(0.0);
+        }
         if options.discriminative_weights.is_empty() {
             options.discriminative_weights = vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
         }
@@ -464,7 +481,7 @@ fn usage() -> String {
      [--search-k N] \
      [--context all|none|present] [--limit N] [--failures N] [--json] \
      [--neural-model model.gguf] [--neural-max-cost-gap N] \
-     [--neural-max-candidates N] [--lambda X]... \
+     [--neural-max-candidates N] [--lambda X]... [--neural-min-margin X]... \
      [--export-nbest path] \
      [--discriminative-train items.json] [--discriminative-train-limit N] \
      [--discriminative-teacher-model model.gguf] [--discriminative-teacher-lambda X] \
@@ -478,8 +495,10 @@ fn usage() -> String {
      building with --features neural). --neural-max-cost-gap skips neural \
      scoring when the base top-two cost gap exceeds N. --neural-max-candidates \
      restricts neural reordering to the first N lattice candidates while \
-     preserving the remaining base order. --lambda selects \
-     interpolation weights; without it a default sweep runs. The discriminative \
+     preserving the remaining base order. --lambda selects interpolation \
+     weights; without it a default sweep runs. --neural-min-margin accepts a \
+     new top candidate only when its interpolated score exceeds the base top by \
+     at least X; it is repeatable and defaults to zero. The discriminative \
      options train an evaluation-only hashed averaged perceptron on a disjoint \
      AJIMEE-format training file. The optional annotated corpus \
      uses whitespace-separated surface/reading tokens and only affects offline \
@@ -609,6 +628,17 @@ fn parse_lambda(value: Option<String>) -> Result<f64, String> {
     Ok(parsed)
 }
 
+fn parse_non_negative_f64(name: &str, value: Option<String>) -> Result<f64, String> {
+    let parsed: f64 = value
+        .ok_or_else(|| format!("{name} requires a value"))?
+        .parse()
+        .map_err(|_| format!("{name} requires a non-negative number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{name} requires a finite non-negative number"));
+    }
+    Ok(parsed)
+}
+
 fn parse_positive(name: &str, value: Option<String>) -> Result<usize, String> {
     let parsed = parse_usize(name, value)?;
     if parsed == 0 {
@@ -653,6 +683,8 @@ struct EvaluationReport {
     neural_skipped_items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lambda: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_min_margin: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     discriminative: Option<DiscriminativeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -848,7 +880,6 @@ fn evaluate(
                 compute_report(
                     &outcomes,
                     None,
-                    None,
                     Some(&discriminative),
                     Some(weight),
                     options,
@@ -861,7 +892,6 @@ fn evaluate(
     let Some(model_path) = &options.neural_model else {
         return Ok(vec![compute_report(
             &outcomes,
-            None,
             None,
             None,
             None,
@@ -885,21 +915,25 @@ fn evaluate(
             options.neural_max_cost_gap,
             options.neural_max_candidates,
         )?;
-        Ok(options
-            .lambdas
-            .iter()
-            .map(|&lambda| {
-                compute_report(
+        let mut reports =
+            Vec::with_capacity(options.lambdas.len() * options.neural_min_margins.len());
+        for &lambda in &options.lambdas {
+            for &margin in &options.neural_min_margins {
+                reports.push(compute_report(
                     &outcomes,
-                    Some(&neural),
-                    Some(lambda),
+                    Some(NeuralReportConfig {
+                        outcome: &neural,
+                        lambda,
+                        min_margin: margin,
+                    }),
                     None,
                     None,
                     options,
                     word_bigram_diagnostics,
-                )
-            })
-            .collect())
+                ));
+            }
+        }
+        Ok(reports)
     }
 }
 
@@ -1138,7 +1172,7 @@ fn discriminative_teacher_expected(
             .enumerate()
             .map(|(index, outcome)| {
                 let surface =
-                    rescored_surfaces(&outcome.candidates, &neural.logliks[index], lambda)
+                    rescored_surfaces(&outcome.candidates, &neural.logliks[index], lambda, 0.0)
                         .into_iter()
                         .next()
                         .unwrap_or_default();
@@ -1152,6 +1186,13 @@ struct NeuralOutcome {
     logliks: Vec<Vec<f64>>,
     latencies: Vec<Duration>,
     scored_items: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NeuralReportConfig<'a> {
+    outcome: &'a NeuralOutcome,
+    lambda: f64,
+    min_margin: f64,
 }
 
 #[cfg(feature = "neural")]
@@ -1221,7 +1262,12 @@ fn should_score_neurally(candidates: &[Candidate], max_cost_gap: Option<i32>) ->
 /// Reorders candidate surfaces by interpolating the lattice cost with the
 /// neural log-likelihood: `(1-lambda) * (-cost/scale) + lambda * loglik`.
 /// The stable sort keeps the lattice order for ties.
-fn rescored_surfaces(candidates: &[Candidate], logliks: &[f64], lambda: f64) -> Vec<String> {
+fn rescored_surfaces(
+    candidates: &[Candidate],
+    logliks: &[f64],
+    lambda: f64,
+    min_margin: f64,
+) -> Vec<String> {
     let scored_candidates = candidates.len().min(logliks.len());
     let mut indexed: Vec<usize> = (0..scored_candidates).collect();
     let combined: Vec<f64> = candidates
@@ -1233,6 +1279,15 @@ fn rescored_surfaces(candidates: &[Candidate], logliks: &[f64], lambda: f64) -> 
         })
         .collect();
     indexed.sort_by(|&a, &b| combined[b].total_cmp(&combined[a]));
+    if indexed
+        .first()
+        .is_some_and(|&top| top != 0 && combined[top] - combined[0] < min_margin)
+    {
+        return candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+    }
     indexed.extend(scored_candidates..candidates.len());
     indexed
         .into_iter()
@@ -1243,8 +1298,7 @@ fn rescored_surfaces(candidates: &[Candidate], logliks: &[f64], lambda: f64) -> 
 #[allow(clippy::too_many_lines)]
 fn compute_report(
     outcomes: &[ItemOutcome<'_>],
-    neural: Option<&NeuralOutcome>,
-    lambda: Option<f64>,
+    neural: Option<NeuralReportConfig<'_>>,
     discriminative: Option<&DiscriminativeOutcome>,
     discriminative_weight: Option<f32>,
     options: &Options,
@@ -1260,12 +1314,14 @@ fn compute_report(
 
     for (outcome_index, outcome) in outcomes.iter().enumerate() {
         let item = outcome.item;
-        let candidates: Vec<String> = match (neural, lambda, discriminative, discriminative_weight)
-        {
-            (Some(neural), Some(lambda), None, None) => {
-                rescored_surfaces(&outcome.candidates, &neural.logliks[outcome_index], lambda)
-            }
-            (None, None, Some(discriminative), Some(weight)) => discriminative::rescored_surfaces(
+        let candidates: Vec<String> = match (neural, discriminative, discriminative_weight) {
+            (Some(neural), None, None) => rescored_surfaces(
+                &outcome.candidates,
+                &neural.outcome.logliks[outcome_index],
+                neural.lambda,
+                neural.min_margin,
+            ),
+            (None, Some(discriminative), Some(weight)) => discriminative::rescored_surfaces(
                 &outcome.candidates,
                 &discriminative.scores[outcome_index],
                 weight,
@@ -1278,7 +1334,7 @@ fn compute_report(
         };
         let mut latency = outcome.latency;
         if let Some(neural) = neural {
-            latency += neural.latencies[outcome_index];
+            latency += neural.outcome.latencies[outcome_index];
         }
         if let Some(discriminative) = discriminative {
             latency += discriminative.latencies[outcome_index];
@@ -1341,7 +1397,7 @@ fn compute_report(
         dataset_sha256: options.dataset_sha256.clone(),
         context_filter: options.context,
         context_used_by_engine: built_in_document_context
-            || neural.is_some_and(|neural| neural.scored_items > 0)
+            || neural.is_some_and(|neural| neural.outcome.scored_items > 0)
             || discriminative.is_some()
             || word_bigram_diagnostics
                 .and_then(|diagnostics| diagnostics.context)
@@ -1352,9 +1408,10 @@ fn compute_report(
             .map(|path| path.display().to_string()),
         neural_max_cost_gap: options.neural_max_cost_gap,
         neural_max_candidates: options.neural_max_candidates,
-        neural_scored_items: neural.map(|neural| neural.scored_items),
-        neural_skipped_items: neural.map(|neural| outcomes.len() - neural.scored_items),
-        lambda,
+        neural_scored_items: neural.map(|neural| neural.outcome.scored_items),
+        neural_skipped_items: neural.map(|neural| outcomes.len() - neural.outcome.scored_items),
+        lambda: neural.map(|neural| neural.lambda),
+        neural_min_margin: neural.map(|neural| neural.min_margin),
         discriminative: discriminative.map(DiscriminativeReport::new),
         discriminative_weight,
         word_bigram: word_bigram_report(word_bigram_diagnostics),
@@ -1416,6 +1473,9 @@ fn print_report(report: &EvaluationReport) {
     }
     if let Some(lambda) = report.lambda {
         println!("lambda: {lambda:.2}");
+    }
+    if let Some(margin) = report.neural_min_margin {
+        println!("neural minimum acceptance margin: {margin:.2}");
     }
     if let Some(discriminative) = &report.discriminative {
         print_discriminative_report(discriminative);
@@ -1667,6 +1727,8 @@ mod tests {
                 "750",
                 "--neural-max-candidates",
                 "5",
+                "--neural-min-margin",
+                "0.25",
                 "--export-nbest",
                 "nbest.json",
                 "--word-bigram-corpus",
@@ -1693,6 +1755,7 @@ mod tests {
         assert_eq!(options.dataset_revision.as_deref(), Some("revision"));
         assert_eq!(options.dataset_sha256.as_deref(), Some("digest"));
         assert_eq!(options.context, ContextFilter::None);
+        assert_eq!(options.neural_min_margins, [0.25]);
         assert_eq!(options.limit, Some(25));
         assert_eq!(options.failures, 0);
         assert!(options.json);
@@ -1755,11 +1818,35 @@ mod tests {
                 cost: 1_300,
             },
         ];
-        let surfaces = rescored_surfaces(&candidates, &[-10.0, -1.0], 0.8);
+        let surfaces = rescored_surfaces(&candidates, &[-10.0, -1.0], 0.8, 0.0);
         assert_eq!(surfaces, ["第二", "第一", "第三", "第四"]);
         assert_eq!(
-            rescored_surfaces(&candidates, &[], 0.8),
+            rescored_surfaces(&candidates, &[], 0.8, 0.0),
             ["第一", "第二", "第三", "第四"]
+        );
+    }
+
+    #[test]
+    fn neural_rescoring_requires_the_configured_top_candidate_margin() {
+        let candidates = vec![
+            Candidate {
+                surface: "第一".to_owned(),
+                cost: 1_000,
+            },
+            Candidate {
+                surface: "第二".to_owned(),
+                cost: 1_100,
+            },
+        ];
+        let logliks = [-2.0, -1.0];
+
+        assert_eq!(
+            rescored_surfaces(&candidates, &logliks, 0.8, 0.5),
+            ["第二", "第一"]
+        );
+        assert_eq!(
+            rescored_surfaces(&candidates, &logliks, 0.8, 1.0),
+            ["第一", "第二"]
         );
     }
 

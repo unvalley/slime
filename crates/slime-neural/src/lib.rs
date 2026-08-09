@@ -52,8 +52,10 @@ pub struct ScoredItem {
 }
 
 pub struct Rescorer {
-    backend: LlamaBackend,
     model: LlamaModel,
+    // The backend must outlive every model and context created from it. Rust
+    // drops fields in declaration order, so keep it after `model`.
+    backend: LlamaBackend,
     max_parallel_candidates: usize,
     kv_cells: u32,
 }
@@ -99,8 +101,8 @@ impl Rescorer {
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .map_err(|error| format!("failed to load model {}: {error}", model_path.display()))?;
         Ok(Self {
-            backend,
             model,
+            backend,
             max_parallel_candidates,
             kv_cells,
         })

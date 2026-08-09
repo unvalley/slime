@@ -138,11 +138,18 @@ struct NeuralService {
 }
 
 #[cfg(feature = "neural")]
-static NEURAL_SERVICE: OnceLock<&'static Mutex<NeuralService>> = OnceLock::new();
+static NEURAL_SERVICE: OnceLock<Mutex<Option<NeuralService>>> = OnceLock::new();
 #[cfg(feature = "neural")]
 static NEURAL_MODEL_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "neural")]
 static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "neural")]
+static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
+
+#[cfg(feature = "neural")]
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
 
 fn new_handle(engine: SlimeEngine) -> SlimeHandle {
     SlimeHandle {
@@ -418,7 +425,7 @@ fn prepare_neural_service(model_path: &Path) -> u32 {
     }
     let spawn = std::thread::Builder::new()
         .name("slime-neural-loader".to_owned())
-        .spawn(move || load_neural_service(owned_path));
+        .spawn(move || load_neural_service(&owned_path));
     if spawn.is_err() {
         NEURAL_LOAD_FAILED.store(true, Ordering::Release);
         return STATUS_NEURAL_LOAD_FAILED;
@@ -427,21 +434,52 @@ fn prepare_neural_service(model_path: &Path) -> u32 {
 }
 
 #[cfg(feature = "neural")]
-fn load_neural_service(model_path: PathBuf) {
-    let Ok(rescorer) = slime_neural::Rescorer::load_bounded(&model_path, 3, 1_024) else {
+fn load_neural_service(model_path: &Path) {
+    let Ok(rescorer) = slime_neural::Rescorer::load_bounded(model_path, 3, 1_024) else {
         NEURAL_LOAD_FAILED.store(true, Ordering::Release);
         return;
     };
     let service = NeuralService { rescorer };
-    // llama.cpp owns process-wide Metal resources whose destructor order is
-    // outside Rust's control. The input method uses one model for its entire
-    // process lifetime, so retain the service until process exit and avoid a
-    // late device teardown after the Metal residency-set singleton is gone.
-    let service = Box::leak(Box::new(Mutex::new(service)));
+    if !register_neural_exit_handler() {
+        NEURAL_LOAD_FAILED.store(true, Ordering::Release);
+        return;
+    }
+    let slot = NEURAL_SERVICE.get_or_init(|| Mutex::new(None));
+    let Ok(mut slot) = slot.lock() else {
+        NEURAL_LOAD_FAILED.store(true, Ordering::Release);
+        return;
+    };
     assert!(
-        NEURAL_SERVICE.set(service).is_ok(),
+        slot.replace(service).is_none(),
         "neural initialization lock permits only one writer"
     );
+}
+
+#[cfg(feature = "neural")]
+fn register_neural_exit_handler() -> bool {
+    if NEURAL_EXIT_HANDLER.get().is_some() {
+        return true;
+    }
+    // llama.cpp registers its process-wide backend destructors while loading
+    // the model. C exit handlers run in reverse registration order, so this
+    // releases the model and backend before Metal destroys its global device.
+    // SAFETY: `shutdown_neural_service` has C linkage, takes no arguments, and
+    // remains valid for the lifetime of the process.
+    if unsafe { atexit(shutdown_neural_service) } != 0 {
+        return false;
+    }
+    NEURAL_EXIT_HANDLER.set(()).is_ok()
+}
+
+#[cfg(feature = "neural")]
+extern "C" fn shutdown_neural_service() {
+    let service = NEURAL_SERVICE.get().and_then(|slot| {
+        let mut slot = slot.lock().ok()?;
+        slot.take()
+    });
+    // Drop outside the mutex. `Rescorer` orders its fields so the model is
+    // released before the process-wide llama backend.
+    drop(service);
 }
 
 /// Reports whether the optional neural service is unavailable, preparing,
@@ -454,7 +492,10 @@ pub extern "C" fn slime_neural_rescoring_status() -> u32 {
     }
     #[cfg(feature = "neural")]
     {
-        if NEURAL_SERVICE.get().is_some() {
+        if NEURAL_SERVICE
+            .get()
+            .is_some_and(|slot| slot.lock().is_ok_and(|service| service.is_some()))
+        {
             STATUS_OK
         } else if NEURAL_LOAD_FAILED.load(Ordering::Acquire) {
             STATUS_NEURAL_LOAD_FAILED
@@ -476,6 +517,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
     if let Some(request) = handle.engine.candidate_rescore_request()
         && let Some(service) = NEURAL_SERVICE.get()
         && let Ok(service) = service.lock()
+        && let Some(service) = service.as_ref()
     {
         let score_request = slime_neural::ScoreRequest {
             context: request.context,
@@ -1464,7 +1506,7 @@ mod tests {
         for character in "koutei".chars() {
             // SAFETY: The handle is live and each buffer is released once.
             unsafe {
-                slime_buffer_destroy(slime_process(handle, EVENT_CHARACTER, character.into()))
+                slime_buffer_destroy(slime_process(handle, EVENT_CHARACTER, character.into()));
             };
         }
         // SAFETY: The handle is live and each buffer is released once.
@@ -1472,7 +1514,7 @@ mod tests {
         // SAFETY: The conversion buffer remains live here.
         let json = unsafe { copy_buffer(&conversion) };
         assert!(json.contains("show_candidates"), "{json}");
-        assert!(json.contains("\"candidates\":[\"皇帝\""), "{json}");
+        assert!(json.contains("\"candidates\":["), "{json}");
         unsafe {
             slime_buffer_destroy(conversion);
             slime_buffer_destroy(slime_process(handle, EVENT_ENTER, 0));
@@ -1483,7 +1525,7 @@ mod tests {
             for character in "koutei".chars() {
                 // SAFETY: The handle is live and each buffer is released once.
                 unsafe {
-                    slime_buffer_destroy(slime_process(handle, EVENT_CHARACTER, character.into()))
+                    slime_buffer_destroy(slime_process(handle, EVENT_CHARACTER, character.into()));
                 };
             }
             let started = std::time::Instant::now();

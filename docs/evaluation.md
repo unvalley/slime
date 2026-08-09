@@ -442,6 +442,22 @@ zenz-v3.1-xsmall（lambda 0.8）の先頭候補をteacher labelとした10,000�
 
 固定devで+1.92pt出てもheld-outで反転し、後述のnews/blog外部devではさらに大きく悪化した。同じJWTD修正窓10,000件へのteacher蒸留をモデル拡大だけで続ける根拠はない。AJIMEEはこの設定の最終報告に一度使用済みなので、以後の調整には戻さない。
 
+### 2026-08-10 両側文脈cross-encoder student
+
+[azooKey/Zenzai v3](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/zenzai.md)は左文脈に加えて右文脈を独立したtagで扱う。bi-encoderで文脈と候補を別々に圧縮した際の情報損失を切り分けるため、`[CLS] 左文脈 [RIGHT] 右文脈 [INPUT] 読み [OUTPUT] 候補`を候補ごとにjoint encodeするcross-encoderを評価専用スクリプトへ追加した。RustのN-best exportも`right_context_text`を保持する。フィールドがない既存exportは空文字として読み込むため、従来artifactとの互換性は維持する。
+
+JWTD train先頭10,000件とGSD train 1,940件を5回反復した19,700件（正解候補reachable 16,317件）を学習側に使用した。固定devはJWTD 400件とGSD dev 331件の合計731件。hidden 128、2層、4 head、793,217 parameterを3 epoch学習し、既存Viterbi scoreへのweight 0.5を比較した。
+
+| dataset | baseline acc@1 / MRR@10 | cross-encoder acc@1 / MRR@10 | 6文字以上だけ適用 | 判断 |
+| --- | ---: | ---: | ---: | --- |
+| JWTD dev (400) | 0.2950 / 0.4314 | **0.3625 / 0.4784** | **0.3625 / 0.4784** | 長文domainでは改善 |
+| GSD dev (331) | **0.8550 / 0.9044** | 0.8278 / 0.8905 | **0.8550 / 0.9044** | 全面適用は回帰 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5350 / 0.6282 | 0.5300 / 0.6257 | 長さgateはtop-1不変 |
+
+10候補の単体latencyはApple GPUでp50 2.36–4.97 ms、p95 2.85–9.65 msの範囲、重みは3,175,763 bytes（FP32、FP16概算1.59 MB）だった。6文字以上のgateなら短いGSDを構造的に変更せずJWTDの改善を残せるが、この境界はAJIMEEで複数値を見た後に選んでいる。AJIMEEをheld-outと呼び直すことはできないため、独立した新規held-outを得るまで製品採用はNo-Goとし、モデルや学習データはbundleしない。
+
+学習スクリプトは最終epochを無条件に保存せず、devのacc@1、MRR、より小さいweightの順で最良checkpointを保存する。既存の非空outputも上書きしない。JWTD/AJIMEEは[CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)、GSDは[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)のShareAlike条件を持つデータに由来する。いずれも商用利用自体は許すが、将来モデルを配布する場合は帰属・同一条件をアプリ本体とは分けて確認する。現時点のartifactは評価専用で、商用bundleには含めない。
+
 ## UD Japanese GSD 外部ドメイン評価
 
 [UD Japanese GSD](https://universaldependencies.org/treebanks/ja_gsd/index.html) r2.18（commit `33e7310b58308e85fd2b33a2fc3ef3e434f821c7`）を、CC BY-SA 4.0の評価専用キャッシュとして追加した。Wikipedia修正履歴ではなくnews/blogを原文とし、手動由来の短単位語境界、UniDic品詞、表層発音を持つ。製品bundleには含めない。

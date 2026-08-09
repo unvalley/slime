@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Train an evaluation-only compact N-best candidate scorer with MLX.
+"""Train an evaluation-only N-best candidate scorer with MLX.
 
-The student never generates text. It scores only candidates supplied by the
-Rust converter from local context, reading, and candidate surface. Training
-data and model artifacts stay under target/evaluation and are not bundled.
+The bi-encoder shares an encoder between the local context/reading prefix and
+candidate surfaces. The cross-encoder jointly encodes both document sides,
+reading, and one candidate. Neither architecture generates text: both score
+only candidates supplied by the Rust converter. Training data and model
+artifacts stay under target/evaluation and are not bundled.
 """
 
 from __future__ import annotations
@@ -27,9 +29,10 @@ PAD = "<pad>"
 UNK = "<unk>"
 CLS = "<cls>"
 CONTEXT = "<context>"
+RIGHT = "<right>"
 INPUT = "<input>"
 OUTPUT = "<output>"
-SPECIAL_TOKENS = [PAD, UNK, CLS, CONTEXT, INPUT, OUTPUT]
+SPECIAL_TOKENS = [PAD, UNK, CLS, CONTEXT, RIGHT, INPUT, OUTPUT]
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dev", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--load", type=Path)
+    parser.add_argument("--architecture", choices=("bi", "cross"), default="bi")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--dimensions", type=int, default=256)
@@ -49,9 +53,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-vocabulary", type=int, default=8192)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=20260803)
+    parser.add_argument("--minimum-input-characters", type=int, default=0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dev-limit", type=int)
     return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    positive = {
+        "epochs": args.epochs,
+        "batch size": args.batch_size,
+        "dimensions": args.dimensions,
+        "layers": args.layers,
+        "heads": args.heads,
+        "MLP dimensions": args.mlp_dimensions,
+        "maximum prefix length": args.max_prefix_length,
+        "maximum candidate length": args.max_candidate_length,
+        "maximum vocabulary": args.max_vocabulary,
+        "learning rate": args.learning_rate,
+    }
+    for name, value in positive.items():
+        if value <= 0:
+            raise SystemExit(f"{name} must be positive")
+    if args.minimum_input_characters < 0:
+        raise SystemExit("minimum input characters must be non-negative")
+    for name, value in (("limit", args.limit), ("development limit", args.dev_limit)):
+        if value is not None and value <= 0:
+            raise SystemExit(f"{name} must be positive")
+    if args.max_vocabulary < len(SPECIAL_TOKENS):
+        raise SystemExit(
+            f"maximum vocabulary must be at least {len(SPECIAL_TOKENS)}"
+        )
+    if args.max_prefix_length < 7:
+        raise SystemExit("maximum prefix length must be at least 7")
+    if args.max_candidate_length < 3:
+        raise SystemExit("maximum candidate length must be at least 3")
+    if args.dimensions % args.heads != 0:
+        raise SystemExit("dimensions must be divisible by heads")
+    if args.load is not None and (args.train is not None or args.output is not None):
+        raise SystemExit("evaluation with --load cannot also train or write an output")
+    if args.load is None and (args.train is None or args.output is None):
+        raise SystemExit("training requires --train and --output; evaluation requires --load")
 
 
 def load_export(path: Path) -> dict:
@@ -66,6 +108,7 @@ def build_vocabulary(items: list[dict], maximum: int) -> tuple[dict[str, int], l
     counts: collections.Counter[str] = collections.Counter()
     for item in items:
         counts.update(item["context_text"])
+        counts.update(item.get("right_context_text", ""))
         counts.update(item["input"])
         for candidate in item["candidates"]:
             counts.update(candidate["surface"])
@@ -83,18 +126,67 @@ def pad(tokens: list[str], token_ids: dict[str, int], maximum: int) -> list[int]
 
 def encode_prefix(item: dict, token_ids: dict[str, int], maximum: int) -> list[int]:
     context = list(item["context_text"][-40:])
+    has_right_marker = RIGHT in token_ids
+    right_context = (
+        list(item.get("right_context_text", "")[:40]) if has_right_marker else []
+    )
     reading = list(item["input"])
-    fixed = 3 + len(reading)
-    if fixed + len(context) > maximum:
-        context = context[-max(0, maximum - fixed) :]
+    fixed = 3 + len(reading) + int(has_right_marker)
+    while fixed + len(context) + len(right_context) > maximum:
+        if len(context) >= len(right_context) and context:
+            context.pop(0)
+        elif right_context:
+            right_context.pop()
+        else:
+            break
     if fixed > maximum:
-        reading = reading[: maximum - 3]
+        marker_count = 4 if has_right_marker else 3
+        reading = reading[: max(0, maximum - marker_count)]
         context = []
-    return pad([CLS, CONTEXT, *context, INPUT, *reading], token_ids, maximum)
+        right_context = []
+    right = [RIGHT, *right_context] if has_right_marker else []
+    return pad(
+        [CLS, CONTEXT, *context, *right, INPUT, *reading], token_ids, maximum
+    )
 
 
 def encode_candidate(surface: str, token_ids: dict[str, int], maximum: int) -> list[int]:
     return pad([CLS, OUTPUT, *surface], token_ids, maximum)
+
+
+def encode_cross(
+    item: dict, surface: str, token_ids: dict[str, int], maximum: int
+) -> list[int]:
+    context = list(item["context_text"][-40:])
+    right_context = list(item.get("right_context_text", "")[:40])
+    reading = list(item["input"])
+    candidate = list(surface)
+    fixed = 5 + len(reading) + len(candidate)
+    while fixed + len(context) + len(right_context) > maximum:
+        if len(context) >= len(right_context) and context:
+            context.pop(0)
+        elif right_context:
+            right_context.pop()
+        else:
+            break
+    if fixed > maximum:
+        reading = reading[: max(0, maximum - 5)]
+        candidate = candidate[: max(0, maximum - 5 - len(reading))]
+    return pad(
+        [
+            CLS,
+            CONTEXT,
+            *context,
+            RIGHT,
+            *right_context,
+            INPUT,
+            *reading,
+            OUTPUT,
+            *candidate,
+        ],
+        token_ids,
+        maximum,
+    )
 
 
 class PreparedItem:
@@ -104,12 +196,20 @@ class PreparedItem:
         token_ids: dict[str, int],
         max_prefix_length: int,
         max_candidate_length: int,
+        architecture: str,
     ):
+        self.input_characters = item.get("input_characters", len(item["input"]))
         self.prefix = encode_prefix(item, token_ids, max_prefix_length)
-        self.sequences = [
-            encode_candidate(candidate["surface"], token_ids, max_candidate_length)
-            for candidate in item["candidates"]
-        ]
+        if architecture == "cross":
+            self.sequences = [
+                encode_cross(item, candidate["surface"], token_ids, max_prefix_length)
+                for candidate in item["candidates"]
+            ]
+        else:
+            self.sequences = [
+                encode_candidate(candidate["surface"], token_ids, max_candidate_length)
+                for candidate in item["candidates"]
+            ]
         self.base_scores = [-candidate["cost"] / 500.0 for candidate in item["candidates"]]
         self.label = item["label_index"]
 
@@ -119,9 +219,16 @@ def prepare(
     token_ids: dict[str, int],
     max_prefix_length: int,
     max_candidate_length: int,
+    architecture: str,
 ) -> list[PreparedItem]:
     return [
-        PreparedItem(item, token_ids, max_prefix_length, max_candidate_length)
+        PreparedItem(
+            item,
+            token_ids,
+            max_prefix_length,
+            max_candidate_length,
+            architecture,
+        )
         for item in items
     ]
 
@@ -204,8 +311,43 @@ class CandidateScorer(nn.Module):
         return self.match(features).squeeze(-1)
 
 
+class CrossCandidateScorer(nn.Module):
+    def __init__(
+        self,
+        vocabulary_size: int,
+        dimensions: int,
+        layers: int,
+        heads: int,
+        mlp_dimensions: int,
+        max_length: int,
+    ):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocabulary_size, dimensions)
+        self.position_embedding = nn.Embedding(max_length, dimensions)
+        self.encoder = nn.TransformerEncoder(
+            layers,
+            dimensions,
+            heads,
+            mlp_dims=mlp_dimensions,
+            dropout=0.0,
+            norm_first=True,
+        )
+        self.score = nn.Linear(dimensions, 1)
+
+    def __call__(self, prefixes: mx.array, candidates: mx.array) -> mx.array:
+        del prefixes
+        batch, candidate_count, length = candidates.shape
+        tokens = candidates.reshape(batch * candidate_count, length)
+        positions = mx.arange(length)
+        hidden = self.token_embedding(tokens) + self.position_embedding(positions)
+        key_mask = tokens != 0
+        attention_mask = mx.where(key_mask[:, None, None, :], 0.0, -1e9)
+        encoded = self.encoder(hidden, attention_mask)
+        return self.score(encoded[:, 0, :]).reshape(batch, candidate_count)
+
+
 def loss_fn(
-    model: CandidateScorer,
+    model: nn.Module,
     prefixes: mx.array,
     candidates: mx.array,
     base_scores: mx.array,
@@ -227,7 +369,7 @@ def batches(count: int, batch_size: int, order: list[int]):
 
 
 def score_items(
-    model: CandidateScorer,
+    model: nn.Module,
     items: list[PreparedItem],
     batch_size: int,
     max_candidate_length: int,
@@ -251,7 +393,10 @@ def score_items(
 
 
 def evaluate(
-    items: list[PreparedItem], model_scores: list[list[float]], base_scores: list[list[float]]
+    items: list[PreparedItem],
+    model_scores: list[list[float]],
+    base_scores: list[list[float]],
+    minimum_input_characters: int,
 ) -> list[dict]:
     reports = []
     for weight in [0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]:
@@ -259,8 +404,13 @@ def evaluate(
         oracle = 0
         reciprocal_rank = 0.0
         for item, student, base in zip(items, model_scores, base_scores):
+            effective_weight = (
+                weight if item.input_characters >= minimum_input_characters else 0.0
+            )
             ranking = sorted(
-                range(len(student)), key=lambda index: base[index] + weight * student[index], reverse=True
+                range(len(student)),
+                key=lambda index: base[index] + effective_weight * student[index],
+                reverse=True,
             )
             if item.label is not None:
                 oracle += 1
@@ -278,7 +428,18 @@ def evaluate(
     return reports
 
 
-def benchmark(model: CandidateScorer, item: PreparedItem, max_candidate_length: int) -> dict:
+def best_weight_report(reports: list[dict]) -> dict:
+    return max(
+        reports,
+        key=lambda report: (
+            report["accuracy_at_1"],
+            report["mrr_at_k"],
+            -report["weight"],
+        ),
+    )
+
+
+def benchmark(model: nn.Module, item: PreparedItem, max_candidate_length: int) -> dict:
     prefixes, candidates, _, _, _ = make_batch([item], [0], max_candidate_length)
     for _ in range(10):
         result = model(prefixes, candidates)
@@ -301,10 +462,13 @@ def benchmark(model: CandidateScorer, item: PreparedItem, max_candidate_length: 
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
     randomizer = random.Random(args.seed)
     mx.random.seed(args.seed)
     dev_export = load_export(args.dev)
     dev_items = dev_export["items"][: args.dev_limit]
+    if not dev_items:
+        raise SystemExit("development export has no items")
 
     if args.load is not None:
         with (args.load / "config.json").open(encoding="utf-8") as handle:
@@ -312,13 +476,16 @@ def main() -> None:
         with (args.load / "vocabulary.json").open(encoding="utf-8") as handle:
             vocabulary = json.load(handle)
         token_ids = {token: index for index, token in enumerate(vocabulary)}
+        architecture = config.get("architecture", "bi")
         dev = prepare(
             dev_items,
             token_ids,
             config["max_prefix_length"],
             config["max_candidate_length"],
+            architecture,
         )
-        model = CandidateScorer(
+        model_type = CrossCandidateScorer if architecture == "cross" else CandidateScorer
+        model = model_type(
             len(vocabulary),
             config["dimensions"],
             config["layers"],
@@ -328,14 +495,24 @@ def main() -> None:
         )
         model.load_weights(str(args.load / "model.safetensors"))
         mx.eval(model.parameters())
+        sequence_length = (
+            config["max_prefix_length"]
+            if architecture == "cross"
+            else config["max_candidate_length"]
+        )
         model_scores, base_scores = score_items(
-            model, dev, max(args.batch_size, 16), config["max_candidate_length"]
+            model, dev, max(args.batch_size, 16), sequence_length
         )
         print(
             json.dumps(
                 {
-                    "dev": evaluate(dev, model_scores, base_scores),
-                    "latency": benchmark(model, dev[0], config["max_candidate_length"]),
+                    "dev": evaluate(
+                        dev,
+                        model_scores,
+                        base_scores,
+                        args.minimum_input_characters,
+                    ),
+                    "latency": benchmark(model, dev[0], sequence_length),
                     "parameters": parameter_count(model),
                     "weights_bytes": (args.load / "model.safetensors").stat().st_size,
                 },
@@ -345,18 +522,36 @@ def main() -> None:
         )
         return
 
-    if args.train is None or args.output is None:
-        raise SystemExit("training requires --train and --output; evaluation requires --load")
+    assert args.train is not None
+    assert args.output is not None
     train_export = load_export(args.train)
     train_items = train_export["items"][: args.limit]
     token_ids, vocabulary = build_vocabulary(train_items, args.max_vocabulary)
     train = prepare(
-        train_items, token_ids, args.max_prefix_length, args.max_candidate_length
+        train_items,
+        token_ids,
+        args.max_prefix_length,
+        args.max_candidate_length,
+        args.architecture,
     )
-    dev = prepare(dev_items, token_ids, args.max_prefix_length, args.max_candidate_length)
+    dev = prepare(
+        dev_items,
+        token_ids,
+        args.max_prefix_length,
+        args.max_candidate_length,
+        args.architecture,
+    )
     train = [item for item in train if item.label is not None]
+    if not train:
+        raise SystemExit("training export has no reachable labels")
+    if args.output.exists() and (
+        not args.output.is_dir() or any(args.output.iterdir())
+    ):
+        raise SystemExit(f"output directory is not empty: {args.output}")
+    args.output.mkdir(parents=True, exist_ok=True)
 
-    model = CandidateScorer(
+    model_type = CrossCandidateScorer if args.architecture == "cross" else CandidateScorer
+    model = model_type(
         len(vocabulary),
         args.dimensions,
         args.layers,
@@ -384,13 +579,21 @@ def main() -> None:
     )
 
     order = list(range(len(train)))
+    sequence_length = (
+        args.max_prefix_length
+        if args.architecture == "cross"
+        else args.max_candidate_length
+    )
+    best_key: tuple[float, float, float] | None = None
+    best_epoch = 0
+    best_report: dict | None = None
     for epoch in range(args.epochs):
         model.train()
         randomizer.shuffle(order)
         losses = []
         started = time.perf_counter()
         for step, indices in enumerate(batches(len(train), args.batch_size, order), 1):
-            batch = make_batch(train, indices, args.max_candidate_length)
+            batch = make_batch(train, indices, sequence_length)
             loss, gradients = loss_and_grad(model, *batch)
             optimizer.update(model, gradients)
             mx.eval(model.parameters(), optimizer.state, loss)
@@ -407,9 +610,25 @@ def main() -> None:
                     flush=True,
                 )
         model_scores, base_scores = score_items(
-            model, dev, max(args.batch_size, 16), args.max_candidate_length
+            model, dev, max(args.batch_size, 16), sequence_length
         )
-        reports = evaluate(dev, model_scores, base_scores)
+        reports = evaluate(
+            dev,
+            model_scores,
+            base_scores,
+            args.minimum_input_characters,
+        )
+        selected = best_weight_report(reports)
+        selected_key = (
+            selected["accuracy_at_1"],
+            selected["mrr_at_k"],
+            -selected["weight"],
+        )
+        if best_key is None or selected_key > best_key:
+            best_key = selected_key
+            best_epoch = epoch + 1
+            best_report = selected
+            model.save_weights(str(args.output / "model.safetensors"))
         print(
             json.dumps(
                 {
@@ -423,20 +642,38 @@ def main() -> None:
             flush=True,
         )
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    model.save_weights(str(args.output / "model.safetensors"))
+    assert best_report is not None
+    model.load_weights(str(args.output / "model.safetensors"))
+    mx.eval(model.parameters())
     with (args.output / "vocabulary.json").open("w", encoding="utf-8") as handle:
         json.dump(vocabulary, handle, ensure_ascii=False)
     with (args.output / "config.json").open("w", encoding="utf-8") as handle:
-        json.dump(vars(args) | {"parameters": parameters}, handle, ensure_ascii=False, default=str)
+        json.dump(
+            vars(args)
+            | {
+                "parameters": parameters,
+                "best_epoch": best_epoch,
+                "best_weight": best_report["weight"],
+            },
+            handle,
+            ensure_ascii=False,
+            default=str,
+        )
     model_scores, base_scores = score_items(
-        model, dev, max(args.batch_size, 16), args.max_candidate_length
+        model, dev, max(args.batch_size, 16), sequence_length
     )
     final_report = {
-        "dev": evaluate(dev, model_scores, base_scores),
-        "latency": benchmark(model, dev[0], args.max_candidate_length),
+        "dev": evaluate(
+            dev,
+            model_scores,
+            base_scores,
+            args.minimum_input_characters,
+        ),
+        "latency": benchmark(model, dev[0], sequence_length),
         "parameters": parameters,
         "weights_bytes": (args.output / "model.safetensors").stat().st_size,
+        "best_epoch": best_epoch,
+        "best_weight": best_report["weight"],
     }
     print(json.dumps(final_report, ensure_ascii=False), flush=True)
 

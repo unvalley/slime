@@ -16,12 +16,7 @@ fn main() {
     run("converter/segmented_phrase", iterations, || {
         black_box(dictionary.convert_best(black_box("わたしはにほん")));
     });
-    run("converter/n_best_search", iterations, || {
-        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(10)));
-    });
-    run("converter/n_best_search_20", iterations, || {
-        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(20)));
-    });
+    run_n_best_benchmarks(&dictionary, iterations);
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
     });
@@ -106,6 +101,24 @@ fn main() {
     });
     run("converter/short_dictionary_layer", iterations, || {
         black_box(short_dictionary_layer());
+    });
+}
+
+fn run_n_best_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run("converter/n_best_search", iterations, || {
+        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(10)));
+    });
+    run("converter/n_best_search_20", iterations, || {
+        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(20)));
+    });
+    run("converter/n_best_search_32", iterations, || {
+        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(32)));
+    });
+    run("converter/n_best_long_10", iterations, || {
+        black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(10)));
+    });
+    run("converter/n_best_long_32", iterations, || {
+        black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(32)));
     });
 }
 

@@ -1829,6 +1829,7 @@ struct NBestNode<'a> {
 #[derive(Debug, Default)]
 struct NBestBucket {
     states: Vec<usize>,
+    worst_position: usize,
     worst_total_cost: Option<i32>,
 }
 
@@ -2038,7 +2039,6 @@ fn insert_n_best_node<'a>(
 
     let mut same_state_count = 0;
     let mut worst_same_state = None;
-    let mut worst_global = None;
     for (position, &existing_index) in bucket.states.iter().enumerate() {
         let existing = &arena[existing_index];
         if existing.right_id == candidate.right_id
@@ -2063,34 +2063,34 @@ fn insert_n_best_node<'a>(
                 worst_same_state = Some((position, existing.total_cost));
             }
         }
-        if worst_global.is_none_or(|(_, cost)| existing.total_cost >= cost) {
-            worst_global = Some((position, existing.total_cost));
-        }
     }
 
     if same_state_count < limit_per_state {
         if bucket.states.len() >= beam_size {
-            let Some((worst_position, worst_cost)) = worst_global else {
+            let Some(worst_cost) = bucket.worst_total_cost else {
                 return;
             };
             if candidate.total_cost >= worst_cost {
                 return;
             }
-            let worst_index = bucket.states[worst_position];
+            let worst_index = bucket.states[bucket.worst_position];
             arena[worst_index] = candidate;
             refresh_worst_n_best_cost(arena, bucket);
             return;
         }
 
         let index = arena.len();
+        let position = bucket.states.len();
         let total_cost = candidate.total_cost;
         arena.push(candidate);
         bucket.states.push(index);
-        bucket.worst_total_cost = Some(
-            bucket
-                .worst_total_cost
-                .map_or(total_cost, |worst_cost| worst_cost.max(total_cost)),
-        );
+        if bucket
+            .worst_total_cost
+            .is_none_or(|worst_cost| total_cost >= worst_cost)
+        {
+            bucket.worst_position = position;
+            bucket.worst_total_cost = Some(total_cost);
+        }
         return;
     }
 
@@ -2108,11 +2108,15 @@ fn insert_n_best_node<'a>(
 }
 
 fn refresh_worst_n_best_cost(arena: &[NBestNode<'_>], bucket: &mut NBestBucket) {
-    bucket.worst_total_cost = bucket
+    let worst = bucket
         .states
         .iter()
-        .map(|&index| arena[index].total_cost)
-        .max();
+        .enumerate()
+        .max_by_key(|&(position, &index)| (arena[index].total_cost, position));
+    if let Some((position, _)) = worst {
+        bucket.worst_position = position;
+    }
+    bucket.worst_total_cost = worst.map(|(_, &index)| arena[index].total_cost);
 }
 
 fn reconstruct_n_best_conversions(
@@ -2859,6 +2863,7 @@ mod tests {
         }
 
         assert_eq!(bucket.states.len(), 8);
+        assert_eq!(bucket.worst_position, 7);
         assert_eq!(bucket.worst_total_cost, Some(80));
         insert_n_best_node(
             &mut arena,
@@ -2891,6 +2896,7 @@ mod tests {
             },
             1,
         );
+        assert_eq!(bucket.worst_position, 6);
         assert_eq!(bucket.worst_total_cost, Some(70));
 
         insert_n_best_node(
@@ -2908,6 +2914,7 @@ mod tests {
             1,
         );
         assert_eq!(bucket.states.len(), 8);
+        assert_eq!(bucket.worst_position, 6);
         assert_eq!(bucket.worst_total_cost, Some(60));
     }
 

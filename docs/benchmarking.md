@@ -15,6 +15,8 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 | `converter/segmented_phrase` | `わたしはにほん`のラティス探索 | 20 ms未満 |
 | `converter/n_best_phrase` | `わたしはにほん`の上位10候補を有限ビームで探索 | 20 ms未満 |
 | `converter/n_best_search_20` | 同じ入力で内部探索幅だけ20へ広げた比較用ケース | 評価用。上位10件との差分を記録 |
+| `converter/n_best_search_32` | 同じ入力で内部探索幅を32へ広げた比較用ケース | 評価用。oracle@32との性能差を記録 |
+| `converter/n_best_long_{10,32}` | 長文で探索幅10/32の増幅率を比較 | 評価用。幅32を製品経路へ入れる前に測定 |
 | `converter/digit_counter_phrase` | 全角数字列と年・月・日の数詞接続を含む候補窓 | 20 ms未満 |
 | `engine/nihon_conversion` | engine生成から入力、変換、確定まで | 参考値。cold startを分離予定 |
 | `engine/history_completion_{off,on}_500_entries` | 500件の履歴を保持した長寿命engineで`pafu`を入力・確定 | ON/OFFの絶対差を5 ms未満に保つ |
@@ -26,6 +28,10 @@ micro benchmarkは、変更前後で同じhot pathを比較するために使う
 2026-08-01、Apple M3、release、1,000 iterationsで、全角数字と年・月・日を含む`converter/digit_counter_phrase`は489,084 ns/opだった。allocation benchmarkは419 allocations/op、101,387 bytes/op。数詞node追加後も20 ms予算の十分内側にある。
 
 同日、語bigramの再ランキング対象を広げる判断のため`わたしはにほん`を探索幅10/20で比較した。幅10は1,366,503 ns/op、172 allocations/op、59,605 bytes/op、幅20は4,756,460 ns/op、300 allocations/op、152,305 bytes/opだった。状態identityを`HashMap`で索引する試作は幅20を4,592,558 ns/opへ3.4%短縮しただけで、幅10を1,794,526 ns/opへ悪化させ、割当も増えたため撤回した。広い探索を常用する前に、線形scanを置き換える低割当なbucket/heap設計が必要である。
+
+2026-08-09、N-best bucketの全体最悪costだけでなく位置も保持し、候補挿入ごとの全体最悪state探索を省いた。Apple M3、release、旧新を交互に6組実行したペア比の中央値では、`わたしはにほん`の幅10が6.0%、幅20が5.0%、幅32が6.1%、長文の幅32が5.6%短縮した。高い外部CPU負荷による外れ値があったため、異なる時刻の絶対値ではなく同一組の比を採用した。
+
+割当回数は幅10/20/32で172/300/508、長文幅10/32で1,053/4,492のまま不変だった。最悪位置の保持で割当byte数は幅32が307,160→307,336 bytes/op、長文幅32が2,290,069→2,291,205 bytes/opとそれぞれ0.06%/0.05%増えた。JWTD-train dev 100件を`search-k=32`で旧新exportし、計測時間を除いた候補表層・順序・costのSHA-256一致を確認した。探索結果を変えない高速化として採用するが、この約6%だけでは長文の無条件幅32を製品経路へ入れられない。
 
 ## 初回baseline
 

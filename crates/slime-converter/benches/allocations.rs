@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use slime_converter::{Dictionary, DictionaryEntry, DictionaryLayer};
 
+const LONG_CANDIDATE_READING: &str = "きょうはあさからあめがふっていたのでえきまであるいていきひるすぎにしごとをおえていえにもどった";
+
 struct CountingAllocator;
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
@@ -67,6 +69,15 @@ fn main() {
     });
     run("converter/n_best_search_20", iterations, || {
         black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(20)));
+    });
+    run("converter/n_best_search_32", iterations, || {
+        black_box(dictionary.convert_n_best(black_box("わたしはにほん"), black_box(32)));
+    });
+    run("converter/n_best_long_10", iterations, || {
+        black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(10)));
+    });
+    run("converter/n_best_long_32", iterations, || {
+        black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(32)));
     });
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));

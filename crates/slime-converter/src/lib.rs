@@ -3315,6 +3315,22 @@ mod tests {
     }
 
     #[test]
+    fn document_context_reuses_a_repeated_tail_segment_in_a_long_conversion() {
+        let dictionary = Dictionary::bundled();
+        let reading = "、そしてしょきがいんようする";
+
+        assert_eq!(
+            dictionary.candidates_with_context(reading, "漢城陥落は『三国史記』と『日本書紀』")[0]
+                .surface,
+            "、そして書紀が引用する"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context(reading, "無関係な文脈")[0].surface,
+            "、そして初期が引用する"
+        );
+    }
+
+    #[test]
     fn document_context_promotes_a_dictionary_backed_phrase_continuation() {
         let dictionary = Dictionary::bundled();
 

@@ -50,6 +50,7 @@ const EXTENDED_LONG_RESCORE_N_BEST: usize = 16;
 const EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT: usize = 16;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
+const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2001,11 +2002,19 @@ fn candidate_rescore_state_with_limit(
         return None;
     }
     let base_cost = dictionary_candidates.first()?.cost;
+    // Multi-segment paths accumulate a wider base-cost spread than short
+    // homophones. Let the ready local model inspect that bounded tail without
+    // weakening the conservative window used by short readings.
+    let max_candidate_cost_gap = if reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS {
+        LONG_RESCORE_MAX_CANDIDATE_COST_GAP
+    } else {
+        RESCORE_MAX_CANDIDATE_COST_GAP
+    };
     let candidates: Vec<_> = dictionary_candidates
         .iter()
         .take(candidate_limit)
         .take_while(|candidate| {
-            candidate.cost.saturating_sub(base_cost).max(0) <= RESCORE_MAX_CANDIDATE_COST_GAP
+            candidate.cost.saturating_sub(base_cost).max(0) <= max_candidate_cost_gap
         })
         .cloned()
         .collect();
@@ -3958,6 +3967,39 @@ mod tests {
             (0..super::LONG_RESCORE_CANDIDATE_LIMIT)
                 .map(|index| format!("長文候補{index}"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn external_scoring_widens_the_cost_window_only_for_long_readings() {
+        let entries_for = |reading: &str| {
+            [
+                DictionaryEntry::new(reading, "第一候補", 1_000),
+                DictionaryEntry::new(reading, "第二候補", 1_100),
+                DictionaryEntry::new(reading, "深い候補", 3_000),
+            ]
+        };
+
+        let mut short = SlimeEngine::new(Dictionary::new(Vec::from(entries_for("しょうぶん"))));
+        type_text(&mut short, "shoubun");
+        short.handle(InputEvent::Space);
+        assert_eq!(
+            short
+                .candidate_rescore_request()
+                .expect("short ambiguous reading should be scoreable")
+                .candidates,
+            ["第一候補", "第二候補"]
+        );
+
+        let long_reading = "ちょうぶんしょうに";
+        let mut long = SlimeEngine::new(Dictionary::new(Vec::from(entries_for(long_reading))));
+        type_text(&mut long, "choubunshouni");
+        long.handle(InputEvent::Space);
+        assert_eq!(
+            long.candidate_rescore_request()
+                .expect("long ambiguous reading should be scoreable")
+                .candidates,
+            ["第一候補", "第二候補", "深い候補"]
         );
     }
 

@@ -62,6 +62,21 @@ scripts/evaluate-ajimee.sh --top-k 10 --context all
 
 固定8候補では短いGSD testが1件悪化したが、9文字境界では短文を従来の5候補に保つため回避できた。AJIMEE 200件の3回交互測定では、5/8候補の中央値がp50 9.44 ms / p95 24.93 ms / p99 38.35 ms、5/16候補がp50 11.41 ms / p95 38.72 ms / p99 50.22 msだった。長文だけtail latencyを許容して+1.5ptを採り、KVセル数1024のメモリ上限は変更しない。
 
+### 2026-08-09 長い読みのニューラルcost窓
+
+[ATOK 2026の公式説明](https://www.atok.com/features/)は、助詞が省かれる口語や、確定済みの語に続いて助詞から細切れ入力する場合の変換を強化している。[azooKeyの通常変換](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も、辞書costと接続costからN-bestを探索したうえで後段の評価へ渡す。Slimeでは短い同音語の安全境界を変えず、9文字以上の読みだけ、ニューラル採点候補の先頭からのcost差を1,500から2,500へ広げた。探索幅16、短文5候補、長文16候補、base上位2件のcost差1,000、lambda 0.7、EOS除外scoreは変更しない。
+
+cost窓はJWTD devだけで1,500 / 2,000 / 2,500 / 3,000を比較し、top-1とMRRが最良だった2,500に固定した。2,500では`誌上で`、`仕えることに`、`神学院`、`エイトキン`、`神託事件`、`行われていた`など7件を修正し、`たかじん → た歌人`を1件悪化させ、差し引き6件改善した。単一dev例を消す表記別filterは追加せず、別domainのheld-out非回帰を採用条件にした。
+
+| dataset | cost差1,500 acc@1 / MRR | 長文のみ2,500 acc@1 / MRR | MinCER@1 | 平均採点候補 | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JWTD dev (400) | 0.4400 / 0.5372 | **0.4550 / 0.5574** | 0.0697 → **0.0688** | 6.97 → 10.30 | 29.70 → 30.26 ms |
+| GSD dev (331) | 0.8852 / 0.9259 | 0.8852 / 0.9259 | 0.1052（不変） | 3.51（不変） | 5.73 → 5.81 ms |
+| AJIMEE held-out (200) | 0.7300 / 0.7761 | 0.7300 / **0.7804** | 0.0376 → **0.0368** | 7.16 → 9.72 | 40.39 → 40.74 ms |
+| GSD test held-out (323) | 0.8824 / 0.9221 | 0.8824 / 0.9221 | 0.0908（不変） | 3.57（不変） | 5.77 → 5.52 ms |
+
+AJIMEEはtop-1を維持しながら正解候補の平均順位とMinCERが改善し、GSD testは候補数を含めて不変だった。モデル未使用・準備中・失敗時は従来どおり追加探索も順位変更も行わない。ATOKの口語例`大丈夫、自信持てって`はxsmallモデルではまだ正解しないため、今回の改善済み例には数えず、商用再配布可能な意味rankerの次期評価対象として残す。
+
 ### 2026-08-09 編集位置の右文脈
 
 [ATOKの公式説明](https://atok.com/info/features/engine.html)は、直前の確定語を機械的に優先するのではなく、日本語として自然な文章を優先する方針を示す。[azooKey/Zenz v3のprompt実装](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzPromptBuilder.swift)は、左文脈とは別の`U+EE07`タグでカーソル後方の右文脈を最大40文字渡す。Slimeも文章途中の編集時だけ、macOS/Windowsアダプターがカーソル両側の文書を取得し、ローカルモデルへ左末尾40文字・右先頭40文字を渡す。文書内容は保存せず、private modeでは両側とも破棄する。通常の文末入力では右文脈が空なので従来promptと順位を変えない。

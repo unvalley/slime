@@ -121,16 +121,23 @@ GSD devでは1件改善・悪化0、GSD train、GSD test、AJIMEE、JWTDは候�
 
 GSD train・dev・testで各1件改善・悪化0、AJIMEE held-outとJWTD devは候補順を含めて不変だった。通常入力、ライブ変換、private modeには右文脈が渡らないため影響しない。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 長い読みの意味候補を深く採点
+
+[ATOK 2026](https://www.atok.com/features/)は、`逸材入った`のような助詞省略を含む口語と、確定した`経験`に続けて`のうむ`と細切れ入力した場合の`の有無`を強化している。Slimeは後者と旧公式例`アルプス` + `のやま → の山`を既存の文書境界変換で既に再現できたため、回帰testとして固定した。一方、前者の意味選択は接続行列だけでは解けず、ローカルニューラルrankerの担当になる。
+
+9文字以上の読みでは、モデル準備完了後に限り、ニューラル採点へ渡す候補のcost窓を1,500から2,500へ広げる。短い読み、モデルなし、モデル準備中、ロード・採点失敗、履歴・ユーザー辞書・入力ミス訂正候補は従来境界のままとする。JWTD devは6件純改善、AJIMEE held-outはtop-1不変でMRR/MinCER改善、GSD dev/testは候補数を含め不変だった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 組織名・地名recallの監査結果
 
 [ATOKの固有名詞優先](https://atok.com/other/support/howtouse/mac/tr/pgs/tr_conv_name.htm)に対応する追加探索を検討したが、Mozcの組織・地域POS 14万2,957 entryから均等抽出した約4,900件はすべて初回10候補に入った。GSDの未回収地名も大半が語彙不在または読み差で、beam追加では直らない。初回候補を汚す専用順位変更は行わず、今後はライセンスを確認できる語彙だけをoptional packで評価する。
 
 ## 次の実装順
 
-1. 組織名・地名は、辞書にない語だけをライセンス・頻度付きoptional packとして評価し、初回top-1を変えない改善だけを採用する。
-2. 入力ミス訂正と学習強度の実利用false positiveを固定データへ追加する。
-3. macOSを再インストールし、TextEditで逐次入力、候補操作、再変換、private/secure inputを確認する。
-4. Windowsは署名以外の実機動作をVMで先に閉じ、配布可能という表現は署名・install/update/uninstall完了まで使わない。
+1. 複数domainで意味的同音語を改善でき、商用再配布条件が明確なローカルrankerを学習・評価する。現行zenzモデルは任意指定に留め、Slime製品へ同梱しない。
+2. 組織名・地名は、辞書にない語だけをライセンス・頻度付きoptional packとして評価し、初回top-1を変えない改善だけを採用する。
+3. 入力ミス訂正と学習強度の実利用false positiveを固定データへ追加する。
+4. macOSを再インストールし、TextEditで逐次入力、候補操作、再変換、private/secure inputを確認する。
+5. Windowsは署名以外の実機動作をVMで先に閉じ、配布可能という表現は署名・install/update/uninstall完了まで使わない。
 
 ## 公式資料
 

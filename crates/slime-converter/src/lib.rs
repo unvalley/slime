@@ -4252,6 +4252,17 @@ mod tests {
     }
 
     #[test]
+    fn document_context_keeps_a_particle_led_fragment_attached() {
+        let dictionary = Dictionary::bundled();
+        let candidates = dictionary.candidates_with_context("のうむ", "経験");
+
+        assert_eq!(candidates[0].surface, "の有無", "{candidates:?}");
+
+        let candidates = dictionary.candidates_with_context("のやま", "アルプス");
+        assert_eq!(candidates[0].surface, "の山", "{candidates:?}");
+    }
+
+    #[test]
     fn surrounding_context_promotes_dictionary_compounds_to_the_right() {
         let dictionary = Dictionary::bundled();
 

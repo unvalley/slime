@@ -241,6 +241,7 @@ struct Options {
     neural_long_input_min_characters: Option<usize>,
     neural_long_input_max_candidates: Option<usize>,
     neural_max_candidate_cost_gap: Option<i32>,
+    neural_long_input_max_candidate_cost_gap: Option<i32>,
     lambdas: Vec<f64>,
     neural_min_margins: Vec<f64>,
     neural_score_modes: Vec<NeuralScoreMode>,
@@ -287,6 +288,7 @@ impl Options {
             neural_long_input_min_characters: None,
             neural_long_input_max_candidates: None,
             neural_max_candidate_cost_gap: None,
+            neural_long_input_max_candidate_cost_gap: None,
             lambdas: Vec::new(),
             neural_min_margins: Vec::new(),
             neural_score_modes: Vec::new(),
@@ -389,6 +391,13 @@ impl Options {
                         "--neural-max-candidate-cost-gap",
                         arguments.next(),
                     )?);
+                }
+                "--neural-long-input-max-candidate-cost-gap" => {
+                    options.neural_long_input_max_candidate_cost_gap =
+                        Some(parse_non_negative_i32(
+                            "--neural-long-input-max-candidate-cost-gap",
+                            arguments.next(),
+                        )?);
                 }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
                 "--neural-min-margin" => options.neural_min_margins.push(parse_non_negative_f64(
@@ -506,6 +515,15 @@ impl Options {
         {
             return Err("long-input neural limits require --neural-max-candidates".to_owned());
         }
+        if options.neural_long_input_max_candidate_cost_gap.is_some()
+            && (options.neural_long_input_min_characters.is_none()
+                || options.neural_max_candidate_cost_gap.is_none())
+        {
+            return Err(
+                "long-input neural candidate cost gap requires both --neural-long-input-min-characters and --neural-max-candidate-cost-gap"
+                    .to_owned(),
+            );
+        }
         if let (Some(short), Some(long)) = (
             options.neural_max_candidates,
             options.neural_long_input_max_candidates,
@@ -521,6 +539,7 @@ impl Options {
             || options.neural_long_input_min_characters.is_some()
             || options.neural_long_input_max_candidates.is_some()
             || options.neural_max_candidate_cost_gap.is_some()
+            || options.neural_long_input_max_candidate_cost_gap.is_some()
             || !options.neural_min_margins.is_empty()
             || !options.neural_score_modes.is_empty())
             && options.neural_model.is_none()
@@ -592,6 +611,7 @@ fn usage() -> String {
      [--neural-max-candidates N] [--neural-max-candidate-cost-gap N] \
      [--neural-long-input-min-characters N] \
      [--neural-long-input-max-candidates N] \
+     [--neural-long-input-max-candidate-cost-gap N] \
      [--lambda X]... [--neural-min-margin X]... \
      [--neural-score-mode with-eos|without-eos|mean-with-eos|mean-without-eos]... \
      [--export-nbest path] \
@@ -611,7 +631,8 @@ fn usage() -> String {
      that limit once the input reaches the configured character count. \
      --neural-max-candidate-cost-gap \
      further restricts that prefix to candidates no more than N cost units \
-     above the base winner. --lambda selects interpolation \
+     above the base winner. The corresponding long-input option replaces that \
+     cost gap at the same character boundary. --lambda selects interpolation \
      weights; without it a default sweep runs. --neural-min-margin accepts a \
      new top candidate only when its interpolated score exceeds the base top by \
      at least X; it is repeatable and defaults to zero. --neural-score-mode \
@@ -806,6 +827,8 @@ struct EvaluationReport {
     neural_long_input_max_candidates: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_max_candidate_cost_gap: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_long_input_max_candidate_cost_gap: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_scored_items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1052,6 +1075,7 @@ fn evaluate(
             options.neural_long_input_min_characters,
             options.neural_long_input_max_candidates,
             options.neural_max_candidate_cost_gap,
+            options.neural_long_input_max_candidate_cost_gap,
         )?;
         let mut reports = Vec::with_capacity(
             options.lambdas.len()
@@ -1313,7 +1337,8 @@ fn discriminative_teacher_expected(
             model_path.display()
         );
         let rescorer = neural::Rescorer::load(model_path)?;
-        let neural = score_neural_outcomes(&rescorer, outcomes, None, None, None, None, None)?;
+        let neural =
+            score_neural_outcomes(&rescorer, outcomes, None, None, None, None, None, None)?;
         Ok(outcomes
             .iter()
             .enumerate()
@@ -1367,6 +1392,7 @@ fn score_neural_outcomes(
     long_input_min_characters: Option<usize>,
     long_input_max_candidates: Option<usize>,
     max_candidate_cost_gap: Option<i32>,
+    long_input_max_candidate_cost_gap: Option<i32>,
 ) -> Result<NeuralOutcome, String> {
     let candidate_counts: Vec<_> = outcomes
         .iter()
@@ -1380,7 +1406,12 @@ fn score_neural_outcomes(
                         long_input_min_characters,
                         long_input_max_candidates,
                     ),
-                    max_candidate_cost_gap,
+                    neural_candidate_cost_gap(
+                        &outcome.item.input,
+                        max_candidate_cost_gap,
+                        long_input_min_characters,
+                        long_input_max_candidate_cost_gap,
+                    ),
                 )
             } else {
                 0
@@ -1462,6 +1493,19 @@ fn neural_candidate_limit(
     match (long_input_min_characters, long_input_max_candidates) {
         (Some(minimum), Some(maximum)) if input.chars().count() >= minimum => Some(maximum),
         _ => max_candidates,
+    }
+}
+
+#[cfg(any(feature = "neural", test))]
+fn neural_candidate_cost_gap(
+    input: &str,
+    max_candidate_cost_gap: Option<i32>,
+    long_input_min_characters: Option<usize>,
+    long_input_max_candidate_cost_gap: Option<i32>,
+) -> Option<i32> {
+    match (long_input_min_characters, long_input_max_candidate_cost_gap) {
+        (Some(minimum), Some(maximum)) if input.chars().count() >= minimum => Some(maximum),
+        _ => max_candidate_cost_gap,
     }
 }
 
@@ -1669,6 +1713,7 @@ fn compute_report(
         neural_long_input_min_characters: options.neural_long_input_min_characters,
         neural_long_input_max_candidates: options.neural_long_input_max_candidates,
         neural_max_candidate_cost_gap: options.neural_max_candidate_cost_gap,
+        neural_long_input_max_candidate_cost_gap: options.neural_long_input_max_candidate_cost_gap,
         neural_scored_items: neural.map(|neural| neural.outcome.scored_items),
         neural_skipped_items: neural.map(|neural| outcomes.len() - neural.outcome.scored_items),
         neural_scored_candidates: neural.map(|neural| neural.outcome.scored_candidates),
@@ -1734,6 +1779,12 @@ fn print_neural_report(report: &EvaluationReport) {
     }
     if let Some(maximum) = report.neural_max_candidate_cost_gap {
         println!("neural max candidate cost gap: {maximum}");
+    }
+    if let (Some(minimum), Some(maximum)) = (
+        report.neural_long_input_min_characters,
+        report.neural_long_input_max_candidate_cost_gap,
+    ) {
+        println!("neural long-input max candidate cost gap: {maximum} from {minimum} characters");
     }
     if let Some(scored) = report.neural_scored_items {
         println!("neural scored items: {scored}");
@@ -1959,8 +2010,9 @@ mod tests {
     use super::{
         ContextFilter, DatasetFormat, NeuralScoreMode, Options, base_cost_gap,
         character_error_rate, katakana_to_hiragana, load_annotated_items, mean_logliks,
-        neural_candidate_limit, neural_candidate_prefix_len, normalize_for_evaluation,
-        parse_anthy_line, percentile, rescored_surfaces, should_score_neurally,
+        neural_candidate_cost_gap, neural_candidate_limit, neural_candidate_prefix_len,
+        normalize_for_evaluation, parse_anthy_line, percentile, rescored_surfaces,
+        should_score_neurally,
     };
     use slime_converter::Candidate;
     use std::fs;
@@ -2029,6 +2081,8 @@ mod tests {
                 "8",
                 "--neural-max-candidate-cost-gap",
                 "900",
+                "--neural-long-input-max-candidate-cost-gap",
+                "2500",
                 "--neural-min-margin",
                 "0.25",
                 "--neural-score-mode",
@@ -2069,6 +2123,10 @@ mod tests {
         assert_eq!(options.neural_long_input_min_characters, Some(9));
         assert_eq!(options.neural_long_input_max_candidates, Some(8));
         assert_eq!(options.neural_max_candidate_cost_gap, Some(900));
+        assert_eq!(
+            options.neural_long_input_max_candidate_cost_gap,
+            Some(2_500)
+        );
         assert_eq!(
             options.export_nbest,
             Some(std::path::PathBuf::from("nbest.json"))
@@ -2134,6 +2192,18 @@ mod tests {
         assert_eq!(
             neural_candidate_prefix_len(&candidates, Some(4), Some(249)),
             1
+        );
+    }
+
+    #[test]
+    fn neural_candidate_cost_gap_expands_only_for_long_inputs() {
+        assert_eq!(
+            neural_candidate_cost_gap("ショウブン", Some(1_500), Some(9), Some(2_500)),
+            Some(1_500)
+        );
+        assert_eq!(
+            neural_candidate_cost_gap("チョウブンショウニ", Some(1_500), Some(9), Some(2_500)),
+            Some(2_500)
         );
     }
 

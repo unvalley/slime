@@ -147,7 +147,7 @@ static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "neural")]
 const NEURAL_CANDIDATE_WEIGHT: f64 = 0.7;
 #[cfg(feature = "neural")]
-const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 5;
+const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 8;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
 
@@ -1513,6 +1513,34 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(slime_neural_rescoring_status(), STATUS_OK);
+        let eight_candidate_latency = {
+            let service = super::NEURAL_SERVICE
+                .get()
+                .expect("neural service should be initialized")
+                .lock()
+                .expect("neural service lock should not be poisoned");
+            let service = service.as_ref().expect("neural service should be loaded");
+            let request = slime_neural::ScoreRequest {
+                context: String::new(),
+                input_katakana: "チョウブンショウニ".to_owned(),
+                candidates: (0..super::NEURAL_MAX_PARALLEL_CANDIDATES)
+                    .map(|index| format!("長文候補{index}"))
+                    .collect(),
+            };
+            let scored = service
+                .rescorer
+                .score_all(&[request])
+                .expect("the product runtime bound should score the expanded pool");
+            assert_eq!(
+                scored[0].candidate_logliks.len(),
+                super::NEURAL_MAX_PARALLEL_CANDIDATES
+            );
+            scored[0].latency
+        };
+        eprintln!(
+            "ffi neural eight-candidate conversion: {:.3}ms",
+            eight_candidate_latency.as_secs_f64() * 1_000.0
+        );
         for character in "koutei".chars() {
             // SAFETY: The handle is live and each buffer is released once.
             unsafe {

@@ -37,6 +37,28 @@ scripts/evaluate-ajimee.sh --top-k 10 --context all
 
 `--context none`は左文脈なし100件、`--context present`は左文脈あり100件、`--context all`は全200件を評価する。現在の変換器は左文脈を順位付けに使わないため、レポートの`context_used_by_engine`は`false`になる。文脈モデルを導入した場合、この区分を維持して効果を比較する。
 
+### 2026-08-09 入力長に応じたニューラル候補幅
+
+製品のニューラル再順位付けは、8文字以下の短い読みを5候補、9文字以上の長い読みを8候補まで採点する。候補は従来どおり、先頭候補とのcost差1500以内に限定する。評価器では次の組み合わせで同じ境界を再現する。
+
+```sh
+--neural-max-candidates 5 \
+--neural-long-input-min-characters 9 \
+--neural-long-input-max-candidates 8 \
+--neural-max-candidate-cost-gap 1500
+```
+
+しきい値はJWTDとGSD devだけで決め、AJIMEEとGSD testは採否確認に一度だけ使用した。
+
+| dataset | 固定5候補 acc@1 | 適応5/8候補 acc@1 | 差 |
+| --- | ---: | ---: | ---: |
+| JWTD dev (400) | 0.4200 | 0.4325 | +5件 |
+| GSD dev (331) | 0.8640 | 0.8640 | 0件 |
+| AJIMEE held-out (200) | 0.6950 | 0.7150 | +4件 |
+| GSD test held-out (323) | 0.8700 | 0.8700 | 0件 |
+
+固定8候補では短いGSD testが1件悪化したが、9文字境界では短文を従来の5候補に保つため回避できた。製品ランタイムは最大並列候補数だけ8へ広げ、KVセル数1024のメモリ上限は変更しない。
+
 ### 2026-07-20 baseline
 
 N-bestを10件、ユーザー履歴なし、追加辞書なしで測定した。辞書の初期化時間はlatencyから除外している。

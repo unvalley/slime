@@ -41,7 +41,9 @@ const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
-const RESCORE_CANDIDATE_LIMIT: usize = 5;
+const SHORT_RESCORE_CANDIDATE_LIMIT: usize = 5;
+const LONG_RESCORE_CANDIDATE_LIMIT: usize = 8;
+const LONG_RESCORE_READING_CHARACTERS: usize = MAX_EXPANDED_READING_CHARACTERS + 1;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
@@ -1865,9 +1867,14 @@ fn candidate_rescore_state(
         return None;
     }
     let base_cost = dictionary_candidates.first()?.cost;
+    let candidate_limit = if reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS {
+        LONG_RESCORE_CANDIDATE_LIMIT
+    } else {
+        SHORT_RESCORE_CANDIDATE_LIMIT
+    };
     let candidates: Vec<_> = dictionary_candidates
         .iter()
-        .take(RESCORE_CANDIDATE_LIMIT)
+        .take(candidate_limit)
         .take_while(|candidate| {
             candidate.cost.saturating_sub(base_cost).max(0) <= RESCORE_MAX_CANDIDATE_COST_GAP
         })
@@ -3670,7 +3677,7 @@ mod tests {
     }
 
     #[test]
-    fn external_scoring_exposes_the_full_standard_candidate_pool() {
+    fn external_scoring_exposes_the_full_short_candidate_pool() {
         let entries = (0_i32..12)
             .map(|index| {
                 DictionaryEntry::new(
@@ -3687,7 +3694,10 @@ mod tests {
         let request = engine
             .candidate_rescore_request()
             .expect("ambiguous dictionary candidates should be scoreable");
-        assert_eq!(request.candidates.len(), super::RESCORE_CANDIDATE_LIMIT);
+        assert_eq!(
+            request.candidates.len(),
+            super::SHORT_RESCORE_CANDIDATE_LIMIT
+        );
         assert_eq!(
             request.candidates,
             (0..5)
@@ -3695,6 +3705,37 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!request.candidates.contains(&"コウホ".to_owned()));
+    }
+
+    #[test]
+    fn external_scoring_expands_the_candidate_pool_for_long_readings() {
+        let reading = "ちょうぶんしょうに";
+        assert_eq!(
+            reading.chars().count(),
+            super::LONG_RESCORE_READING_CHARACTERS
+        );
+        let entries = (0_i32..12)
+            .map(|index| {
+                DictionaryEntry::new(
+                    reading,
+                    format!("長文候補{index}"),
+                    1_000 + index.saturating_mul(10),
+                )
+            })
+            .collect();
+        let mut engine = SlimeEngine::new(Dictionary::new(entries));
+        type_text(&mut engine, "choubunshouni");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("long ambiguous readings should expose the expanded pool");
+        assert_eq!(
+            request.candidates,
+            (0..super::LONG_RESCORE_CANDIDATE_LIMIT)
+                .map(|index| format!("長文候補{index}"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

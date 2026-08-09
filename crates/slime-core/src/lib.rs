@@ -435,13 +435,14 @@ impl SlimeEngine {
         let reading = current.request.reading.clone();
         let context = current.request.context.clone();
         let right_context = current.request.right_context.clone();
-        let dictionary_candidates = if context.is_empty() {
+        let dictionary_candidates = if context.is_empty() && right_context.is_empty() {
             self.dictionary
                 .candidates_with_limit(&reading, EXTENDED_LONG_RESCORE_N_BEST)
         } else {
-            self.dictionary.candidates_with_context_limit(
+            self.dictionary.candidates_with_surrounding_context_limit(
                 &reading,
                 &context,
+                &right_context,
                 EXTENDED_LONG_RESCORE_N_BEST,
             )
         };
@@ -2201,7 +2202,7 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
-    use slime_converter::{Candidate, Dictionary, DictionaryEntry};
+    use slime_converter::{Candidate, Dictionary, DictionaryEntry, DictionaryLayer};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4025,6 +4026,39 @@ mod tests {
                 .candidates
                 .len(),
             super::EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT
+        );
+    }
+
+    #[test]
+    fn ready_external_scorer_keeps_right_context_in_the_deeper_pool() {
+        let reading = "あしたゆっくりのめ";
+        let dictionary = Dictionary::bundled_with_layers(vec![DictionaryLayer::new(
+            "right-context-regression",
+            "Right context regression",
+            vec![
+                DictionaryEntry::new(reading, "明日ゆっくりの目", -10_000),
+                DictionaryEntry::new(reading, "明日ゆっくり飲め", -9_700),
+            ],
+        )]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.set_external_context("", "ました。");
+        type_text(&mut engine, "ashitayukkurinome");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("long ambiguous reading should be scoreable")
+                .candidates[0],
+            "明日ゆっくり飲め"
+        );
+        engine.prepare_extended_candidate_rescore();
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("deeper request should retain right context")
+                .candidates[0],
+            "明日ゆっくり飲め"
         );
     }
 

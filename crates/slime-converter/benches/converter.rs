@@ -189,8 +189,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             );
         },
     );
-    run_unique_right_grammar_benchmark(dictionary, iterations);
-    run_unique_right_suru_benchmark(dictionary, iterations);
+    run_right_grammar_benchmarks(dictionary, iterations);
     run("converter/right_compound_candidates", iterations, || {
         black_box(dictionary.candidates_with_surrounding_context(
             black_box("まち"),
@@ -464,6 +463,33 @@ fn run_unique_right_grammar_benchmark(dictionary: &Dictionary, iterations: u64) 
             );
         },
     );
+}
+
+fn run_right_grammar_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run_unique_right_grammar_benchmark(dictionary, iterations);
+    run_right_function_word_benchmark(dictionary, iterations);
+    run_unique_right_suru_benchmark(dictionary, iterations);
+}
+
+fn run_right_function_word_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/right_function_word_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("とく"),
+                black_box("メルダーザへかけられた呪は、マリシーユにも"),
+                black_box("ことができなかった。"),
+            ));
+        },
+    );
+    run("converter/right_function_word_nonmatch", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("とく"),
+            black_box("メルダーザへかけられた呪は、マリシーユにも"),
+            black_box("しかありません。"),
+        ));
+    });
 }
 
 fn run_unique_right_suru_benchmark(dictionary: &Dictionary, iterations: u64) {

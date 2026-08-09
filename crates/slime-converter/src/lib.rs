@@ -139,9 +139,11 @@ struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
+    right_function_word_costs: Vec<DocumentContextualCost<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
     unique_right_grammar_surface: Option<&'a str>,
+    has_polite_right_context: bool,
     unique_right_suru_surface: Option<&'a str>,
     surrounding_notation_surface: Option<&'static str>,
     follows_region_name: bool,
@@ -186,12 +188,15 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 right_context,
                 allows_single_character_phrase_prefix,
             ),
+            right_function_word_costs: dictionary
+                .document_right_function_word_costs(reading, right_context),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
             right_auxiliary_costs: dictionary
                 .document_right_auxiliary_costs(reading, right_context),
             unique_right_grammar_surface: dictionary
                 .document_unique_right_grammar_surface(reading, right_context),
+            has_polite_right_context: starts_with_polite_auxiliary(right_context),
             unique_right_suru_surface: dictionary
                 .document_unique_right_suru_surface(reading, right_context),
             surrounding_notation_surface: surrounding_structured_notation_surface(
@@ -220,6 +225,34 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             self.allows_single_character_phrase_prefix,
         )
     }
+
+    fn right_function_word_promotion(&self, conversion: &Conversion) -> i32 {
+        self.right_function_word_costs
+            .iter()
+            .filter(|contextual| {
+                conversion.segments.len() == 1 && contextual.surface == conversion.surface
+            })
+            .map(|contextual| {
+                DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP
+                    .saturating_sub(contextual.relative_cost)
+                    .clamp(0, DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn unique_right_grammar_promotion(&self, conversion: &Conversion) -> i32 {
+        if conversion.segments.len() != 1
+            || self.unique_right_grammar_surface != Some(conversion.surface.as_str())
+        {
+            return 0;
+        }
+        if self.has_polite_right_context {
+            DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION
+        } else {
+            DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION
+        }
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -247,6 +280,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .map(|promotion| promotion.promotion)
             .max()
             .unwrap_or(0);
+        let right_function_word_promotion = self.right_function_word_promotion(conversion);
         let notation_promotion =
             if structured_notation_matches(left_context, reading, &conversion.surface)
                 || self.surrounding_notation_surface == Some(conversion.surface.as_str())
@@ -289,13 +323,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             })
             .max()
             .unwrap_or(0);
-        let unique_right_grammar_promotion = if conversion.segments.len() == 1
-            && self.unique_right_grammar_surface == Some(conversion.surface.as_str())
-        {
-            DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION
-        } else {
-            0
-        };
+        let unique_right_grammar_promotion = self.unique_right_grammar_promotion(conversion);
         let unique_right_suru_promotion = if conversion.segments.len() == 1
             && self.unique_right_suru_surface == Some(conversion.surface.as_str())
         {
@@ -328,7 +356,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         repeated_cost
             .saturating_add(boundary_adjustment)
             .saturating_sub(specialized_promotion)
-            .saturating_sub(right_phrase_promotion)
+            .saturating_sub(right_phrase_promotion.max(right_function_word_promotion))
             .saturating_sub(right_inflection_promotion)
             .saturating_sub(right_auxiliary_promotion)
             .saturating_sub(unique_right_grammar_promotion)
@@ -508,9 +536,11 @@ const DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
 const DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
-const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 500;
+const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 1_000;
 const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
+const DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP: i32 = 1_100;
 const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
+const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
 const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
 const DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN: i32 = 1_500;
 const DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN: i32 = 1_000;
@@ -520,11 +550,21 @@ const MOZC_NEGATIVE_AUXILIARY_POS_ID: u16 = 204;
 const MOZC_POLITE_AUXILIARY_POS_ID: u16 = 240;
 const MOZC_TE_CONNECTIVE_PARTICLE_POS_ID: u16 = 348;
 const MOZC_DE_CONNECTIVE_PARTICLE_POS_ID: u16 = 349;
+// Zero-cost grammar surfaces in the bundled Mozc dictionary. Keeping these
+// IDs static avoids a second dictionary lookup on the right-context hot path.
+const MOZC_NODE_CONNECTIVE_PARTICLE_POS_ID: u16 = 359;
+const MOZC_MONO_CASE_PARTICLE_POS_ID: u16 = 376;
 const MOZC_CAUSATIVE_SASERU_CONTINUATIVE_POS_ID: u16 = 482;
 const MOZC_CAUSATIVE_SERU_CONTINUATIVE_POS_ID: u16 = 484;
 const MOZC_PASSIVE_RARERU_CONTINUATIVE_POS_ID: u16 = 485;
 const MOZC_PASSIVE_RERU_CONTINUATIVE_POS_ID: u16 = 486;
-const MOZC_COUNTER_POS_ID: u16 = 2011;
+const MOZC_YOU_GENERAL_SUFFIX_NOUN_POS_ID: u16 = 1_950;
+const MOZC_COUNTER_POS_ID: u16 = 2_011;
+const MOZC_KOTO_NON_INDEPENDENT_NOUN_POS_ID: u16 = 2_066;
+const MOZC_TAME_NON_INDEPENDENT_NOUN_POS_ID: u16 = 2_076;
+const MOZC_MONO_NON_INDEPENDENT_NOUN_POS_ID: u16 = 2_090;
+const MOZC_TAME_ADVERBIAL_NOUN_POS_ID: u16 = 2_140;
+const MOZC_YOU_AUXILIARY_STEM_NOUN_POS_ID: u16 = 2_192;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
 const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
@@ -1759,6 +1799,58 @@ impl Dictionary {
         });
         // Candidate generation deduplicates equal surfaces, so retain every exact POS path here
         // and normalize the paths that can connect directly to the following auxiliary.
+        if let Some(minimum) = costs
+            .iter()
+            .map(|contextual| contextual.relative_cost)
+            .min()
+        {
+            for contextual in &mut costs {
+                contextual.relative_cost = contextual.relative_cost.saturating_sub(minimum);
+            }
+        }
+        costs
+    }
+
+    fn document_right_function_word_costs<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Vec<DocumentContextualCost<'s>> {
+        if !self.uses_connection_costs {
+            return Vec::new();
+        }
+        let Some(right_left_ids) = document_right_function_word_left_ids(right_context) else {
+            return Vec::new();
+        };
+
+        let connection = ConnectionMatrix::bundled();
+        let mut costs = Vec::<DocumentContextualCost<'s>>::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading
+                || !entry
+                    .surface
+                    .chars()
+                    .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+            {
+                return;
+            }
+            let transition_cost = right_left_ids
+                .iter()
+                .map(|left_id| connection.cost(entry.right_id, *left_id))
+                .min()
+                .unwrap_or(i32::MAX);
+            if let Some(contextual) = costs
+                .iter_mut()
+                .find(|contextual| contextual.surface == entry.surface)
+            {
+                contextual.relative_cost = contextual.relative_cost.min(transition_cost);
+            } else {
+                costs.push(DocumentContextualCost {
+                    surface: entry.surface,
+                    relative_cost: transition_cost,
+                });
+            }
+        });
         if let Some(minimum) = costs
             .iter()
             .map(|contextual| contextual.relative_cost)
@@ -3283,6 +3375,31 @@ fn starts_with_polite_auxiliary(right_context: &str) -> bool {
         .any(|prefix| right_context.starts_with(prefix))
 }
 
+fn document_right_function_word_left_ids(right_context: &str) -> Option<&'static [u16]> {
+    if right_context.starts_with("こと") {
+        return Some(&[MOZC_KOTO_NON_INDEPENDENT_NOUN_POS_ID]);
+    }
+    if right_context.starts_with("もの") {
+        return Some(&[
+            MOZC_MONO_CASE_PARTICLE_POS_ID,
+            MOZC_MONO_NON_INDEPENDENT_NOUN_POS_ID,
+        ]);
+    }
+    if right_context.starts_with("ため") {
+        return Some(&[
+            MOZC_TAME_NON_INDEPENDENT_NOUN_POS_ID,
+            MOZC_TAME_ADVERBIAL_NOUN_POS_ID,
+        ]);
+    }
+    if right_context.starts_with("ので") {
+        return Some(&[MOZC_NODE_CONNECTIVE_PARTICLE_POS_ID]);
+    }
+    right_context.starts_with("よう").then_some(&[
+        MOZC_YOU_GENERAL_SUFFIX_NOUN_POS_ID,
+        MOZC_YOU_AUXILIARY_STEM_NOUN_POS_ID,
+    ])
+}
+
 fn starts_with_suru_inflection(right_context: &str) -> bool {
     if right_context.starts_with("する") {
         return true;
@@ -4599,6 +4716,22 @@ mod tests {
         let candidates =
             dictionary.candidates_with_surrounding_context("のめ", "うまいコーヒーが", "ました。");
         assert_eq!(candidates[0].surface, "飲め", "{candidates:?}");
+        for (reading, left_context, right_context, expected) in [
+            (
+                "ちかい",
+                "問答があり文鮮明が読み上げる内容に応えて“",
+                "ます”と恩恵を受ける者は",
+                "誓い",
+            ),
+            ("あき", "二階の古美術品も見て", "ませんでした!", "飽き"),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
         assert_eq!(
             dictionary.candidates_with_surrounding_context("ぶ", "第三", "まで")[0].surface,
             dictionary.candidates_with_context("ぶ", "第三")[0].surface,
@@ -4617,6 +4750,58 @@ mod tests {
             "たい物が買えました。",
         );
         assert_eq!(candidates[0].surface, "買い", "{candidates:?}");
+    }
+
+    #[test]
+    fn surrounding_context_uses_pos_connections_before_function_words() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            (
+                "よる",
+                "泉谷小学校、泉谷中学校からすぐの学校帰りに",
+                "ことなども簡単です。",
+                "寄る",
+            ),
+            (
+                "とく",
+                "メルダーザへかけられた呪は、マリシーユにも",
+                "ことができなかった。",
+                "解く",
+            ),
+            (
+                "かよう",
+                "いろいろなお店に体験に行った結果、このお店へ",
+                "ことにしました。",
+                "通う",
+            ),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
+
+        let left_only = dictionary.candidates_with_context("おう", "責任は広告主が");
+        let with_function_word = dictionary.candidates_with_surrounding_context(
+            "おう",
+            "責任は広告主が",
+            "ものとします。",
+        );
+        let surface_position = |candidates: &[Candidate], surface: &str| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.surface == surface)
+                .expect("surface must remain visible")
+        };
+        assert_eq!(
+            surface_position(&left_only, "追う") < surface_position(&left_only, "負う"),
+            surface_position(&with_function_word, "追う")
+                < surface_position(&with_function_word, "負う"),
+            "the POS boundary may prefer verbs over nouns but must not reverse semantic peers"
+        );
     }
 
     #[test]

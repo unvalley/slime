@@ -280,6 +280,27 @@ AJIMEE・JWTD・PUDは候補表層、cost、順序まで全件完全一致した
 
 GSD trainでは`全身し → 前進し`、`即しない → 即死しない`、`大尉した → 退位した`の3件を修正した。dev/testでcostが変わった候補はすべて元から正解top-1のサ変名詞で、正解順位は変わらない。AJIMEE、JWTD、PUDは候補表層、cost、順序まで完全一致した。Apple M3、Release、50,000回を旧新交互に3組測定すると、`した`対象経路の中央値は173.443→174.235 µs/op（+0.792 µs）、非該当の`しか`経路は116.762→116.857 µs/op（+0.095 µs）だった。
 
+#### 「こと・もの・ため・ので・よう」への右品詞接続
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は、一般的な文法と単語同士のつながりを辞書へ取り入れ、自然な文章を優先すると説明している。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)も各entryに左右接続IDを保持し、[通常変換のViterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)で前件の`rcid`と後件の`lcid`の接続重みを加える。Slimeでは右文脈先頭が`こと`、`もの`、`ため`、`ので`、`よう`の場合だけ、[Mozcの`id.def`](https://github.com/google/mozc/blob/master/src/data/dictionary_oss/id.def)にある非自立名詞・接続助詞などの左POSと、現在候補の右POSとの接続costを比較する。
+
+語彙costは再加算せず、最良接続との差だけを最大1,100 costの補正へ変換する。同じ活用型の表層には同じ補正がかかるため、`負う`と`追う`のような意味差を品詞規則だけで逆転しない。候補は生成せず、一語exact候補だけを対象とする。完全辞書句による右文脈補正も存在する場合は大きい方だけを使い、証拠を二重加算しない。
+
+丁寧助動詞も同時に再評価した。漢字を含む活用形への一律補正は500から1,000へ、一意な後続接続がある場合は`ます`系に限り1,500から2,000へ広げた。汎用の一意接続補正を2,500へ広げる案は`診察です → 新札です`を起こしたため棄却した。
+
+| dataset | 変更前 acc@1 / MRR@10 | 右品詞接続後 acc@1 / MRR@10 | 候補配列の変化 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7113 / 0.8072 | **0.7134 / 0.8083** | 54件 | 4 / 0 |
+| GSD dev (331) | 0.8671 / 0.9104 | 0.8671 / 0.9104 | 4件 | 0 / 0 |
+| GSD test (323) | 0.8824 / 0.9230 | **0.8854 / 0.9246** | 9件 | 1 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 0件 | 0 / 0 |
+
+trainでは`夜こと → 寄ること`、`得こと → 解くこと`、`近います → 誓います`、`秋ません → 飽きません`を修正した。testでは`火曜こと → 通うこと`を修正した。`王もの → 追うもの`は名詞から動詞へ移るが、正解の`負う`との意味差は残る。AJIMEE、JWTD、PUDは候補表層、cost、順序まで完全一致した。
+
+Apple M3、Release、50,000回、warmup 1,000回を旧新交互に5組測定した。対象経路`right_function_word_candidates`の中央値は106.383→110.333 µs/op（+3.950 µs）、非該当経路`right_function_word_nonmatch`は109.050→108.894 µs/op（-0.156 µs、測定誤差内）だった。文法語のPOSは変換ごとの辞書検索ではなく、同梱Mozc接続行列と同じ名前付きIDスライスから取得する。
+
 #### 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)は数値表記を通常語とは別の入力支援として扱う。[azooKey](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)も桁区切り、日時、時刻などを独立したSpecial Conversionとして実装する。Slimeでも一般の`たい`候補costを変えず、左末尾と右先頭がともに整数である`1｜たい｜1`型だけを構造化表記として扱う。

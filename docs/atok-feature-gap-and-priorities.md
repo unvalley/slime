@@ -164,6 +164,12 @@ GSD trainで`敵視して`を1件、診断済みのGSD testで`長居して`、`
 
 これによりGSD trainの`前進し`、`即死しない`、`退位した`を修正し、悪化は0件だった。GSD dev/testはtop-1と正解順位が不変、AJIMEE、JWTD、PUDは候補配列まで不変だった。Release測定の中央値差は対象経路+0.792 µs、非該当経路+0.095 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 「こと・もの・ため・ので・よう」への右品詞接続
+
+[ATOKの高精度な変換エンジン](https://atok.com/info/features/engine.html)が重視する文法と単語のつながり、[azooKeyの左右接続ID](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbiでの接続重み](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)に沿い、右文脈先頭の`こと`・`もの`・`ため`・`ので`・`よう`をMozcの品詞IDで接続する。語彙costを重ねず、候補右POSから後続左POSへの相対接続costだけを最大1,100補正する。同じ活用型の意味候補は同量補正し、完全辞書句とは最大値だけを使う。
+
+丁寧助動詞前の活用形補正も安全な範囲で強め、GSD trainの`寄ること`、`解くこと`、`誓います`、`飽きません`を4件、GSD testの`通うこと`を1件修正した。train/dev/testでtop-1悪化0、AJIMEE、JWTD、PUDは候補配列まで不変だった。汎用補正2,500は`診察です → 新札です`を起こしたため採用していない。Release測定の中央値差は対象経路+3.950 µs、非該当経路は測定誤差内だった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

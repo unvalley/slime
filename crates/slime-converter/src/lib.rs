@@ -462,8 +462,10 @@ fn trailing_integer(text: &str) -> Option<u32> {
 fn trailing_numeric_surface(text: &str) -> Option<CompactString> {
     if let Some((prefix, value)) = split_trailing_decimal(text) {
         let valid = if matches!(prefix.chars().next_back(), Some('.' | '．')) {
-            let before_fraction = &prefix[..prefix.len() - 1];
-            split_trailing_decimal(before_fraction)
+            prefix
+                .strip_suffix('.')
+                .or_else(|| prefix.strip_suffix('．'))
+                .and_then(split_trailing_decimal)
                 .is_some_and(|(prefix, _)| !matches!(prefix.chars().next_back(), Some('-' | '−')))
         } else {
             !matches!(prefix.chars().next_back(), Some('-' | '−'))
@@ -3375,7 +3377,7 @@ mod tests {
         Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
         DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
         MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, NBestBucket, NBestNode, UNKNOWN_POS_ID,
-        document_region_suffix_promotion, insert_n_best_node,
+        document_region_suffix_promotion, insert_n_best_node, trailing_numeric_surface,
     };
 
     struct PreferSurface<'a>(&'a str);
@@ -4081,6 +4083,15 @@ mod tests {
             dictionary.candidates_with_context("にち", "8月12")[0].surface,
             "日"
         );
+    }
+
+    #[test]
+    fn trailing_numeric_context_handles_a_multibyte_decimal_separator() {
+        assert_eq!(
+            trailing_numeric_surface("1．3"),
+            trailing_numeric_surface("1.3")
+        );
+        assert_eq!(trailing_numeric_surface("Ｆ．Ｅ．Ａ．Ｒ．２０"), None);
     }
 
     #[test]

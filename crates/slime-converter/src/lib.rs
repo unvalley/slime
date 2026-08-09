@@ -4267,6 +4267,14 @@ mod tests {
             dictionary.candidates_with_context("たい", "ナスタアリーク")[0].surface,
             "体"
         );
+        assert_eq!(
+            dictionary.candidates_with_context("そ", "線形作用")[0].surface,
+            "素"
+        );
+        assert_ne!(
+            dictionary.candidates_with_context("そ", "線形")[0].surface,
+            "素"
+        );
     }
 
     #[test]

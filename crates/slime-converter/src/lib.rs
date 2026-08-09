@@ -140,6 +140,7 @@ struct DictionaryDocumentContextRanker<'a> {
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
+    right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
 }
@@ -149,6 +150,12 @@ struct DocumentBoundaryPromotion<'a> {
     surface: &'a str,
     isolated_cost: i32,
     promotion: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DocumentContextualCost<'a> {
+    surface: &'a str,
+    relative_cost: i32,
 }
 
 impl<'a> DictionaryDocumentContextRanker<'a> {
@@ -172,6 +179,8 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             ),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
+            right_auxiliary_costs: dictionary
+                .document_right_auxiliary_costs(reading, right_context),
             follows_region_name: is_document_region_suffix_reading(reading)
                 && dictionary.document_context_has_pos_suffix(
                     left_context,
@@ -239,6 +248,19 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .map(|promotion| promotion.promotion)
             .max()
             .unwrap_or(0);
+        let right_auxiliary_promotion = self
+            .right_auxiliary_costs
+            .iter()
+            .filter(|contextual| {
+                conversion.segments.len() == 1 && contextual.surface == conversion.surface
+            })
+            .map(|contextual| {
+                DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP
+                    .saturating_sub(contextual.relative_cost)
+                    .clamp(0, DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP)
+            })
+            .max()
+            .unwrap_or(0);
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
@@ -266,6 +288,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(specialized_promotion)
             .saturating_sub(right_phrase_promotion)
             .saturating_sub(right_inflection_promotion)
+            .saturating_sub(right_auxiliary_promotion)
     }
 }
 
@@ -351,6 +374,8 @@ const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
 const DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 500;
+const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
+const MOZC_DESIDERATIVE_AUXILIARY_POS_ID: u16 = 152;
 const MOZC_COUNTER_POS_ID: u16 = 2011;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
@@ -1427,6 +1452,47 @@ impl Dictionary {
             });
         });
         promotions
+    }
+
+    fn document_right_auxiliary_costs<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Vec<DocumentContextualCost<'s>> {
+        if !self.uses_connection_costs {
+            return Vec::new();
+        }
+        if !right_context.starts_with("たい") {
+            return Vec::new();
+        }
+        let connection = ConnectionMatrix::bundled();
+        let mut costs = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading || !looks_like_inflected_kanji_surface(entry.surface) {
+                return;
+            }
+            costs.push(DocumentContextualCost {
+                surface: entry.surface,
+                relative_cost: connection
+                    .cost(BOS_EOS_POS_ID, entry.left_id)
+                    .saturating_add(entry.word_cost)
+                    .saturating_add(
+                        connection.cost(entry.right_id, MOZC_DESIDERATIVE_AUXILIARY_POS_ID),
+                    ),
+            });
+        });
+        // Candidate generation deduplicates equal surfaces, so retain every exact POS path here
+        // and normalize the paths that can connect directly to the following auxiliary.
+        if let Some(minimum) = costs
+            .iter()
+            .map(|contextual| contextual.relative_cost)
+            .min()
+        {
+            for contextual in &mut costs {
+                contextual.relative_cost = contextual.relative_cost.saturating_sub(minimum);
+            }
+        }
+        costs
     }
 
     fn document_numeric_counter_promotions(
@@ -4036,6 +4102,19 @@ mod tests {
             dictionary.candidates_with_context("ぶ", "第三")[0].surface,
             "まで is a particle and must not be mistaken for the polite auxiliary"
         );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_a_continuative_verb_before_desiderative_auxiliary() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("かい")[0].surface, "回");
+        let candidates = dictionary.candidates_with_surrounding_context(
+            "かい",
+            "丁寧に案内してもらい、",
+            "たい物が買えました。",
+        );
+        assert_eq!(candidates[0].surface, "買い", "{candidates:?}");
     }
 
     #[test]

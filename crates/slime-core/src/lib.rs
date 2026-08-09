@@ -2914,6 +2914,17 @@ mod tests {
     }
 
     #[test]
+    fn external_right_context_ranks_a_continuative_verb_before_desiderative_auxiliary() {
+        let mut engine = SlimeEngine::bundled();
+
+        engine.set_external_context("丁寧に案内してもらい、", "たい物が買えました。");
+        type_text(&mut engine, "kai");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "買い");
+    }
+
+    #[test]
     fn external_right_context_ranks_a_dictionary_compound_prefix() {
         let mut engine = SlimeEngine::bundled();
 

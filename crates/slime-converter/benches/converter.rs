@@ -160,6 +160,29 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             dictionary.candidates_with_context(black_box("のめ"), black_box("うまいコーヒーが")),
         );
     });
+    run(
+        "converter/desiderative_right_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("かい"),
+                black_box("丁寧に案内してもらい、"),
+                black_box("たい物が買えました。"),
+            ));
+        },
+    );
+    run(
+        "converter/desiderative_left_only_candidates",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(
+                    black_box("かい"),
+                    black_box("丁寧に案内してもらい、"),
+                ),
+            );
+        },
+    );
     run("converter/right_compound_candidates", iterations, || {
         black_box(dictionary.candidates_with_surrounding_context(
             black_box("まち"),

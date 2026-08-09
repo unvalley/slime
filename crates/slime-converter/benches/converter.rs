@@ -480,6 +480,28 @@ fn run_unique_right_suru_benchmark(dictionary: &Dictionary, iterations: u64) {
             black_box("自分でも趣味で料理をするもので一層"),
         ));
     });
+    run(
+        "converter/unique_right_suru_past_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("たいい"),
+                black_box("これにより、ギャネンドラ国王は"),
+                black_box("した。"),
+            ));
+        },
+    );
+    run(
+        "converter/unique_right_suru_nonmatch_shika",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("とまる"),
+                black_box("学校のまわりにはホテルも無いので、成田か香取で"),
+                black_box("しかありません。"),
+            ));
+        },
+    );
 }
 
 fn run_fixed_segment_benchmark(dictionary: &Dictionary, iterations: u64) {

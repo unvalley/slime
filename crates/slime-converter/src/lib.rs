@@ -3284,9 +3284,30 @@ fn starts_with_polite_auxiliary(right_context: &str) -> bool {
 }
 
 fn starts_with_suru_inflection(right_context: &str) -> bool {
-    ["する", "して"]
-        .iter()
-        .any(|prefix| right_context.starts_with(prefix))
+    if right_context.starts_with("する") {
+        return true;
+    }
+    let Some(remainder) = right_context.strip_prefix('し') else {
+        return false;
+    };
+    match remainder.chars().next() {
+        None | Some('た' | 'て') => true,
+        Some('な') => ["ない", "なか", "なく", "ながら"]
+            .iter()
+            .any(|prefix| remainder.starts_with(prefix)),
+        Some('ま') => ["ます", "まし", "ませ"]
+            .iter()
+            .any(|prefix| remainder.starts_with(prefix)),
+        Some('よ') => remainder.starts_with("よう"),
+        Some('つ') => remainder.starts_with("つつ"),
+        Some(character) => {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '、' | '。' | '，' | '．' | ',' | '.' | '!' | '?' | '！' | '？'
+                )
+        }
+    }
 }
 
 fn document_right_grammar_pos_id(right_context: &str) -> Option<u16> {
@@ -4639,6 +4660,14 @@ mod tests {
             ("かんしん", "参加者が", "すること", "感心"),
             ("くし", "能力を", "するスナイパー", "駆使"),
             ("いち", "中心に", "する", "位置"),
+            (
+                "ぜんしん",
+                "一般的な層流翼型と比べ負圧中心が",
+                "し、圧力勾配はなだらかである。",
+                "前進",
+            ),
+            ("そくし", "腹部を切開しただけでは人は", "しない。", "即死"),
+            ("たいい", "これにより、ギャネンドラ国王は", "した。", "退位"),
         ] {
             let candidates = dictionary.candidates_with_surrounding_context(
                 reading,
@@ -4652,6 +4681,27 @@ mod tests {
             dictionary.candidates_with_surrounding_context("ながい", "そのまま", "道路")[0].surface,
             "長い",
             "unrelated right context must not promote a verbal noun"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "とまる",
+                "学校のまわりにはホテルも無いので、成田か香取で",
+                "しかありません。"
+            )[0]
+            .surface,
+            "止まる",
+            "the binding particle しか must not be parsed as a suru inflection"
+        );
+        assert!(
+            dictionary
+                .candidates_with_surrounding_context(
+                    "し",
+                    "星取り参加は当然とされ,不参加は白眼",
+                    "される。"
+                )
+                .iter()
+                .any(|candidate| candidate.surface == "視"),
+            "a broad passive-form rule must not evict an otherwise visible candidate"
         );
     }
 

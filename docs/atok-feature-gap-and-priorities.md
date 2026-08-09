@@ -158,6 +158,12 @@ GSD trainは`最下位`を1件修正してacc@1が0.7088から0.7093へ上がり
 
 GSD trainで`敵視して`を1件、診断済みのGSD testで`長居して`、`感心する`、`駆使する`、`位置する`を4件修正し、悪化は0件だった。GSD devはtop-1不変、AJIMEE、JWTD、PUDは候補表層・cost・順序まで全件不変だった。50,000回×3組の旧新交互測定では中央値差が約0.0058 ms/opだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 「する」の連用・過去・否定形
+
+[ATOKの品詞対応表](https://atok.com/other/support/howtouse/mac/ap/pgs/ap_hinsi_atok8.htm)、[Mozcの名詞サ変接続とサ変活用](https://github.com/google/mozc/blob/master/src/data/dictionary_oss/id.def)、[azooKeyの左右接続ID](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)に沿い、既存の一意なサ変名詞だけを昇格する規則を`した`、`しない`、`します`、`しよう`と、句読点へ続く単独の`し`へ広げた。受動形`される`はGSD testの正解候補をtop-10から落とし、`せず`は一般名詞にも続くため採用しなかった。
+
+これによりGSD trainの`前進し`、`即死しない`、`退位した`を修正し、悪化は0件だった。GSD dev/testはtop-1と正解順位が不変、AJIMEE、JWTD、PUDは候補配列まで不変だった。Release測定の中央値差は対象経路+0.792 µs、非該当経路+0.095 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

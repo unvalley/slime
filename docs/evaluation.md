@@ -263,6 +263,23 @@ GSD train・dev・testは既に右文脈規則の診断に使っているため�
 
 AJIMEE・JWTD・PUDは候補表層、cost、順序まで全件完全一致した。Apple M3、Release、50,000回を旧新交互に3組測定した`unique_right_suru_candidates`は、旧0.352〜0.360 ms/op、新0.355〜0.375 ms/opだった。中央値差は約0.0058 ms/opで、候補初回表示20 ms予算内にある。
 
+#### 「する」の連用・過去・否定形
+
+[ATOKの品詞対応表](https://atok.com/other/support/howtouse/mac/ap/pgs/ap_hinsi_atok8.htm)は名詞サ変を独立品詞として扱う。[Mozcの`id.def`](https://github.com/google/mozc/blob/master/src/data/dictionary_oss/id.def)も名詞サ変接続をID 1841、サ変・スルの活用をID 627〜638に分けている。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も、各語の左右接続IDと接続重みを変換経路へ加える。Slimeでは既存の「最安のサ変名詞表層が次点より1,500 costを超えて優勢」という条件を維持したまま、右文脈の`する`・`して`判定を`した`、`しない`、`します`、`しよう`、`しつつ`、`しながら`へ広げる。単独の`し`は直後が文末、空白、句読点の場合だけ連用形とみなす。
+
+受動・使役を含む全活用へ広げる案も比較したが、`される`でGSD testの正解`視`がtop-10から落ちたため採用しなかった。`せず`も`嫌な顔せず`のように一般名詞へ続くため対象外とした。候補生成、昇格量、曖昧なサ変名詞を動かさない条件は変更しない。
+
+| dataset | 変更前 acc@1 | 活用拡張後 acc@1 | 候補配列の変化 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7098 | **0.7113** | 18件 | 3 / 0 |
+| GSD dev (331) | 0.8671 | 0.8671 | 6件 | 0 / 0 |
+| GSD test (323) | 0.8824 | 0.8824 | 3件 | 0 / 0 |
+| AJIMEE (200) | 0.5300 | 0.5300 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 | 0.2950 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 | 0.6547 | 0件 | 0 / 0 |
+
+GSD trainでは`全身し → 前進し`、`即しない → 即死しない`、`大尉した → 退位した`の3件を修正した。dev/testでcostが変わった候補はすべて元から正解top-1のサ変名詞で、正解順位は変わらない。AJIMEE、JWTD、PUDは候補表層、cost、順序まで完全一致した。Apple M3、Release、50,000回を旧新交互に3組測定すると、`した`対象経路の中央値は173.443→174.235 µs/op（+0.792 µs）、非該当の`しか`経路は116.762→116.857 µs/op（+0.095 µs）だった。
+
 #### 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)は数値表記を通常語とは別の入力支援として扱う。[azooKey](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)も桁区切り、日時、時刻などを独立したSpecial Conversionとして実装する。Slimeでも一般の`たい`候補costを変えず、左末尾と右先頭がともに整数である`1｜たい｜1`型だけを構造化表記として扱う。

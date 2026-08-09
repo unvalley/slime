@@ -44,6 +44,8 @@ const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
 const SHORT_RESCORE_CANDIDATE_LIMIT: usize = 5;
 const LONG_RESCORE_CANDIDATE_LIMIT: usize = 8;
 const LONG_RESCORE_READING_CHARACTERS: usize = MAX_EXPANDED_READING_CHARACTERS + 1;
+const EXTENDED_LONG_RESCORE_N_BEST: usize = 16;
+const EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT: usize = 16;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
@@ -402,6 +404,43 @@ impl SlimeEngine {
             .map(|state| state.request.clone())
     }
 
+    /// Widens the pending external-scoring pool for a long explicit reading.
+    ///
+    /// Interactive adapters call this only after their local scorer is ready.
+    /// The visible ten-candidate result remains untouched unless scoring
+    /// succeeds. A missing or not-yet-ready optional model cannot add latency,
+    /// and a scoring failure cannot partially publish the deeper result.
+    pub fn prepare_extended_candidate_rescore(&mut self) {
+        if self.candidate_kind != Some(CandidateKind::Conversion)
+            || self.selected != 0
+            || self.reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+        {
+            return;
+        }
+        let Some(current) = self.candidate_rescore.as_ref() else {
+            return;
+        };
+        let reading = current.request.reading.clone();
+        let context = current.request.context.clone();
+        let dictionary_candidates = if context.is_empty() {
+            self.dictionary
+                .candidates_with_limit(&reading, EXTENDED_LONG_RESCORE_N_BEST)
+        } else {
+            self.dictionary.candidates_with_context_limit(
+                &reading,
+                &context,
+                EXTENDED_LONG_RESCORE_N_BEST,
+            )
+        };
+        self.candidate_rescore = candidate_rescore_state_with_limit(
+            &reading,
+            &context,
+            &[],
+            &dictionary_candidates,
+            EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT,
+        );
+    }
+
     /// Applies model log-likelihoods to the pending dictionary-only request.
     ///
     /// The pending request is consumed even when validation fails, so stale or
@@ -425,16 +464,38 @@ impl SlimeEngine {
             return None;
         }
 
-        let mut positions = Vec::with_capacity(state.candidates.len());
-        for candidate in &state.candidates {
-            let position = self
-                .candidates
-                .iter()
-                .position(|surface| surface == &candidate.surface)?;
-            if positions.contains(&position) {
+        let mut pending_candidates = self.candidates.clone();
+        let existing_positions: Vec<_> = state
+            .candidates
+            .iter()
+            .map(|candidate| {
+                pending_candidates
+                    .iter()
+                    .position(|surface| surface == &candidate.surface)
+            })
+            .collect();
+        let mut seen_positions = Vec::with_capacity(state.candidates.len());
+        for position in existing_positions.iter().flatten().copied() {
+            if seen_positions.contains(&position) {
                 return None;
             }
-            positions.push(position);
+            seen_positions.push(position);
+        }
+        let mut insertion_position = existing_positions
+            .iter()
+            .flatten()
+            .copied()
+            .max()?
+            .saturating_add(1);
+        let mut positions = Vec::with_capacity(state.candidates.len());
+        for (candidate, existing_position) in state.candidates.iter().zip(existing_positions) {
+            if let Some(position) = existing_position {
+                positions.push(position);
+            } else {
+                pending_candidates.insert(insertion_position, candidate.surface.clone());
+                positions.push(insertion_position);
+                insertion_position += 1;
+            }
         }
 
         let mut order: Vec<usize> = (0..state.candidates.len()).collect();
@@ -449,8 +510,9 @@ impl SlimeEngine {
             .collect();
         order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
         for (position, candidate_index) in positions.into_iter().zip(order) {
-            self.candidates[position].clone_from(&state.candidates[candidate_index].surface);
+            pending_candidates[position].clone_from(&state.candidates[candidate_index].surface);
         }
+        self.candidates = pending_candidates;
         Some(self.candidate_actions())
     }
 
@@ -1863,15 +1925,31 @@ fn candidate_rescore_state(
     protected_candidates: &[String],
     dictionary_candidates: &[Candidate],
 ) -> Option<CandidateRescoreState> {
-    if !protected_candidates.is_empty() {
-        return None;
-    }
-    let base_cost = dictionary_candidates.first()?.cost;
     let candidate_limit = if reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS {
         LONG_RESCORE_CANDIDATE_LIMIT
     } else {
         SHORT_RESCORE_CANDIDATE_LIMIT
     };
+    candidate_rescore_state_with_limit(
+        reading,
+        context,
+        protected_candidates,
+        dictionary_candidates,
+        candidate_limit,
+    )
+}
+
+fn candidate_rescore_state_with_limit(
+    reading: &str,
+    context: &str,
+    protected_candidates: &[String],
+    dictionary_candidates: &[Candidate],
+    candidate_limit: usize,
+) -> Option<CandidateRescoreState> {
+    if !protected_candidates.is_empty() {
+        return None;
+    }
+    let base_cost = dictionary_candidates.first()?.cost;
     let candidates: Vec<_> = dictionary_candidates
         .iter()
         .take(candidate_limit)
@@ -2054,15 +2132,15 @@ impl Default for SlimeEngine {
 mod tests {
     use super::{
         ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateAnnotation, CandidateDetail,
-        CandidateKind, ConversionSearch, DictionaryPackTrust, DictionaryPackVerificationKey,
-        DictionaryPackVersionFloor, DictionaryPackWord, EnginePreferences, InputEvent,
-        LiveConversionDecision, MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine,
-        TECHNOLOGY_DICTIONARY, UserData, bundled_dictionary, date_time_candidates,
-        katakana_candidate,
+        CandidateKind, CandidateRescoreRequest, CandidateRescoreState, ConversionSearch,
+        DictionaryPackTrust, DictionaryPackVerificationKey, DictionaryPackVersionFloor,
+        DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision,
+        MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY,
+        UserData, bundled_dictionary, date_time_candidates, katakana_candidate,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
-    use slime_converter::{Dictionary, DictionaryEntry};
+    use slime_converter::{Candidate, Dictionary, DictionaryEntry};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3736,6 +3814,77 @@ mod tests {
                 .map(|index| format!("長文候補{index}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn ready_external_scorer_can_prepare_a_deeper_long_reading_pool() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "sekairekishitaikeiigirisushi");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("long reading should have a standard request")
+                .candidates
+                .len(),
+            super::LONG_RESCORE_CANDIDATE_LIMIT
+        );
+        engine.prepare_extended_candidate_rescore();
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("ready scorer should receive the deeper request")
+                .candidates
+                .len(),
+            super::EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT
+        );
+    }
+
+    #[test]
+    fn external_scores_insert_a_deep_candidate_only_after_success() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, "nihon");
+        engine.handle(InputEvent::Space);
+        assert!(!engine.candidates.contains(&"深層".to_owned()));
+
+        let candidates = vec![
+            Candidate {
+                surface: "日本".to_owned(),
+                cost: 1_000,
+            },
+            Candidate {
+                surface: "二本".to_owned(),
+                cost: 1_100,
+            },
+            Candidate {
+                surface: "深層".to_owned(),
+                cost: 1_200,
+            },
+        ];
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                reading: "にほん".to_owned(),
+                candidates: candidates
+                    .iter()
+                    .map(|candidate| candidate.surface.clone())
+                    .collect(),
+            },
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[-10.0, -10.0, 0.0], 0.7)
+            .expect("aligned deep scores should apply");
+
+        assert_eq!(engine.candidates[0], "深層");
+        assert_eq!(engine.candidates[1], "ニホン");
+        assert!(engine.candidates.contains(&"日本".to_owned()));
+        assert!(engine.candidates.contains(&"二本".to_owned()));
     }
 
     #[test]

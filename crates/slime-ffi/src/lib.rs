@@ -147,7 +147,7 @@ static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "neural")]
 const NEURAL_CANDIDATE_WEIGHT: f64 = 0.7;
 #[cfg(feature = "neural")]
-const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 8;
+const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 16;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
 
@@ -521,11 +521,17 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
     }
 
     #[cfg(feature = "neural")]
-    if let Some(request) = handle.engine.candidate_rescore_request()
-        && let Some(service) = NEURAL_SERVICE.get()
-        && let Ok(service) = service.lock()
-        && let Some(service) = service.as_ref()
-    {
+    if let Some(service) = NEURAL_SERVICE.get() {
+        handle.engine.prepare_extended_candidate_rescore();
+        let Some(request) = handle.engine.candidate_rescore_request() else {
+            return actions;
+        };
+        let Ok(service) = service.lock() else {
+            return actions;
+        };
+        let Some(service) = service.as_ref() else {
+            return actions;
+        };
         let score_request = slime_neural::ScoreRequest {
             context: request.context,
             input_katakana: full_katakana(&request.reading),
@@ -1513,7 +1519,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(slime_neural_rescoring_status(), STATUS_OK);
-        let eight_candidate_latency = {
+        let expanded_candidate_latency = {
             let service = super::NEURAL_SERVICE
                 .get()
                 .expect("neural service should be initialized")
@@ -1538,8 +1544,8 @@ mod tests {
             scored[0].latency
         };
         eprintln!(
-            "ffi neural eight-candidate conversion: {:.3}ms",
-            eight_candidate_latency.as_secs_f64() * 1_000.0
+            "ffi neural expanded-candidate conversion: {:.3}ms",
+            expanded_candidate_latency.as_secs_f64() * 1_000.0
         );
         for character in "koutei".chars() {
             // SAFETY: The handle is live and each buffer is released once.

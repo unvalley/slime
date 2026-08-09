@@ -483,6 +483,10 @@ just evaluate-pud-heldout --json
 
 長文held-outは446件すべてが6文字gate対象で、現行辞書baselineは`acc@1 0.6547`、`acc@10 0.8744`、`MRR@10 0.7390`だった。390件は正解候補がN-best内にあり、未知domainの長文順位付けと候補生成を分けて報告できる。データは`target/evaluation`だけに保存し、製品bundleへ含めない。
 
+PUDを一度も参照せず、JWTD 10,000件とGSD train 1,940件の5回反復から作った19,700件でcross-encoderを再学習した。hidden 128、2層、4 head、927,873 parameter、3 epochの設定と、先に固定した6文字gate・weight 0.5を変更せずPUDへ適用した結果、`acc@1`は`0.6547 → 0.6390`（292件→285件、-1.57pt）、`MRR@10`は`0.7390 → 0.7308`へ悪化した。10候補の再採点latencyもp50 8.67 ms、p95 12.81 ms、FP32重み3,714,387 bytesだった。
+
+参考としてweight 0.1では`acc@1 0.6592`まで上がるが、独立held-outを見た後のweight変更は採用判定に使わない。固定条件で主指標を悪化させたため、このcross-encoderはNo-Goとし、製品コードや商用bundleへ組み込まない。PUDはこの方式の最終判定に使用済みなので、同じモデル系列の追加調整では今後held-outとして再利用しない。
+
 ## UD Japanese GSD 外部ドメイン評価
 
 [UD Japanese GSD](https://universaldependencies.org/treebanks/ja_gsd/index.html) r2.18（commit `33e7310b58308e85fd2b33a2fc3ef3e434f821c7`）を、CC BY-SA 4.0の評価専用キャッシュとして追加した。Wikipedia修正履歴ではなくnews/blogを原文とし、手動由来の短単位語境界、UniDic品詞、表層発音を持つ。製品bundleには含めない。

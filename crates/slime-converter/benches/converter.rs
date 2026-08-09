@@ -14,6 +14,7 @@ fn main() {
     });
     run_document_context_benchmark(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
+    run_noun_prefix_right_phrase_benchmark(&dictionary, iterations);
     run("converter/segmented_phrase", iterations, || {
         black_box(dictionary.convert_best(black_box("わたしはにほん")));
     });
@@ -241,6 +242,31 @@ fn run_superlative_prefix_context_benchmark(dictionary: &Dictionary, iterations:
         iterations,
         || {
             black_box(dictionary.candidates_with_context(black_box("き"), black_box("大正")));
+        },
+    );
+}
+
+fn run_noun_prefix_right_phrase_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/noun_prefix_right_phrase_conflict",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("み"),
+                black_box("犯人は検挙されておらず、2012年8月現在"),
+                black_box("解決。"),
+            ));
+        },
+    );
+    run(
+        "converter/left_phrase_with_unmatched_right_context",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("かい"),
+                black_box("もうひとつは最"),
+                black_box("でした"),
+            ));
         },
     );
 }

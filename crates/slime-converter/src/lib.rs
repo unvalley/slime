@@ -382,6 +382,9 @@ const MOZC_INDEPENDENT_VERB_POS_ID_END: u16 = 856;
 const MOZC_GENERAL_GODAN_CONTINUATIVE_POS_ID: u16 = 842;
 const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
+const MOZC_NOUN_PREFIX_POS_ID_START: u16 = 2_600;
+const MOZC_EXPLICIT_NOUN_PREFIX_POS_ID_START: u16 = 2_601;
+const MOZC_NOUN_PREFIX_POS_ID_END: u16 = 2_637;
 
 fn is_bounded_coordination_suffix(suffix: &str) -> bool {
     let mut characters = suffix.chars();
@@ -492,6 +495,10 @@ const DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING: i32 = 7_500;
 const DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING: i32 = 9_300;
 const DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING: i32 = 7_000;
 const DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING: i32 = 9_000;
+// Exact noun-prefix compounds are stronger than an incidental phrase ending
+// on the left, but remain bounded so alternatives stay in the candidate list.
+const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_COST_CEILING: i32 = 9_000;
+const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION: i32 = 4_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
@@ -1405,7 +1412,15 @@ impl Dictionary {
             return Vec::new();
         }
         let mut has_left_phrase_evidence = false;
+        let mut has_noun_prefix_candidate = false;
         self.for_each_exact(reading, |entry| {
+            // ID 2600 is Mozc's generic noun-prefix class and contains broad
+            // homophones such as 快/皆. Only a lexeme-specific prefix may
+            // reopen a boundary that already has exact evidence on the left.
+            has_noun_prefix_candidate |= (MOZC_EXPLICIT_NOUN_PREFIX_POS_ID_START
+                ..=MOZC_NOUN_PREFIX_POS_ID_END)
+                .contains(&entry.left_id)
+                && entry.surface.chars().count() == 1;
             has_left_phrase_evidence |= self.document_phrase_promotion(
                 left_context,
                 reading,
@@ -1413,7 +1428,7 @@ impl Dictionary {
                 allows_single_character_phrase_prefix,
             ) > 0;
         });
-        if has_left_phrase_evidence {
+        if has_left_phrase_evidence && !has_noun_prefix_candidate {
             return Vec::new();
         }
         let connection = ConnectionMatrix::bundled();
@@ -1424,6 +1439,7 @@ impl Dictionary {
                 entry.surface,
                 right_context,
                 numeric_left_context,
+                has_left_phrase_evidence,
             );
             if entry.surface != reading && promotion > 0 {
                 promotions.push(DocumentBoundaryPromotion {
@@ -1442,6 +1458,7 @@ impl Dictionary {
         candidate_surface: &str,
         right_context: &str,
         requires_general_noun: bool,
+        requires_noun_prefix: bool,
     ) -> i32 {
         let Some(compact) = self.bundled else {
             return 0;
@@ -1474,6 +1491,10 @@ impl Dictionary {
             |suffix, entry| {
                 let bounded_nominal_suffix =
                     is_bounded_coordination_suffix(suffix) || is_bounded_genitive_suffix(suffix);
+                let noun_prefix_entry = (MOZC_NOUN_PREFIX_POS_ID_START
+                    ..=MOZC_NOUN_PREFIX_POS_ID_END)
+                    .contains(&entry.left_id)
+                    && candidate_surface.chars().count() == 1;
                 let accepted = !matches!(
                     entry.left_id,
                     MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
@@ -1483,6 +1504,7 @@ impl Dictionary {
                 ) && (!requires_general_noun
                     || (entry.left_id == MOZC_GENERAL_NOUN_POS_ID
                         && entry.right_id == MOZC_GENERAL_NOUN_POS_ID))
+                    && (!requires_noun_prefix || noun_prefix_entry)
                     && (!starts_with_hiragana
                         || is_safe_hiragana_right_phrase_entry(entry, suffix))
                     && (!bounded_nominal_suffix
@@ -1490,7 +1512,9 @@ impl Dictionary {
                 if !accepted {
                     return;
                 }
-                let cost_ceiling = if is_bounded_coordination_suffix(suffix) {
+                let cost_ceiling = if noun_prefix_entry {
+                    DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_COST_CEILING
+                } else if is_bounded_coordination_suffix(suffix) {
                     DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING
                 } else if is_sibling_right_phrase_suffix(suffix, right_context) {
                     DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING
@@ -1501,11 +1525,14 @@ impl Dictionary {
                 } else {
                     DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING
                 };
-                best_promotion = best_promotion.max(
-                    cost_ceiling
-                        .saturating_sub(entry.word_cost)
-                        .min(DOCUMENT_PHRASE_PROMOTION),
-                );
+                best_promotion =
+                    best_promotion.max(cost_ceiling.saturating_sub(entry.word_cost).min(
+                        if noun_prefix_entry {
+                            DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION
+                        } else {
+                            DOCUMENT_PHRASE_PROMOTION
+                        },
+                    ));
             },
         );
         best_promotion
@@ -4678,6 +4705,16 @@ mod tests {
             dictionary.candidates_with_surrounding_context("わ", "古典演奏から", "楽器を")[0]
                 .surface,
             "和"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "み",
+                "犯人は検挙されておらず、2012年8月現在",
+                "解決。"
+            )[0]
+            .surface,
+            "未",
+            "an exact noun-prefix phrase should beat an incidental left phrase"
         );
         assert_eq!(
             dictionary.candidates_with_surrounding_context(

@@ -140,6 +140,12 @@ GSD trainで`胃の調子`、`素の状態`、`真の目的`、`未知の世界`
 
 GSD trainは`最下位`を1件修正してacc@1が0.7088から0.7093へ上がり、悪化0だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変で、逆引きartifactも増えない。Release測定では`最`一致経路が中央値約19.1 µs増えたが、通常の一文字末尾非一致経路は約0.35 µs増に留まった。
 
+## 今回の実装: 右側に続く一文字接頭辞
+
+[ATOKの品詞説明](https://atok.com/other/support/howtouse/mac/shrd/shrd_hinsi_other.htm)と[Mozcの名詞接頭詞POS](https://github.com/google/mozc/blob/master/src/data/dictionary_oss/id.def)に沿い、`未｜解決`のように一文字候補と右文脈が完全な辞書語になる場合だけ既存候補を昇格する。左側にも辞書句がある場合は、汎用接頭詞を除く個別POSの一文字候補に限定し、一般の右句を再解禁しない。
+
+これにより`2012年8月現在｜み｜解決`を`見 → 未`へ修正した。GSD trainは1件改善・悪化0、GSD dev/testはtop-1不変、AJIMEE、JWTD、PUDは候補配列まで不変だった。逆引きartifactは増えず、Release測定の対象経路は中央値約3.3 µs増、接頭辞候補がない経路は測定誤差内だった。
+
 ## 今回の実装: 数字直後の一般名詞複合語
 
 [ATOKのAI用例](https://atok.com/other/support/howtouse/mac/shrd/shrd_yougo.htm)が示す「登録された語の組み合わせ」を、数字直後でも構造が強い場合だけ使う。左末尾がASCIIまたは全角の10進数字で、候補と右文脈を結合した完全なMozc辞書語が一般名詞POSで始まり終わる場合に限り、既存候補を昇格する。日本語数詞、助数詞、動詞活用、固有名詞は従来の数値境界を維持する。

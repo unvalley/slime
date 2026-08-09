@@ -2127,6 +2127,90 @@ mod tests {
     }
 
     #[test]
+    fn long_expanded_recall_crosses_typed_actions_and_commits_by_index() {
+        let handle = slime_create();
+        let mut capture = TypedCapture::default();
+        for character in "watashihanihonjin".chars() {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions(
+                        handle,
+                        EVENT_CHARACTER,
+                        character.into(),
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_SPACE,
+                    0,
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+        let initial_count = capture.candidate_count;
+
+        for _ in 0..initial_count {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions(
+                        handle,
+                        EVENT_NEXT_CANDIDATE,
+                        0,
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        assert!(capture.candidate_count > initial_count);
+        let expanded = capture.candidates[initial_count].clone();
+
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_SELECT_CANDIDATE,
+                    u32::try_from(initial_count).unwrap(),
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(capture.last_preedit, expanded);
+        // SAFETY: Pointers remain live for the synchronous callback.
+        assert_eq!(
+            unsafe {
+                slime_process_actions(
+                    handle,
+                    EVENT_ACCEPT_CANDIDATE,
+                    0,
+                    (&raw mut capture).cast(),
+                    Some(collect_typed_action),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(capture.last_commit, expanded);
+        // SAFETY: The handle is live and released once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[test]
     fn short_left_context_learning_crosses_typed_actions_and_persists() {
         let directory =
             std::env::temp_dir().join(format!("slime-ffi-short-context-{}", std::process::id()));

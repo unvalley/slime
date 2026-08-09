@@ -32,7 +32,8 @@ pub use user_data::{HistoryEntry, UserData, UserDictionaryEntry};
 /// Every built-in date candidate format, used as the default by adapters.
 pub const ALL_DATE_FORMATS: u32 = date_time_candidates::ALL_FORMATS;
 
-const EXPANDED_N_BEST: usize = 32;
+const SHORT_EXPANDED_N_BEST: usize = 32;
+const LONG_EXPANDED_N_BEST: usize = 16;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
 const MAX_COMPOUND_READING_CHARACTERS: usize = 16;
 const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
@@ -980,12 +981,17 @@ impl SlimeEngine {
 
         let mut merged = self.candidates.clone();
         let reading_length = self.reading.chars().count();
-        if reading_length <= MAX_EXPANDED_READING_CHARACTERS {
-            for candidate in self
-                .conversion_candidates_for_reading_with_limit(&self.reading, Some(EXPANDED_N_BEST))
-            {
-                push_unique(&mut merged, candidate);
-            }
+        // Keep long-input expansion bounded: this runs only after the user
+        // reaches the end of the initial candidate list, never on first show.
+        let expanded_n_best = if reading_length <= MAX_EXPANDED_READING_CHARACTERS {
+            SHORT_EXPANDED_N_BEST
+        } else {
+            LONG_EXPANDED_N_BEST
+        };
+        for candidate in
+            self.conversion_candidates_for_reading_with_limit(&self.reading, Some(expanded_n_best))
+        {
+            push_unique(&mut merged, candidate);
         }
         if reading_length <= MAX_COMPOUND_READING_CHARACTERS {
             for candidate in self.dictionary.compound_candidates(
@@ -3858,17 +3864,28 @@ mod tests {
     }
 
     #[test]
-    fn cycling_long_reading_uses_bounded_compounds_without_wide_n_best() {
-        let mut engine = SlimeEngine::bundled();
+    fn cycling_long_reading_adds_bounded_n_best_candidates() {
+        let dictionary = Dictionary::bundled();
+        let reading = "わたしはにほんじん";
+        let mut engine = SlimeEngine::new(dictionary);
         type_text(&mut engine, "watashihanihonjin");
         engine.handle(InputEvent::Space);
 
-        let initial_count = engine.snapshot().candidates.len();
+        let initial = engine.snapshot().candidates;
+        let target = engine
+            .conversion_candidates_for_reading_with_limit(
+                reading,
+                Some(super::LONG_EXPANDED_N_BEST),
+            )
+            .into_iter()
+            .find(|surface| !initial.contains(surface))
+            .expect("bounded N-best 16 should add a candidate beyond the initial search");
+        let initial_count = initial.len();
         for _ in 0..initial_count {
             engine.handle(InputEvent::NextCandidate);
         }
 
-        assert!(engine.snapshot().candidates.len() >= initial_count);
+        assert!(engine.snapshot().candidates.contains(&target));
         assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
     }
 

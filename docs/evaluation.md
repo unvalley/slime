@@ -232,6 +232,23 @@ GSD train・dev・testは既に右文脈規則の診断に使っているため�
 
 AJIMEE・JWTD・PUDは候補表層、cost、順序まで全件完全一致した。Apple M3、Release、50,000回を旧新交互に3組測定した`unique_right_suru_candidates`は、旧0.352〜0.360 ms/op、新0.355〜0.375 ms/opだった。中央値差は約0.0058 ms/opで、候補初回表示20 ms予算内にある。
 
+#### 数字同士を結ぶ「対」
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)は数値表記を通常語とは別の入力支援として扱う。[azooKey](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)も桁区切り、日時、時刻などを独立したSpecial Conversionとして実装する。Slimeでも一般の`たい`候補costを変えず、左末尾と右先頭がともに整数である`1｜たい｜1`型だけを構造化表記として扱う。
+
+ASCII・全角・漢数字に対応し、既存候補の`対`を最大3,000 cost昇格する。小数、片側だけが数値、右文脈がない通常入力、ライブ変換、private modeは対象外である。
+
+| dataset | 変更前 acc@1 | 数字間の「対」対応後 acc@1 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: |
+| GSD train 1,940件 | 0.7067 | **0.7072** | 1 / 0 |
+| GSD dev 331件 | **0.8671** | **0.8671** | 0 / 0 |
+| GSD test 323件 | 0.8762 | **0.8793** | 1 / 0 |
+| AJIMEE 200件 | **0.5300** | **0.5300** | 0 / 0 |
+| JWTD dev 400件 | **0.2950** | **0.2950** | 0 / 0 |
+| PUD phrase 446件 | **0.6547** | **0.6547** | 0 / 0 |
+
+変化したのはtrainとtestの`1対1`だけで、いずれも`体 → 対`へ修正した。devは候補配列まで不変、AJIMEE・JWTD・PUDも候補表層、cost、順序まで全件完全一致した。Apple M3、Release、50,000回を旧新交互に3組測定した`numeric_score_notation_candidates`は旧0.0909〜0.0917 ms/op、新0.0913〜0.0924 ms/opで、中央値差は約0.00028 ms/opだった。
+
 #### 距離・所要時間に続く「圏内・圏外」
 
 右側の短い辞書語だけを優先すると、低costな`県内`が`徒歩10分｜圏内`を上書きする。一般の右複合語閾値は広げず、左側が数値と距離・時間単位（`秒`・`分`・`時間`・`駅`・メートル/キロメートル表記）で終わり、読みが`けん`、右文脈が`内`または`外`で始まる場合だけ、到達範囲の`圏`を既存候補内で優先する。`福岡｜県内`のように計測表現がない行政区域は従来順位のままにする。

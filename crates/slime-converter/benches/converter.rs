@@ -145,6 +145,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });
     run_numeric_right_compound_benchmark(dictionary, iterations);
+    run_numeric_score_notation_benchmark(dictionary, iterations);
     run(
         "converter/polite_right_context_candidates",
         iterations,
@@ -241,6 +242,29 @@ fn run_numeric_right_compound_benchmark(dictionary: &Dictionary, iterations: u64
             black_box(
                 dictionary
                     .candidates_with_context(black_box("かんせん"), black_box("デドフスクにはM9")),
+            );
+        },
+    );
+}
+
+fn run_numeric_score_notation_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/numeric_score_notation_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("たい"),
+                black_box("相手GKと1"),
+                black_box("1になった"),
+            ));
+        },
+    );
+    run(
+        "converter/numeric_score_notation_left_only",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("たい"), black_box("相手GKと1")),
             );
         },
     );

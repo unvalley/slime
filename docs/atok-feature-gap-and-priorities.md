@@ -144,6 +144,12 @@ GSD trainで`胃の調子`、`素の状態`、`真の目的`、`未知の世界`
 
 GSD trainで`敵視して`を1件、診断済みのGSD testで`長居して`、`感心する`、`駆使する`、`位置する`を4件修正し、悪化は0件だった。GSD devはtop-1不変、AJIMEE、JWTD、PUDは候補表層・cost・順序まで全件不変だった。50,000回×3組の旧新交互測定では中央値差が約0.0058 ms/opだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 数字同士を結ぶ「対」
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。
+
+GSD train/testで`1対1`を各1件修正し、悪化は0件だった。GSD dev、AJIMEE、JWTD、PUDは候補配列まで不変で、Release測定の中央値差は約0.00028 ms/opだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 「たい」へ接続する動詞連用形
 
 右文脈が`たい`で始まる場合だけ、Mozcの助動詞POSへの接続costを使い、接続可能な一語候補を最大1,500 cost昇格する。候補表層が同じでも名詞経路と動詞経路を区別し、`かい｜たい`を`回｜たい`ではなく`買い｜たい`にする。右文脈がない通常入力、ライブ変換、private modeは変更しない。

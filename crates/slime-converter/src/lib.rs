@@ -554,6 +554,16 @@ fn surrounding_structured_notation_surface(
     reading: &str,
     right_context: &str,
 ) -> Option<&'static str> {
+    if reading == "たい"
+        && (trailing_integer(left_context).is_some()
+            || left_context
+                .chars()
+                .next_back()
+                .is_some_and(is_japanese_numeric_character))
+        && starts_with_score_integer(right_context)
+    {
+        return Some("対");
+    }
     if reading == "けん"
         && (right_context.starts_with('内') || right_context.starts_with('外'))
         && trailing_reach_measurement(left_context)
@@ -561,6 +571,31 @@ fn surrounding_structured_notation_surface(
         return Some("圏");
     }
     None
+}
+
+fn starts_with_score_integer(text: &str) -> bool {
+    let mut characters = text.chars().peekable();
+    let Some(first) = characters.peek().copied() else {
+        return false;
+    };
+    if decimal_digit(first).is_some() {
+        while characters
+            .peek()
+            .is_some_and(|character| decimal_digit(*character).is_some())
+        {
+            characters.next();
+        }
+    } else if is_japanese_numeric_character(first) {
+        while characters
+            .peek()
+            .is_some_and(|character| is_japanese_numeric_character(*character))
+        {
+            characters.next();
+        }
+    } else {
+        return false;
+    }
+    !matches!(characters.next(), Some('.' | '．'))
 }
 
 fn trailing_reach_measurement(text: &str) -> bool {
@@ -4274,6 +4309,8 @@ mod tests {
             DictionaryEntry::new("か", "日", 2_500),
             DictionaryEntry::new("にち", "日時", 0),
             DictionaryEntry::new("にち", "日", 2_500),
+            DictionaryEntry::new("たい", "体", 0),
+            DictionaryEntry::new("たい", "対", 2_500),
         ]);
 
         assert_eq!(
@@ -4292,6 +4329,28 @@ mod tests {
             dictionary.candidates_with_context("にち", "8月12")[0].surface,
             "日"
         );
+        for (left_context, right_context) in [("1", "1"), ("１", "１"), ("一", "一")] {
+            assert_eq!(
+                dictionary.candidates_with_surrounding_context("たい", left_context, right_context)
+                    [0]
+                .surface,
+                "対"
+            );
+        }
+        for (left_context, right_context) in [
+            ("相手と", "1"),
+            ("1", "人"),
+            ("1.5", "1"),
+            ("1", "1.5"),
+            ("１", "１．５"),
+        ] {
+            assert_eq!(
+                dictionary.candidates_with_surrounding_context("たい", left_context, right_context)
+                    [0]
+                .surface,
+                "体"
+            );
+        }
     }
 
     #[test]

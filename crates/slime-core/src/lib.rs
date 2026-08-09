@@ -1,6 +1,6 @@
 //! Platform-independent IME state machine.
 
-use slime_converter::{Dictionary, Segment};
+use slime_converter::{Candidate, Dictionary, Segment};
 use slime_romaji::RomajiComposer;
 
 mod date_time_candidates;
@@ -40,6 +40,9 @@ const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
+const RESCORE_CANDIDATE_LIMIT: usize = 3;
+const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
+const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -106,6 +109,19 @@ pub struct CandidateDetail {
     pub detail: Option<String>,
 }
 
+/// Immutable input for an optional external candidate scorer.
+///
+/// Only ordinary dictionary candidates are exposed here. Candidates promoted
+/// by the user dictionary, history, an installed context rule, or typo
+/// correction remain outside this request and cannot be displaced by an
+/// external model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateRescoreRequest {
+    pub context: String,
+    pub reading: String,
+    pub candidates: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Composing,
@@ -169,6 +185,18 @@ struct CandidateCorrection {
     reading: String,
 }
 
+#[derive(Clone, Debug)]
+struct CandidateRescoreState {
+    request: CandidateRescoreRequest,
+    candidates: Vec<Candidate>,
+}
+
+#[derive(Debug)]
+struct ConversionCandidateSet {
+    surfaces: Vec<String>,
+    rescore: Option<CandidateRescoreState>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransformStyle {
     Hiragana,
@@ -194,6 +222,7 @@ pub struct SlimeEngine {
     raw_input: String,
     candidates: Vec<String>,
     candidate_corrections: Vec<CandidateCorrection>,
+    candidate_rescore: Option<CandidateRescoreState>,
     selected: usize,
     candidate_kind: Option<CandidateKind>,
     completion_selected: bool,
@@ -225,6 +254,7 @@ impl SlimeEngine {
             raw_input: String::new(),
             candidates: Vec::new(),
             candidate_corrections: Vec::new(),
+            candidate_rescore: None,
             selected: 0,
             candidate_kind: None,
             completion_selected: false,
@@ -351,6 +381,73 @@ impl SlimeEngine {
     #[must_use]
     pub fn conversion_candidates(&self, reading: &str) -> Vec<String> {
         self.conversion_candidates_for_reading(reading)
+    }
+
+    /// Returns the current explicit-conversion candidates eligible for an
+    /// optional external scorer. The request is absent when a personalized or
+    /// rule-based candidate is already promoted, the base winner is decisive,
+    /// or the active candidates came from completion, reconversion, segmented
+    /// conversion, or typo correction.
+    #[must_use]
+    pub fn candidate_rescore_request(&self) -> Option<CandidateRescoreRequest> {
+        self.candidate_rescore
+            .as_ref()
+            .filter(|_| {
+                self.candidate_kind == Some(CandidateKind::Conversion) && self.selected == 0
+            })
+            .map(|state| state.request.clone())
+    }
+
+    /// Applies model log-likelihoods to the pending dictionary-only request.
+    ///
+    /// The pending request is consumed even when validation fails, so stale or
+    /// malformed model output can never be applied to a later composition.
+    /// A successful result contains replacement candidate/preedit actions;
+    /// callers should publish these instead of the actions emitted before
+    /// scoring.
+    pub fn apply_candidate_rescore(
+        &mut self,
+        log_likelihoods: &[f64],
+        lambda: f64,
+    ) -> Option<Vec<SlimeAction>> {
+        let state = self.candidate_rescore.take()?;
+        if self.candidate_kind != Some(CandidateKind::Conversion)
+            || self.selected != 0
+            || state.candidates.len() != log_likelihoods.len()
+            || !(0.0..=1.0).contains(&lambda)
+            || !lambda.is_finite()
+            || log_likelihoods.iter().any(|score| !score.is_finite())
+        {
+            return None;
+        }
+
+        let mut positions = Vec::with_capacity(state.candidates.len());
+        for candidate in &state.candidates {
+            let position = self
+                .candidates
+                .iter()
+                .position(|surface| surface == &candidate.surface)?;
+            if positions.contains(&position) {
+                return None;
+            }
+            positions.push(position);
+        }
+
+        let mut order: Vec<usize> = (0..state.candidates.len()).collect();
+        let combined: Vec<f64> = state
+            .candidates
+            .iter()
+            .zip(log_likelihoods)
+            .map(|(candidate, log_likelihood)| {
+                (1.0 - lambda) * (-f64::from(candidate.cost) / RESCORE_COST_LOG_SCALE)
+                    + lambda * log_likelihood
+            })
+            .collect();
+        order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
+        for (position, candidate_index) in positions.into_iter().zip(order) {
+            self.candidates[position].clone_from(&state.candidates[candidate_index].surface);
+        }
+        Some(self.candidate_actions())
     }
 
     /// Returns conversion candidates for an explicit transient left context.
@@ -573,6 +670,7 @@ impl SlimeEngine {
             self.candidate_kind,
             Some(CandidateKind::Conversion | CandidateKind::SegmentedConversion)
         ) {
+            self.candidate_rescore = None;
             if self.selected + 1 == self.candidates.len() {
                 self.expand_conversion_candidates_if_needed();
             }
@@ -590,10 +688,11 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
-        let (candidates, corrections) =
+        let (candidates, corrections, rescore) =
             self.conversion_candidates_with_corrections(&self.reading, &self.raw_input);
         self.candidates = candidates;
         self.candidate_corrections = corrections;
+        self.candidate_rescore = rescore;
         self.selected = 0;
         self.candidate_kind = Some(CandidateKind::Conversion);
         self.completion_selected = false;
@@ -623,6 +722,20 @@ impl SlimeEngine {
         dictionary_limit: Option<usize>,
         explicit_previous_surface: Option<&str>,
     ) -> Vec<String> {
+        self.conversion_candidate_set_for_reading_with_limit_and_context(
+            reading,
+            dictionary_limit,
+            explicit_previous_surface,
+        )
+        .surfaces
+    }
+
+    fn conversion_candidate_set_for_reading_with_limit_and_context(
+        &self,
+        reading: &str,
+        dictionary_limit: Option<usize>,
+        explicit_previous_surface: Option<&str>,
+    ) -> ConversionCandidateSet {
         let mut candidates = Vec::new();
         let previous_surface = if self.preferences.private_mode {
             None
@@ -658,16 +771,14 @@ impl SlimeEngine {
             (None, None) => self.dictionary.candidates(reading),
         };
         let dictionary_surfaces: Vec<_> = dictionary_candidates
-            .into_iter()
-            .map(|candidate| candidate.surface)
+            .iter()
+            .map(|candidate| candidate.surface.as_str())
             .collect();
         if let Some(previous_surface) = previous_surface {
             let mut promoted = 0;
             self.installed_packs
                 .visit_contextual_surfaces(previous_surface, reading, |surface| {
-                    if dictionary_surfaces
-                        .iter()
-                        .any(|candidate| candidate == surface)
+                    if dictionary_surfaces.contains(&surface)
                         && !candidates.iter().any(|candidate| candidate == surface)
                     {
                         candidates.push(surface.to_owned());
@@ -676,23 +787,37 @@ impl SlimeEngine {
                     promoted < CONTEXT_RULE_PROMOTION_LIMIT
                 });
         }
-        for surface in dictionary_surfaces {
-            push_unique(&mut candidates, surface);
+        let rescore = candidate_rescore_state(
+            reading,
+            previous_surface.unwrap_or_default(),
+            &candidates,
+            &dictionary_candidates,
+        );
+        for candidate in dictionary_candidates {
+            push_unique(&mut candidates, candidate.surface);
         }
         insert_visible_katakana_candidate(&mut candidates, reading);
         insert_unique_candidates_after_first(
             &mut candidates,
             date_time_candidates::candidates(reading, self.preferences.date_format_mask),
         );
-        candidates
+        ConversionCandidateSet {
+            surfaces: candidates,
+            rescore,
+        }
     }
 
     fn conversion_candidates_with_corrections(
         &self,
         reading: &str,
         raw_input: &str,
-    ) -> (Vec<String>, Vec<CandidateCorrection>) {
-        let ordinary = self.conversion_candidates_for_reading(reading);
+    ) -> (
+        Vec<String>,
+        Vec<CandidateCorrection>,
+        Option<CandidateRescoreState>,
+    ) {
+        let ordinary =
+            self.conversion_candidate_set_for_reading_with_limit_and_context(reading, None, None);
         if self.dictionary.has_exact_reading(reading)
             || self
                 .user_data
@@ -705,7 +830,7 @@ impl SlimeEngine {
                 english_reverse::reverse_match(reading, key) == Some(ReverseMatch::Exact)
             })
         {
-            return (ordinary, Vec::new());
+            return (ordinary.surfaces, Vec::new(), ordinary.rescore);
         }
 
         let mut ranked_corrections: Vec<(CandidateCorrection, (u8, i32))> = Vec::new();
@@ -761,18 +886,18 @@ impl SlimeEngine {
         let corrections = select_candidate_corrections(ranked_corrections, 3);
 
         if corrections.is_empty() {
-            return (ordinary, corrections);
+            return (ordinary.surfaces, corrections, ordinary.rescore);
         }
 
-        let mut candidates = Vec::with_capacity(ordinary.len() + corrections.len() + 1);
+        let mut candidates = Vec::with_capacity(ordinary.surfaces.len() + corrections.len() + 1);
         push_unique(&mut candidates, reading.to_owned());
         for correction in &corrections {
             push_unique(&mut candidates, correction.surface.clone());
         }
-        for candidate in ordinary {
+        for candidate in ordinary.surfaces {
             push_unique(&mut candidates, candidate);
         }
-        (candidates, corrections)
+        (candidates, corrections, None)
     }
 
     fn history_is_available(&self) -> bool {
@@ -812,6 +937,7 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
+        self.candidate_rescore = None;
         if self.selected + 1 == self.candidates.len() {
             self.expand_conversion_candidates_if_needed();
         }
@@ -828,6 +954,7 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
+        self.candidate_rescore = None;
         if self.selected == 0 {
             self.expand_conversion_candidates_if_needed();
         }
@@ -1401,6 +1528,7 @@ impl SlimeEngine {
     fn clear_candidates(&mut self) {
         self.candidates.clear();
         self.candidate_corrections.clear();
+        self.candidate_rescore = None;
         self.selected = 0;
         self.candidate_kind = None;
         self.completion_selected = false;
@@ -1718,6 +1846,42 @@ fn bundled_dictionary_with_packs(
         layers.push(user_layer);
     }
     Dictionary::bundled_with_layers(layers)
+}
+
+fn candidate_rescore_state(
+    reading: &str,
+    context: &str,
+    protected_candidates: &[String],
+    dictionary_candidates: &[Candidate],
+) -> Option<CandidateRescoreState> {
+    if !protected_candidates.is_empty() {
+        return None;
+    }
+    let candidates: Vec<_> = dictionary_candidates
+        .iter()
+        .take(RESCORE_CANDIDATE_LIMIT)
+        .cloned()
+        .collect();
+    let first = candidates.first()?.cost;
+    let alternative = candidates
+        .iter()
+        .skip(1)
+        .map(|candidate| candidate.cost)
+        .min()?;
+    if alternative.saturating_sub(first).max(0) > RESCORE_MAX_BASE_COST_GAP {
+        return None;
+    }
+    Some(CandidateRescoreState {
+        request: CandidateRescoreRequest {
+            context: context.to_owned(),
+            reading: reading.to_owned(),
+            candidates: candidates
+                .iter()
+                .map(|candidate| candidate.surface.clone())
+                .collect(),
+        },
+        candidates,
+    })
 }
 
 fn select_candidate_corrections(
@@ -3459,6 +3623,93 @@ mod tests {
         let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
         assert!(history.contains("にほん\t日本\t1\t"));
         assert!(!history.contains(&format!("{original}\t日本")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_scores_reorder_only_pending_dictionary_candidates() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+            DictionaryEntry::new("にほん", "仁本", 1_200),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, "nihon");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("ambiguous dictionary candidates should be scoreable");
+        assert_eq!(request.reading, "にほん");
+        assert!(request.context.is_empty());
+        assert_eq!(request.candidates.len(), 3);
+        let promoted = request.candidates[1].clone();
+        let scores: Vec<_> = request
+            .candidates
+            .iter()
+            .map(|candidate| if candidate == &promoted { 0.0 } else { -10.0 })
+            .collect();
+        let actions = engine
+            .apply_candidate_rescore(&scores, 0.7)
+            .expect("aligned scores should apply");
+
+        assert_eq!(engine.snapshot().candidates.first(), Some(&promoted));
+        assert!(actions.contains(&SlimeAction::UpdatePreedit(promoted)));
+        assert!(engine.candidate_rescore_request().is_none());
+    }
+
+    #[test]
+    fn malformed_scores_leave_the_base_order_and_are_not_reused() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, "nihon");
+        engine.handle(InputEvent::Space);
+        let base = engine.snapshot().candidates;
+
+        assert!(engine.apply_candidate_rescore(&[], 0.7).is_none());
+        assert_eq!(engine.snapshot().candidates, base);
+        assert!(engine.candidate_rescore_request().is_none());
+    }
+
+    #[test]
+    fn history_and_typo_corrections_are_never_exposed_to_external_scoring() {
+        let directory = test_directory("rescore-protected");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nにほん\t履歴日本\t5\t10\n",
+        )
+        .unwrap();
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+        ]);
+        let mut history = SlimeEngine::with_user_data(dictionary, UserData::load(&directory));
+        history.set_preferences(EnginePreferences {
+            history_completion: true,
+            history_learning: true,
+            ..EnginePreferences::default()
+        });
+        type_text(&mut history, "nihon");
+        history.handle(InputEvent::Space);
+        assert_eq!(
+            history.snapshot().candidates.first().map(String::as_str),
+            Some("履歴日本")
+        );
+        assert!(history.candidate_rescore_request().is_none());
+
+        let mut typo = SlimeEngine::bundled();
+        type_text(&mut typo, "nihpn");
+        typo.handle(InputEvent::Space);
+        assert!(
+            typo.snapshot()
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "日本")
+        );
+        assert!(typo.candidate_rescore_request().is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 

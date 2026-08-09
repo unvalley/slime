@@ -145,6 +145,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });
     run_general_noun_context_benchmark(dictionary, iterations);
+    run_genitive_context_benchmark(dictionary, iterations);
     run_numeric_right_compound_benchmark(dictionary, iterations);
     run_numeric_score_notation_benchmark(dictionary, iterations);
     run(
@@ -220,6 +221,27 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_genitive_context_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/verbal_noun_genitive_context_candidates",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("しかい"), black_box("多数の番組の")),
+            );
+        },
+    );
+    run(
+        "converter/verbal_noun_genitive_context_without_match",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(black_box("しかい"), black_box("多数の番組")),
+            );
         },
     );
 }

@@ -74,8 +74,10 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
                     && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
                     && is_bounded_coordination_phrase(&entry.surface))
                 || (entry.word_cost <= MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST
-                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                    && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+                    && ((entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+                        && entry.right_id == MOZC_GENERAL_NOUN_POS_ID)
+                        || (entry.left_id == MOZC_VERBAL_NOUN_POS_ID
+                            && entry.right_id == MOZC_VERBAL_NOUN_POS_ID))
                     && is_bounded_genitive_phrase(&entry.surface));
             if entry.surface == *reading
                 || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)

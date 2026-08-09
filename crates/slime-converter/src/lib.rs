@@ -4294,6 +4294,14 @@ mod tests {
                 .surface,
             "勲"
         );
+        assert_eq!(
+            dictionary.candidates_with_context("しかい", "多数の番組の")[0].surface,
+            "司会"
+        );
+        assert_ne!(
+            dictionary.candidates_with_context("しかい", "多数の番組")[0].surface,
+            "司会"
+        );
     }
 
     #[test]

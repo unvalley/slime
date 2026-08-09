@@ -310,6 +310,22 @@ const PERSONAL_NAME_MAX_ENTRIES_PER_PART: usize = 64;
 const PERSONAL_NAME_MAX_CANDIDATES: usize = 128;
 const MOZC_PERSONAL_GIVEN_NAME_POS_ID: u16 = 1922;
 const MOZC_PERSONAL_SURNAME_POS_ID: u16 = 1923;
+const MOZC_INDEPENDENT_VERB_POS_ID_START: u16 = 577;
+const MOZC_INDEPENDENT_VERB_POS_ID_END: u16 = 856;
+const MOZC_GENERAL_GODAN_CONTINUATIVE_POS_ID: u16 = 842;
+
+fn is_safe_hiragana_right_phrase_entry(entry: compact::CompactEntry, suffix: &str) -> bool {
+    if entry.left_id != entry.right_id {
+        return false;
+    }
+    let suffix_characters = suffix.chars().count();
+    if suffix_characters == 1 {
+        return suffix == "に" && entry.left_id == MOZC_GENERAL_GODAN_CONTINUATIVE_POS_ID;
+    }
+    suffix_characters >= 2
+        && (MOZC_INDEPENDENT_VERB_POS_ID_START..=MOZC_INDEPENDENT_VERB_POS_ID_END)
+            .contains(&entry.left_id)
+}
 const FIXED_SEGMENT_MAX_READING_CHARACTERS: usize = 128;
 const FIXED_SEGMENT_MAX_SEGMENTS: usize = 64;
 const FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT: usize = 8;
@@ -323,6 +339,7 @@ const DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS: usize = 8;
 const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
 const DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING: i32 = 6_300;
+const DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING: i32 = 7_000;
 const DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
@@ -1172,7 +1189,10 @@ impl Dictionary {
         if !candidate_surface
             .chars()
             .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
-            || !matches!(first, '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}')
+            || !matches!(
+                first,
+                '\u{3040}'..='\u{309f}' | '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'
+            )
         {
             return 0;
         }
@@ -1181,34 +1201,39 @@ impl Dictionary {
             .nth(DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS)
             .map_or(right_context.len(), |(index, _)| index);
         let context_head = &right_context[..context_end];
+        let starts_with_hiragana = matches!(first, '\u{3040}'..='\u{309f}');
         let mut best_promotion = 0;
-        for end in context_head
-            .char_indices()
-            .skip(1)
-            .map(|(index, _)| index)
-            .chain(std::iter::once(context_head.len()))
-        {
-            if let Some(word_cost) = compact.joined_surface_reading_prefix_cost(
-                candidate_surface,
-                &context_head[..end],
-                reading,
-                &[
-                    MOZC_PERSONAL_GIVEN_NAME_POS_ID,
-                    MOZC_PERSONAL_SURNAME_POS_ID,
-                ],
-            ) {
-                let cost_ceiling = if context_head[..end].chars().count() >= 2 {
+        compact.for_each_joined_surface_reading_prefix(
+            candidate_surface,
+            context_head,
+            reading,
+            DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS,
+            |suffix, entry| {
+                let accepted = !matches!(
+                    entry.left_id,
+                    MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
+                ) && !matches!(
+                    entry.right_id,
+                    MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
+                ) && (!starts_with_hiragana
+                    || is_safe_hiragana_right_phrase_entry(entry, suffix));
+                if !accepted {
+                    return;
+                }
+                let cost_ceiling = if suffix == "的" {
+                    DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING
+                } else if suffix.chars().count() >= 2 {
                     DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING
                 } else {
                     DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING
                 };
                 best_promotion = best_promotion.max(
                     cost_ceiling
-                        .saturating_sub(word_cost)
+                        .saturating_sub(entry.word_cost)
                         .min(DOCUMENT_PHRASE_PROMOTION),
                 );
-            }
-        }
+            },
+        );
         best_promotion
     }
 
@@ -4032,6 +4057,33 @@ mod tests {
                 .surface,
             "和"
         );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "かぶ",
+                "現在、その名称はアトレティコの",
+                "組織の名前として残っている"
+            )[0]
+            .surface,
+            "下部"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "き",
+                "カラフルで色合いがいいデザインがあったので",
+                "に入りました"
+            )[0]
+            .surface,
+            "気"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "し",
+                "これが無い場合、作業者は",
+                "に至る致命傷を負う"
+            )[0]
+            .surface,
+            "死"
+        );
     }
 
     #[test]
@@ -4052,6 +4104,26 @@ mod tests {
                 .surface,
             dictionary.candidates_with_context("あき", "現在は")[0].surface,
             "a surname-only compound must not become document phrase evidence"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "し",
+                "破裂した心臓すら治せるという超能力なのに、佐藤",
+                "の病気は治せなかった"
+            )[0]
+            .surface,
+            "氏",
+            "an unrelated inflection must not override a noun before a particle"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ねがい",
+                "今後ともよろしくお",
+                "いたします"
+            )[0]
+            .surface,
+            "願い",
+            "right-side evidence must not reuse a surface already covered by the reading"
         );
     }
 

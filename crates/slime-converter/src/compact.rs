@@ -181,56 +181,69 @@ impl CompactDictionary {
         best_cost
     }
 
-    /// Returns the lowest reverse-index word cost whose reading starts with
-    /// `prefix` for the split `surface + suffix` surface.
-    pub(crate) fn joined_surface_reading_prefix_cost(
+    /// Calls `callback` for reverse-index entries whose surface is
+    /// `surface + suffix_prefix` and whose reading strictly extends `prefix`.
+    /// The shared surface path is traversed once while the suffix grows.
+    pub(crate) fn for_each_joined_surface_reading_prefix(
         &self,
         surface: &str,
-        suffix: &str,
+        suffixes: &str,
         prefix: &str,
-        excluded_pos_ids: &[u16],
-    ) -> Option<i32> {
+        max_suffix_characters: usize,
+        mut callback: impl FnMut(&str, CompactEntry),
+    ) {
         let mut node = self.reverse_fst.root();
         let mut output = fst::raw::Output::zero();
-        for byte in surface.bytes().chain(suffix.bytes()) {
-            let transition_index = node.find_input(byte)?;
+        for byte in surface.bytes() {
+            let Some(transition_index) = node.find_input(byte) else {
+                return;
+            };
             let transition = node.transition(transition_index);
             output = output.cat(transition.out);
             node = self.reverse_fst.node(transition.addr);
         }
-        if !node.is_final() {
-            return None;
-        }
-        let block = output.cat(node.final_output()).value();
-        let mut cursor = usize::try_from(block).expect("reverse block offset");
-        let count = read_reverse_varint(&mut cursor);
-        let mut best_cost = None;
-        for _ in 0..count {
-            let offset = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
-            let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
-            let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
-                .expect("valid reverse reading UTF-8");
-            cursor += 2;
-            if reading.starts_with(prefix) {
-                self.for_each_exact(reading, |entry| {
-                    let entry_surface = entry.surface.as_bytes();
-                    let joined_length = surface.len().saturating_add(suffix.len());
-                    let matches_joined_surface = entry_surface.len() == joined_length
-                        && entry_surface.get(..surface.len()) == Some(surface.as_bytes())
-                        && entry_surface.get(surface.len()..) == Some(suffix.as_bytes());
-                    if matches_joined_surface
-                        && !excluded_pos_ids.contains(&entry.left_id)
-                        && !excluded_pos_ids.contains(&entry.right_id)
-                    {
-                        best_cost = Some(
-                            best_cost
-                                .map_or(entry.word_cost, |best: i32| best.min(entry.word_cost)),
-                        );
-                    }
-                });
+        let suffix_bytes = suffixes.as_bytes();
+        let mut suffix_end = 0;
+        for (suffix_start, character) in suffixes.char_indices().take(max_suffix_characters) {
+            let next_suffix_end = suffix_start + character.len_utf8();
+            for &byte in &suffix_bytes[suffix_end..next_suffix_end] {
+                let Some(transition_index) = node.find_input(byte) else {
+                    return;
+                };
+                let transition = node.transition(transition_index);
+                output = output.cat(transition.out);
+                node = self.reverse_fst.node(transition.addr);
+            }
+            suffix_end = next_suffix_end;
+            if !node.is_final() {
+                continue;
+            }
+            let block = output.cat(node.final_output()).value();
+            let mut cursor = usize::try_from(block).expect("reverse block offset");
+            let count = read_reverse_varint(&mut cursor);
+            let suffix = &suffixes[..suffix_end];
+            for _ in 0..count {
+                let offset =
+                    usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
+                let length =
+                    usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
+                let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
+                    .expect("valid reverse reading UTF-8");
+                cursor += 2;
+                if reading.starts_with(prefix) && reading.len() > prefix.len() {
+                    self.for_each_exact(reading, |entry| {
+                        let entry_surface = entry.surface.as_bytes();
+                        let joined_length = surface.len().saturating_add(suffix.len());
+                        let matches_joined_surface = entry_surface.len() == joined_length
+                            && entry_surface.get(..surface.len()) == Some(surface.as_bytes())
+                            && entry_surface.get(surface.len()..) == Some(suffix.as_bytes());
+                        if matches_joined_surface {
+                            callback(suffix, entry);
+                        }
+                    });
+                }
             }
         }
-        best_cost
     }
 }
 
@@ -285,7 +298,31 @@ fn read_varint(cursor: &mut usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::CompactDictionary;
+    use super::{CompactDictionary, CompactEntry};
+
+    fn joined_surface_reading_prefix_cost(
+        dictionary: &CompactDictionary,
+        surface: &str,
+        suffix: &str,
+        prefix: &str,
+        mut accepts_entry: impl FnMut(CompactEntry) -> bool,
+    ) -> Option<i32> {
+        let mut best_cost = None;
+        dictionary.for_each_joined_surface_reading_prefix(
+            surface,
+            suffix,
+            prefix,
+            suffix.chars().count(),
+            |matched_suffix, entry| {
+                if matched_suffix.len() == suffix.len() && accepts_entry(entry) {
+                    best_cost = Some(
+                        best_cost.map_or(entry.word_cost, |best: i32| best.min(entry.word_cost)),
+                    );
+                }
+            },
+        );
+        best_cost
+    }
 
     #[test]
     fn exact_lookup_returns_known_entries() {
@@ -357,13 +394,20 @@ mod tests {
         let dictionary = CompactDictionary::bundled();
 
         assert!(
-            dictionary
-                .joined_surface_reading_prefix_cost("圏", "内", "けん", &[])
-                .is_some()
+            joined_surface_reading_prefix_cost(dictionary, "圏", "内", "けん", |_| true).is_some()
         );
         assert_eq!(
-            dictionary.joined_surface_reading_prefix_cost("圏", "内", "かん", &[]),
+            joined_surface_reading_prefix_cost(dictionary, "圏", "内", "かん", |_| true),
             None
+        );
+        assert_eq!(
+            joined_surface_reading_prefix_cost(dictionary, "下部", "組織", "かぶ", |_| true),
+            Some(7_081)
+        );
+        assert_eq!(
+            joined_surface_reading_prefix_cost(dictionary, "願", "い", "ねがい", |_| true),
+            None,
+            "right-side surface evidence must extend the input reading"
         );
     }
 

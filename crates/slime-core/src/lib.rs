@@ -2925,6 +2925,17 @@ mod tests {
     }
 
     #[test]
+    fn external_right_context_ranks_an_inflectional_phrase_prefix() {
+        let mut engine = SlimeEngine::bundled();
+
+        engine.set_external_context("カラフルで色合いがいいデザインがあったので", "に入りました");
+        type_text(&mut engine, "ki");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "気");
+    }
+
+    #[test]
     fn private_mode_ignores_external_right_context() {
         let mut engine = SlimeEngine::bundled();
         engine.set_preferences(EnginePreferences {

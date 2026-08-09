@@ -194,6 +194,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
     run("converter/right_compound_left_only", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("まち"), black_box("患者と患者の")));
     });
+    run_right_coordination_phrase_benchmark(dictionary, iterations);
     run_measured_reach_benchmark(dictionary, iterations);
     run(
         "converter/right_inflectional_phrase_candidates",
@@ -214,6 +215,32 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_right_coordination_phrase_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/right_coordination_phrase_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("かた"),
+                black_box("デスクワークで固まった"),
+                black_box("や背中をほぐす"),
+            ));
+        },
+    );
+    run(
+        "converter/right_coordination_phrase_left_only",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(
+                    black_box("かた"),
+                    black_box("デスクワークで固まった"),
+                ),
+            );
         },
     );
 }

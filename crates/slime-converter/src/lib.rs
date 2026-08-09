@@ -355,10 +355,51 @@ const MOZC_PERSONAL_SURNAME_POS_ID: u16 = 1923;
 const MOZC_INDEPENDENT_VERB_POS_ID_START: u16 = 577;
 const MOZC_INDEPENDENT_VERB_POS_ID_END: u16 = 856;
 const MOZC_GENERAL_GODAN_CONTINUATIVE_POS_ID: u16 = 842;
+const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
+
+fn is_bounded_coordination_suffix(suffix: &str) -> bool {
+    let mut characters = suffix.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| matches!(character, 'や' | 'と'))
+    {
+        return false;
+    }
+    let mut remainder_characters = 0;
+    for character in characters {
+        if !matches!(
+            character,
+            '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+        ) {
+            return false;
+        }
+        remainder_characters += 1;
+        if remainder_characters > 7 {
+            return false;
+        }
+    }
+    remainder_characters > 0
+}
+
+fn is_coordination_right_phrase_suffix(suffix: &str, right_context: &str) -> bool {
+    if !is_bounded_coordination_suffix(suffix) {
+        return false;
+    }
+    match right_context
+        .strip_prefix(suffix)
+        .and_then(|remainder| remainder.chars().next())
+    {
+        Some(next) => !matches!(next, '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'),
+        None => true,
+    }
+}
 
 fn is_safe_hiragana_right_phrase_entry(entry: compact::CompactEntry, suffix: &str) -> bool {
     if entry.left_id != entry.right_id {
         return false;
+    }
+    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID && is_bounded_coordination_suffix(suffix) {
+        return true;
     }
     let suffix_characters = suffix.chars().count();
     if suffix_characters == 1 {
@@ -396,6 +437,7 @@ const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
 const DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING: i32 = 6_300;
 const DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING: i32 = 7_500;
+const DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING: i32 = 9_300;
 const DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING: i32 = 7_000;
 const DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
@@ -1331,7 +1373,9 @@ impl Dictionary {
                 if !accepted {
                     return;
                 }
-                let cost_ceiling = if is_sibling_right_phrase_suffix(suffix, right_context) {
+                let cost_ceiling = if is_coordination_right_phrase_suffix(suffix, right_context) {
+                    DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING
+                } else if is_sibling_right_phrase_suffix(suffix, right_context) {
                     DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING
                 } else if suffix == "的" {
                     DOCUMENT_RIGHT_DERIVATIONAL_PHRASE_COST_CEILING
@@ -4382,6 +4426,34 @@ mod tests {
             )[0]
             .surface,
             "死"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "かた",
+                "デスクワークで固まった",
+                "や背中をほぐす"
+            )[0]
+            .surface,
+            "肩"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "はな",
+                "生え際を評価するパターン、",
+                "や口の大きさを評価する"
+            )[0]
+            .surface,
+            "鼻"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "かた",
+                "デスクワークで固まった",
+                "や背中合わせの配置"
+            )[0]
+            .surface,
+            dictionary.candidates_with_context("かた", "デスクワークで固まった")[0].surface,
+            "a coordination phrase inside a longer noun is not a word boundary"
         );
         assert_eq!(
             dictionary.candidates_with_surrounding_context("いぼ", "劉裕の", "弟にあたる")[0]

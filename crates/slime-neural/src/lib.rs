@@ -3,8 +3,9 @@
 //! Scores each existing candidate both with and without its trailing EOS under
 //! a character-level conditional LM. Rescoring is prefill-only and
 //! normally needs a single decode call per item: the shared `context +
-//! reading` prefix is assigned to every sequence and each candidate continues
-//! its own sequence in the same batch.
+//! reading` prefix is assigned to every sequence, and candidate prefixes are
+//! represented as a trie so candidates such as long sentence variants do not
+//! decode their identical leading tokens once per candidate.
 //!
 //! Prompt format (zenz-v3): `\u{EE02}<context>\u{EE00}<katakana input>\u{EE01}<output></s>`.
 //! The context block is omitted when the item has no left context.
@@ -231,23 +232,22 @@ impl Rescorer {
             }
 
             // The prefix distribution occupies output row 0 of the merged
-            // decode; candidate rows follow in insertion order.
-            let mut next_row = usize::from(merged_prefix);
-            let mut row_offsets = Vec::with_capacity(chunk.len());
-            for (chunk_slot, tokens) in chunk.iter().enumerate() {
-                row_offsets.push(next_row);
-                let sequence = [sequences[chunk_slot]];
-                for (index, token) in tokens.iter().enumerate() {
-                    batch
-                        .add(
-                            *token,
-                            position(prefix_tokens.len() + index),
-                            &sequence,
-                            true,
-                        )
-                        .map_err(|error| format!("failed to build candidate batch: {error}"))?;
-                }
-                next_row += tokens.len();
+            // decode. Candidate rows follow in trie-node insertion order.
+            // Each node belongs to every sequence with that exact token
+            // prefix, letting llama.cpp share its KV state until candidates
+            // diverge instead of decoding an identical sentence prefix once
+            // per candidate.
+            let trie = CandidateTokenTrie::build(chunk);
+            let candidate_row_base = usize::from(merged_prefix);
+            for node in &trie.nodes {
+                batch
+                    .add(
+                        node.token,
+                        position(prefix_tokens.len() + node.depth - 1),
+                        &node.sequences,
+                        true,
+                    )
+                    .map_err(|error| format!("failed to build candidate batch: {error}"))?;
             }
             let decode_started = Instant::now();
             context
@@ -265,8 +265,8 @@ impl Rescorer {
             let vocabulary = usize::try_from(self.model.n_vocab()).expect("n_vocab fits usize");
             let logits_row = |row: usize| -> &[f32] {
                 // SAFETY: the output buffer holds one `n_vocab` row per
-                // logits-enabled batch token; `row` is below `next_row`, the
-                // number of tokens decoded with logits in this batch.
+                // logits-enabled batch token; `row` is below the prefix row
+                // plus the number of trie nodes decoded in this batch.
                 unsafe {
                     std::slice::from_raw_parts(
                         logits_base.as_ptr().add(row * vocabulary),
@@ -280,7 +280,7 @@ impl Rescorer {
             let first_token_scores = first_token_scores
                 .as_ref()
                 .expect("prefix distribution captured in the first chunk");
-            for (tokens, row_offset) in chunk.iter().zip(&row_offsets) {
+            for (tokens, path) in chunk.iter().zip(&trie.candidate_paths) {
                 let Some(first) = tokens.first() else {
                     logliks.push(f64::NEG_INFINITY);
                     candidate_logliks.push(f64::NEG_INFINITY);
@@ -288,10 +288,15 @@ impl Rescorer {
                 };
                 let mut loglik = first_token_scores.log_probability(*first);
                 for (index, token) in tokens.iter().enumerate().skip(1) {
-                    loglik += token_log_probability(logits_row(row_offset + index - 1), *token);
+                    let preceding_node = path[index - 1];
+                    loglik += token_log_probability(
+                        logits_row(candidate_row_base + preceding_node),
+                        *token,
+                    );
                 }
                 candidate_logliks.push(loglik);
-                loglik += token_log_probability(logits_row(row_offset + tokens.len() - 1), eos);
+                let final_node = *path.last().expect("non-empty candidate has a trie path");
+                loglik += token_log_probability(logits_row(candidate_row_base + final_node), eos);
                 logliks.push(loglik);
             }
             timing.scoring += scoring_started.elapsed();
@@ -303,6 +308,66 @@ impl Rescorer {
             candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
             latency: started.elapsed(),
         })
+    }
+}
+
+#[derive(Debug)]
+struct CandidateTokenTrie {
+    nodes: Vec<CandidateTokenNode>,
+    candidate_paths: Vec<Vec<usize>>,
+}
+
+#[derive(Debug)]
+struct CandidateTokenNode {
+    token: LlamaToken,
+    depth: usize,
+    sequences: Vec<i32>,
+    children: Vec<usize>,
+}
+
+impl CandidateTokenTrie {
+    fn build(candidates: &[Vec<LlamaToken>]) -> Self {
+        let mut nodes = Vec::<CandidateTokenNode>::new();
+        let mut roots = Vec::<usize>::new();
+        let mut candidate_paths = Vec::with_capacity(candidates.len());
+
+        for (sequence, tokens) in candidates.iter().enumerate() {
+            let sequence = i32::try_from(sequence).expect("candidate sequence fits i32");
+            let mut parent: Option<usize> = None;
+            let mut path = Vec::with_capacity(tokens.len());
+            for (depth, &token) in tokens.iter().enumerate() {
+                let siblings =
+                    parent.map_or(roots.as_slice(), |index| nodes[index].children.as_slice());
+                let existing = siblings
+                    .iter()
+                    .copied()
+                    .find(|&index| nodes[index].token == token);
+                let index = existing.unwrap_or_else(|| {
+                    let index = nodes.len();
+                    nodes.push(CandidateTokenNode {
+                        token,
+                        depth: depth + 1,
+                        sequences: Vec::new(),
+                        children: Vec::new(),
+                    });
+                    if let Some(parent) = parent {
+                        nodes[parent].children.push(index);
+                    } else {
+                        roots.push(index);
+                    }
+                    index
+                });
+                nodes[index].sequences.push(sequence);
+                path.push(index);
+                parent = Some(index);
+            }
+            candidate_paths.push(path);
+        }
+
+        Self {
+            nodes,
+            candidate_paths,
+        }
     }
 }
 
@@ -412,7 +477,40 @@ impl LogDistribution {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_prompt, exp_approx, log_sum_exp};
+    use llama_cpp_2::token::LlamaToken;
+
+    use super::{CandidateTokenTrie, build_prompt, exp_approx, log_sum_exp};
+
+    #[test]
+    fn candidate_trie_shares_exact_token_prefixes() {
+        let trie = CandidateTokenTrie::build(&[
+            vec![LlamaToken(1), LlamaToken(2), LlamaToken(3)],
+            vec![LlamaToken(1), LlamaToken(2), LlamaToken(4)],
+            vec![LlamaToken(1), LlamaToken(5)],
+        ]);
+
+        assert_eq!(trie.nodes.len(), 5);
+        assert_eq!(trie.candidate_paths[0], [0, 1, 2]);
+        assert_eq!(trie.candidate_paths[1], [0, 1, 3]);
+        assert_eq!(trie.candidate_paths[2], [0, 4]);
+        assert_eq!(trie.nodes[0].sequences, [0, 1, 2]);
+        assert_eq!(trie.nodes[1].sequences, [0, 1]);
+        assert_eq!(trie.nodes[2].sequences, [0]);
+        assert_eq!(trie.nodes[3].sequences, [1]);
+        assert_eq!(trie.nodes[4].sequences, [2]);
+    }
+
+    #[test]
+    fn candidate_trie_keeps_empty_and_disjoint_candidates_aligned() {
+        let trie =
+            CandidateTokenTrie::build(&[Vec::new(), vec![LlamaToken(7)], vec![LlamaToken(8)]]);
+
+        assert!(trie.candidate_paths[0].is_empty());
+        assert_eq!(trie.candidate_paths[1], [0]);
+        assert_eq!(trie.candidate_paths[2], [1]);
+        assert_eq!(trie.nodes[0].sequences, [1]);
+        assert_eq!(trie.nodes[1].sequences, [2]);
+    }
 
     #[test]
     fn exp_approximation_matches_libm_in_the_clamped_range() {

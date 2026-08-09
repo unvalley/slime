@@ -185,6 +185,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
         },
     );
     run_unique_right_grammar_benchmark(dictionary, iterations);
+    run_unique_right_suru_benchmark(dictionary, iterations);
     run("converter/right_compound_candidates", iterations, || {
         black_box(dictionary.candidates_with_surrounding_context(
             black_box("まち"),
@@ -333,6 +334,22 @@ fn run_unique_right_grammar_benchmark(dictionary: &Dictionary, iterations: u64) 
             );
         },
     );
+}
+
+fn run_unique_right_suru_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run("converter/unique_right_suru_candidates", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("かんしん"),
+            black_box("自分でも趣味で料理をするもので一層"),
+            black_box("することが多いのです。"),
+        ));
+    });
+    run("converter/unique_right_suru_left_only", iterations, || {
+        black_box(dictionary.candidates_with_context(
+            black_box("かんしん"),
+            black_box("自分でも趣味で料理をするもので一層"),
+        ));
+    });
 }
 
 fn run_fixed_segment_benchmark(dictionary: &Dictionary, iterations: u64) {

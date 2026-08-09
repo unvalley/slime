@@ -142,6 +142,7 @@ struct DictionaryDocumentContextRanker<'a> {
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
     unique_right_grammar_surface: Option<&'a str>,
+    unique_right_suru_surface: Option<&'a str>,
     surrounding_notation_surface: Option<&'static str>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
@@ -185,6 +186,8 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 .document_right_auxiliary_costs(reading, right_context),
             unique_right_grammar_surface: dictionary
                 .document_unique_right_grammar_surface(reading, right_context),
+            unique_right_suru_surface: dictionary
+                .document_unique_right_suru_surface(reading, right_context),
             surrounding_notation_surface: surrounding_structured_notation_surface(
                 left_context,
                 reading,
@@ -279,6 +282,13 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         } else {
             0
         };
+        let unique_right_suru_promotion = if conversion.segments.len() == 1
+            && self.unique_right_suru_surface == Some(conversion.surface.as_str())
+        {
+            DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION
+        } else {
+            0
+        };
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
@@ -308,6 +318,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(right_inflection_promotion)
             .saturating_sub(right_auxiliary_promotion)
             .saturating_sub(unique_right_grammar_promotion)
+            .saturating_sub(unique_right_suru_promotion)
     }
 }
 
@@ -355,6 +366,7 @@ const MOZC_PERSONAL_SURNAME_POS_ID: u16 = 1923;
 const MOZC_INDEPENDENT_VERB_POS_ID_START: u16 = 577;
 const MOZC_INDEPENDENT_VERB_POS_ID_END: u16 = 856;
 const MOZC_GENERAL_GODAN_CONTINUATIVE_POS_ID: u16 = 842;
+const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 
 fn is_bounded_coordination_suffix(suffix: &str) -> bool {
@@ -478,6 +490,8 @@ const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 500;
 const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
+const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
+const DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN: i32 = 1_500;
 const DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN: i32 = 1_000;
 const MOZC_PAST_AUXILIARY_POS_ID: u16 = 142;
 const MOZC_DESIDERATIVE_AUXILIARY_POS_ID: u16 = 152;
@@ -1711,6 +1725,41 @@ impl Dictionary {
         });
         let (surface, _) = compatible.next()?;
         compatible.next().is_none().then_some(surface)
+    }
+
+    fn document_unique_right_suru_surface<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Option<&'s str> {
+        if !self.uses_connection_costs || !starts_with_suru_inflection(right_context) {
+            return None;
+        }
+        let mut surface_costs = Vec::<(&str, i32)>::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.left_id != MOZC_VERBAL_NOUN_POS_ID
+                || entry.right_id != MOZC_VERBAL_NOUN_POS_ID
+                || entry.surface == reading
+            {
+                return;
+            }
+            if let Some((_, cost)) = surface_costs
+                .iter_mut()
+                .find(|(surface, _)| *surface == entry.surface)
+            {
+                *cost = (*cost).min(entry.word_cost);
+            } else {
+                surface_costs.push((entry.surface, entry.word_cost));
+            }
+        });
+        surface_costs.sort_unstable_by_key(|(_, cost)| *cost);
+        let (surface, cost) = surface_costs.first().copied()?;
+        surface_costs
+            .get(1)
+            .is_none_or(|(_, next_cost)| {
+                *next_cost > cost.saturating_add(DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN)
+            })
+            .then_some(surface)
     }
 
     fn document_numeric_counter_promotions(
@@ -3149,6 +3198,12 @@ fn starts_with_polite_auxiliary(right_context: &str) -> bool {
         .any(|prefix| right_context.starts_with(prefix))
 }
 
+fn starts_with_suru_inflection(right_context: &str) -> bool {
+    ["する", "して"]
+        .iter()
+        .any(|prefix| right_context.starts_with(prefix))
+}
+
 fn document_right_grammar_pos_id(right_context: &str) -> Option<u16> {
     if right_context.starts_with("たい") {
         return None;
@@ -3529,8 +3584,9 @@ mod tests {
     use super::{
         Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
         DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
-        MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, NBestBucket, NBestNode, UNKNOWN_POS_ID,
-        document_region_suffix_promotion, insert_n_best_node, trailing_numeric_surface,
+        MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, MOZC_VERBAL_NOUN_POS_ID, NBestBucket,
+        NBestNode, UNKNOWN_POS_ID, document_region_suffix_promotion, insert_n_best_node,
+        trailing_numeric_surface,
     };
 
     struct PreferSurface<'a>(&'a str);
@@ -4412,6 +4468,52 @@ mod tests {
             .surface,
             "模試",
             "ambiguous compatible verb surfaces require semantic evidence"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_a_unique_verbal_noun_before_suru() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            ("ながい", "そのまま", "してしまいます", "長居"),
+            ("かんしん", "参加者が", "すること", "感心"),
+            ("くし", "能力を", "するスナイパー", "駆使"),
+            ("いち", "中心に", "する", "位置"),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("ながい", "そのまま", "道路")[0].surface,
+            "長い",
+            "unrelated right context must not promote a verbal noun"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_does_not_choose_between_ambiguous_verbal_nouns() {
+        let dictionary = Dictionary::bundled_with_layers(vec![DictionaryLayer::new(
+            "ambiguous-verbal-noun",
+            "Ambiguous verbal noun",
+            vec![DictionaryEntry::with_pos(
+                "ながい",
+                "長異",
+                MOZC_VERBAL_NOUN_POS_ID,
+                MOZC_VERBAL_NOUN_POS_ID,
+                6_000,
+            )],
+        )]);
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("ながい", "そのまま", "してしまいます"),
+            dictionary.candidates_with_context("ながい", "そのまま"),
+            "semantic ambiguity must remain with the existing ranker"
         );
     }
 

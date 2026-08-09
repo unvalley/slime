@@ -194,6 +194,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
     run("converter/right_compound_left_only", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("まち"), black_box("患者と患者の")));
     });
+    run_measured_reach_benchmark(dictionary, iterations);
     run(
         "converter/right_inflectional_phrase_candidates",
         iterations,
@@ -215,6 +216,21 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             ));
         },
     );
+}
+
+fn run_measured_reach_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run("converter/measured_reach_candidates", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("けん"),
+            black_box("大阪駅から徒歩10分"),
+            black_box("内のホテル"),
+        ));
+    });
+    run("converter/measured_reach_left_only", iterations, || {
+        black_box(
+            dictionary.candidates_with_context(black_box("けん"), black_box("大阪駅から徒歩10分")),
+        );
+    });
 }
 
 fn run_unique_right_grammar_benchmark(dictionary: &Dictionary, iterations: u64) {

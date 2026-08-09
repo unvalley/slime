@@ -142,6 +142,7 @@ struct DictionaryDocumentContextRanker<'a> {
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
     unique_right_grammar_surface: Option<&'a str>,
+    surrounding_notation_surface: Option<&'static str>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
 }
@@ -184,6 +185,11 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 .document_right_auxiliary_costs(reading, right_context),
             unique_right_grammar_surface: dictionary
                 .document_unique_right_grammar_surface(reading, right_context),
+            surrounding_notation_surface: surrounding_structured_notation_surface(
+                left_context,
+                reading,
+                right_context,
+            ),
             follows_region_name: is_document_region_suffix_reading(reading)
                 && dictionary.document_context_has_pos_suffix(
                     left_context,
@@ -225,7 +231,9 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max()
             .unwrap_or(0);
         let notation_promotion =
-            if structured_notation_matches(left_context, reading, &conversion.surface) {
+            if structured_notation_matches(left_context, reading, &conversion.surface)
+                || self.surrounding_notation_surface == Some(conversion.surface.as_str())
+            {
                 DOCUMENT_STRUCTURED_NOTATION_PROMOTION
             } else {
                 0
@@ -457,6 +465,45 @@ fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'st
         "だい" if trailing_integer(left_context).is_some() => Some("台"),
         _ => None,
     }
+}
+
+fn surrounding_structured_notation_surface(
+    left_context: &str,
+    reading: &str,
+    right_context: &str,
+) -> Option<&'static str> {
+    if reading == "けん"
+        && (right_context.starts_with('内') || right_context.starts_with('外'))
+        && trailing_reach_measurement(left_context)
+    {
+        return Some("圏");
+    }
+    None
+}
+
+fn trailing_reach_measurement(text: &str) -> bool {
+    [
+        "キロメートル",
+        "センチメートル",
+        "ミリメートル",
+        "メートル",
+        "時間",
+        "キロ",
+        "ｋｍ",
+        "ＫＭ",
+        "km",
+        "KM",
+        "㎞",
+        "ｍ",
+        "m",
+        "駅",
+        "秒",
+        "分",
+    ]
+    .iter()
+    .find_map(|unit| text.strip_suffix(unit))
+    .and_then(trailing_numeric_surface)
+    .is_some()
 }
 
 fn structured_notation_owns_numeric_context(left_context: &str, reading: &str) -> bool {
@@ -4387,6 +4434,32 @@ mod tests {
             .surface,
             "願い",
             "right-side evidence must not reuse a surface already covered by the reading"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_prefers_a_reach_range_after_a_measurement() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "けん",
+                "大阪駅から徒歩10分",
+                "内のホテル"
+            )[0]
+            .surface,
+            "圏"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("けん", "半径５ｋｍ", "外から通勤する")
+                [0]
+            .surface,
+            "圏"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("けん", "福岡", "内のホテル")[0].surface,
+            "県",
+            "a place name without a measured reach remains an administrative region"
         );
     }
 

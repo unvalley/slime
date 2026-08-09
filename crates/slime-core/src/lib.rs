@@ -2957,6 +2957,17 @@ mod tests {
     }
 
     #[test]
+    fn external_right_context_ranks_a_measured_reach_range() {
+        let mut engine = SlimeEngine::bundled();
+
+        engine.set_external_context("大阪駅から徒歩10分", "内のホテル");
+        type_text(&mut engine, "kenn");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "圏");
+    }
+
+    #[test]
     fn external_right_context_ranks_an_inflectional_phrase_prefix() {
         let mut engine = SlimeEngine::bundled();
 

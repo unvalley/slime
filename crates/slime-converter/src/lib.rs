@@ -1326,7 +1326,14 @@ impl Dictionary {
         left_context: &str,
         right_context: &str,
     ) -> Vec<DocumentBoundaryPromotion<'s>> {
-        if !self.uses_connection_costs || trailing_numeric_surface(left_context).is_some() {
+        if !self.uses_connection_costs {
+            return Vec::new();
+        }
+        let numeric_left_context = trailing_numeric_surface(left_context).is_some();
+        // Japanese numerals retain the dedicated counter boundary. Decimal
+        // suffixes also appear inside route IDs and section numbers, so they
+        // may use only the stricter general-noun phrase evidence below.
+        if numeric_left_context && split_trailing_decimal(left_context).is_none() {
             return Vec::new();
         }
         let mut has_left_phrase_evidence = false;
@@ -1340,8 +1347,12 @@ impl Dictionary {
         let connection = ConnectionMatrix::bundled();
         let mut promotions = Vec::new();
         self.for_each_exact(reading, |entry| {
-            let promotion =
-                self.document_right_phrase_promotion(reading, entry.surface, right_context);
+            let promotion = self.document_right_phrase_promotion(
+                reading,
+                entry.surface,
+                right_context,
+                numeric_left_context,
+            );
             if entry.surface != reading && promotion > 0 {
                 promotions.push(DocumentBoundaryPromotion {
                     surface: entry.surface,
@@ -1358,6 +1369,7 @@ impl Dictionary {
         reading: &str,
         candidate_surface: &str,
         right_context: &str,
+        requires_general_noun: bool,
     ) -> i32 {
         let Some(compact) = self.bundled else {
             return 0;
@@ -1396,8 +1408,11 @@ impl Dictionary {
                 ) && !matches!(
                     entry.right_id,
                     MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
-                ) && (!starts_with_hiragana
-                    || is_safe_hiragana_right_phrase_entry(entry, suffix))
+                ) && (!requires_general_noun
+                    || (entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+                        && entry.right_id == MOZC_GENERAL_NOUN_POS_ID))
+                    && (!starts_with_hiragana
+                        || is_safe_hiragana_right_phrase_entry(entry, suffix))
                     && (!bounded_nominal_suffix
                         || right_phrase_suffix_has_boundary(suffix, right_context));
                 if !accepted {
@@ -4534,6 +4549,33 @@ mod tests {
     fn right_compound_evidence_respects_stronger_left_boundaries() {
         let dictionary = Dictionary::bundled();
 
+        for left_context in ["デドフスクにはM9", "デドフスクにはM９"] {
+            assert_eq!(
+                dictionary.candidates_with_surrounding_context(
+                    "かんせん",
+                    left_context,
+                    "道路が通る"
+                )[0]
+                .surface,
+                "幹線"
+            );
+        }
+        for left_context in ["県警2", "県警２"] {
+            assert_eq!(
+                dictionary.candidates_with_surrounding_context("か", left_context, "長を務めた")[0]
+                    .surface,
+                "課"
+            );
+        }
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "だい",
+                "特に六",
+                "目尾上梅幸を相方とした"
+            ),
+            dictionary.candidates_with_context("だい", "特に六"),
+            "Japanese numerals must retain the dedicated numeric boundary"
+        );
         assert_eq!(
             dictionary.candidates_with_surrounding_context("けん", "福岡都市", "内外から")[0]
                 .surface,

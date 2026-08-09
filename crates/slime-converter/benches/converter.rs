@@ -144,6 +144,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
     run("converter/numeric_context_candidates", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });
+    run_numeric_right_compound_benchmark(dictionary, iterations);
     run(
         "converter/polite_right_context_candidates",
         iterations,
@@ -216,6 +217,30 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_numeric_right_compound_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/numeric_right_compound_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("かんせん"),
+                black_box("デドフスクにはM9"),
+                black_box("道路が通る"),
+            ));
+        },
+    );
+    run(
+        "converter/numeric_right_compound_left_only",
+        iterations,
+        || {
+            black_box(
+                dictionary
+                    .candidates_with_context(black_box("かんせん"), black_box("デドフスクにはM9")),
+            );
         },
     );
 }

@@ -1,7 +1,7 @@
 //! Neural N-best rescoring with a zenz GGUF model.
 //!
-//! Scores each existing candidate as `log P(candidate, EOS | context, reading)`
-//! under a character-level conditional LM. Rescoring is prefill-only and
+//! Scores each existing candidate both with and without its trailing EOS under
+//! a character-level conditional LM. Rescoring is prefill-only and
 //! normally needs a single decode call per item: the shared `context +
 //! reading` prefix is assigned to every sequence and each candidate continues
 //! its own sequence in the same batch.
@@ -47,6 +47,10 @@ pub struct ScoreRequest {
 pub struct ScoredItem {
     /// `log P(candidate, EOS | prompt)` per candidate, aligned with the request.
     pub logliks: Vec<f64>,
+    /// `log P(candidate | prompt)` before the EOS contribution.
+    pub candidate_logliks: Vec<f64>,
+    /// Token counts used to derive length-normalized evaluation scores.
+    pub candidate_token_counts: Vec<usize>,
     /// Wall-clock time spent scoring this item (prefix + all candidates).
     pub latency: Duration,
 }
@@ -181,6 +185,8 @@ impl Rescorer {
             // Too long to score: report neutral scores so the base order wins.
             return Ok(ScoredItem {
                 logliks: vec![0.0; request.candidates.len()],
+                candidate_logliks: vec![0.0; request.candidates.len()],
+                candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
                 latency: started.elapsed(),
             });
         }
@@ -208,6 +214,7 @@ impl Rescorer {
 
         let eos = self.model.token_eos();
         let mut logliks = Vec::with_capacity(candidate_tokens.len());
+        let mut candidate_logliks = Vec::with_capacity(candidate_tokens.len());
         let mut first_token_scores: Option<LogDistribution> = None;
         for (chunk_index, chunk) in candidate_tokens
             .chunks(self.max_parallel_candidates)
@@ -276,12 +283,14 @@ impl Rescorer {
             for (tokens, row_offset) in chunk.iter().zip(&row_offsets) {
                 let Some(first) = tokens.first() else {
                     logliks.push(f64::NEG_INFINITY);
+                    candidate_logliks.push(f64::NEG_INFINITY);
                     continue;
                 };
                 let mut loglik = first_token_scores.log_probability(*first);
                 for (index, token) in tokens.iter().enumerate().skip(1) {
                     loglik += token_log_probability(logits_row(row_offset + index - 1), *token);
                 }
+                candidate_logliks.push(loglik);
                 loglik += token_log_probability(logits_row(row_offset + tokens.len() - 1), eos);
                 logliks.push(loglik);
             }
@@ -290,6 +299,8 @@ impl Rescorer {
 
         Ok(ScoredItem {
             logliks,
+            candidate_logliks,
+            candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
             latency: started.elapsed(),
         })
     }

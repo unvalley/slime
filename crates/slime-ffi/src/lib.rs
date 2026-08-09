@@ -143,6 +143,9 @@ static NEURAL_SERVICE: OnceLock<Mutex<Option<NeuralService>>> = OnceLock::new();
 static NEURAL_MODEL_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "neural")]
 static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "neural")]
+const NEURAL_CANDIDATE_WEIGHT: f64 = 0.85;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
 
@@ -526,8 +529,9 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         };
         if let Ok(scored) = service.rescorer.score_all(&[score_request])
             && let Some(scored) = scored.first()
-            && let Some(rescored_actions) =
-                handle.engine.apply_candidate_rescore(&scored.logliks, 0.7)
+            && let Some(rescored_actions) = handle
+                .engine
+                .apply_candidate_rescore(&scored.candidate_logliks, NEURAL_CANDIDATE_WEIGHT)
         {
             return rescored_actions;
         }

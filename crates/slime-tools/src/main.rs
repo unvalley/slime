@@ -69,9 +69,13 @@ fn run() -> Result<(), String> {
             let parameter = report.discriminative_weight.map_or_else(
                 || {
                     format!(
-                        "lambda={:.2} min_margin={:.2}",
+                        "lambda={:.2} min_margin={:.2} score_mode={}",
                         report.lambda.unwrap_or(0.0),
-                        report.neural_min_margin.unwrap_or(0.0)
+                        report.neural_min_margin.unwrap_or(0.0),
+                        report
+                            .neural_score_mode
+                            .unwrap_or(NeuralScoreMode::Total)
+                            .as_str()
                     )
                 },
                 |weight| format!("discriminative_weight={weight:.3}"),
@@ -114,6 +118,42 @@ enum ContextFilter {
     All,
     None,
     Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+enum NeuralScoreMode {
+    #[serde(rename = "with_eos")]
+    Total,
+    #[serde(rename = "without_eos")]
+    Candidate,
+    #[serde(rename = "mean_with_eos")]
+    MeanTotal,
+    #[serde(rename = "mean_without_eos")]
+    MeanCandidate,
+}
+
+impl NeuralScoreMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Total => "with-eos",
+            Self::Candidate => "without-eos",
+            Self::MeanTotal => "mean-with-eos",
+            Self::MeanCandidate => "mean-without-eos",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "with-eos" => Ok(Self::Total),
+            "without-eos" => Ok(Self::Candidate),
+            "mean-with-eos" => Ok(Self::MeanTotal),
+            "mean-without-eos" => Ok(Self::MeanCandidate),
+            _ => Err(format!(
+                "unknown neural score mode {value:?}; expected with-eos, without-eos, \
+                 mean-with-eos, or mean-without-eos"
+            )),
+        }
+    }
 }
 
 impl ContextFilter {
@@ -200,6 +240,7 @@ struct Options {
     neural_max_candidates: Option<usize>,
     lambdas: Vec<f64>,
     neural_min_margins: Vec<f64>,
+    neural_score_modes: Vec<NeuralScoreMode>,
     discriminative_train: Option<PathBuf>,
     discriminative_teacher_model: Option<PathBuf>,
     discriminative_teacher_lambda: f64,
@@ -242,6 +283,7 @@ impl Options {
             neural_max_candidates: None,
             lambdas: Vec::new(),
             neural_min_margins: Vec::new(),
+            neural_score_modes: Vec::new(),
             discriminative_train: None,
             discriminative_teacher_model: None,
             discriminative_teacher_lambda: 0.8,
@@ -325,6 +367,14 @@ impl Options {
                     "--neural-min-margin",
                     arguments.next(),
                 )?),
+                "--neural-score-mode" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--neural-score-mode requires a value".to_owned())?;
+                    options
+                        .neural_score_modes
+                        .push(NeuralScoreMode::parse(&value)?);
+                }
                 "--discriminative-train" => {
                     let value = arguments
                         .next()
@@ -417,10 +467,11 @@ impl Options {
         }
         if (options.neural_max_cost_gap.is_some()
             || options.neural_max_candidates.is_some()
-            || !options.neural_min_margins.is_empty())
+            || !options.neural_min_margins.is_empty()
+            || !options.neural_score_modes.is_empty())
             && options.neural_model.is_none()
         {
-            return Err("neural limits and margins require --neural-model".to_owned());
+            return Err("neural scoring options require --neural-model".to_owned());
         }
         if options.neural_model.is_some() && options.discriminative_train.is_some() {
             return Err(
@@ -453,6 +504,9 @@ impl Options {
         if options.neural_min_margins.is_empty() {
             options.neural_min_margins.push(0.0);
         }
+        if options.neural_score_modes.is_empty() {
+            options.neural_score_modes.push(NeuralScoreMode::Total);
+        }
         if options.discriminative_weights.is_empty() {
             options.discriminative_weights = vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
         }
@@ -482,6 +536,7 @@ fn usage() -> String {
      [--context all|none|present] [--limit N] [--failures N] [--json] \
      [--neural-model model.gguf] [--neural-max-cost-gap N] \
      [--neural-max-candidates N] [--lambda X]... [--neural-min-margin X]... \
+     [--neural-score-mode with-eos|without-eos|mean-with-eos|mean-without-eos]... \
      [--export-nbest path] \
      [--discriminative-train items.json] [--discriminative-train-limit N] \
      [--discriminative-teacher-model model.gguf] [--discriminative-teacher-lambda X] \
@@ -498,7 +553,9 @@ fn usage() -> String {
      preserving the remaining base order. --lambda selects interpolation \
      weights; without it a default sweep runs. --neural-min-margin accepts a \
      new top candidate only when its interpolated score exceeds the base top by \
-     at least X; it is repeatable and defaults to zero. The discriminative \
+     at least X; it is repeatable and defaults to zero. --neural-score-mode \
+     controls EOS inclusion and token-length normalization, is repeatable, and \
+     defaults to with-eos. The discriminative \
      options train an evaluation-only hashed averaged perceptron on a disjoint \
      AJIMEE-format training file. The optional annotated corpus \
      uses whitespace-separated surface/reading tokens and only affects offline \
@@ -685,6 +742,8 @@ struct EvaluationReport {
     lambda: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_min_margin: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_score_mode: Option<NeuralScoreMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     discriminative: Option<DiscriminativeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -915,22 +974,28 @@ fn evaluate(
             options.neural_max_cost_gap,
             options.neural_max_candidates,
         )?;
-        let mut reports =
-            Vec::with_capacity(options.lambdas.len() * options.neural_min_margins.len());
+        let mut reports = Vec::with_capacity(
+            options.lambdas.len()
+                * options.neural_score_modes.len()
+                * options.neural_min_margins.len(),
+        );
         for &lambda in &options.lambdas {
-            for &margin in &options.neural_min_margins {
-                reports.push(compute_report(
-                    &outcomes,
-                    Some(NeuralReportConfig {
-                        outcome: &neural,
-                        lambda,
-                        min_margin: margin,
-                    }),
-                    None,
-                    None,
-                    options,
-                    word_bigram_diagnostics,
-                ));
+            for &score_mode in &options.neural_score_modes {
+                for &margin in &options.neural_min_margins {
+                    reports.push(compute_report(
+                        &outcomes,
+                        Some(NeuralReportConfig {
+                            outcome: &neural,
+                            lambda,
+                            min_margin: margin,
+                            score_mode,
+                        }),
+                        None,
+                        None,
+                        options,
+                        word_bigram_diagnostics,
+                    ));
+                }
             }
         }
         Ok(reports)
@@ -1172,7 +1237,7 @@ fn discriminative_teacher_expected(
             .enumerate()
             .map(|(index, outcome)| {
                 let surface =
-                    rescored_surfaces(&outcome.candidates, &neural.logliks[index], lambda, 0.0)
+                    rescored_surfaces(&outcome.candidates, &neural.with_eos[index], lambda, 0.0)
                         .into_iter()
                         .next()
                         .unwrap_or_default();
@@ -1183,9 +1248,23 @@ fn discriminative_teacher_expected(
 }
 
 struct NeuralOutcome {
-    logliks: Vec<Vec<f64>>,
+    with_eos: Vec<Vec<f64>>,
+    without_eos: Vec<Vec<f64>>,
+    mean_with_eos: Vec<Vec<f64>>,
+    mean_without_eos: Vec<Vec<f64>>,
     latencies: Vec<Duration>,
     scored_items: usize,
+}
+
+impl NeuralOutcome {
+    fn scores(&self, index: usize, mode: NeuralScoreMode) -> &[f64] {
+        match mode {
+            NeuralScoreMode::Total => &self.with_eos[index],
+            NeuralScoreMode::Candidate => &self.without_eos[index],
+            NeuralScoreMode::MeanTotal => &self.mean_with_eos[index],
+            NeuralScoreMode::MeanCandidate => &self.mean_without_eos[index],
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1193,6 +1272,7 @@ struct NeuralReportConfig<'a> {
     outcome: &'a NeuralOutcome,
     lambda: f64,
     min_margin: f64,
+    score_mode: NeuralScoreMode,
 }
 
 #[cfg(feature = "neural")]
@@ -1223,24 +1303,61 @@ fn score_neural_outcomes(
         .collect();
     let scored = rescorer.score_all(&requests)?;
     let mut scored = scored.into_iter();
-    let mut logliks = Vec::with_capacity(outcomes.len());
+    let mut with_eos = Vec::with_capacity(outcomes.len());
+    let mut without_eos = Vec::with_capacity(outcomes.len());
+    let mut mean_with_eos = Vec::with_capacity(outcomes.len());
+    let mut mean_without_eos = Vec::with_capacity(outcomes.len());
     let mut latencies = Vec::with_capacity(outcomes.len());
     for score in &score_item {
         if *score {
             let item = scored.next().expect("one score per selected request");
-            logliks.push(item.logliks);
+            mean_with_eos.push(mean_logliks(
+                &item.logliks,
+                &item.candidate_token_counts,
+                true,
+            ));
+            mean_without_eos.push(mean_logliks(
+                &item.candidate_logliks,
+                &item.candidate_token_counts,
+                false,
+            ));
+            with_eos.push(item.logliks);
+            without_eos.push(item.candidate_logliks);
             latencies.push(item.latency);
         } else {
-            logliks.push(Vec::new());
+            with_eos.push(Vec::new());
+            without_eos.push(Vec::new());
+            mean_with_eos.push(Vec::new());
+            mean_without_eos.push(Vec::new());
             latencies.push(Duration::ZERO);
         }
     }
     debug_assert!(scored.next().is_none());
     Ok(NeuralOutcome {
-        logliks,
+        with_eos,
+        without_eos,
+        mean_with_eos,
+        mean_without_eos,
         latencies,
         scored_items: score_item.iter().filter(|score| **score).count(),
     })
+}
+
+#[cfg(any(feature = "neural", test))]
+fn mean_logliks(logliks: &[f64], token_counts: &[usize], includes_eos: bool) -> Vec<f64> {
+    debug_assert_eq!(logliks.len(), token_counts.len());
+    logliks
+        .iter()
+        .zip(token_counts)
+        .map(|(&loglik, &tokens)| {
+            let denominator = tokens + usize::from(includes_eos);
+            if denominator == 0 {
+                loglik
+            } else {
+                loglik / usize_to_f64(denominator)
+            }
+        })
+        .collect()
 }
 
 #[cfg(any(feature = "neural", test))]
@@ -1317,7 +1434,7 @@ fn compute_report(
         let candidates: Vec<String> = match (neural, discriminative, discriminative_weight) {
             (Some(neural), None, None) => rescored_surfaces(
                 &outcome.candidates,
-                &neural.outcome.logliks[outcome_index],
+                neural.outcome.scores(outcome_index, neural.score_mode),
                 neural.lambda,
                 neural.min_margin,
             ),
@@ -1412,6 +1529,7 @@ fn compute_report(
         neural_skipped_items: neural.map(|neural| outcomes.len() - neural.outcome.scored_items),
         lambda: neural.map(|neural| neural.lambda),
         neural_min_margin: neural.map(|neural| neural.min_margin),
+        neural_score_mode: neural.map(|neural| neural.score_mode),
         discriminative: discriminative.map(DiscriminativeReport::new),
         discriminative_weight,
         word_bigram: word_bigram_report(word_bigram_diagnostics),
@@ -1476,6 +1594,9 @@ fn print_report(report: &EvaluationReport) {
     }
     if let Some(margin) = report.neural_min_margin {
         println!("neural minimum acceptance margin: {margin:.2}");
+    }
+    if let Some(mode) = report.neural_score_mode {
+        println!("neural score mode: {}", mode.as_str());
     }
     if let Some(discriminative) = &report.discriminative {
         print_discriminative_report(discriminative);
@@ -1662,9 +1783,10 @@ fn u64_to_f64(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextFilter, DatasetFormat, Options, base_cost_gap, character_error_rate,
-        katakana_to_hiragana, load_annotated_items, normalize_for_evaluation, parse_anthy_line,
-        percentile, rescored_surfaces, should_score_neurally,
+        ContextFilter, DatasetFormat, NeuralScoreMode, Options, base_cost_gap,
+        character_error_rate, katakana_to_hiragana, load_annotated_items, mean_logliks,
+        normalize_for_evaluation, parse_anthy_line, percentile, rescored_surfaces,
+        should_score_neurally,
     };
     use slime_converter::Candidate;
     use std::fs;
@@ -1729,6 +1851,8 @@ mod tests {
                 "5",
                 "--neural-min-margin",
                 "0.25",
+                "--neural-score-mode",
+                "without-eos",
                 "--export-nbest",
                 "nbest.json",
                 "--word-bigram-corpus",
@@ -1756,6 +1880,7 @@ mod tests {
         assert_eq!(options.dataset_sha256.as_deref(), Some("digest"));
         assert_eq!(options.context, ContextFilter::None);
         assert_eq!(options.neural_min_margins, [0.25]);
+        assert_eq!(options.neural_score_modes, [NeuralScoreMode::Candidate]);
         assert_eq!(options.limit, Some(25));
         assert_eq!(options.failures, 0);
         assert!(options.json);
@@ -1796,6 +1921,12 @@ mod tests {
         assert!(should_score_neurally(&candidates, Some(600)));
         assert!(!should_score_neurally(&candidates, Some(599)));
         assert!(!should_score_neurally(&candidates[..1], Some(1_000)));
+    }
+
+    #[test]
+    fn neural_mean_scores_use_the_selected_eos_denominator() {
+        assert_eq!(mean_logliks(&[-6.0, -8.0], &[2, 3], true), [-2.0, -2.0]);
+        assert_eq!(mean_logliks(&[-6.0, -8.0], &[2, 4], false), [-3.0, -2.0]);
     }
 
     #[test]

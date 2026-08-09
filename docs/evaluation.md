@@ -157,6 +157,21 @@ latency（M3、Metal）: 全体でp50 24.7 ms、p95 86.3 ms、p99 116.0 ms。res
 
 GSDでは曖昧な順位変更を抑える効果があった一方、JWTDでは最小の0.1から悪化した。単一のscore差はドメインをまたぐ信頼度になっていないため、製品の採用条件には加えず、held-out評価も行わない。今後はscore差だけでなく、入力長、文脈有無、base cost差を含む校正済みconfidenceを独立した学習・評価境界として扱う。
 
+### 2026-08-09 EOSを除外した候補score
+
+[azooKeyKanaKanjiConverterの現行候補評価](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/8e3a6eb89e088efd868aa28dadb74c697df4e6fb/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift)は、候補tokenごとにモデルの最尤tokenとの一致を確認し、候補末尾のEOSを順位scoreに使わない。Slimeは候補とEOSの合計対数尤度をN-bestへ補間していたため、`--neural-score-mode`を追加し、同じdecode結果からEOSの有無とtoken平均を比較した。公式実装は制約付き逐次探索であり、Slimeの上位3候補再ランキングと同一方式ではないが、EOSを候補表記の評価から分離する根拠として用いた。
+
+JWTD devとGSD devだけで、EOS除外・lambda 0.85を凍結した。token平均は両devで悪化したため不採用とした。凍結後にAJIMEEとGSD testを各1回だけ現行方式と比較した。
+
+| dataset | EOS込み / lambda 0.7 acc@1 | EOS除外 / lambda 0.85 acc@1 | MRR変化 | MinCER@1変化 |
+| --- | ---: | ---: | ---: | ---: |
+| JWTD-train dev 400件 | 0.4075 | **0.4200** | 0.4943 → 0.5010 | 0.0750 → 0.0742 |
+| UD GSD dev 331件 | 0.8248 | **0.8580** | 0.8885 → 0.9062 | 0.1611 → 0.1354 |
+| held-out AJIMEE 200件 | **0.6350** | **0.6350** | 0.6869 → 0.6869 | 0.0508 → 0.0506 |
+| UD GSD held-out test 323件 | 0.8266 | **0.8638** | 0.8863 → 0.9074 | 0.1605 → 0.1202 |
+
+製品FFIもEOS除外scoreとlambda 0.85へ切り替えた。xsmall実モデルによる50回の明示変換はp50 7.90 ms、p95 12.45 msで、候補数3・base cost差1000以下という既存の実行境界は維持する。AJIMEE非悪化と別domain held-out改善を同時に満たしたため採用する。
+
 ### 2026-08-02 大規模な非生成判別reranker
 
 数百例では学習量が不足していた可能性を切り分けるため、JWTD v2 train全体から同じ読み信頼性フィルタを通過した48,393件を生成した。元JSONL行番号の`mod 10 == 0`を固定dev（4,788件）、残り43,605件を学習候補とし、`source_split + index`の複合identityで重複を除外する。AJIMEEはJWTD test由来なので引き続き最終held-outとした。

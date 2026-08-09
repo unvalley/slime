@@ -3,8 +3,9 @@
 //! The source corpus contains news/blog sentences, manual token boundaries,
 //! `UniDic` part-of-speech tags, and surface pronunciations. For each sentence,
 //! this tool selects at most one content word whose reading maps to multiple
-//! bundled-dictionary surfaces. Only left context is exposed, matching what an
-//! IME has before the current conversion span.
+//! bundled-dictionary surfaces. Both bounded sides of the target are retained
+//! so an editing-time scorer can be evaluated separately from end-of-document
+//! conversion.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -55,6 +56,7 @@ struct EvaluationItem {
     source_split: String,
     index: String,
     context_text: String,
+    right_context_text: String,
     input: String,
     expected_output: Vec<String>,
     original_text: String,
@@ -233,7 +235,7 @@ fn build_items(
     for sentence in sentences {
         let mut context = String::new();
         let mut candidates = Vec::new();
-        for token in &sentence.tokens {
+        for (token_index, token) in sentence.tokens.iter().enumerate() {
             let reading = katakana_to_hiragana(&token.pronunciation);
             if is_content_word(&token.upos)
                 && context.chars().count() >= 2
@@ -247,7 +249,7 @@ fn build_items(
                     .filter(|surface| surface.chars().any(is_kanji))
                     .count();
                 if ambiguous_kanji >= 2 {
-                    candidates.push((ambiguous_kanji, token, context.clone()));
+                    candidates.push((ambiguous_kanji, token_index, token, context.clone()));
                 }
             }
             context.push_str(&token.surface);
@@ -255,15 +257,25 @@ fn build_items(
                 context.push(' ');
             }
         }
-        let Some((_, token, context)) = candidates
+        let Some((_, token_index, token, context)) = candidates
             .into_iter()
-            .max_by_key(|(ambiguity, _, context)| (*ambiguity, context.chars().count()))
+            .max_by_key(|(ambiguity, _, _, context)| (*ambiguity, context.chars().count()))
         else {
             continue;
         };
         let identity = (token.pronunciation.as_str(), token.surface.as_str());
         if !seen.insert(identity) {
             continue;
+        }
+        let mut right_context = String::new();
+        if token.space_after {
+            right_context.push(' ');
+        }
+        for following in sentence.tokens.iter().skip(token_index + 1) {
+            right_context.push_str(&following.surface);
+            if following.space_after {
+                right_context.push(' ');
+            }
         }
         items.push(EvaluationItem {
             source_split: source_split.to_owned(),
@@ -276,6 +288,7 @@ fn build_items(
                 .into_iter()
                 .rev()
                 .collect(),
+            right_context_text: right_context.chars().take(40).collect(),
             input: token.pronunciation.clone(),
             expected_output: vec![token.surface.clone()],
             original_text: sentence.text.clone(),
@@ -330,7 +343,7 @@ mod tests {
 
     #[test]
     fn creates_one_contextual_ambiguous_item_per_sentence() {
-        let source = "# sent_id = test-1\n# text = 私は魚を食べる。\n1\t私\t私\tPRON\t代名詞\t_\t3\tnsubj\t_\tSpaceAfter=No|UnidicInfo=ワタシ,私,私,私,ワタシ\n2\tは\tは\tADP\t助詞\t_\t1\tcase\t_\tSpaceAfter=No|UnidicInfo=ハ,は,は,は,ワ\n3\t魚\t魚\tNOUN\t名詞\t_\t5\tobj\t_\tSpaceAfter=No|UnidicInfo=サカナ,魚,魚,魚,サカナ\n\n";
+        let source = "# sent_id = test-1\n# text = 私は魚を食べる。\n1\t私\t私\tPRON\t代名詞\t_\t3\tnsubj\t_\tSpaceAfter=No|UnidicInfo=ワタシ,私,私,私,ワタシ\n2\tは\tは\tADP\t助詞\t_\t1\tcase\t_\tSpaceAfter=No|UnidicInfo=ハ,は,は,は,ワ\n3\t魚\t魚\tNOUN\t名詞\t_\t5\tobj\t_\tSpaceAfter=No|UnidicInfo=サカナ,魚,魚,魚,サカナ\n4\tを\tを\tADP\t助詞\t_\t3\tcase\t_\tSpaceAfter=No|UnidicInfo=ヲ,を,を,を,オ\n5\t食べる\t食べる\tVERB\t動詞\t_\t0\troot\t_\tSpaceAfter=No|UnidicInfo=タベル,食べる,食べ,食べる,タベル\n6\t。\t。\tPUNCT\t補助記号\t_\t5\tpunct\t_\tSpaceAfter=No\n\n";
         let sentences = parse_conllu(source);
         let dictionary = HashMap::from([(
             "さかな".to_owned(),
@@ -339,6 +352,7 @@ mod tests {
         let items = build_items(&sentences, &dictionary, "test");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].context_text, "私は");
+        assert_eq!(items[0].right_context_text, "を食べる。");
         assert_eq!(items[0].input, "サカナ");
         assert_eq!(items[0].expected_output, ["魚"]);
     }

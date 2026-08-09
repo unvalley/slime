@@ -35,7 +35,7 @@ scripts/evaluate-ajimee.sh --top-k 10 --context all
 - `mincer@k`: 上位k候補と許容解の組み合わせで最小の文字誤り率
 - latency `p50/p95/p99/max`: 辞書初期化を除いた候補生成時間
 
-`--context none`は左文脈なし100件、`--context present`は左文脈あり100件、`--context all`は全200件を評価する。現在の変換器は左文脈を順位付けに使わないため、レポートの`context_used_by_engine`は`false`になる。文脈モデルを導入した場合、この区分を維持して効果を比較する。
+`--context none`は左文脈なし100件、`--context present`は左文脈あり100件、`--context all`は全200件を評価する。初期baselineでは`context_used_by_engine`が`false`だったが、現在は辞書規則とローカルニューラル再順位付けが左文脈を使う。評価itemに任意の`right_context_text`があればニューラルpromptだけへ渡し、フィールドがない既存fixtureは空文字として後方互換に読み込む。
 
 ### 2026-08-09 入力長に応じたニューラル候補幅
 
@@ -61,6 +61,19 @@ scripts/evaluate-ajimee.sh --top-k 10 --context all
 | GSD test held-out (323) | 0.8700 | 0.8700 | 0件 |
 
 固定8候補では短いGSD testが1件悪化したが、9文字境界では短文を従来の5候補に保つため回避できた。AJIMEE 200件の3回交互測定では、5/8候補の中央値がp50 9.44 ms / p95 24.93 ms / p99 38.35 ms、5/16候補がp50 11.41 ms / p95 38.72 ms / p99 50.22 msだった。長文だけtail latencyを許容して+1.5ptを採り、KVセル数1024のメモリ上限は変更しない。
+
+### 2026-08-09 編集位置の右文脈
+
+[ATOKの公式説明](https://atok.com/info/features/engine.html)は、直前の確定語を機械的に優先するのではなく、日本語として自然な文章を優先する方針を示す。[azooKey/Zenz v3のprompt実装](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzPromptBuilder.swift)は、左文脈とは別の`U+EE07`タグでカーソル後方の右文脈を最大40文字渡す。Slimeも文章途中の編集時だけ、macOS/Windowsアダプターがカーソル両側の文書を取得し、ローカルモデルへ左末尾40文字・右先頭40文字を渡す。文書内容は保存せず、private modeでは両側とも破棄する。通常の文末入力では右文脈が空なので従来promptと順位を変えない。
+
+UD Japanese GSDの各曖昧語について、同じ候補集合・候補数・lambda 0.7・EOS除外scoreを固定し、元文の対象語より後ろを`right_context_text`として追加した。GSD devで右文脈ありの場合だけ最小score差0.1を採用する条件を凍結し、その後testを一度だけ確認した。
+
+| dataset | 左文脈のみ acc@1 / MRR | 両側文脈 acc@1 / MRR | top-1差 |
+| --- | ---: | ---: | ---: |
+| GSD dev (331) | 0.8640 / 0.9132 | **0.8761 / 0.9190** | +4件 |
+| GSD test held-out (323) | 0.8700 / 0.9139 | **0.8731 / 0.9154** | +1件 |
+
+devでは7件改善・3件悪化だった。右側の助詞や後続名詞によって`熱々の料理`、`機体の改修`、`第二選択薬`などを回収した一方、固有名詞や数値表記には誤変更も残る。したがって右文脈なしへ0.1 marginを一般化せず、右文脈が実在する編集時だけ適用する。候補生成件数は左右で同一であり、GSD testの候補生成込みp95も5.78 msと5.39 msで同じ測定帯だった。
 
 ### 2026-07-20 baseline
 
@@ -180,7 +193,7 @@ latency（M3、Metal）: 全体でp50 24.7 ms、p95 86.3 ms、p99 116.0 ms。res
 | 2 | 0.3550 | **0.8338** |
 | 4 | 0.3200 | 0.8187 |
 
-GSDでは曖昧な順位変更を抑える効果があった一方、JWTDでは最小の0.1から悪化した。単一のscore差はドメインをまたぐ信頼度になっていないため、製品の採用条件には加えず、held-out評価も行わない。今後はscore差だけでなく、入力長、文脈有無、base cost差を含む校正済みconfidenceを独立した学習・評価境界として扱う。
+GSDでは曖昧な順位変更を抑える効果があった一方、JWTDでは最小の0.1から悪化した。単一のscore差はドメインをまたぐ信頼度になっていないため、全変換共通の採用条件には加えず、held-out評価も行わなかった。後述の右文脈対応では「右文脈が実在する編集時」という別境界で0.1をdev固定し、右文脈なしはmargin 0のまま維持する。今後はscore差だけでなく、入力長、文脈有無、base cost差を含む校正済みconfidenceを独立した学習・評価境界として扱う。
 
 ### 2026-08-09 EOSを除外した候補score
 

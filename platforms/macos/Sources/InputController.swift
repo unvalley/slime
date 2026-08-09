@@ -432,13 +432,20 @@ final class SlimeController: IMKInputController {
             return
         }
         needsExternalDocumentContext = false
-        let context = precedingDocumentContext(
-            selectedRange: inputClient.selectedRange()
+        let selectedRange = inputClient.selectedRange()
+        let leftContext = precedingDocumentContext(
+            selectedRange: selectedRange
+        ) { range in
+            inputClient.attributedSubstring(from: range)?.string
+        } ?? ""
+        let rightContext = followingDocumentContext(
+            selectedRange: selectedRange,
+            documentLength: inputClient.length()
         ) { range in
             inputClient.attributedSubstring(from: range)?.string
         } ?? ""
         do {
-            try engine.setExternalLeftContext(context)
+            try engine.setExternalContext(left: leftContext, right: rightContext)
         } catch {
             NSLog(
                 "Slime: failed to set transient document context %@",

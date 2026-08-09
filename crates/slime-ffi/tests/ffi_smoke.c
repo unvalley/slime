@@ -155,6 +155,15 @@ int main(void) {
   assert(slime_set_external_left_context(NULL, (const uint8_t *)left_context,
                                          strlen(left_context)) ==
          SLIME_STATUS_NULL_HANDLE);
+  const char *right_context = "後続の文章";
+  assert(slime_set_external_context(
+             handle, (const uint8_t *)left_context, strlen(left_context),
+             (const uint8_t *)right_context, strlen(right_context)) ==
+         SLIME_STATUS_OK);
+  assert(slime_set_external_context(handle, (const uint8_t *)left_context,
+                                    strlen(left_context), invalid_context,
+                                    sizeof(invalid_context)) ==
+         SLIME_STATUS_INVALID_UTF8);
   slime_destroy(handle);
 
   handle = slime_create();

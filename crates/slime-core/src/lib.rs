@@ -124,6 +124,7 @@ pub struct CandidateDetail {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateRescoreRequest {
     pub context: String,
+    pub right_context: String,
     pub reading: String,
     pub candidates: Vec<String>,
 }
@@ -374,10 +375,18 @@ impl SlimeEngine {
     /// not used to learn a contextual history edge because its reading is
     /// unknown.
     pub fn set_external_left_context(&mut self, surface: &str) {
+        self.set_external_context(surface, "");
+    }
+
+    /// Replaces transient document context on both sides of the platform
+    /// caret. Only the left side participates in lattice ranking; an optional
+    /// external model may use both sides. Neither side is persisted.
+    pub fn set_external_context(&mut self, left_surface: &str, right_surface: &str) {
         if self.preferences.private_mode {
             self.session_history.reset_context();
         } else {
-            self.session_history.set_external_context(surface);
+            self.session_history
+                .set_external_contexts(left_surface, right_surface);
         }
     }
 
@@ -422,6 +431,7 @@ impl SlimeEngine {
         };
         let reading = current.request.reading.clone();
         let context = current.request.context.clone();
+        let right_context = current.request.right_context.clone();
         let dictionary_candidates = if context.is_empty() {
             self.dictionary
                 .candidates_with_limit(&reading, EXTENDED_LONG_RESCORE_N_BEST)
@@ -435,6 +445,7 @@ impl SlimeEngine {
         self.candidate_rescore = candidate_rescore_state_with_limit(
             &reading,
             &context,
+            &right_context,
             &[],
             &dictionary_candidates,
             EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT,
@@ -452,6 +463,7 @@ impl SlimeEngine {
         &mut self,
         log_likelihoods: &[f64],
         lambda: f64,
+        minimum_margin: f64,
     ) -> Option<Vec<SlimeAction>> {
         let state = self.candidate_rescore.take()?;
         if self.candidate_kind != Some(CandidateKind::Conversion)
@@ -459,6 +471,8 @@ impl SlimeEngine {
             || state.candidates.len() != log_likelihoods.len()
             || !(0.0..=1.0).contains(&lambda)
             || !lambda.is_finite()
+            || minimum_margin < 0.0
+            || !minimum_margin.is_finite()
             || log_likelihoods.iter().any(|score| !score.is_finite())
         {
             return None;
@@ -509,6 +523,12 @@ impl SlimeEngine {
             })
             .collect();
         order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
+        if order
+            .first()
+            .is_some_and(|&top| top != 0 && combined[top] - combined[0] < minimum_margin)
+        {
+            return Some(self.candidate_actions());
+        }
         for (position, candidate_index) in positions.into_iter().zip(order) {
             pending_candidates[position].clone_from(&state.candidates[candidate_index].surface);
         }
@@ -808,6 +828,12 @@ impl SlimeEngine {
         } else {
             explicit_previous_surface.or_else(|| self.session_history.previous_surface())
         };
+        let right_context = if self.preferences.private_mode || explicit_previous_surface.is_some()
+        {
+            ""
+        } else {
+            self.session_history.right_surface().unwrap_or_default()
+        };
         for surface in self.user_data.exact_dictionary_surfaces(reading) {
             push_unique(&mut candidates, surface.to_owned());
         }
@@ -856,6 +882,7 @@ impl SlimeEngine {
         let rescore = candidate_rescore_state(
             reading,
             previous_surface.unwrap_or_default(),
+            right_context,
             &candidates,
             &dictionary_candidates,
         );
@@ -1922,6 +1949,7 @@ fn bundled_dictionary_with_packs(
 fn candidate_rescore_state(
     reading: &str,
     context: &str,
+    right_context: &str,
     protected_candidates: &[String],
     dictionary_candidates: &[Candidate],
 ) -> Option<CandidateRescoreState> {
@@ -1933,6 +1961,7 @@ fn candidate_rescore_state(
     candidate_rescore_state_with_limit(
         reading,
         context,
+        right_context,
         protected_candidates,
         dictionary_candidates,
         candidate_limit,
@@ -1942,6 +1971,7 @@ fn candidate_rescore_state(
 fn candidate_rescore_state_with_limit(
     reading: &str,
     context: &str,
+    right_context: &str,
     protected_candidates: &[String],
     dictionary_candidates: &[Candidate],
     candidate_limit: usize,
@@ -1970,6 +2000,7 @@ fn candidate_rescore_state_with_limit(
     Some(CandidateRescoreState {
         request: CandidateRescoreRequest {
             context: context.to_owned(),
+            right_context: right_context.to_owned(),
             reading: reading.to_owned(),
             candidates: candidates
                 .iter()
@@ -3730,6 +3761,7 @@ mod tests {
             DictionaryEntry::new("にほん", "仁本", 1_200),
         ]);
         let mut engine = SlimeEngine::new(dictionary);
+        engine.set_external_context("直前", "直後");
         type_text(&mut engine, "nihon");
         engine.handle(InputEvent::Space);
 
@@ -3737,7 +3769,8 @@ mod tests {
             .candidate_rescore_request()
             .expect("ambiguous dictionary candidates should be scoreable");
         assert_eq!(request.reading, "にほん");
-        assert!(request.context.is_empty());
+        assert_eq!(request.context, "直前");
+        assert_eq!(request.right_context, "直後");
         assert_eq!(request.candidates.len(), 3);
         let promoted = request.candidates[1].clone();
         let scores: Vec<_> = request
@@ -3746,12 +3779,33 @@ mod tests {
             .map(|candidate| if candidate == &promoted { 0.0 } else { -10.0 })
             .collect();
         let actions = engine
-            .apply_candidate_rescore(&scores, 0.7)
+            .apply_candidate_rescore(&scores, 0.7, 0.1)
             .expect("aligned scores should apply");
 
         assert_eq!(engine.snapshot().candidates.first(), Some(&promoted));
         assert!(actions.contains(&SlimeAction::UpdatePreedit(promoted)));
         assert!(engine.candidate_rescore_request().is_none());
+    }
+
+    #[test]
+    fn weak_external_score_change_keeps_the_base_winner() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, "nihon");
+        engine.handle(InputEvent::Space);
+
+        let actions = engine
+            .apply_candidate_rescore(&[-1.0, -0.9], 0.7, 0.1)
+            .expect("aligned finite scores should be consumed");
+
+        assert_eq!(
+            engine.snapshot().candidates.first(),
+            Some(&"日本".to_owned())
+        );
+        assert!(actions.contains(&SlimeAction::UpdatePreedit("日本".to_owned())));
     }
 
     #[test]
@@ -3869,6 +3923,7 @@ mod tests {
         engine.candidate_rescore = Some(CandidateRescoreState {
             request: CandidateRescoreRequest {
                 context: String::new(),
+                right_context: String::new(),
                 reading: "にほん".to_owned(),
                 candidates: candidates
                     .iter()
@@ -3878,7 +3933,7 @@ mod tests {
             candidates,
         });
         engine
-            .apply_candidate_rescore(&[-10.0, -10.0, 0.0], 0.7)
+            .apply_candidate_rescore(&[-10.0, -10.0, 0.0], 0.7, 0.1)
             .expect("aligned deep scores should apply");
 
         assert_eq!(engine.candidates[0], "深層");
@@ -3916,7 +3971,7 @@ mod tests {
         engine.handle(InputEvent::Space);
         let base = engine.snapshot().candidates;
 
-        assert!(engine.apply_candidate_rescore(&[], 0.7).is_none());
+        assert!(engine.apply_candidate_rescore(&[], 0.7, 0.1).is_none());
         assert_eq!(engine.snapshot().candidates, base);
         assert!(engine.candidate_rescore_request().is_none());
     }

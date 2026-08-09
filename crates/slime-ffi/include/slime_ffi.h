@@ -174,7 +174,7 @@ SlimeBuffer slime_set_options_v5(SlimeHandle *handle, bool live_conversion,
                              uint32_t date_format_mask);
 SlimeBuffer slime_begin_reconversion(SlimeHandle *handle,
                                  const uint8_t *surface, size_t surface_len);
-/* Breaks transient left context after an external caret, document, or client
+/* Breaks transient document context after an external caret, document, or client
    boundary without deleting persisted history. */
 uint32_t slime_reset_context(SlimeHandle *handle);
 /* Supplies committed text immediately before the platform caret. The context
@@ -182,6 +182,13 @@ uint32_t slime_reset_context(SlimeHandle *handle);
 uint32_t slime_set_external_left_context(SlimeHandle *handle,
                                          const uint8_t *surface,
                                          size_t surface_len);
+/* Supplies committed text on both sides of the platform caret. Both sides are
+   bounded, transient, never persisted, and ignored in private mode. */
+uint32_t slime_set_external_context(SlimeHandle *handle,
+                                    const uint8_t *left_surface,
+                                    size_t left_surface_len,
+                                    const uint8_t *right_surface,
+                                    size_t right_surface_len);
 SlimeBuffer slime_reload_user_data(SlimeHandle *handle);
 SlimeBuffer slime_domain_dictionary_words(uint32_t mask);
 SlimeBuffer slime_installed_dictionary_packs(const SlimeHandle *handle);

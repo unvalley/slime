@@ -205,12 +205,25 @@ final class RustEngine {
     }
 
     func setExternalLeftContext(_ context: String) throws {
-        let bytes = Array(context.utf8)
-        let status = bytes.withUnsafeBufferPointer { buffer in
-            slime_set_external_left_context(handle, buffer.baseAddress, buffer.count)
+        try setExternalContext(left: context, right: "")
+    }
+
+    func setExternalContext(left: String, right: String) throws {
+        let leftBytes = Array(left.utf8)
+        let rightBytes = Array(right.utf8)
+        let status = leftBytes.withUnsafeBufferPointer { leftBuffer in
+            rightBytes.withUnsafeBufferPointer { rightBuffer in
+                slime_set_external_context(
+                    handle,
+                    leftBuffer.baseAddress,
+                    leftBuffer.count,
+                    rightBuffer.baseAddress,
+                    rightBuffer.count
+                )
+            }
         }
         guard status == 0 else {
-            throw EngineError.rejected("external_left_context_status_\(status)")
+            throw EngineError.rejected("external_context_status_\(status)")
         }
     }
 

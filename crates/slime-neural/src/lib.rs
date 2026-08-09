@@ -7,8 +7,9 @@
 //! represented as a trie so candidates such as long sentence variants do not
 //! decode their identical leading tokens once per candidate.
 //!
-//! Prompt format (zenz-v3): `\u{EE02}<context>\u{EE00}<katakana input>\u{EE01}<output></s>`.
-//! The context block is omitted when the item has no left context.
+//! Prompt format (zenz-v3):
+//! `\u{EE02}<left>\u{EE07}<right>\u{EE00}<katakana input>\u{EE01}<output></s>`.
+//! Empty context blocks are omitted.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -36,11 +37,13 @@ const DEFAULT_KV_CELLS: u32 = 4096;
 const MAX_POSITIONS: usize = 1024;
 
 const CONTEXT_MARK: char = '\u{EE02}';
+const RIGHT_CONTEXT_MARK: char = '\u{EE07}';
 const INPUT_MARK: char = '\u{EE00}';
 const OUTPUT_MARK: char = '\u{EE01}';
 
 pub struct ScoreRequest {
     pub context: String,
+    pub right_context: String,
     pub input_katakana: String,
     pub candidates: Vec<String>,
 }
@@ -166,7 +169,11 @@ impl Rescorer {
         timing: &mut Timing,
     ) -> Result<ScoredItem, String> {
         let started = Instant::now();
-        let prompt = build_prompt(&request.context, &request.input_katakana);
+        let prompt = build_prompt(
+            &request.context,
+            &request.right_context,
+            &request.input_katakana,
+        );
         let prefix_tokens = self
             .model
             .str_to_token(&prompt, AddBos::Never)
@@ -371,13 +378,17 @@ impl CandidateTokenTrie {
     }
 }
 
-fn build_prompt(context: &str, input_katakana: &str) -> String {
+fn build_prompt(context: &str, right_context: &str, input_katakana: &str) -> String {
     let mut prompt = String::new();
     if !context.is_empty() {
         prompt.push(CONTEXT_MARK);
         let characters: Vec<char> = context.chars().collect();
         let start = characters.len().saturating_sub(MAX_CONTEXT_CHARACTERS);
         prompt.extend(&characters[start..]);
+    }
+    if !right_context.is_empty() {
+        prompt.push(RIGHT_CONTEXT_MARK);
+        prompt.extend(right_context.chars().take(MAX_CONTEXT_CHARACTERS));
     }
     prompt.push(INPUT_MARK);
     prompt.push_str(input_katakana);
@@ -551,25 +562,39 @@ mod tests {
     #[test]
     fn builds_zenz_v3_prompt_with_context() {
         assert_eq!(
-            build_prompt("彼は", "コウテイ"),
+            build_prompt("彼は", "", "コウテイ"),
             "\u{EE02}彼は\u{EE00}コウテイ\u{EE01}"
         );
     }
 
     #[test]
     fn omits_context_block_when_context_is_empty() {
-        assert_eq!(build_prompt("", "コウテイ"), "\u{EE00}コウテイ\u{EE01}");
+        assert_eq!(build_prompt("", "", "コウテイ"), "\u{EE00}コウテイ\u{EE01}");
     }
 
     #[test]
     fn truncates_context_to_the_last_forty_characters() {
         let context: String = "あ".repeat(60);
-        let prompt = build_prompt(&context, "カナ");
+        let prompt = build_prompt(&context, "", "カナ");
         let context_part: String = prompt
             .chars()
             .skip(1)
             .take_while(|&character| character != '\u{EE00}')
             .collect();
         assert_eq!(context_part.chars().count(), 40);
+    }
+
+    #[test]
+    fn builds_zenz_v3_prompt_with_bounded_right_context() {
+        let right_context: String = "後".repeat(60);
+        let prompt = build_prompt("前", &right_context, "カナ");
+        assert!(prompt.starts_with("\u{EE02}前\u{EE07}"));
+        let right: String = prompt
+            .chars()
+            .skip_while(|&character| character != '\u{EE07}')
+            .skip(1)
+            .take_while(|&character| character != '\u{EE00}')
+            .collect();
+        assert_eq!(right.chars().count(), 40);
     }
 }

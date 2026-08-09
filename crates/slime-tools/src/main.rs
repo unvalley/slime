@@ -685,6 +685,7 @@ fn load_anthy_items(paths: &[PathBuf]) -> Result<Vec<AjimeeItem>, String> {
                 source_split: None,
                 index: format!("{}:{}", path.display(), line_index + 1),
                 context_text: String::new(),
+                right_context_text: String::new(),
                 input: reading,
                 expected_output: vec![expected],
             });
@@ -714,6 +715,7 @@ fn load_annotated_items(paths: &[PathBuf]) -> Result<Vec<AjimeeItem>, String> {
                 source_split: None,
                 index: format!("{}:{}", path.display(), line_index + 1),
                 context_text: String::new(),
+                right_context_text: String::new(),
                 input,
                 expected_output: vec![expected],
             });
@@ -778,6 +780,9 @@ struct AjimeeItem {
     source_split: Option<String>,
     index: String,
     context_text: String,
+    #[serde(default)]
+    #[cfg_attr(not(feature = "neural"), allow(dead_code))]
+    right_context_text: String,
     input: String,
     expected_output: Vec<String>,
 }
@@ -1385,6 +1390,7 @@ fn score_neural_outcomes(
         .filter(|(_, candidate_count)| **candidate_count >= 2)
         .map(|(outcome, &candidate_count)| neural::ScoreRequest {
             context: outcome.item.context_text.clone(),
+            right_context: outcome.item.right_context_text.clone(),
             input_katakana: outcome.item.input.clone(),
             candidates: outcome
                 .candidates

@@ -49,6 +49,31 @@ func runInputContextTests(in directory: URL) throws {
         unavailable == nil && !fetchedUnavailable,
         "an unavailable caret must not read document text"
     )
+    var followingRange: NSRange?
+    let following = followingDocumentContext(
+        selectedRange: NSRange(location: 4, length: 2),
+        documentLength: 300
+    ) { range in
+        followingRange = range
+        return String(repeating: "後", count: 150) + "😀末尾"
+    }
+    try contextExpect(
+        followingRange == NSRange(location: 6, length: 256)
+            && following == String((String(repeating: "後", count: 150) + "😀末尾").prefix(128)),
+        "right document context should start after the selection and stay bounded"
+    )
+    var fetchedPastEnd = false
+    let pastEnd = followingDocumentContext(
+        selectedRange: NSRange(location: 301, length: 0),
+        documentLength: 300
+    ) { _ in
+        fetchedPastEnd = true
+        return "should not be read"
+    }
+    try contextExpect(
+        pastEnd == nil && !fetchedPastEnd,
+        "a caret past the reported document end must not read text"
+    )
 
     let packDirectory = directory.appendingPathComponent(
         "dictionary-packs",

@@ -1716,13 +1716,17 @@ void TextService::SynchronizeExternalDocumentContext(
 
   ComPtr<ITfRange> contextRange;
   if (!GetSelectionCaret(editCookie, context, contextRange)) {
-    slime_set_external_left_context(engine_, nullptr, 0);
+    slime_set_external_context(engine_, nullptr, 0, nullptr, 0);
     return;
+  }
+  ComPtr<ITfRange> rightRange;
+  if (FAILED(contextRange->Clone(rightRange.GetAddressOf()))) {
+    rightRange.Reset();
   }
   LONG shifted = 0;
   if (FAILED(contextRange->ShiftStart(editCookie, -kDocumentContextUtf16Limit,
                                       &shifted, nullptr))) {
-    slime_set_external_left_context(engine_, nullptr, 0);
+    slime_set_external_context(engine_, nullptr, 0, nullptr, 0);
     return;
   }
   std::array<wchar_t,
@@ -1731,17 +1735,38 @@ void TextService::SynchronizeExternalDocumentContext(
   ULONG length = 0;
   if (FAILED(contextRange->GetText(editCookie, 0, text.data(),
                                    static_cast<ULONG>(text.size()), &length))) {
-    slime_set_external_left_context(engine_, nullptr, 0);
+    slime_set_external_context(engine_, nullptr, 0, nullptr, 0);
     return;
   }
-  const auto utf8 = WideToUtf8(text.data(), length);
-  if (!utf8.has_value()) {
-    slime_set_external_left_context(engine_, nullptr, 0);
+  const auto leftUtf8 = WideToUtf8(text.data(), length);
+  if (!leftUtf8.has_value()) {
+    slime_set_external_context(engine_, nullptr, 0, nullptr, 0);
     return;
   }
-  slime_set_external_left_context(
-      engine_, reinterpret_cast<const std::uint8_t *>(utf8->data()),
-      utf8->size());
+  std::string rightUtf8;
+  if (rightRange != nullptr) {
+    LONG rightShifted = 0;
+    if (SUCCEEDED(rightRange->ShiftEnd(editCookie, kDocumentContextUtf16Limit,
+                                       &rightShifted, nullptr))) {
+      std::array<wchar_t,
+                 static_cast<std::size_t>(kDocumentContextUtf16Limit)>
+          rightText{};
+      ULONG rightLength = 0;
+      if (SUCCEEDED(rightRange->GetText(
+              editCookie, 0, rightText.data(),
+              static_cast<ULONG>(rightText.size()), &rightLength))) {
+        const auto converted = WideToUtf8(rightText.data(), rightLength);
+        if (converted.has_value()) {
+          rightUtf8 = *converted;
+        }
+      }
+    }
+  }
+  slime_set_external_context(
+      engine_, reinterpret_cast<const std::uint8_t *>(leftUtf8->data()),
+      leftUtf8->size(),
+      reinterpret_cast<const std::uint8_t *>(rightUtf8.data()),
+      rightUtf8.size());
 }
 
 void TextService::MaybeReloadPreferences(const bool force) noexcept {

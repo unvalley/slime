@@ -25,6 +25,34 @@ func precedingDocumentContext(
     return String(text.suffix(maximumCharacters))
 }
 
+func followingDocumentContext(
+    selectedRange: NSRange,
+    documentLength: Int,
+    maximumCharacters: Int = 128,
+    fetch: (NSRange) -> String?
+) -> String? {
+    guard selectedRange.location != NSNotFound,
+          selectedRange.length != NSNotFound,
+          documentLength != NSNotFound,
+          documentLength >= 0,
+          maximumCharacters > 0,
+          maximumCharacters <= Int.max / 2,
+          selectedRange.location <= Int.max - selectedRange.length
+    else {
+        return nil
+    }
+    let start = selectedRange.location + selectedRange.length
+    guard start <= documentLength else { return nil }
+    guard start < documentLength else { return "" }
+
+    // IMKTextInput offsets and length are UTF-16 based. Bound the request by
+    // the reported document end, then cap decoded Characters once more.
+    let requestedLength = min(documentLength - start, maximumCharacters * 2)
+    let range = NSRange(location: start, length: requestedLength)
+    guard let text = fetch(range) else { return nil }
+    return String(text.prefix(maximumCharacters))
+}
+
 struct InputContextBoundary {
     private enum Selection: Equatable {
         case range(NSRange)

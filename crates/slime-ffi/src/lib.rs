@@ -147,6 +147,8 @@ static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "neural")]
 const NEURAL_CANDIDATE_WEIGHT: f64 = 0.7;
 #[cfg(feature = "neural")]
+const NEURAL_RIGHT_CONTEXT_MINIMUM_SCORE_MARGIN: f64 = 0.1;
+#[cfg(feature = "neural")]
 const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 16;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
@@ -532,16 +534,24 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let Some(service) = service.as_ref() else {
             return actions;
         };
+        let minimum_margin = if request.right_context.is_empty() {
+            0.0
+        } else {
+            NEURAL_RIGHT_CONTEXT_MINIMUM_SCORE_MARGIN
+        };
         let score_request = slime_neural::ScoreRequest {
             context: request.context,
+            right_context: request.right_context,
             input_katakana: full_katakana(&request.reading),
             candidates: request.candidates,
         };
         if let Ok(scored) = service.rescorer.score_all(&[score_request])
             && let Some(scored) = scored.first()
-            && let Some(rescored_actions) = handle
-                .engine
-                .apply_candidate_rescore(&scored.candidate_logliks, NEURAL_CANDIDATE_WEIGHT)
+            && let Some(rescored_actions) = handle.engine.apply_candidate_rescore(
+                &scored.candidate_logliks,
+                NEURAL_CANDIDATE_WEIGHT,
+                minimum_margin,
+            )
         {
             return rescored_actions;
         }
@@ -921,7 +931,7 @@ pub unsafe extern "C" fn slime_begin_reconversion(
     unsafe { engine_control(handle, |engine| engine.begin_reconversion(surface)) }
 }
 
-/// Breaks transient left context after an external caret, document, or input
+/// Breaks transient document context after an external caret, document, or input
 /// client boundary without deleting persisted history.
 ///
 /// # Safety
@@ -967,6 +977,46 @@ pub unsafe extern "C" fn slime_set_external_left_context(
         };
         // SAFETY: This function's contract requires a live, exclusive handle.
         unsafe { &mut (*handle).engine }.set_external_left_context(surface);
+        STATUS_OK
+    }));
+    result.unwrap_or(STATUS_PANIC)
+}
+
+/// Supplies bounded committed text on both sides of the platform caret.
+///
+/// The context is transient, never persisted, and ignored in private mode.
+/// Left context also participates in deterministic lattice ranking; right
+/// context is reserved for optional local candidate scoring.
+///
+/// # Safety
+///
+/// `handle` must be live and exclusively accessed. Each non-null pointer must
+/// address its declared readable byte length for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_set_external_context(
+    handle: *mut SlimeHandle,
+    left_surface: *const u8,
+    left_surface_len: usize,
+    right_surface: *const u8,
+    right_surface_len: usize,
+) -> u32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return STATUS_NULL_HANDLE;
+        }
+        // SAFETY: The caller promises readable bytes for the duration of the call.
+        let Some(left_surface) = (unsafe { decode_utf8_argument(left_surface, left_surface_len) })
+        else {
+            return STATUS_INVALID_UTF8;
+        };
+        // SAFETY: The caller promises readable bytes for the duration of the call.
+        let Some(right_surface) =
+            (unsafe { decode_utf8_argument(right_surface, right_surface_len) })
+        else {
+            return STATUS_INVALID_UTF8;
+        };
+        // SAFETY: This function's contract requires a live, exclusive handle.
+        unsafe { &mut (*handle).engine }.set_external_context(left_surface, right_surface);
         STATUS_OK
     }));
     result.unwrap_or(STATUS_PANIC)
@@ -1470,8 +1520,8 @@ mod tests {
         slime_installed_dictionary_pack_words, slime_installed_dictionary_packs,
         slime_neural_rescoring_status, slime_process, slime_process_actions,
         slime_process_actions_v2, slime_record_external_selection, slime_reset_context,
-        slime_set_external_left_context, slime_set_options, slime_set_options_v2,
-        slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
+        slime_set_external_context, slime_set_external_left_context, slime_set_options,
+        slime_set_options_v2, slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
     };
     use std::ffi::c_void;
     use std::fs;
@@ -1528,6 +1578,7 @@ mod tests {
             let service = service.as_ref().expect("neural service should be loaded");
             let request = slime_neural::ScoreRequest {
                 context: String::new(),
+                right_context: String::new(),
                 input_katakana: "チョウブンショウニ".to_owned(),
                 candidates: (0..super::NEURAL_MAX_PARALLEL_CANDIDATES)
                     .map(|index| format!("長文候補{index}"))
@@ -1546,6 +1597,21 @@ mod tests {
         eprintln!(
             "ffi neural expanded-candidate conversion: {:.3}ms",
             expanded_candidate_latency.as_secs_f64() * 1_000.0
+        );
+        let left_context = "文章の途中で";
+        let right_context = "を編集する";
+        // SAFETY: The handle and both UTF-8 strings are live for this call.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    handle,
+                    left_context.as_ptr(),
+                    left_context.len(),
+                    right_context.as_ptr(),
+                    right_context.len(),
+                )
+            },
+            STATUS_OK
         );
         for character in "koutei".chars() {
             // SAFETY: The handle is live and each buffer is released once.
@@ -2478,6 +2544,55 @@ mod tests {
                     std::ptr::null_mut(),
                     context.as_ptr(),
                     context.len(),
+                )
+            },
+            STATUS_NULL_HANDLE
+        );
+        // SAFETY: The handle is live and has not previously been released.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[test]
+    fn bidirectional_context_reports_invalid_inputs_without_panicking() {
+        let handle = slime_create();
+        let left = "直前の文章";
+        let right = "後続の文章";
+        // SAFETY: Both UTF-8 byte ranges and the handle remain live for the call.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    handle,
+                    left.as_ptr(),
+                    left.len(),
+                    right.as_ptr(),
+                    right.len(),
+                )
+            },
+            STATUS_OK
+        );
+        let invalid = [0xff];
+        // SAFETY: The right byte is readable but deliberately invalid UTF-8.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    handle,
+                    left.as_ptr(),
+                    left.len(),
+                    invalid.as_ptr(),
+                    invalid.len(),
+                )
+            },
+            STATUS_INVALID_UTF8
+        );
+        // SAFETY: A null handle is explicitly accepted and reported.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    std::ptr::null_mut(),
+                    left.as_ptr(),
+                    left.len(),
+                    right.as_ptr(),
+                    right.len(),
                 )
             },
             STATUS_NULL_HANDLE

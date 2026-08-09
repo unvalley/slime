@@ -141,6 +141,7 @@ struct DictionaryDocumentContextRanker<'a> {
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
+    unique_right_grammar_surface: Option<&'a str>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
 }
@@ -181,6 +182,8 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 .document_right_inflection_promotions(reading, right_context),
             right_auxiliary_costs: dictionary
                 .document_right_auxiliary_costs(reading, right_context),
+            unique_right_grammar_surface: dictionary
+                .document_unique_right_grammar_surface(reading, right_context),
             follows_region_name: is_document_region_suffix_reading(reading)
                 && dictionary.document_context_has_pos_suffix(
                     left_context,
@@ -261,6 +264,13 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             })
             .max()
             .unwrap_or(0);
+        let unique_right_grammar_promotion = if conversion.segments.len() == 1
+            && self.unique_right_grammar_surface == Some(conversion.surface.as_str())
+        {
+            DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION
+        } else {
+            0
+        };
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
@@ -289,6 +299,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(right_phrase_promotion)
             .saturating_sub(right_inflection_promotion)
             .saturating_sub(right_auxiliary_promotion)
+            .saturating_sub(unique_right_grammar_promotion)
     }
 }
 
@@ -375,7 +386,18 @@ const DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 500;
 const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
+const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
+const DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN: i32 = 1_000;
+const MOZC_PAST_AUXILIARY_POS_ID: u16 = 142;
 const MOZC_DESIDERATIVE_AUXILIARY_POS_ID: u16 = 152;
+const MOZC_NEGATIVE_AUXILIARY_POS_ID: u16 = 204;
+const MOZC_POLITE_AUXILIARY_POS_ID: u16 = 240;
+const MOZC_TE_CONNECTIVE_PARTICLE_POS_ID: u16 = 348;
+const MOZC_DE_CONNECTIVE_PARTICLE_POS_ID: u16 = 349;
+const MOZC_CAUSATIVE_SASERU_CONTINUATIVE_POS_ID: u16 = 482;
+const MOZC_CAUSATIVE_SERU_CONTINUATIVE_POS_ID: u16 = 484;
+const MOZC_PASSIVE_RARERU_CONTINUATIVE_POS_ID: u16 = 485;
+const MOZC_PASSIVE_RERU_CONTINUATIVE_POS_ID: u16 = 486;
 const MOZC_COUNTER_POS_ID: u16 = 2011;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
@@ -1493,6 +1515,47 @@ impl Dictionary {
             }
         }
         costs
+    }
+
+    fn document_unique_right_grammar_surface<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Option<&'s str> {
+        if !self.uses_connection_costs {
+            return None;
+        }
+        let right_pos_id = document_right_grammar_pos_id(right_context)?;
+        let connection = ConnectionMatrix::bundled();
+        let mut surface_costs = Vec::<(&str, i32)>::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading
+                || !entry
+                    .surface
+                    .chars()
+                    .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+            {
+                return;
+            }
+            let transition_cost = connection.cost(entry.right_id, right_pos_id);
+            if let Some((_, cost)) = surface_costs
+                .iter_mut()
+                .find(|(surface, _)| *surface == entry.surface)
+            {
+                *cost = (*cost).min(transition_cost);
+            } else {
+                surface_costs.push((entry.surface, transition_cost));
+            }
+        });
+        let minimum = surface_costs.iter().map(|(_, cost)| *cost).min()?;
+        // A grammatical continuation is only structural evidence. If several
+        // surfaces connect almost equally well, choosing among them needs
+        // semantic context and must remain with the existing ranker.
+        let mut compatible = surface_costs.into_iter().filter(|(_, cost)| {
+            *cost <= minimum.saturating_add(DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN)
+        });
+        let (surface, _) = compatible.next()?;
+        compatible.next().is_none().then_some(surface)
     }
 
     fn document_numeric_counter_promotions(
@@ -2931,6 +2994,45 @@ fn starts_with_polite_auxiliary(right_context: &str) -> bool {
         .any(|prefix| right_context.starts_with(prefix))
 }
 
+fn document_right_grammar_pos_id(right_context: &str) -> Option<u16> {
+    if right_context.starts_with("たい") {
+        return None;
+    }
+    if right_context.starts_with("られ") {
+        return Some(MOZC_PASSIVE_RARERU_CONTINUATIVE_POS_ID);
+    }
+    if right_context.starts_with("させ") {
+        return Some(MOZC_CAUSATIVE_SASERU_CONTINUATIVE_POS_ID);
+    }
+    if ["せた", "せて", "せる", "せない", "せられ"]
+        .iter()
+        .any(|prefix| right_context.starts_with(prefix))
+    {
+        return Some(MOZC_CAUSATIVE_SERU_CONTINUATIVE_POS_ID);
+    }
+    if ["れた", "れて", "れる", "れない"]
+        .iter()
+        .any(|prefix| right_context.starts_with(prefix))
+    {
+        return Some(MOZC_PASSIVE_RERU_CONTINUATIVE_POS_ID);
+    }
+    if right_context.starts_with("ない") {
+        return Some(MOZC_NEGATIVE_AUXILIARY_POS_ID);
+    }
+    if starts_with_polite_auxiliary(right_context) {
+        return Some(MOZC_POLITE_AUXILIARY_POS_ID);
+    }
+    if right_context.starts_with('て') {
+        return Some(MOZC_TE_CONNECTIVE_PARTICLE_POS_ID);
+    }
+    if right_context.starts_with('で') {
+        return Some(MOZC_DE_CONNECTIVE_PARTICLE_POS_ID);
+    }
+    right_context
+        .starts_with('た')
+        .then_some(MOZC_PAST_AUXILIARY_POS_ID)
+}
+
 fn looks_like_inflected_kanji_surface(surface: &str) -> bool {
     surface
         .chars()
@@ -4115,6 +4217,38 @@ mod tests {
             "たい物が買えました。",
         );
         assert_eq!(candidates[0].surface, "買い", "{candidates:?}");
+    }
+
+    #[test]
+    fn surrounding_context_promotes_a_unique_form_before_following_grammar() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("こ")[0].surface, "個");
+        let candidates = dictionary.candidates_with_surrounding_context(
+            "こ",
+            "有名な先生方が講師として",
+            "られています。",
+        );
+        assert_eq!(candidates[0].surface, "来", "{candidates:?}");
+
+        assert_eq!(dictionary.candidates("わたし")[0].surface, "私");
+        let candidates = dictionary.candidates_with_surrounding_context(
+            "わたし",
+            "彼らは更に自らの救命胴衣を他の兵士に",
+            "た。",
+        );
+        assert_eq!(candidates[0].surface, "渡し", "{candidates:?}");
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "もし",
+                "旅の途中で出会うモンスターを",
+                "た家具を"
+            )[0]
+            .surface,
+            "模試",
+            "ambiguous compatible verb surfaces require semantic evidence"
+        );
     }
 
     #[test]

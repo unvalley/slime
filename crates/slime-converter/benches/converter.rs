@@ -183,6 +183,7 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             );
         },
     );
+    run_unique_right_grammar_benchmark(dictionary, iterations);
     run("converter/right_compound_candidates", iterations, || {
         black_box(dictionary.candidates_with_surrounding_context(
             black_box("まち"),
@@ -212,6 +213,32 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_unique_right_grammar_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/unique_right_grammar_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("こ"),
+                black_box("有名な先生方が講師として"),
+                black_box("られています。"),
+            ));
+        },
+    );
+    run(
+        "converter/unique_right_grammar_left_only",
+        iterations,
+        || {
+            black_box(
+                dictionary.candidates_with_context(
+                    black_box("こ"),
+                    black_box("有名な先生方が講師として"),
+                ),
+            );
         },
     );
 }

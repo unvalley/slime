@@ -2925,6 +2925,17 @@ mod tests {
     }
 
     #[test]
+    fn external_right_context_ranks_a_unique_form_before_following_grammar() {
+        let mut engine = SlimeEngine::bundled();
+
+        engine.set_external_context("有名な先生方が講師として", "られています。");
+        type_text(&mut engine, "ko");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "来");
+    }
+
+    #[test]
     fn external_right_context_ranks_a_dictionary_compound_prefix() {
         let mut engine = SlimeEngine::bundled();
 

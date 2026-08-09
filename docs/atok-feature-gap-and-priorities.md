@@ -113,6 +113,14 @@ ATOKの強みを機能数として追いかけるのではなく、Slimeでは�
 
 GSD devでは1件改善・悪化0、GSD train、GSD test、AJIMEE、JWTDは候補順を含めて不変だった。過去助動詞`た`への全面拡張は意味的な動詞選択を誤るため不採用とした。
 
+## 今回の実装: 一意な後続文法接続
+
+[ATOKのAI用例](https://atok.com/other/support/howtouse/mac/shrd/shrd_yougo.htm)は前後の語のつながりを変換に使う。[azooKeyの通常変換](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も、辞書entryの左右品詞IDと接続costを含むラティスからN-bestを求める。Slimeではこれらを一般的な設計上の参考とし、ATOKの内部実装を再現せず、既存Mozc辞書の接続行列だけを使う。
+
+文章途中の編集で右文脈が`た`・`ない`・`ます`・`て`・`で`・受身・使役の文法形から始まる場合、同じ読みに属する全exact entryについて後続POSへの接続costを比較する。最良costから1,000以内に入る漢字表層が1種類だけなら、その一語候補を最大1,500 cost昇格する。複数表層が文法的に接続できる場合は意味選択が必要なので順位を変えない。これにより`渡した`、`来られています`、`来ないね`を直し、`模し`・`燃し`などが競合する`模した`は従来順位のままにした。
+
+GSD train・dev・testで各1件改善・悪化0、AJIMEE held-outとJWTD devは候補順を含めて不変だった。通常入力、ライブ変換、private modeには右文脈が渡らないため影響しない。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 組織名・地名recallの監査結果
 
 [ATOKの固有名詞優先](https://atok.com/other/support/howtouse/mac/tr/pgs/tr_conv_name.htm)に対応する追加探索を検討したが、Mozcの組織・地域POS 14万2,957 entryから均等抽出した約4,900件はすべて初回10候補に入った。GSDの未回収地名も大半が語彙不在または読み差で、beam追加では直らない。初回候補を汚す専用順位変更は行わず、今後はライセンスを確認できる語彙だけをoptional packで評価する。

@@ -40,8 +40,9 @@ const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
-const RESCORE_CANDIDATE_LIMIT: usize = 3;
+const RESCORE_CANDIDATE_LIMIT: usize = 5;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
+const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1857,9 +1858,13 @@ fn candidate_rescore_state(
     if !protected_candidates.is_empty() {
         return None;
     }
+    let base_cost = dictionary_candidates.first()?.cost;
     let candidates: Vec<_> = dictionary_candidates
         .iter()
         .take(RESCORE_CANDIDATE_LIMIT)
+        .take_while(|candidate| {
+            candidate.cost.saturating_sub(base_cost).max(0) <= RESCORE_MAX_CANDIDATE_COST_GAP
+        })
         .cloned()
         .collect();
     let first = candidates.first()?.cost;
@@ -3656,6 +3661,52 @@ mod tests {
         assert_eq!(engine.snapshot().candidates.first(), Some(&promoted));
         assert!(actions.contains(&SlimeAction::UpdatePreedit(promoted)));
         assert!(engine.candidate_rescore_request().is_none());
+    }
+
+    #[test]
+    fn external_scoring_exposes_the_full_standard_candidate_pool() {
+        let entries = (0_i32..12)
+            .map(|index| {
+                DictionaryEntry::new(
+                    "こうほ",
+                    format!("候補{index}"),
+                    1_000 + index.saturating_mul(10),
+                )
+            })
+            .collect();
+        let mut engine = SlimeEngine::new(Dictionary::new(entries));
+        type_text(&mut engine, "kouho");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("ambiguous dictionary candidates should be scoreable");
+        assert_eq!(request.candidates.len(), super::RESCORE_CANDIDATE_LIMIT);
+        assert_eq!(
+            request.candidates,
+            (0..5)
+                .map(|index| format!("候補{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(!request.candidates.contains(&"コウホ".to_owned()));
+    }
+
+    #[test]
+    fn external_scoring_omits_a_remote_candidate_tail() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("こうほ", "第一", 1_000),
+            DictionaryEntry::new("こうほ", "第二", 1_100),
+            DictionaryEntry::new("こうほ", "第三", 2_501),
+            DictionaryEntry::new("こうほ", "第四", 2_600),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        type_text(&mut engine, "kouho");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("the close top two candidates should remain scoreable");
+        assert_eq!(request.candidates, ["第一", "第二"]);
     }
 
     #[test]

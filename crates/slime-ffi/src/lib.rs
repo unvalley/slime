@@ -145,7 +145,9 @@ static NEURAL_MODEL_PATH: OnceLock<PathBuf> = OnceLock::new();
 static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "neural")]
-const NEURAL_CANDIDATE_WEIGHT: f64 = 0.85;
+const NEURAL_CANDIDATE_WEIGHT: f64 = 0.7;
+#[cfg(feature = "neural")]
+const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 5;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
 
@@ -438,7 +440,9 @@ fn prepare_neural_service(model_path: &Path) -> u32 {
 
 #[cfg(feature = "neural")]
 fn load_neural_service(model_path: &Path) {
-    let Ok(rescorer) = slime_neural::Rescorer::load_bounded(model_path, 3, 1_024) else {
+    let Ok(rescorer) =
+        slime_neural::Rescorer::load_bounded(model_path, NEURAL_MAX_PARALLEL_CANDIDATES, 1_024)
+    else {
         NEURAL_LOAD_FAILED.store(true, Ordering::Release);
         return;
     };
@@ -1498,7 +1502,9 @@ mod tests {
         // SAFETY: The handle and model path are live for this synchronous call.
         let status = unsafe { slime_enable_neural_rescoring(handle, model.as_ptr(), model.len()) };
         assert_eq!(status, STATUS_OK);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // A cold llama.cpp/Metal initialization can include shader compilation
+        // and exceed 30 seconds on an otherwise busy development machine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
         while slime_neural_rescoring_status() == super::STATUS_NEURAL_PREPARING {
             assert!(
                 std::time::Instant::now() < deadline,

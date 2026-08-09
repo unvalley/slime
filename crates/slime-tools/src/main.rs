@@ -238,6 +238,7 @@ struct Options {
     neural_model: Option<PathBuf>,
     neural_max_cost_gap: Option<i32>,
     neural_max_candidates: Option<usize>,
+    neural_max_candidate_cost_gap: Option<i32>,
     lambdas: Vec<f64>,
     neural_min_margins: Vec<f64>,
     neural_score_modes: Vec<NeuralScoreMode>,
@@ -281,6 +282,7 @@ impl Options {
             neural_model: None,
             neural_max_cost_gap: None,
             neural_max_candidates: None,
+            neural_max_candidate_cost_gap: None,
             lambdas: Vec::new(),
             neural_min_margins: Vec::new(),
             neural_score_modes: Vec::new(),
@@ -361,6 +363,12 @@ impl Options {
                         return Err("--neural-max-candidates must be at least 2".to_owned());
                     }
                     options.neural_max_candidates = Some(maximum);
+                }
+                "--neural-max-candidate-cost-gap" => {
+                    options.neural_max_candidate_cost_gap = Some(parse_non_negative_i32(
+                        "--neural-max-candidate-cost-gap",
+                        arguments.next(),
+                    )?);
                 }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
                 "--neural-min-margin" => options.neural_min_margins.push(parse_non_negative_f64(
@@ -467,6 +475,7 @@ impl Options {
         }
         if (options.neural_max_cost_gap.is_some()
             || options.neural_max_candidates.is_some()
+            || options.neural_max_candidate_cost_gap.is_some()
             || !options.neural_min_margins.is_empty()
             || !options.neural_score_modes.is_empty())
             && options.neural_model.is_none()
@@ -535,7 +544,8 @@ fn usage() -> String {
      [--search-k N] \
      [--context all|none|present] [--limit N] [--failures N] [--json] \
      [--neural-model model.gguf] [--neural-max-cost-gap N] \
-     [--neural-max-candidates N] [--lambda X]... [--neural-min-margin X]... \
+     [--neural-max-candidates N] [--neural-max-candidate-cost-gap N] \
+     [--lambda X]... [--neural-min-margin X]... \
      [--neural-score-mode with-eos|without-eos|mean-with-eos|mean-without-eos]... \
      [--export-nbest path] \
      [--discriminative-train items.json] [--discriminative-train-limit N] \
@@ -550,7 +560,9 @@ fn usage() -> String {
      building with --features neural). --neural-max-cost-gap skips neural \
      scoring when the base top-two cost gap exceeds N. --neural-max-candidates \
      restricts neural reordering to the first N lattice candidates while \
-     preserving the remaining base order. --lambda selects interpolation \
+     preserving the remaining base order. --neural-max-candidate-cost-gap \
+     further restricts that prefix to candidates no more than N cost units \
+     above the base winner. --lambda selects interpolation \
      weights; without it a default sweep runs. --neural-min-margin accepts a \
      new top candidate only when its interpolated score exceeds the base top by \
      at least X; it is repeatable and defaults to zero. --neural-score-mode \
@@ -735,9 +747,15 @@ struct EvaluationReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_max_candidates: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    neural_max_candidate_cost_gap: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     neural_scored_items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_skipped_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_scored_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_mean_candidates_per_scored_item: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lambda: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -973,6 +991,7 @@ fn evaluate(
             &outcomes,
             options.neural_max_cost_gap,
             options.neural_max_candidates,
+            options.neural_max_candidate_cost_gap,
         )?;
         let mut reports = Vec::with_capacity(
             options.lambdas.len()
@@ -1231,7 +1250,7 @@ fn discriminative_teacher_expected(
             model_path.display()
         );
         let rescorer = neural::Rescorer::load(model_path)?;
-        let neural = score_neural_outcomes(&rescorer, outcomes, None, None)?;
+        let neural = score_neural_outcomes(&rescorer, outcomes, None, None, None)?;
         Ok(outcomes
             .iter()
             .enumerate()
@@ -1254,6 +1273,7 @@ struct NeuralOutcome {
     mean_without_eos: Vec<Vec<f64>>,
     latencies: Vec<Duration>,
     scored_items: usize,
+    scored_candidates: usize,
 }
 
 impl NeuralOutcome {
@@ -1281,22 +1301,33 @@ fn score_neural_outcomes(
     outcomes: &[ItemOutcome<'_>],
     max_cost_gap: Option<i32>,
     max_candidates: Option<usize>,
+    max_candidate_cost_gap: Option<i32>,
 ) -> Result<NeuralOutcome, String> {
-    let score_item: Vec<_> = outcomes
+    let candidate_counts: Vec<_> = outcomes
         .iter()
-        .map(|outcome| should_score_neurally(&outcome.candidates, max_cost_gap))
+        .map(|outcome| {
+            if should_score_neurally(&outcome.candidates, max_cost_gap) {
+                neural_candidate_prefix_len(
+                    &outcome.candidates,
+                    max_candidates,
+                    max_candidate_cost_gap,
+                )
+            } else {
+                0
+            }
+        })
         .collect();
     let requests: Vec<_> = outcomes
         .iter()
-        .zip(&score_item)
-        .filter(|(_, score)| **score)
-        .map(|(outcome, _)| neural::ScoreRequest {
+        .zip(&candidate_counts)
+        .filter(|(_, candidate_count)| **candidate_count >= 2)
+        .map(|(outcome, &candidate_count)| neural::ScoreRequest {
             context: outcome.item.context_text.clone(),
             input_katakana: outcome.item.input.clone(),
             candidates: outcome
                 .candidates
                 .iter()
-                .take(max_candidates.unwrap_or(usize::MAX))
+                .take(candidate_count)
                 .map(|candidate| candidate.surface.clone())
                 .collect(),
         })
@@ -1308,8 +1339,8 @@ fn score_neural_outcomes(
     let mut mean_with_eos = Vec::with_capacity(outcomes.len());
     let mut mean_without_eos = Vec::with_capacity(outcomes.len());
     let mut latencies = Vec::with_capacity(outcomes.len());
-    for score in &score_item {
-        if *score {
+    for &candidate_count in &candidate_counts {
+        if candidate_count >= 2 {
             let item = scored.next().expect("one score per selected request");
             mean_with_eos.push(mean_logliks(
                 &item.logliks,
@@ -1339,8 +1370,34 @@ fn score_neural_outcomes(
         mean_with_eos,
         mean_without_eos,
         latencies,
-        scored_items: score_item.iter().filter(|score| **score).count(),
+        scored_items: candidate_counts
+            .iter()
+            .filter(|&&candidate_count| candidate_count >= 2)
+            .count(),
+        scored_candidates: candidate_counts
+            .iter()
+            .filter(|&&candidate_count| candidate_count >= 2)
+            .sum(),
     })
+}
+
+#[cfg(any(feature = "neural", test))]
+fn neural_candidate_prefix_len(
+    candidates: &[Candidate],
+    max_candidates: Option<usize>,
+    max_candidate_cost_gap: Option<i32>,
+) -> usize {
+    let Some(first_cost) = candidates.first().map(|candidate| candidate.cost) else {
+        return 0;
+    };
+    candidates
+        .iter()
+        .take(max_candidates.unwrap_or(usize::MAX))
+        .take_while(|candidate| {
+            max_candidate_cost_gap
+                .is_none_or(|maximum| candidate.cost.saturating_sub(first_cost).max(0) <= maximum)
+        })
+        .count()
 }
 
 #[cfg(any(feature = "neural", test))]
@@ -1525,8 +1582,18 @@ fn compute_report(
             .map(|path| path.display().to_string()),
         neural_max_cost_gap: options.neural_max_cost_gap,
         neural_max_candidates: options.neural_max_candidates,
+        neural_max_candidate_cost_gap: options.neural_max_candidate_cost_gap,
         neural_scored_items: neural.map(|neural| neural.outcome.scored_items),
         neural_skipped_items: neural.map(|neural| outcomes.len() - neural.outcome.scored_items),
+        neural_scored_candidates: neural.map(|neural| neural.outcome.scored_candidates),
+        neural_mean_candidates_per_scored_item: neural.map(|neural| {
+            if neural.outcome.scored_items == 0 {
+                0.0
+            } else {
+                usize_to_f64(neural.outcome.scored_candidates)
+                    / usize_to_f64(neural.outcome.scored_items)
+            }
+        }),
         lambda: neural.map(|neural| neural.lambda),
         neural_min_margin: neural.map(|neural| neural.min_margin),
         neural_score_mode: neural.map(|neural| neural.score_mode),
@@ -1563,16 +1630,7 @@ fn normalize_for_evaluation(value: &str, format: DatasetFormat) -> String {
     }
 }
 
-fn print_report(report: &EvaluationReport) {
-    println!("dataset: {}", report.dataset);
-    if let Some(revision) = &report.dataset_revision {
-        println!("dataset revision: {revision}");
-    }
-    if let Some(sha256) = &report.dataset_sha256 {
-        println!("dataset sha256: {sha256}");
-    }
-    println!("context filter: {:?}", report.context_filter);
-    println!("context used by engine: {}", report.context_used_by_engine);
+fn print_neural_report(report: &EvaluationReport) {
     if let Some(model) = &report.neural_model {
         println!("neural model: {model}");
     }
@@ -1582,11 +1640,22 @@ fn print_report(report: &EvaluationReport) {
     if let Some(maximum) = report.neural_max_candidates {
         println!("neural max candidates: {maximum}");
     }
+    if let Some(maximum) = report.neural_max_candidate_cost_gap {
+        println!("neural max candidate cost gap: {maximum}");
+    }
     if let Some(scored) = report.neural_scored_items {
         println!("neural scored items: {scored}");
         println!(
             "neural skipped items: {}",
             report.neural_skipped_items.unwrap_or(0)
+        );
+        println!(
+            "neural scored candidates: {}",
+            report.neural_scored_candidates.unwrap_or(0)
+        );
+        println!(
+            "neural mean candidates per scored item: {:.2}",
+            report.neural_mean_candidates_per_scored_item.unwrap_or(0.0)
         );
     }
     if let Some(lambda) = report.lambda {
@@ -1598,6 +1667,19 @@ fn print_report(report: &EvaluationReport) {
     if let Some(mode) = report.neural_score_mode {
         println!("neural score mode: {}", mode.as_str());
     }
+}
+
+fn print_report(report: &EvaluationReport) {
+    println!("dataset: {}", report.dataset);
+    if let Some(revision) = &report.dataset_revision {
+        println!("dataset revision: {revision}");
+    }
+    if let Some(sha256) = &report.dataset_sha256 {
+        println!("dataset sha256: {sha256}");
+    }
+    println!("context filter: {:?}", report.context_filter);
+    println!("context used by engine: {}", report.context_used_by_engine);
+    print_neural_report(report);
     if let Some(discriminative) = &report.discriminative {
         print_discriminative_report(discriminative);
     }
@@ -1785,8 +1867,8 @@ mod tests {
     use super::{
         ContextFilter, DatasetFormat, NeuralScoreMode, Options, base_cost_gap,
         character_error_rate, katakana_to_hiragana, load_annotated_items, mean_logliks,
-        normalize_for_evaluation, parse_anthy_line, percentile, rescored_surfaces,
-        should_score_neurally,
+        neural_candidate_prefix_len, normalize_for_evaluation, parse_anthy_line, percentile,
+        rescored_surfaces, should_score_neurally,
     };
     use slime_converter::Candidate;
     use std::fs;
@@ -1849,6 +1931,8 @@ mod tests {
                 "750",
                 "--neural-max-candidates",
                 "5",
+                "--neural-max-candidate-cost-gap",
+                "900",
                 "--neural-min-margin",
                 "0.25",
                 "--neural-score-mode",
@@ -1886,6 +1970,7 @@ mod tests {
         assert!(options.json);
         assert_eq!(options.neural_max_cost_gap, Some(750));
         assert_eq!(options.neural_max_candidates, Some(5));
+        assert_eq!(options.neural_max_candidate_cost_gap, Some(900));
         assert_eq!(
             options.export_nbest,
             Some(std::path::PathBuf::from("nbest.json"))
@@ -1921,6 +2006,37 @@ mod tests {
         assert!(should_score_neurally(&candidates, Some(600)));
         assert!(!should_score_neurally(&candidates, Some(599)));
         assert!(!should_score_neurally(&candidates[..1], Some(1_000)));
+    }
+
+    #[test]
+    fn neural_candidate_cost_gap_bounds_the_scored_prefix() {
+        let candidates = vec![
+            Candidate {
+                surface: "第一".to_owned(),
+                cost: 1_000,
+            },
+            Candidate {
+                surface: "第二".to_owned(),
+                cost: 1_250,
+            },
+            Candidate {
+                surface: "第三".to_owned(),
+                cost: 1_800,
+            },
+            Candidate {
+                surface: "第四".to_owned(),
+                cost: 1_900,
+            },
+        ];
+        assert_eq!(neural_candidate_prefix_len(&candidates, Some(3), None), 3);
+        assert_eq!(
+            neural_candidate_prefix_len(&candidates, Some(4), Some(800)),
+            3
+        );
+        assert_eq!(
+            neural_candidate_prefix_len(&candidates, Some(4), Some(249)),
+            1
+        );
     }
 
     #[test]

@@ -144,6 +144,22 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
     run("converter/numeric_context_candidates", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("だん"), black_box("3")));
     });
+    run(
+        "converter/polite_right_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("のめ"),
+                black_box("うまいコーヒーが"),
+                black_box("ました。"),
+            ));
+        },
+    );
+    run("converter/polite_left_only_candidates", iterations, || {
+        black_box(
+            dictionary.candidates_with_context(black_box("のめ"), black_box("うまいコーヒーが")),
+        );
+    });
 }
 
 fn run_fixed_segment_benchmark(dictionary: &Dictionary, iterations: u64) {

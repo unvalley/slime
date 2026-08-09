@@ -138,6 +138,7 @@ pub struct Dictionary {
 struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
+    right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
 }
@@ -151,9 +152,20 @@ struct DocumentBoundaryPromotion<'a> {
 
 impl<'a> DictionaryDocumentContextRanker<'a> {
     fn new(dictionary: &'a Dictionary, reading: &str, left_context: &str) -> Self {
+        Self::new_with_surrounding_context(dictionary, reading, left_context, "")
+    }
+
+    fn new_with_surrounding_context(
+        dictionary: &'a Dictionary,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+    ) -> Self {
         Self {
             dictionary,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
+            right_inflection_promotions: dictionary
+                .document_right_inflection_promotions(reading, right_context),
             follows_region_name: is_document_region_suffix_reading(reading)
                 && dictionary.document_context_has_pos_suffix(
                     left_context,
@@ -199,6 +211,17 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         } else {
             0
         };
+        let right_inflection_promotion = self
+            .right_inflection_promotions
+            .iter()
+            .filter(|promotion| {
+                conversion.segments.len() == 1
+                    && promotion.surface == conversion.surface
+                    && promotion.isolated_cost == conversion.cost
+            })
+            .map(|promotion| promotion.promotion)
+            .max()
+            .unwrap_or(0);
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
@@ -224,6 +247,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         repeated_cost
             .saturating_add(boundary_adjustment)
             .saturating_sub(specialized_promotion)
+            .saturating_sub(right_inflection_promotion)
     }
 }
 
@@ -288,6 +312,7 @@ const DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
 const DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
+const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 500;
 const MOZC_COUNTER_POS_ID: u16 = 2011;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
@@ -1247,6 +1272,29 @@ impl Dictionary {
         promotions
     }
 
+    fn document_right_inflection_promotions<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Vec<DocumentBoundaryPromotion<'s>> {
+        if !self.uses_connection_costs || !starts_with_polite_auxiliary(right_context) {
+            return Vec::new();
+        }
+        let connection = ConnectionMatrix::bundled();
+        let mut promotions = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading || !looks_like_inflected_kanji_surface(entry.surface) {
+                return;
+            }
+            promotions.push(DocumentBoundaryPromotion {
+                surface: entry.surface,
+                isolated_cost: whole_reading_entry_cost(Some(connection), &entry),
+                promotion: DOCUMENT_POLITE_AUXILIARY_PROMOTION,
+            });
+        });
+        promotions
+    }
+
     fn document_numeric_counter_promotions(
         &self,
         reading: &str,
@@ -1381,6 +1429,23 @@ impl Dictionary {
         )
     }
 
+    /// Returns default-width candidates using committed text on both sides of
+    /// the editing position.
+    #[must_use]
+    pub fn candidates_with_surrounding_context(
+        &self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+    ) -> Vec<Candidate> {
+        self.candidates_with_surrounding_context_limit(
+            reading,
+            left_context,
+            right_context,
+            DEFAULT_N_BEST,
+        )
+    }
+
     /// Returns cost-ranked candidates using an explicit N-best search width.
     ///
     /// Interactive callers can keep the default search on the initial key
@@ -1404,6 +1469,30 @@ impl Dictionary {
             left_context,
             limit,
             &DictionaryDocumentContextRanker::new(self, reading, left_context),
+        )
+    }
+
+    /// Context-aware conversion using both committed sides of an editing
+    /// position. Only fixed grammatical prefixes are inspected in the right
+    /// context, and neither side is retained.
+    #[must_use]
+    pub fn candidates_with_surrounding_context_limit(
+        &self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+        limit: usize,
+    ) -> Vec<Candidate> {
+        self.candidates_with_context_ranker(
+            reading,
+            left_context,
+            limit,
+            &DictionaryDocumentContextRanker::new_with_surrounding_context(
+                self,
+                reading,
+                left_context,
+                right_context,
+            ),
         )
     }
 
@@ -2636,6 +2725,22 @@ fn is_grammar_literal(reading: &str) -> bool {
     )
 }
 
+fn starts_with_polite_auxiliary(right_context: &str) -> bool {
+    ["ました", "まして", "ましょう", "ません", "ます"]
+        .iter()
+        .any(|prefix| right_context.starts_with(prefix))
+}
+
+fn looks_like_inflected_kanji_surface(surface: &str) -> bool {
+    surface
+        .chars()
+        .last()
+        .is_some_and(|character| matches!(character, '\u{3041}'..='\u{3096}'))
+        && surface
+            .chars()
+            .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+}
+
 /// A lattice node generated at runtime instead of coming from the dictionary:
 /// digit runs, composed numerals (せんきゅうひゃく → 1900), and katakana runs
 /// for unknown foreign words. `end` is the absolute byte offset where the node
@@ -3781,6 +3886,21 @@ mod tests {
         assert_eq!(
             dictionary.candidates_with_context("わ", "-3")[0].surface,
             "話"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_an_inflected_word_before_polite_auxiliary() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("のめ")[0].surface, "の目");
+        let candidates =
+            dictionary.candidates_with_surrounding_context("のめ", "うまいコーヒーが", "ました。");
+        assert_eq!(candidates[0].surface, "飲め", "{candidates:?}");
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("ぶ", "第三", "まで")[0].surface,
+            dictionary.candidates_with_context("ぶ", "第三")[0].surface,
+            "まで is a particle and must not be mistaken for the polite auxiliary"
         );
     }
 

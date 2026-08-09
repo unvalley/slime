@@ -856,13 +856,25 @@ impl SlimeEngine {
         }
         // The literal hiragana reading stays selectable; hiding it made
         // single-kana words like み unreachable through the candidate window.
-        let dictionary_candidates = match (dictionary_limit, previous_surface) {
-            (Some(limit), Some(context)) => self
-                .dictionary
-                .candidates_with_context_limit(reading, context, limit),
-            (None, Some(context)) => self.dictionary.candidates_with_context(reading, context),
-            (Some(limit), None) => self.dictionary.candidates_with_limit(reading, limit),
-            (None, None) => self.dictionary.candidates(reading),
+        let dictionary_candidates = if previous_surface.is_some() || !right_context.is_empty() {
+            match dictionary_limit {
+                Some(limit) => self.dictionary.candidates_with_surrounding_context_limit(
+                    reading,
+                    previous_surface.unwrap_or_default(),
+                    right_context,
+                    limit,
+                ),
+                None => self.dictionary.candidates_with_surrounding_context(
+                    reading,
+                    previous_surface.unwrap_or_default(),
+                    right_context,
+                ),
+            }
+        } else {
+            match dictionary_limit {
+                Some(limit) => self.dictionary.candidates_with_limit(reading, limit),
+                None => self.dictionary.candidates(reading),
+            }
         };
         let dictionary_surfaces: Vec<_> = dictionary_candidates
             .iter()
@@ -2888,6 +2900,32 @@ mod tests {
         assert_ne!(engine.snapshot().preedit, "漢字");
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_right_context_ranks_an_inflected_word_before_a_polite_auxiliary() {
+        let mut engine = SlimeEngine::bundled();
+
+        engine.set_external_context("うまいコーヒーが", "ました。");
+        type_text(&mut engine, "nome");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "飲め");
+    }
+
+    #[test]
+    fn private_mode_ignores_external_right_context() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_preferences(EnginePreferences {
+            private_mode: true,
+            ..EnginePreferences::default()
+        });
+
+        engine.set_external_context("うまいコーヒーが", "ました。");
+        type_text(&mut engine, "nome");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "の目");
     }
 
     #[test]

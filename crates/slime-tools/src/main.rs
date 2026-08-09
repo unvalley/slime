@@ -1103,9 +1103,12 @@ fn generate_outcomes<'a>(
                 search_k,
                 ranker,
             ),
-            None => {
-                dictionary.candidates_with_context_limit(&reading, &item.context_text, search_k)
-            }
+            None => dictionary.candidates_with_surrounding_context_limit(
+                &reading,
+                &item.context_text,
+                &item.right_context_text,
+                search_k,
+            ),
         };
         let candidates: Vec<_> = generated.into_iter().take(top_k).collect();
         let latency = started.elapsed();

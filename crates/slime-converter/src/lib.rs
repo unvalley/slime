@@ -154,12 +154,13 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         Self {
             dictionary,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
-            follows_region_name: dictionary.document_context_has_pos_suffix(
-                left_context,
-                &MOZC_REGION_POS_IDS,
-                2,
-                DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS,
-            ),
+            follows_region_name: is_document_region_suffix_reading(reading)
+                && dictionary.document_context_has_pos_suffix(
+                    left_context,
+                    &MOZC_REGION_POS_IDS,
+                    2,
+                    DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS,
+                ),
             numeric_counter_promotions: dictionary
                 .document_numeric_counter_promotions(reading, left_context),
         }
@@ -193,16 +194,15 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .iter()
             .find_map(|(surface, promotion)| (*surface == conversion.surface).then_some(*promotion))
             .unwrap_or(0);
-        let region_line_promotion =
-            if self.follows_region_name && reading == "せん" && conversion.surface == "線" {
-                DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION
-            } else {
-                0
-            };
+        let region_suffix_promotion = if self.follows_region_name {
+            document_region_suffix_promotion(reading, &conversion.surface)
+        } else {
+            0
+        };
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
-            .max(region_line_promotion);
+            .max(region_suffix_promotion);
         let boundary_adjustment = if specialized_promotion > 0 {
             0
         } else {
@@ -271,6 +271,7 @@ const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
 const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
+const DOCUMENT_REGION_ADMINISTRATIVE_SUFFIX_PROMOTION: i32 = 750;
 const DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
 const DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS: usize = 8;
@@ -279,6 +280,26 @@ const MOZC_COUNTER_POS_ID: u16 = 2011;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
 const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
+
+fn document_region_suffix_promotion(reading: &str, surface: &str) -> i32 {
+    match (reading, surface) {
+        ("し", "市")
+        | ("く", "区")
+        | ("けん", "県")
+        | ("ぐん", "郡")
+        | ("ちょう" | "まち", "町")
+        | ("そん" | "むら", "村") => DOCUMENT_REGION_ADMINISTRATIVE_SUFFIX_PROMOTION,
+        ("せん", "線") => DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION,
+        _ => 0,
+    }
+}
+
+fn is_document_region_suffix_reading(reading: &str) -> bool {
+    matches!(
+        reading,
+        "し" | "く" | "けん" | "ぐん" | "ちょう" | "まち" | "そん" | "むら" | "せん"
+    )
+}
 
 fn structured_notation_matches(left_context: &str, reading: &str, surface: &str) -> bool {
     structured_notation_surface(left_context, reading).is_some_and(|preferred| preferred == surface)
@@ -922,6 +943,21 @@ impl Dictionary {
             let suffix = &context_tail[index..];
             let mut best_cost = i32::MAX;
             let mut best_matching_cost = i32::MAX;
+            if suffix
+                .chars()
+                .all(|character| matches!(character, '\u{3040}'..='\u{30ff}'))
+            {
+                // Place names are sometimes intentionally written in kana
+                // (for example いなべ市). When the best dictionary reading is
+                // itself a region entry, retain that POS evidence instead of
+                // requiring a kanji surface spelling in the document.
+                self.for_each_exact(suffix, |entry| {
+                    best_cost = best_cost.min(entry.word_cost);
+                    if pos_ids.contains(&entry.right_id) {
+                        best_matching_cost = best_matching_cost.min(entry.word_cost);
+                    }
+                });
+            }
             compact.for_each_surface_entry(suffix, |entry| {
                 best_cost = best_cost.min(entry.word_cost);
                 if pos_ids.contains(&entry.right_id) {
@@ -2772,7 +2808,7 @@ mod tests {
     use super::{
         Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
         DictionaryEntry, DictionaryLayer, NBestBucket, NBestNode, UNKNOWN_POS_ID,
-        insert_n_best_node,
+        document_region_suffix_promotion, insert_n_best_node,
     };
 
     struct PreferSurface<'a>(&'a str);
@@ -3559,6 +3595,34 @@ mod tests {
             dictionary.candidates_with_context("せん", "超長距離")[0].surface,
             "戦"
         );
+        assert_eq!(
+            dictionary.candidates_with_context("し", "いなべ")[0].surface,
+            "市"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("し", "高木守道")[0].surface,
+            "氏",
+            "a person's name must not be treated as a region"
+        );
+    }
+
+    #[test]
+    fn region_suffix_promotion_is_limited_to_administrative_surfaces() {
+        for (reading, surface) in [
+            ("し", "市"),
+            ("く", "区"),
+            ("けん", "県"),
+            ("ぐん", "郡"),
+            ("ちょう", "町"),
+            ("まち", "町"),
+            ("そん", "村"),
+            ("むら", "村"),
+            ("せん", "線"),
+        ] {
+            assert!(document_region_suffix_promotion(reading, surface) > 0);
+        }
+        assert_eq!(document_region_suffix_promotion("し", "氏"), 0);
+        assert_eq!(document_region_suffix_promotion("まち", "街"), 0);
     }
 
     #[test]

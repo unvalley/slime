@@ -151,33 +151,46 @@ impl CompactDictionary {
         surface: &str,
         suffix: &str,
     ) -> bool {
+        self.joined_surface_reading_suffix_cost(prefix, surface, suffix)
+            .is_some()
+    }
+
+    /// Returns the lowest reverse-index word cost whose reading ends with
+    /// `suffix` for the split `prefix + surface` surface.
+    pub(crate) fn joined_surface_reading_suffix_cost(
+        &self,
+        prefix: &str,
+        surface: &str,
+        suffix: &str,
+    ) -> Option<i32> {
         let mut node = self.reverse_fst.root();
         let mut output = fst::raw::Output::zero();
         for byte in prefix.bytes().chain(surface.bytes()) {
-            let Some(transition_index) = node.find_input(byte) else {
-                return false;
-            };
+            let transition_index = node.find_input(byte)?;
             let transition = node.transition(transition_index);
             output = output.cat(transition.out);
             node = self.reverse_fst.node(transition.addr);
         }
         if !node.is_final() {
-            return false;
+            return None;
         }
         let block = output.cat(node.final_output()).value();
         let mut cursor = usize::try_from(block).expect("reverse block offset");
         let count = read_reverse_varint(&mut cursor);
+        let mut best_cost = None;
         for _ in 0..count {
             let offset = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading offset");
             let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
             let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
                 .expect("valid reverse reading UTF-8");
+            let cost = u16::from_le_bytes([REVERSE_BLOCKS[cursor], REVERSE_BLOCKS[cursor + 1]]);
             cursor += 2;
             if reading.ends_with(suffix) {
-                return true;
+                best_cost =
+                    Some(best_cost.map_or(i32::from(cost), |best: i32| best.min(i32::from(cost))));
             }
         }
-        false
+        best_cost
     }
 }
 

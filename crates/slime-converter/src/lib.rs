@@ -137,10 +137,11 @@ pub struct Dictionary {
 struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
     follows_region_name: bool,
+    numeric_counter_promotions: Vec<(&'static str, i32)>,
 }
 
 impl<'a> DictionaryDocumentContextRanker<'a> {
-    fn new(dictionary: &'a Dictionary, left_context: &str) -> Self {
+    fn new(dictionary: &'a Dictionary, reading: &str, left_context: &str) -> Self {
         Self {
             dictionary,
             follows_region_name: dictionary.document_context_has_pos_suffix(
@@ -149,6 +150,8 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 2,
                 DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS,
             ),
+            numeric_counter_promotions: dictionary
+                .document_numeric_counter_promotions(reading, left_context),
         }
     }
 }
@@ -181,6 +184,11 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             } else {
                 0
             };
+        let numeric_counter_promotion = self
+            .numeric_counter_promotions
+            .iter()
+            .find_map(|(surface, promotion)| (*surface == conversion.surface).then_some(*promotion))
+            .unwrap_or(0);
         let region_line_promotion =
             if self.follows_region_name && reading == "せん" && conversion.surface == "線" {
                 DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION
@@ -190,6 +198,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         repeated_cost.saturating_sub(
             phrase_promotion
                 .max(notation_promotion)
+                .max(numeric_counter_promotion)
                 .max(region_line_promotion),
         )
     }
@@ -233,24 +242,41 @@ const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
 const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 2_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
+const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
+const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
 const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
 const DOCUMENT_REGION_MAX_CONTEXT_CHARACTERS: usize = 8;
 const DOCUMENT_POS_SURFACE_COST_GAP: i32 = 500;
+const MOZC_COUNTER_POS_ID: u16 = 2011;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
 const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
 
 fn structured_notation_matches(left_context: &str, reading: &str, surface: &str) -> bool {
-    match (reading, surface) {
-        ("しん", "進") => radix_suffix_matches(left_context),
-        ("か" | "にち", "日") => calendar_day_suffix_matches(left_context, reading),
-        ("さい", "歳") => trailing_integer(left_context).is_some_and(|age| age <= 150),
-        ("かこく", "カ国") => {
-            trailing_integer(left_context).is_some_and(|countries| countries <= 999)
+    structured_notation_surface(left_context, reading).is_some_and(|preferred| preferred == surface)
+}
+
+fn structured_notation_context_matches(left_context: &str, reading: &str) -> bool {
+    structured_notation_surface(left_context, reading).is_some()
+}
+
+fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'static str> {
+    match reading {
+        "しん" if radix_suffix_matches(left_context) => Some("進"),
+        "か" | "にち" if calendar_day_suffix_matches(left_context, reading) => Some("日"),
+        "さい" if trailing_integer(left_context).is_some_and(|age| age <= 150) => Some("歳"),
+        "かこく" if trailing_integer(left_context).is_some_and(|countries| countries <= 999) => {
+            Some("カ国")
         }
-        ("だい", "台") => trailing_integer(left_context).is_some(),
-        _ => false,
+        "だい" if trailing_integer(left_context).is_some() => Some("台"),
+        _ => None,
     }
+}
+
+fn structured_notation_owns_numeric_context(left_context: &str, reading: &str) -> bool {
+    structured_notation_context_matches(left_context, reading)
+        || (split_trailing_decimal(left_context).is_some()
+            && matches!(reading, "しん" | "か" | "にち" | "さい" | "かこく" | "だい"))
 }
 
 fn radix_suffix_matches(left_context: &str) -> bool {
@@ -260,6 +286,90 @@ fn radix_suffix_matches(left_context: &str) -> bool {
 fn trailing_integer(text: &str) -> Option<u32> {
     let (prefix, value) = split_trailing_decimal(text)?;
     (!matches!(prefix.chars().next_back(), Some('.' | '．' | '-' | '−'))).then_some(value)
+}
+
+fn trailing_numeric_surface(text: &str) -> Option<CompactString> {
+    if let Some((prefix, value)) = split_trailing_decimal(text) {
+        let valid = if matches!(prefix.chars().next_back(), Some('.' | '．')) {
+            let before_fraction = &prefix[..prefix.len() - 1];
+            split_trailing_decimal(before_fraction)
+                .is_some_and(|(prefix, _)| !matches!(prefix.chars().next_back(), Some('-' | '−')))
+        } else {
+            !matches!(prefix.chars().next_back(), Some('-' | '−'))
+        };
+        return valid.then(|| japanese_number_surface(value)).flatten();
+    }
+
+    let start = text
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_japanese_numeric_character(*character))
+        .last()
+        .map(|(index, _)| index)?;
+    Some(CompactString::from(&text[start..]))
+}
+
+fn is_japanese_numeric_character(character: char) -> bool {
+    matches!(
+        character,
+        '〇' | '零'
+            | '一'
+            | '二'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+            | '億'
+            | '兆'
+    )
+}
+
+fn japanese_number_surface(value: u32) -> Option<CompactString> {
+    if value > 9_999 {
+        return None;
+    }
+    if value == 0 {
+        return Some(CompactString::from("〇"));
+    }
+
+    let mut surface = CompactString::new("");
+    let mut remainder = value;
+    for (unit_value, unit_surface) in [(1_000, '千'), (100, '百'), (10, '十')] {
+        let digit = remainder / unit_value;
+        if digit > 0 {
+            if digit > 1 {
+                surface.push(japanese_digit_surface(digit)?);
+            }
+            surface.push(unit_surface);
+            remainder %= unit_value;
+        }
+    }
+    if remainder > 0 {
+        surface.push(japanese_digit_surface(remainder)?);
+    }
+    Some(surface)
+}
+
+fn japanese_digit_surface(digit: u32) -> Option<char> {
+    match digit {
+        1 => Some('一'),
+        2 => Some('二'),
+        3 => Some('三'),
+        4 => Some('四'),
+        5 => Some('五'),
+        6 => Some('六'),
+        7 => Some('七'),
+        8 => Some('八'),
+        9 => Some('九'),
+        _ => None,
+    }
 }
 
 fn calendar_day_suffix_matches(left_context: &str, reading: &str) -> bool {
@@ -794,6 +904,47 @@ impl Dictionary {
         false
     }
 
+    fn document_numeric_counter_promotions(
+        &self,
+        reading: &str,
+        left_context: &str,
+    ) -> Vec<(&'static str, i32)> {
+        if structured_notation_owns_numeric_context(left_context, reading) {
+            return Vec::new();
+        }
+        let Some(numeric_surface) = trailing_numeric_surface(left_context) else {
+            return Vec::new();
+        };
+        let Some(compact) = self.bundled else {
+            return Vec::new();
+        };
+
+        let mut promotions = Vec::new();
+        compact.for_each_exact(reading, |entry| {
+            if entry.right_id != MOZC_COUNTER_POS_ID
+                || promotions
+                    .iter()
+                    .any(|(surface, _)| *surface == entry.surface)
+            {
+                return;
+            }
+            let Some(word_cost) = compact.joined_surface_reading_suffix_cost(
+                &numeric_surface,
+                entry.surface,
+                reading,
+            ) else {
+                return;
+            };
+            let promotion = DOCUMENT_NUMERIC_COMPOUND_COST_CEILING
+                .saturating_sub(word_cost)
+                .min(DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP);
+            if promotion > 0 {
+                promotions.push((entry.surface, promotion));
+            }
+        });
+        promotions
+    }
+
     /// Calls `callback` for every entry whose reading equals `reading`.
     fn for_each_exact<'s>(&'s self, reading: &str, mut callback: impl FnMut(EntryView<'s>)) {
         if let Some(compact) = self.bundled {
@@ -883,7 +1034,7 @@ impl Dictionary {
             reading,
             left_context,
             DEFAULT_N_BEST,
-            &DictionaryDocumentContextRanker::new(self, left_context),
+            &DictionaryDocumentContextRanker::new(self, reading, left_context),
         )
     }
 
@@ -909,7 +1060,7 @@ impl Dictionary {
             reading,
             left_context,
             limit,
-            &DictionaryDocumentContextRanker::new(self, left_context),
+            &DictionaryDocumentContextRanker::new(self, reading, left_context),
         )
     }
 
@@ -3126,8 +3277,42 @@ mod tests {
             "台"
         );
         assert_eq!(
+            dictionary.candidates_with_context("か", "8月3")[0].surface,
+            "日"
+        );
+        assert_eq!(
             dictionary.candidates_with_context("だい", "1.5")[0].surface,
             "第"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_dictionary_counter_pos_after_numbers() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_context("だん", "3")[0].surface,
+            "段"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("わ", "3")[0].surface,
+            "話"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("るい", "1.3")[0].surface,
+            "塁"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("だい", "六")[0].surface,
+            "代"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("だい", "4")[0].surface,
+            "台"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("わ", "-3")[0].surface,
+            "話"
         );
     }
 

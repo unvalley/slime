@@ -213,6 +213,15 @@ impl UserData {
 
     #[must_use]
     pub fn exact_history_surfaces(&self, reading: &str) -> Vec<&str> {
+        let (established, transient) = self.exact_history_surfaces_by_strength(reading);
+        established.into_iter().chain(transient).collect()
+    }
+
+    #[must_use]
+    pub(crate) fn exact_history_surfaces_by_strength(
+        &self,
+        reading: &str,
+    ) -> (Vec<&str>, Vec<&str>) {
         let mut entries: Vec<_> = self
             .history
             .iter()
@@ -221,10 +230,21 @@ impl UserData {
             })
             .collect();
         sort_history(&mut entries);
-        entries
-            .into_iter()
-            .map(|entry| entry.surface.as_str())
-            .collect()
+        let established_count = entries
+            .iter()
+            .take_while(|entry| history_strength(entry))
+            .count();
+        let (established, transient) = entries.split_at(established_count);
+        (
+            established
+                .iter()
+                .map(|entry| entry.surface.as_str())
+                .collect(),
+            transient
+                .iter()
+                .map(|entry| entry.surface.as_str())
+                .collect(),
+        )
     }
 
     #[must_use]
@@ -970,6 +990,29 @@ mod tests {
 
         let data = UserData::load(&directory);
         assert_eq!(data.exact_history_surfaces("かんじ"), ["漢字", "感じ"]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn history_surfaces_are_partitioned_without_changing_their_rank() {
+        let directory = test_directory("partitioned-learning-strength");
+        fs::write(
+            directory.join("history.tsv"),
+            format!(
+                "{HISTORY_HEADER}\nかんじ\t漢字\t100\t10\nかんじ\t感じ\t1\t30\nかんじ\t幹事\t1\t20\n"
+            ),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        let (established, transient) = data.exact_history_surfaces_by_strength("かんじ");
+        assert_eq!(established, ["漢字"]);
+        assert_eq!(transient, ["感じ", "幹事"]);
+        assert_eq!(
+            data.exact_history_surfaces("かんじ"),
+            ["漢字", "感じ", "幹事"]
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

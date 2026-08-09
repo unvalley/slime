@@ -391,7 +391,7 @@ fn run_history_benchmarks(iterations: u64) {
         std::env::temp_dir().join(format!("slime-history-benchmark-{}", std::process::id()));
     fs::create_dir_all(&directory).expect("create history benchmark directory");
     let mut fixture = String::from("# slime-history-v1\n");
-    for index in 0..499 {
+    for index in 0..498 {
         writeln!(
             fixture,
             "れきし{index}\t履歴{index}\t{}\t{index}",
@@ -400,6 +400,7 @@ fn run_history_benchmarks(iterations: u64) {
         .expect("write history benchmark row");
     }
     fixture.push_str("ぱふぉーまんす\tパフォーマンス\t8\t1000\n");
+    fixture.push_str("わたし\tワタシ\t1\t1001\n");
     fs::write(directory.join("history.tsv"), fixture).expect("write history benchmark fixture");
 
     for history_completion in [false, true] {
@@ -422,6 +423,32 @@ fn run_history_benchmarks(iterations: u64) {
                 }
                 black_box(engine.handle(InputEvent::Enter));
             },
+        );
+    }
+
+    for history_completion in [false, true] {
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        black_box(engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion,
+            history_learning: false,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        }));
+        engine.set_external_context("彼らは更に自らの救命胴衣を他の兵士に", "た。");
+        assert_eq!(
+            engine
+                .conversion_candidates("わたし")
+                .first()
+                .map(String::as_str),
+            Some("渡し")
+        );
+        let state = if history_completion { "on" } else { "off" };
+        run(
+            &format!("engine/contextual_conversion_history_{state}_500_entries"),
+            iterations,
+            || query_and_clear(&mut engine, "watashi"),
         );
     }
 

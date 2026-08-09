@@ -820,6 +820,53 @@ impl SlimeEngine {
         .surfaces
     }
 
+    fn dictionary_candidates_for_context(
+        &self,
+        reading: &str,
+        dictionary_limit: Option<usize>,
+        previous_surface: Option<&str>,
+        right_context: &str,
+    ) -> Vec<Candidate> {
+        if previous_surface.is_some() || !right_context.is_empty() {
+            return match dictionary_limit {
+                Some(limit) => self.dictionary.candidates_with_surrounding_context_limit(
+                    reading,
+                    previous_surface.unwrap_or_default(),
+                    right_context,
+                    limit,
+                ),
+                None => self.dictionary.candidates_with_surrounding_context(
+                    reading,
+                    previous_surface.unwrap_or_default(),
+                    right_context,
+                ),
+            };
+        }
+        match dictionary_limit {
+            Some(limit) => self.dictionary.candidates_with_limit(reading, limit),
+            None => self.dictionary.candidates(reading),
+        }
+    }
+
+    fn contextual_dictionary_winner<'a>(
+        &self,
+        reading: &str,
+        has_document_context: bool,
+        has_transient_history: bool,
+        dictionary_candidates: &'a [Candidate],
+    ) -> Option<&'a str> {
+        if !has_document_context || !has_transient_history {
+            return None;
+        }
+        dictionary_candidates.first().and_then(|contextual_winner| {
+            let ordinary_winner = self.dictionary.candidates_with_limit(reading, 1);
+            ordinary_winner
+                .first()
+                .filter(|ordinary| ordinary.surface != contextual_winner.surface)
+                .map(|_| contextual_winner.surface.as_str())
+        })
+    }
+
     fn conversion_candidate_set_for_reading_with_limit_and_context(
         &self,
         reading: &str,
@@ -838,17 +885,43 @@ impl SlimeEngine {
         } else {
             self.session_history.right_surface().unwrap_or_default()
         };
-        for surface in self.user_data.exact_dictionary_surfaces(reading) {
-            push_unique(&mut candidates, surface.to_owned());
-        }
-        if self.history_is_available() {
-            for surface in
-                self.contextual_history_surfaces_for_reading(reading, explicit_previous_surface)
-            {
-                push_unique(&mut candidates, surface.to_owned());
-            }
-            for surface in self.user_data.exact_history_surfaces(reading) {
-                push_unique(&mut candidates, surface.to_owned());
+        let (contextual_history, established_history, transient_history) =
+            if self.history_is_available() {
+                let contextual = self
+                    .contextual_history_surfaces_for_reading(reading, explicit_previous_surface);
+                let (established, transient) =
+                    self.user_data.exact_history_surfaces_by_strength(reading);
+                (contextual, established, transient)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        extend_unique(
+            &mut candidates,
+            self.user_data.exact_dictionary_surfaces(reading),
+        );
+        extend_unique(&mut candidates, contextual_history);
+        extend_unique(&mut candidates, established_history);
+        let dictionary_candidates = self.dictionary_candidates_for_context(
+            reading,
+            dictionary_limit,
+            previous_surface,
+            right_context,
+        );
+        let contextual_dictionary_winner = self.contextual_dictionary_winner(
+            reading,
+            previous_surface.is_some() || !right_context.is_empty(),
+            !transient_history.is_empty(),
+            &dictionary_candidates,
+        );
+        let should_defer_transient_history = |surface: &str| {
+            contextual_dictionary_winner.is_some()
+                && dictionary_candidates
+                    .iter()
+                    .any(|candidate| candidate.surface == surface)
+        };
+        for surface in &transient_history {
+            if !should_defer_transient_history(surface) {
+                push_unique(&mut candidates, (*surface).to_owned());
             }
         }
         for (key, surface) in &self.ascii_surfaces {
@@ -856,28 +929,16 @@ impl SlimeEngine {
                 push_unique(&mut candidates, surface.clone());
             }
         }
+        if let Some(surface) = contextual_dictionary_winner {
+            push_unique(&mut candidates, surface.to_owned());
+        }
+        for surface in transient_history {
+            if should_defer_transient_history(surface) {
+                push_unique(&mut candidates, surface.to_owned());
+            }
+        }
         // The literal hiragana reading stays selectable; hiding it made
         // single-kana words like み unreachable through the candidate window.
-        let dictionary_candidates = if previous_surface.is_some() || !right_context.is_empty() {
-            match dictionary_limit {
-                Some(limit) => self.dictionary.candidates_with_surrounding_context_limit(
-                    reading,
-                    previous_surface.unwrap_or_default(),
-                    right_context,
-                    limit,
-                ),
-                None => self.dictionary.candidates_with_surrounding_context(
-                    reading,
-                    previous_surface.unwrap_or_default(),
-                    right_context,
-                ),
-            }
-        } else {
-            match dictionary_limit {
-                Some(limit) => self.dictionary.candidates_with_limit(reading, limit),
-                None => self.dictionary.candidates(reading),
-            }
-        };
         let dictionary_surfaces: Vec<_> = dictionary_candidates
             .iter()
             .map(|candidate| candidate.surface.as_str())
@@ -2079,6 +2140,12 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+fn extend_unique<'a>(values: &mut Vec<String>, surfaces: impl IntoIterator<Item = &'a str>) {
+    for surface in surfaces {
+        push_unique(values, surface.to_owned());
+    }
+}
+
 fn insert_unique_candidates_after_first(values: &mut Vec<String>, additions: Vec<String>) {
     let mut index = usize::from(!values.is_empty());
     for value in additions {
@@ -2965,6 +3032,133 @@ mod tests {
         engine.handle(InputEvent::Space);
 
         assert_eq!(engine.snapshot().preedit, "圏");
+    }
+
+    #[test]
+    fn contextual_dictionary_winners_outrank_transient_plain_history() {
+        let cases = [
+            (
+                "derivational-suffix",
+                "さいき",
+                "再起",
+                "以上の操作を",
+                "的に繰り返す",
+                "saiki",
+                "再帰",
+            ),
+            (
+                "right-phrase",
+                "しんか",
+                "進化",
+                "事が明らかになった後の対応で",
+                "が問われる",
+                "shinka",
+                "真価",
+            ),
+            (
+                "right-compound",
+                "かたく",
+                "固く",
+                "先日の",
+                "捜索が行われた",
+                "kataku",
+                "家宅",
+            ),
+            (
+                "left-compound",
+                "かがく",
+                "科学",
+                "北部は早くから製鉄・石油",
+                "・火力発電が発達した",
+                "kagaku",
+                "化学",
+            ),
+            (
+                "grammar",
+                "わたし",
+                "ワタシ",
+                "彼らは更に自らの救命胴衣を他の兵士に",
+                "た。",
+                "watashi",
+                "渡し",
+            ),
+        ];
+
+        for (id, reading, history, left, right, raw_input, expected) in cases {
+            let directory = test_directory(id);
+            fs::write(
+                directory.join("history.tsv"),
+                format!("# slime-history-v1\n{reading}\t{history}\t1\t10\n"),
+            )
+            .unwrap();
+            let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+            engine.set_preferences(EnginePreferences {
+                history_completion: true,
+                ..EnginePreferences::default()
+            });
+            assert_eq!(engine.conversion_candidates(reading)[0], history, "{id}");
+
+            engine.set_external_context(left, right);
+            type_text(&mut engine, raw_input);
+            engine.handle(InputEvent::Space);
+
+            let snapshot = engine.snapshot();
+            assert_eq!(snapshot.preedit, expected, "{id}: {snapshot:?}");
+            assert!(
+                snapshot
+                    .candidates
+                    .iter()
+                    .skip(1)
+                    .any(|candidate| candidate == history),
+                "{id} must keep transient history selectable: {:?}",
+                snapshot.candidates
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn established_plain_history_retains_priority_over_document_context() {
+        let directory = test_directory("established-history-before-context");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nわたし\tワタシ\t5\t10\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            history_completion: true,
+            ..EnginePreferences::default()
+        });
+
+        engine.set_external_context("彼らは更に自らの救命胴衣を他の兵士に", "た。");
+        type_text(&mut engine, "watashi");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "ワタシ");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transient_history_outside_the_dictionary_pool_retains_priority() {
+        let directory = test_directory("custom-history-before-context");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nわたし\t私達\t1\t10\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            history_completion: true,
+            ..EnginePreferences::default()
+        });
+
+        engine.set_external_context("彼らは更に自らの救命胴衣を他の兵士に", "た。");
+        type_text(&mut engine, "watashi");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "私達");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

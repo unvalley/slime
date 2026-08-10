@@ -189,7 +189,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         // prefix surface keeps this bounded without a reverse scan on every
         // conversion. A following copula keeps ambiguous inflected forms out.
         let left_context_ends_with_honorific_prefix =
-            matches!(left_context.chars().next_back(), Some('お' | 'ご' | '御'));
+            document_context_ends_with_honorific_prefix(left_context);
         let allows_single_character_phrase_prefix = left_context.ends_with('最')
             || (left_context_ends_with_honorific_prefix && !starts_with_copula(right_context));
         let right_phrase_promotions = dictionary.document_right_phrase_promotions(
@@ -240,12 +240,32 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
     }
 
     fn phrase_promotion(&self, reading: &str, left_context: &str, surface: &str) -> i32 {
-        self.dictionary.document_phrase_promotion(
+        let Some(word_cost) = self.dictionary.document_phrase_word_cost(
             left_context,
             reading,
             surface,
             self.allows_single_character_phrase_prefix,
-        )
+        ) else {
+            return 0;
+        };
+        let regular = DOCUMENT_PHRASE_COST_CEILING
+            .saturating_sub(word_cost)
+            .min(DOCUMENT_PHRASE_PROMOTION);
+        if regular <= 0 || !self.right_phrase_promotions.is_empty() {
+            return regular;
+        }
+        if self.dictionary.document_left_phrase_is_unique(
+            reading,
+            left_context,
+            surface,
+            self.allows_single_character_phrase_prefix,
+        ) {
+            DOCUMENT_UNIQUE_PHRASE_COST_CEILING
+                .saturating_sub(word_cost)
+                .min(DOCUMENT_UNIQUE_PHRASE_PROMOTION)
+        } else {
+            regular
+        }
     }
 
     fn right_function_word_promotion(&self, conversion: &Conversion) -> i32 {
@@ -583,6 +603,10 @@ const DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS: usize = 8;
 // cap bounds how far dictionary evidence can move an existing N-best item.
 const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
+// A sole full-phrase continuation is stronger than an isolated homophone.
+// Competing left phrases or any exact right phrase retain the regular cap.
+const DOCUMENT_UNIQUE_PHRASE_COST_CEILING: i32 = 11_500;
+const DOCUMENT_UNIQUE_PHRASE_PROMOTION: i32 = 5_200;
 const DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING: i32 = 6_300;
 const DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING: i32 = 7_500;
 const DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING: i32 = 9_300;
@@ -658,6 +682,19 @@ const BASE_STATE_PREFIXES: &[&str] = &[
     "二・三塁",
     "満塁",
 ];
+
+fn document_context_ends_with_honorific_prefix(left_context: &str) -> bool {
+    match left_context.chars().next_back() {
+        Some('お' | 'ご') => true,
+        Some('御') => !left_context.chars().rev().nth(1).is_some_and(|character| {
+            matches!(
+                character,
+                '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+            )
+        }),
+        _ => false,
+    }
+}
 
 fn document_region_suffix_promotion(reading: &str, surface: &str) -> i32 {
     match (reading, surface) {
@@ -1659,9 +1696,27 @@ impl Dictionary {
         candidate_surface: &str,
         allows_single_character_prefix: bool,
     ) -> i32 {
-        let Some(compact) = self.bundled else {
-            return 0;
-        };
+        self.document_phrase_word_cost(
+            left_context,
+            reading,
+            candidate_surface,
+            allows_single_character_prefix,
+        )
+        .map_or(0, |word_cost| {
+            DOCUMENT_PHRASE_COST_CEILING
+                .saturating_sub(word_cost)
+                .min(DOCUMENT_PHRASE_PROMOTION)
+        })
+    }
+
+    fn document_phrase_word_cost(
+        &self,
+        left_context: &str,
+        reading: &str,
+        candidate_surface: &str,
+        allows_single_character_prefix: bool,
+    ) -> Option<i32> {
+        let compact = self.bundled?;
         let context_start = left_context
             .char_indices()
             .rev()
@@ -1669,7 +1724,7 @@ impl Dictionary {
             .map_or(0, |(index, _)| index);
         let context_tail = &left_context[context_start..];
         let context_characters = context_tail.chars().count();
-        let mut best_promotion = 0;
+        let mut best_word_cost = None;
         for (position, (index, _)) in context_tail.char_indices().enumerate() {
             let prefix_characters = context_characters - position;
             if prefix_characters < DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS
@@ -1682,14 +1737,40 @@ impl Dictionary {
                 candidate_surface,
                 reading,
             ) {
-                best_promotion = best_promotion.max(
-                    DOCUMENT_PHRASE_COST_CEILING
-                        .saturating_sub(word_cost)
-                        .min(DOCUMENT_PHRASE_PROMOTION),
-                );
+                best_word_cost =
+                    Some(best_word_cost.map_or(word_cost, |best: i32| best.min(word_cost)));
             }
         }
-        best_promotion
+        best_word_cost
+    }
+
+    fn document_left_phrase_is_unique(
+        &self,
+        reading: &str,
+        left_context: &str,
+        candidate_surface: &str,
+        allows_single_character_prefix: bool,
+    ) -> bool {
+        let mut candidate_is_exact = false;
+        let mut has_competing_phrase = false;
+        self.for_each_exact(reading, |entry| {
+            if has_competing_phrase || entry.surface == reading {
+                return;
+            }
+            if entry.surface == candidate_surface {
+                candidate_is_exact = true;
+                return;
+            }
+            has_competing_phrase = self
+                .document_phrase_word_cost(
+                    left_context,
+                    reading,
+                    entry.surface,
+                    allows_single_character_prefix,
+                )
+                .is_some_and(|word_cost| word_cost < DOCUMENT_PHRASE_COST_CEILING);
+        });
+        candidate_is_exact && !has_competing_phrase
     }
 
     fn document_right_phrase_promotions<'s>(
@@ -4231,8 +4312,8 @@ mod tests {
         Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
         DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
         MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, MOZC_VERBAL_NOUN_POS_ID, NBestBucket,
-        NBestNode, UNKNOWN_POS_ID, document_region_suffix_promotion, insert_n_best_node,
-        trailing_numeric_surface,
+        NBestNode, UNKNOWN_POS_ID, document_context_ends_with_honorific_prefix,
+        document_region_suffix_promotion, insert_n_best_node, trailing_numeric_surface,
     };
 
     struct PreferSurface<'a>(&'a str);
@@ -4932,6 +5013,41 @@ mod tests {
         assert_ne!(
             dictionary.candidates_with_context("しかい", "多数の番組")[0].surface,
             "司会"
+        );
+    }
+
+    #[test]
+    fn document_context_strengthens_only_unique_phrase_continuations() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            ("なん", "ダドリーは資金", "の不足を補う", "難"),
+            ("し", "同年12月には『三國", "』が発売された", "志"),
+            ("か", "ガソリンのオクタン", "103以上", "価"),
+            ("しき", "脳外科医の遠野", "の担当である", "志貴"),
+        ] {
+            assert_eq!(
+                dictionary.candidates_with_surrounding_context(
+                    reading,
+                    left_context,
+                    right_context,
+                )[0]
+                .surface,
+                expected
+            );
+        }
+
+        assert_eq!(
+            dictionary.candidates_with_context("かん", "価値")[0].surface,
+            "観",
+            "competing exact phrases must retain their dictionary cost difference"
+        );
+        assert!(!document_context_ends_with_honorific_prefix("防御"));
+        assert!(document_context_ends_with_honorific_prefix("天皇の御"));
+        assert_ne!(
+            dictionary.candidates_with_context("かき", "防御")[0].surface,
+            "垣",
+            "a kanji word ending in 御 is not an honorific boundary"
         );
     }
 

@@ -280,6 +280,8 @@ GSD devは1件改善・悪化0、GSD train・test、AJIMEE、JWTDは候補順を
 
 候補集合外の誤りに対しては、zenz-v3.2-smallのgreedy表層を直接採用せず、完全な辞書lattice path、同じ文字数、ASCII英数字不変、2〜4個の離れた局所変更、各2文字以内、通常cost窓、追加marginをすべて満たす1候補だけを`high-accuracy`の再採点へ加えた。読みは6〜32文字に限定する。JWTDは2回prefix後の225 / 400から227 / 400、PUDは346 / 446から347 / 446へ改善し、AJIMEEとGSD dev/testを維持した。ATOKの継続的な変換強度と同様に、モデルの一度の出力だけで辞書・履歴の境界を越えない。
 
+同じgreedy出力が通常の辞書候補に既にある場合は候補を重複追加せず、通常winnerより候補尤度が0.1〜0.2だけ高い近接一致に限って順位信号として再利用した。JWTDは227→228、PUDは347→348へ各1件改善し、AJIMEEとGSD dev/testは不変、exact悪化0だった。生成beam幅2はJWTDの辞書付きoracleを増やしたものの最終top-1を追加改善せず、対象入力のp95を約114 msから151 msへ増やしたため不採用とした。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

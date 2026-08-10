@@ -27,6 +27,8 @@ const MIN_PREFIX_CHARACTERS: usize = 4;
 const MIN_LOGIT_MARGIN: f32 = 1.5;
 const CONSTRAINED_CANDIDATES: usize = 8;
 const MAX_CHANGED_CHARACTERS: usize = 2;
+const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
+const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 
 #[derive(Debug, Deserialize)]
 struct Item {
@@ -163,6 +165,15 @@ fn run() -> Result<(), String> {
     let mut augmented_iterative_correct = 0usize;
     let mut iterative_improvements = 0usize;
     let mut iterative_regressions = 0usize;
+    let mut existing_generated = 0usize;
+    let mut existing_generated_correct = 0usize;
+    let mut existing_generated_improvements = 0usize;
+    let mut existing_generated_regressions = 0usize;
+    let mut near_tie_improvements = 0usize;
+    let mut near_tie_regressions = 0usize;
+    let mut consensus_correct = 0usize;
+    let mut consensus_improvements = 0usize;
+    let mut consensus_regressions = 0usize;
     let mut latencies = Vec::with_capacity(generated.len());
     let mut eligible_latencies = Vec::new();
     for ((((item, generated), ordinary), augmented), &original_count) in items
@@ -205,6 +216,7 @@ fn run() -> Result<(), String> {
             eligible_latencies.push(generated.latency);
         }
 
+        let mut existing_generation_stats = None;
         let (current_surface, augmented_surface, current_prefix, augmented_prefix) =
             if original_count >= 2 {
                 let scored = scored_items
@@ -216,6 +228,33 @@ fn run() -> Result<(), String> {
                     &scored.candidate_logliks[..original_count],
                     false,
                 );
+                if let Some(generated_index) = augmented[..original_count]
+                    .iter()
+                    .position(|candidate| candidate.surface == generated.surface)
+                {
+                    let has_right_context = !item.right_context_text.is_empty();
+                    let lambda = if !has_right_context
+                        && item.input.chars().count() >= VERY_LONG_INPUT_CHARACTERS
+                    {
+                        0.74
+                    } else {
+                        0.8
+                    };
+                    let combined = |index: usize| {
+                        (1.0 - lambda) * (-f64::from(augmented[index].cost) / COST_LOG_SCALE)
+                            + lambda * scored.candidate_logliks[index]
+                    };
+                    existing_generation_stats = Some((
+                        generated_index + 1,
+                        current_index + 1,
+                        scored.candidate_logliks[generated_index]
+                            - scored.candidate_logliks[current_index],
+                        combined(generated_index) - combined(current_index),
+                        augmented[generated_index]
+                            .cost
+                            .saturating_sub(augmented[0].cost),
+                    ));
+                }
                 let current_surface = augmented[current_index].surface.clone();
                 let current_prefix = apply_prefix_correction(
                     &dictionary,
@@ -285,6 +324,72 @@ fn run() -> Result<(), String> {
             usize::from(!current_iterative_matches && augmented_iterative_matches);
         iterative_regressions +=
             usize::from(current_iterative_matches && !augmented_iterative_matches);
+        let generated_existing = (generated.stopped_at_eos
+            && (MINIMUM_GENERATIVE_READING_CHARACTERS..=MAXIMUM_GENERATIVE_READING_CHARACTERS)
+                .contains(&item.input.chars().count())
+            && augmented.first().is_some_and(|base| {
+                bounded_local_substitution(
+                    &base.surface,
+                    &generated.surface,
+                    MAX_CHANGED_CHARACTERS,
+                )
+            }))
+        .then(|| {
+            augmented[..original_count]
+                .iter()
+                .find(|candidate| candidate.surface == generated.surface)
+                .map(|candidate| candidate.surface.as_str())
+        })
+        .flatten();
+        let mut consensus_matches = augmented_iterative_matches;
+        if let Some(generated_existing) = generated_existing {
+            let generated_matches = matches_expected(generated_existing, &item.expected_output);
+            existing_generated += 1;
+            existing_generated_correct += usize::from(generated_matches);
+            existing_generated_improvements +=
+                usize::from(!current_iterative_matches && generated_matches);
+            existing_generated_regressions +=
+                usize::from(current_iterative_matches && !generated_matches);
+            if existing_generation_stats.is_some_and(|(_, _, model_delta, _, _)| {
+                (GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE
+                    ..=GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE)
+                    .contains(&model_delta)
+            }) {
+                near_tie_improvements +=
+                    usize::from(!current_iterative_matches && generated_matches);
+                near_tie_regressions +=
+                    usize::from(current_iterative_matches && !generated_matches);
+                consensus_matches = generated_matches;
+            }
+            if current_iterative_matches != generated_matches {
+                let stats = existing_generation_stats.map_or_else(
+                    || {
+                        "rank=-\tselected=-\tmodel_delta=-\tcombined_delta=-\tcost_gap=-".to_owned()
+                    },
+                    |(rank, selected, model_delta, combined_delta, cost_gap)| {
+                        format!(
+                            "rank={rank}\tselected={selected}\tmodel_delta={model_delta:.4}\tcombined_delta={combined_delta:.4}\tcost_gap={cost_gap}"
+                        )
+                    },
+                );
+                println!(
+                    "existing_generation_change\t{}\t{}\t{}\tcurrent={}\tgenerated={}\texpected={}",
+                    item.index,
+                    if generated_matches {
+                        "improve"
+                    } else {
+                        "regress"
+                    },
+                    stats,
+                    current_iterative,
+                    generated_existing,
+                    item.expected_output.join(" | "),
+                );
+            }
+        }
+        consensus_correct += usize::from(consensus_matches);
+        consensus_improvements += usize::from(!augmented_iterative_matches && consensus_matches);
+        consensus_regressions += usize::from(augmented_iterative_matches && !consensus_matches);
         if current_iterative_matches != augmented_iterative_matches {
             println!(
                 "iterative_change\t{}\t{}\tcurrent={}\taugmented={}\tgenerated={}\texpected={}",
@@ -323,6 +428,15 @@ fn run() -> Result<(), String> {
     println!("augmented_iterative_top1={augmented_iterative_correct}");
     println!("iterative_improvements={iterative_improvements}");
     println!("iterative_regressions={iterative_regressions}");
+    println!("existing_generated={existing_generated}");
+    println!("existing_generated_correct={existing_generated_correct}");
+    println!("existing_generated_improvements={existing_generated_improvements}");
+    println!("existing_generated_regressions={existing_generated_regressions}");
+    println!("near_tie_improvements={near_tie_improvements}");
+    println!("near_tie_regressions={near_tie_regressions}");
+    println!("consensus_top1={consensus_correct}");
+    println!("consensus_improvements={consensus_improvements}");
+    println!("consensus_regressions={consensus_regressions}");
     println!("stopped_at_eos={stopped_at_eos}");
     println!("generation_p50_ms={:.3}", percentile_ms(&latencies, 50));
     println!("generation_p95_ms={:.3}", percentile_ms(&latencies, 95));

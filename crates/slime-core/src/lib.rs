@@ -61,6 +61,8 @@ const GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
 const GENERATIVE_MIN_CHANGED_REGIONS: usize = 2;
 const GENERATIVE_MAX_CHANGED_REGIONS: usize = 4;
 const GENERATIVE_MAX_CHANGED_CHARACTERS_PER_REGION: usize = 2;
+const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
+const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -217,6 +219,7 @@ struct CandidateRescoreState {
     request: CandidateRescoreRequest,
     candidates: Vec<Candidate>,
     model_supplemental: Vec<bool>,
+    generative_consensus: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -632,14 +635,17 @@ impl SlimeEngine {
             })
     }
 
-    /// Adds one model-generated surface to the pending rescore request after
-    /// proving that it is a complete, bounded path through the base lattice.
+    /// Records agreement with an existing candidate, or adds one generated
+    /// surface after proving it is a bounded path through the base lattice.
     ///
     /// The generated text is never accepted directly. It must preserve the
     /// surface length and ASCII alphanumerics, change two to four disjoint
     /// regions of at most two characters each, and stay inside the same cost
-    /// window as ordinary model candidates. The candidate is marked as model
-    /// supplemental, so the usual additional score margin still applies.
+    /// window as ordinary model candidates. A new candidate is marked as model
+    /// supplemental, so the usual additional score margin still applies. An
+    /// existing candidate is only recorded as generation consensus; it may
+    /// override the ordinary winner later when their model scores are a narrow
+    /// near-tie.
     pub fn prepare_generative_rescore_candidate(
         &mut self,
         generated_surface: &str,
@@ -652,14 +658,26 @@ impl SlimeEngine {
         let reading_characters = reading.chars().count();
         if !(GENERATIVE_MIN_READING_CHARACTERS..=GENERATIVE_MAX_READING_CHARACTERS)
             .contains(&reading_characters)
-            || state
-                .candidates
-                .iter()
-                .any(|candidate| candidate.surface == generated_surface)
-            || !bounded_multi_region_substitution(
+        {
+            return None;
+        }
+        if let Some(index) = state
+            .candidates
+            .iter()
+            .position(|candidate| candidate.surface == generated_surface)
+        {
+            if !bounded_local_substitution(
                 &state.candidates.first()?.surface,
                 generated_surface,
-            )
+                PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+            ) {
+                return None;
+            }
+            let state = self.candidate_rescore.as_mut()?;
+            state.generative_consensus = Some(index);
+            return Some(state.request.clone());
+        }
+        if !bounded_multi_region_substitution(&state.candidates.first()?.surface, generated_surface)
         {
             return None;
         }
@@ -745,13 +763,8 @@ impl SlimeEngine {
         {
             return None;
         }
-        let (_, _, selected) = candidate_rescore_order(
-            &state.candidates,
-            &state.model_supplemental,
-            log_likelihoods,
-            lambda,
-            minimum_margin,
-        )?;
+        let (_, _, selected) =
+            candidate_rescore_order_for_state(state, log_likelihoods, lambda, minimum_margin)?;
         let prefix = prefix_constraints[selected].as_deref()?;
         let current = &state.candidates[selected].surface;
         let correction = self.constrained_local_correction(
@@ -829,13 +842,8 @@ impl SlimeEngine {
             return None;
         }
 
-        let (order, margin_protects_base, selected) = candidate_rescore_order(
-            &state.candidates,
-            &state.model_supplemental,
-            log_likelihoods,
-            lambda,
-            minimum_margin,
-        )?;
+        let (order, margin_protects_base, selected) =
+            candidate_rescore_order_for_state(&state, log_likelihoods, lambda, minimum_margin)?;
 
         let mut pending_candidates = self.candidates.clone();
         let existing_positions: Vec<_> = state
@@ -2584,6 +2592,7 @@ fn candidate_rescore_state_with_limit(
                 .collect(),
         },
         model_supplemental: vec![false; candidates.len()],
+        generative_consensus: None,
         candidates,
     })
 }
@@ -2611,6 +2620,7 @@ fn anchor_model_rescore_state(
                 .any(|base| base.surface == candidate.surface)
         })
         .collect();
+    state.generative_consensus = None;
     state.request.candidates = state
         .candidates
         .iter()
@@ -2656,6 +2666,38 @@ fn candidate_rescore_order(
         };
     let margin_protects_base = top != 0 && combined[top] - combined[0] < required_margin;
     let selected = if margin_protects_base { 0 } else { top };
+    Some((order, margin_protects_base, selected))
+}
+
+fn candidate_rescore_order_for_state(
+    state: &CandidateRescoreState,
+    log_likelihoods: &[f64],
+    lambda: f64,
+    minimum_margin: f64,
+) -> Option<(Vec<usize>, bool, usize)> {
+    let (mut order, mut margin_protects_base, mut selected) = candidate_rescore_order(
+        &state.candidates,
+        &state.model_supplemental,
+        log_likelihoods,
+        lambda,
+        minimum_margin,
+    )?;
+    let Some(consensus) = state.generative_consensus else {
+        return Some((order, margin_protects_base, selected));
+    };
+    if consensus >= log_likelihoods.len() || state.model_supplemental[consensus] {
+        return None;
+    }
+    let model_advantage = log_likelihoods[consensus] - log_likelihoods[selected];
+    if consensus != selected
+        && (GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE..=GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE)
+            .contains(&model_advantage)
+    {
+        order.retain(|&index| index != consensus);
+        order.insert(0, consensus);
+        selected = consensus;
+        margin_protects_base = false;
+    }
     Some((order, margin_protects_base, selected))
 }
 
@@ -2876,7 +2918,7 @@ mod tests {
         DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision,
         MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY,
         UserData, bounded_local_substitution, bundled_dictionary, candidate_rescore_order,
-        date_time_candidates, katakana_candidate,
+        candidate_rescore_order_for_state, date_time_candidates, katakana_candidate,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
@@ -5184,6 +5226,7 @@ mod tests {
                     .collect(),
             },
             model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
             candidates,
         });
         engine
@@ -5218,6 +5261,7 @@ mod tests {
                 candidates: vec![candidate.surface.clone()],
             },
             model_supplemental: vec![false],
+            generative_consensus: None,
             candidates: vec![candidate],
         });
 
@@ -5262,6 +5306,7 @@ mod tests {
                 candidates: vec![candidate.surface.clone()],
             },
             model_supplemental: vec![false],
+            generative_consensus: None,
             candidates: vec![candidate],
         });
 
@@ -5310,6 +5355,7 @@ mod tests {
                 candidates: vec![candidate.surface.clone()],
             },
             model_supplemental: vec![false],
+            generative_consensus: None,
             candidates: vec![candidate],
         });
 
@@ -5355,6 +5401,7 @@ mod tests {
                 candidates: vec![base.surface.clone()],
             },
             model_supplemental: vec![false],
+            generative_consensus: None,
             candidates: vec![base],
         });
 
@@ -5370,6 +5417,82 @@ mod tests {
                 .model_supplemental,
             [false, true]
         );
+    }
+
+    #[test]
+    fn existing_generated_surface_records_generation_consensus_without_duplication() {
+        let candidates = vec![
+            Candidate {
+                surface: "奨学生".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "小学生".to_owned(),
+                cost: 1_100,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::default());
+        engine.reading = "しょうがくせい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        let request = engine
+            .prepare_generative_rescore_candidate("小学生")
+            .expect("an existing generated surface should be recorded");
+        assert_eq!(request.candidates, ["奨学生", "小学生"]);
+        let state = engine
+            .candidate_rescore
+            .as_ref()
+            .expect("pending rescore state");
+        assert_eq!(state.generative_consensus, Some(1));
+        assert_eq!(state.model_supplemental, [false, false]);
+    }
+
+    #[test]
+    fn generation_consensus_only_overrides_for_a_narrow_model_near_tie() {
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: "しょうがくせい".to_owned(),
+                candidates: vec!["奨学生".to_owned(), "小学生".to_owned()],
+            },
+            candidates: vec![
+                Candidate {
+                    surface: "奨学生".to_owned(),
+                    cost: 100,
+                },
+                Candidate {
+                    surface: "小学生".to_owned(),
+                    cost: 1_100,
+                },
+            ],
+            model_supplemental: vec![false, false],
+            generative_consensus: Some(1),
+        };
+
+        for (advantage, expected) in [(0.09, 0), (0.1, 1), (0.2, 1), (0.21, 0)] {
+            let (order, protected, selected) =
+                candidate_rescore_order_for_state(&state, &[0.0, advantage], 0.8, 0.0)
+                    .expect("aligned finite scores");
+            assert_eq!(selected, expected, "advantage={advantage}");
+            assert_eq!(order[0], expected, "advantage={advantage}");
+            assert!(!protected, "combined cost already keeps the base winner");
+        }
     }
 
     #[test]
@@ -5394,6 +5517,7 @@ mod tests {
                     candidates: vec![base.surface.clone()],
                 },
                 model_supplemental: vec![false],
+                generative_consensus: None,
                 candidates: vec![base],
             }
         };

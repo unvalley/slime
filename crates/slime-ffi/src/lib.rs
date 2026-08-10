@@ -2064,6 +2064,31 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_generative_consensus(model: &str) {
+        // Greedy generation agrees with an existing dictionary candidate, but
+        // the cost/model interpolation narrowly keeps 制作 first. The bounded
+        // consensus signal resolves this near-tie without adding a candidate.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let mut capture = TypedCapture::default();
+        for character in "せいさくはぶんげいぷろだくしょんに".chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("製作は文芸プロダクションに")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     fn measure_prefix_diagnostics() {
         let service = super::NEURAL_SERVICE
             .get()
@@ -2133,6 +2158,7 @@ mod tests {
         wait_for_neural_model();
         verify_confident_long_neural_conversion(&model);
         verify_neural_learning_strength(&model);
+        verify_generative_consensus(&model);
         verify_prefix_correction(handle);
         verify_iterative_prefix_correction(handle);
         verify_generative_recall(handle);

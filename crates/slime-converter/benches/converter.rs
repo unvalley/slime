@@ -13,6 +13,7 @@ fn main() {
         black_box(dictionary.candidates(black_box("にほん")));
     });
     run_document_context_benchmark(&dictionary, iterations);
+    run_left_phrase_conflict_benchmarks(&dictionary, iterations);
     run_numeric_context_benchmarks(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_honorific_prefix_context_benchmark(&dictionary, iterations);
@@ -227,6 +228,23 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             ));
         },
     );
+}
+
+fn run_left_phrase_conflict_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run("converter/strong_left_phrase_conflict", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("しんかんせん"),
+            black_box("劇団☆"),
+            black_box("所属。"),
+        ));
+    });
+    run("converter/weak_left_phrase_conflict", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("てん"),
+            black_box("同じグループ"),
+            black_box("で注文する"),
+        ));
+    });
 }
 
 fn run_ordinal_generation_benchmark(dictionary: &Dictionary, iterations: u64) {

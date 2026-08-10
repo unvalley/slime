@@ -139,6 +139,7 @@ struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
+    strong_left_phrase_evidence: StrongLeftPhraseEvidence,
     right_function_word_costs: Vec<DocumentContextualCost<'a>>,
     right_grammar_costs: Vec<DocumentContextualCost<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
@@ -165,6 +166,12 @@ struct DocumentContextualCost<'a> {
     relative_cost: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrongLeftPhraseEvidence {
+    Absent,
+    Present,
+}
+
 impl<'a> DictionaryDocumentContextRanker<'a> {
     fn new(dictionary: &'a Dictionary, reading: &str, left_context: &str) -> Self {
         Self::new_with_surrounding_context(dictionary, reading, left_context, "")
@@ -184,15 +191,22 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             matches!(left_context.chars().next_back(), Some('お' | 'ご' | '御'));
         let allows_single_character_phrase_prefix = left_context.ends_with('最')
             || (left_context_ends_with_honorific_prefix && !starts_with_copula(right_context));
+        let right_phrase_promotions = dictionary.document_right_phrase_promotions(
+            reading,
+            left_context,
+            right_context,
+            allows_single_character_phrase_prefix,
+        );
+        let strong_left_phrase_evidence = dictionary.document_strong_left_phrase_evidence(
+            reading,
+            left_context,
+            allows_single_character_phrase_prefix,
+        );
         Self {
             dictionary,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
-            right_phrase_promotions: dictionary.document_right_phrase_promotions(
-                reading,
-                left_context,
-                right_context,
-                allows_single_character_phrase_prefix,
-            ),
+            right_phrase_promotions,
+            strong_left_phrase_evidence,
             right_function_word_costs: dictionary
                 .document_right_function_word_costs(reading, right_context),
             right_grammar_costs: dictionary.document_right_grammar_costs(reading, right_context),
@@ -357,7 +371,9 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(notation_promotion)
             .max(numeric_counter_promotion)
             .max(region_suffix_promotion);
-        let boundary_adjustment = if specialized_promotion > 0 {
+        let boundary_adjustment = if specialized_promotion > 0
+            || self.strong_left_phrase_evidence == StrongLeftPhraseEvidence::Present
+        {
             0
         } else {
             // A post-hoc boundary score is exact only when the complete
@@ -1529,6 +1545,71 @@ impl Dictionary {
         let mut seen = HashSet::with_capacity(readings.len());
         readings.retain(|(reading, _)| seen.insert(reading.clone()));
         readings.into_iter().map(|(reading, _)| reading).collect()
+    }
+
+    fn document_strong_left_phrase_evidence(
+        &self,
+        reading: &str,
+        left_context: &str,
+        allows_single_character_prefix: bool,
+    ) -> StrongLeftPhraseEvidence {
+        if !self.uses_connection_costs {
+            return StrongLeftPhraseEvidence::Absent;
+        }
+        // A weak compound can be valid but wrong for the sentence (for example
+        // グループ展). Only explicit phrase boundaries and genitive phrases may
+        // suppress the generic connection promotion of competing candidates.
+        let context_start = left_context
+            .char_indices()
+            .rev()
+            .nth(DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS.saturating_sub(1))
+            .map_or(0, |(index, _)| index);
+        let context_tail = &left_context[context_start..];
+        if !left_context.ends_with('の')
+            && !context_tail
+                .chars()
+                .any(|character| !character.is_alphanumeric())
+        {
+            return StrongLeftPhraseEvidence::Absent;
+        }
+        let connection = ConnectionMatrix::bundled();
+        let mut candidates = Vec::<(&str, i32)>::new();
+        // Deduplicate POS variants before reverse lookups. A phrase promotion
+        // cannot recover a surface farther away than its maximum promotion.
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading {
+                return;
+            }
+            let isolated_cost = whole_reading_entry_cost(Some(connection), &entry);
+            if let Some((_, best_cost)) = candidates
+                .iter_mut()
+                .find(|(surface, _)| *surface == entry.surface)
+            {
+                *best_cost = (*best_cost).min(isolated_cost);
+            } else {
+                candidates.push((entry.surface, isolated_cost));
+            }
+        });
+        let Some(best_isolated_cost) = candidates.iter().map(|(_, cost)| *cost).min() else {
+            return StrongLeftPhraseEvidence::Absent;
+        };
+        if candidates.into_iter().any(|(surface, isolated_cost)| {
+            if isolated_cost > best_isolated_cost.saturating_add(DOCUMENT_PHRASE_PROMOTION) {
+                return false;
+            }
+            let promotion = self.document_phrase_promotion(
+                left_context,
+                reading,
+                surface,
+                allows_single_character_prefix,
+            );
+            promotion == DOCUMENT_PHRASE_PROMOTION
+                || (left_context.ends_with('の') && promotion >= 2_000)
+        }) {
+            StrongLeftPhraseEvidence::Present
+        } else {
+            StrongLeftPhraseEvidence::Absent
+        }
     }
 
     fn document_phrase_promotion(
@@ -4743,6 +4824,27 @@ mod tests {
         assert_ne!(
             dictionary.candidates_with_context("しかい", "多数の番組")[0].surface,
             "司会"
+        );
+    }
+
+    #[test]
+    fn strong_left_phrase_evidence_outweighs_generic_boundary_promotions() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("しんかんせん", "劇団☆", "所属。")[0]
+                .surface,
+            "新感線"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("なか", "犬猿の", "です。")[0].surface,
+            "仲"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("さい", "現在は", "下等に相当する。")[0]
+                .surface,
+            "最",
+            "right-side phrase evidence must retain its existing boundary support"
         );
     }
 

@@ -322,6 +322,27 @@ GSD trainではtop-1正解数が1,395→1,411、testでは286→288へ増えた�
 
 Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。対象経路`compatible_right_grammar_candidates`の中央値は99.231→102.520 µs/op（+3.289 µs、+3.3%）、非該当の`compatible_right_grammar_nonmatch`は188.438→186.026 µs/op（-2.412 µs、測定誤差内）だった。
 
+#### 強い左辞書句と一般境界の競合
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は文法だけでなく単語同士のつながりと文章の自然さを使う。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[通常変換のViterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も、語彙costと左右接続costを同じ経路で評価する。Slimeは左表層と候補を連結した完全なMozc辞書句を候補別に昇格していたが、辞書句を持たない競合候補には一般境界補正が残るため、`劇団☆新感線`が`劇団☆新幹線`に、`犬猿の仲`が`犬猿の中`に戻されていた。
+
+一般境界を全辞書句で止める案は、実在する`グループ展`、`代表権`、`研究員`を過信し、正解`店`、`兼`、`院`の順位を落とした。右辞書句まで同様に扱う案も`膜間腔`を`幕間腔`へ変えたため棄却した。採用条件は左辞書句だけとし、最大8文字の左prefixが助詞`の`で終わるか非英数字の明示境界を含み、完全辞書句の補正が上限3,500に達する場合、または`の`境界で2,000以上の場合に限定した。この強い証拠がある変換だけ、辞書句を持たない競合候補の一般境界補正を止める。
+
+事前判定は同じ表層の複数POS entryをまとめ、最大3,500の補正後も最良候補へ届かない表層を辞書検索前に除外する。候補生成、N-best幅、辞書costは変えず、右辞書句と一般境界の既存関係も維持する。
+
+| dataset | 変更前 acc@1 / MRR@10 | 強い左辞書句優先後 acc@1 / MRR@10 | 候補配列の変化 | 正解順位改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7273 / 0.8172 | **0.7284 / 0.8177** | 30件 | 2 / 0 |
+| GSD dev (331) | 0.8671 / 0.9115 | 0.8671 / 0.9115 | 11件 | 0 / 0 |
+| GSD test (323) | 0.8916 / 0.9292 | 0.8916 / 0.9292 | 6件 | 0 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 0件 | 0 / 0 |
+
+GSD trainのtop-1正解数は1,411→1,413へ増え、正解順位が変わったのは`犬猿の中 → 犬猿の仲`と`劇団☆新幹線 → 劇団☆新感線`の2件だけだった。dev、testは候補costに変化があるものの正解順位は全件不変で、AJIMEE、JWTD、PUDは候補表層、cost、順序まで完全一致した。
+
+Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。強い辞書句と一般境界が競合する`strong_left_phrase_conflict`の中央値は773.630→789.011 µs/op（+15.381 µs、+2.0%）、事前gateで辞書句探索を省く`weak_left_phrase_conflict`は90.470→90.257 µs/op（-0.213 µs、測定誤差内）だった。
+
 #### サ変名詞に続く一文字の一般名詞接尾語
 
 [ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)が重視する文法と単語のつながり、[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)が使う左右接続IDを参考に、Mozc辞書にある完全な三文字複合語を文脈証拠として使う範囲を広げた。対象は全て漢字、左POSがサ変名詞、右POSが一般名詞接尾語、辞書cost 7,550以下を同時に満たすentryだけである。候補やword costは追加せず、文脈用の逆引き索引だけを拡張する。

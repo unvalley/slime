@@ -2220,16 +2220,20 @@ impl SlimeEngine {
             .previous_commit()
             .map(|(reading, surface)| (reading.to_owned(), surface.to_owned()));
         if self.preferences.history_learning {
-            if let Some((previous_reading, previous_surface)) = previous {
-                self.user_data.record_context(
-                    &previous_reading,
-                    &previous_surface,
-                    reading,
-                    surface,
-                );
+            if let Some((previous_reading, previous_surface)) = previous.as_ref() {
+                self.user_data
+                    .record_context(previous_reading, previous_surface, reading, surface);
             }
             if should_record_history(reading, surface) {
-                self.user_data.record(reading, surface);
+                if let Some((previous_reading, previous_surface)) = previous.as_ref() {
+                    self.user_data.record_with_preference_context(
+                        reading,
+                        surface,
+                        Some((previous_reading, previous_surface)),
+                    );
+                } else {
+                    self.user_data.record(reading, surface);
+                }
             }
         }
         self.session_history.record_commit(reading, surface);
@@ -2253,7 +2257,7 @@ impl SlimeEngine {
             let mut recorded = Vec::with_capacity(selected_segments.len());
             let mut recorded_contexts = Vec::with_capacity(selected_segments.len());
             for (segment_reading, segment_surface, context) in selected_segments {
-                if let Some((previous_reading, previous_surface)) = context
+                if let Some((previous_reading, previous_surface)) = context.as_ref()
                     && !recorded_contexts.iter().any(
                         |(
                             recorded_previous_reading,
@@ -2261,22 +2265,22 @@ impl SlimeEngine {
                             recorded_reading,
                             recorded_surface,
                         )| {
-                            recorded_previous_reading == &previous_reading
-                                && recorded_previous_surface == &previous_surface
+                            recorded_previous_reading == previous_reading
+                                && recorded_previous_surface == previous_surface
                                 && recorded_reading == &segment_reading
                                 && recorded_surface == &segment_surface
                         },
                     )
                 {
                     self.user_data.record_context(
-                        &previous_reading,
-                        &previous_surface,
+                        previous_reading,
+                        previous_surface,
                         &segment_reading,
                         &segment_surface,
                     );
                     recorded_contexts.push((
-                        previous_reading,
-                        previous_surface,
+                        previous_reading.clone(),
+                        previous_surface.clone(),
                         segment_reading.clone(),
                         segment_surface.clone(),
                     ));
@@ -2289,7 +2293,15 @@ impl SlimeEngine {
                 {
                     continue;
                 }
-                self.user_data.record(&segment_reading, &segment_surface);
+                if let Some((previous_reading, previous_surface)) = context.as_ref() {
+                    self.user_data.record_with_preference_context(
+                        &segment_reading,
+                        &segment_surface,
+                        Some((previous_reading, previous_surface)),
+                    );
+                } else {
+                    self.user_data.record(&segment_reading, &segment_surface);
+                }
                 recorded.push((segment_reading, segment_surface));
             }
         }
@@ -4285,6 +4297,62 @@ mod tests {
         type_text(&mut reloaded, "kanji");
         reloaded.handle(InputEvent::Space);
         assert_eq!(reloaded.snapshot().preedit, "漢字");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repeated_exact_selection_changes_the_durable_preference() {
+        let directory = test_directory("confirmed-exact-history-preference");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nかんじ\t漢字\t100\t20\n",
+        )
+        .unwrap();
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(preferences);
+
+        for repetition in 0..2 {
+            type_text(&mut engine, "kanji");
+            engine.handle(InputEvent::Space);
+            let selected = engine
+                .snapshot()
+                .candidates
+                .iter()
+                .position(|candidate| candidate == "感じ")
+                .unwrap();
+            engine.handle(InputEvent::SelectCandidate(
+                u32::try_from(selected).unwrap(),
+            ));
+            engine.handle(InputEvent::Enter);
+
+            if repetition == 0 {
+                let mut one_off = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+                one_off.set_preferences(preferences);
+                type_text(&mut one_off, "kanji");
+                one_off.handle(InputEvent::Space);
+                assert_eq!(one_off.snapshot().preedit, "漢字");
+            }
+        }
+
+        let mut reloaded = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        reloaded.set_preferences(preferences);
+        type_text(&mut reloaded, "kanji");
+        reloaded.handle(InputEvent::Space);
+        assert_eq!(reloaded.snapshot().preedit, "感じ");
+        assert!(
+            fs::read_to_string(directory.join("history_preferences.tsv"))
+                .unwrap()
+                .contains("かんじ\t感じ\t")
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

@@ -234,9 +234,11 @@ final class UserDataStore {
     let directoryURL: URL
     let dictionaryURL: URL
     let historyURL: URL
+    let historyPreferencesURL: URL
 
     private let dictionaryHeader = "# slime-user-dictionary-v1\n"
     private let historyHeader = "# slime-history-v1\n"
+    private let historyPreferencesHeader = "# slime-history-preferences-v1\n"
 
     private convenience init(fileManager: FileManager = .default) {
         let applicationSupport = fileManager.urls(
@@ -253,6 +255,7 @@ final class UserDataStore {
         self.directoryURL = directoryURL
         dictionaryURL = directoryURL.appendingPathComponent("user_dictionary.tsv")
         historyURL = directoryURL.appendingPathComponent("history.tsv")
+        historyPreferencesURL = directoryURL.appendingPathComponent("history_preferences.tsv")
     }
 
     func loadDictionary() throws -> (entries: [UserDictionaryEntry], base: Data?) {
@@ -387,6 +390,7 @@ final class UserDataStore {
         guard current == base else {
             throw UserDataStoreError.externallyModified
         }
+        let preferencesUpdate = try historyPreferencesUpdate(retaining: entries)
         try FileManager.default.createDirectory(
             at: directoryURL,
             withIntermediateDirectories: true
@@ -398,8 +402,56 @@ final class UserDataStore {
         }
         let data = Data(text.utf8)
         try data.write(to: historyURL, options: .atomic)
+        if let preferencesUpdate,
+           try currentData(at: historyPreferencesURL) == preferencesUpdate.base
+        {
+            try preferencesUpdate.proposed.write(
+                to: historyPreferencesURL,
+                options: .atomic
+            )
+        }
         NotificationCenter.default.post(name: .unvalleyUserDataDidChange, object: nil)
         return data
+    }
+
+    private func historyPreferencesUpdate(
+        retaining entries: [InputHistoryEntry]
+    ) throws -> (base: Data, proposed: Data)? {
+        guard let data = try currentData(at: historyPreferencesURL),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+        let retainedIDs = Set(entries.map(\.id))
+        var seenReadings = Set<String>()
+        var proposed = historyPreferencesHeader
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let value = String(line)
+            if value.isEmpty
+                || value == historyPreferencesHeader.trimmingCharacters(in: .newlines)
+            {
+                continue
+            }
+            let columns = value.split(separator: "\t", omittingEmptySubsequences: false)
+            let reading = String(columns.first ?? "")
+            guard columns.count == 3,
+                  !columns[0].isEmpty,
+                  !columns[1].isEmpty,
+                  UInt64(columns[2]) != nil,
+                  seenReadings.count < 500,
+                  seenReadings.insert(reading).inserted
+            else {
+                // Preserve an unknown or malformed sidecar. Rust also treats
+                // it as read-only, and stale preferences cannot rank without
+                // a matching history entry.
+                return nil
+            }
+            let id = "\(columns[0])\u{0}\(columns[1])"
+            if retainedIDs.contains(id) {
+                proposed += "\(value)\n"
+            }
+        }
+        return (data, Data(proposed.utf8))
     }
 
     func revealDictionary() {

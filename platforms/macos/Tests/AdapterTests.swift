@@ -670,6 +670,13 @@ enum AdapterTests {
             "# slime-history-v1\nにほん\t日本\t2\t100\nぱふぉーまんす\tパフォーマンス\t1\t200\n".utf8
         )
         try historyData.write(to: store.historyURL, options: .atomic)
+        try Data(
+            (
+                "# slime-history-preferences-v1\n"
+                    + "にほん\t日本\t100\n"
+                    + "ぱふぉーまんす\tパフォーマンス\t200\n"
+            ).utf8
+        ).write(to: store.historyPreferencesURL, options: .atomic)
         let history = try store.loadHistorySnapshot()
         let removed = try expectValue(
             history.entries.first(where: { $0.surface == "日本" }),
@@ -684,6 +691,15 @@ enum AdapterTests {
         try expect(
             remaining.map(\.surface) == ["パフォーマンス"],
             "individual history deletion should preserve other entries"
+        )
+        let remainingPreferences = try String(
+            contentsOf: store.historyPreferencesURL,
+            encoding: .utf8
+        )
+        try expect(
+            !remainingPreferences.contains("にほん\t日本\t")
+                && remainingPreferences.contains("ぱふぉーまんす\tパフォーマンス\t"),
+            "individual history deletion should remove only its confirmed preference"
         )
 
         let compactFixture = Data(

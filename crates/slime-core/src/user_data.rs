@@ -6,11 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_DICTIONARY_FILE: &str = "user_dictionary.tsv";
 const HISTORY_FILE: &str = "history.tsv";
+const HISTORY_PREFERENCES_FILE: &str = "history_preferences.tsv";
 const CONTEXT_HISTORY_FILE: &str = "context_history.tsv";
 const USER_DICTIONARY_HEADER: &str = "# slime-user-dictionary-v1";
 const HISTORY_HEADER: &str = "# slime-history-v1";
+const HISTORY_PREFERENCES_HEADER: &str = "# slime-history-preferences-v1";
 const CONTEXT_HISTORY_HEADER: &str = "# slime-context-history-v1";
 const MAX_HISTORY_ENTRIES: usize = 500;
+const MAX_HISTORY_PREFERENCES: usize = MAX_HISTORY_ENTRIES;
 const MAX_CONTEXT_HISTORY_ENTRIES: usize = 500;
 const MIN_COMPLETION_REMAINING_CHARS: usize = 2;
 const MIN_ESTABLISHED_HISTORY_COUNT: u32 = 5;
@@ -37,6 +40,26 @@ pub struct HistoryEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryPreferenceEntry {
+    reading: String,
+    surface: String,
+    last_used: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingHistoryPreference {
+    reading: String,
+    surface: String,
+    context: Option<HistoryPreferenceContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryPreferenceContext {
+    previous_reading: String,
+    previous_surface: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ContextHistoryEntry {
     previous_reading: String,
     previous_surface: String,
@@ -51,8 +74,11 @@ pub struct UserData {
     directory: Option<PathBuf>,
     dictionary: Vec<UserDictionaryEntry>,
     history: Vec<HistoryEntry>,
+    history_preferences: Vec<HistoryPreferenceEntry>,
+    pending_history_preferences: Vec<PendingHistoryPreference>,
     context_history: Vec<ContextHistoryEntry>,
     history_is_writable: bool,
+    history_preferences_are_writable: bool,
     context_history_is_writable: bool,
 }
 
@@ -72,6 +98,16 @@ impl UserData {
             Ok(history) => (history, true),
             Err(()) => (Vec::new(), false),
         };
+        let history_preferences_result = read_optional(&directory.join(HISTORY_PREFERENCES_FILE))
+            .map_err(|_| ())
+            .and_then(|bytes| {
+                bytes.map_or(Ok(Vec::new()), |bytes| parse_history_preferences(&bytes))
+            });
+        let (history_preferences, history_preferences_are_writable) =
+            match history_preferences_result {
+                Ok(preferences) => (preferences, true),
+                Err(()) => (Vec::new(), false),
+            };
         let context_history_result = read_optional(&directory.join(CONTEXT_HISTORY_FILE))
             .map_err(|_| ())
             .and_then(|bytes| bytes.map_or(Ok(Vec::new()), |bytes| parse_context_history(&bytes)));
@@ -84,8 +120,11 @@ impl UserData {
             directory: Some(directory),
             dictionary,
             history,
+            history_preferences,
+            pending_history_preferences: Vec::new(),
             context_history,
             history_is_writable,
+            history_preferences_are_writable,
             context_history_is_writable,
         }
     }
@@ -222,6 +261,7 @@ impl UserData {
         &self,
         reading: &str,
     ) -> (Vec<&str>, Vec<&str>) {
+        let preferred_surface = self.preferred_history_surface(reading);
         let mut entries: Vec<_> = self
             .history
             .iter()
@@ -229,10 +269,12 @@ impl UserData {
                 entry.reading == reading && is_useful_history(&entry.reading, &entry.surface)
             })
             .collect();
-        sort_history(&mut entries);
+        sort_history(&mut entries, preferred_surface);
         let established_count = entries
             .iter()
-            .take_while(|entry| history_strength(entry))
+            .take_while(|entry| {
+                preferred_surface == Some(entry.surface.as_str()) || history_strength(entry)
+            })
             .count();
         let (established, transient) = entries.split_at(established_count);
         (
@@ -245,6 +287,86 @@ impl UserData {
                 .map(|entry| entry.surface.as_str())
                 .collect(),
         )
+    }
+
+    fn preferred_history_surface(&self, reading: &str) -> Option<&str> {
+        if let Some(preference) = self
+            .history_preferences
+            .iter()
+            .find(|preference| preference.reading == reading)
+            && self.history.iter().any(|entry| {
+                entry.reading == reading
+                    && entry.surface == preference.surface
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+        {
+            return Some(preference.surface.as_str());
+        }
+
+        let mut established: Vec<_> = self
+            .history
+            .iter()
+            .filter(|entry| {
+                entry.reading == reading
+                    && history_strength(entry)
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .collect();
+        sort_history(&mut established, None);
+        established.first().map(|entry| entry.surface.as_str())
+    }
+
+    /// Require the same alternative twice before changing an existing durable
+    /// preference. The first conflicting selection freezes the current winner
+    /// in a small sidecar; the second confirms and replaces it. Raw frequency
+    /// remains in history.tsv, so two confirmations do not unlock prediction.
+    fn confirm_history_preference(
+        &mut self,
+        reading: &str,
+        surface: &str,
+        context: Option<(&str, &str)>,
+        last_used: u64,
+    ) -> Option<String> {
+        let Some(current) = self.preferred_history_surface(reading).map(str::to_owned) else {
+            remove_pending_history_preference(&mut self.pending_history_preferences, reading);
+            return None;
+        };
+        if current == surface {
+            remove_pending_history_preference(&mut self.pending_history_preferences, reading);
+            return None;
+        }
+
+        let mut preference_to_persist = None;
+        let current_is_explicit = self
+            .history_preferences
+            .iter()
+            .any(|preference| preference.reading == reading && preference.surface == current);
+        if !current_is_explicit {
+            update_history_preference(&mut self.history_preferences, reading, &current, last_used);
+            trim_history_preferences(&mut self.history_preferences);
+            preference_to_persist = Some(current);
+        }
+
+        if let Some(pending) = self
+            .pending_history_preferences
+            .iter()
+            .find(|pending| pending.reading == reading)
+            && pending.surface == surface
+            && (context.is_none() || !pending_history_context_matches(pending, context))
+        {
+            update_history_preference(&mut self.history_preferences, reading, surface, last_used);
+            trim_history_preferences(&mut self.history_preferences);
+            remove_pending_history_preference(&mut self.pending_history_preferences, reading);
+            return Some(surface.to_owned());
+        }
+
+        update_pending_history_preference(
+            &mut self.pending_history_preferences,
+            reading,
+            surface,
+            context,
+        );
+        preference_to_persist
     }
 
     #[must_use]
@@ -295,6 +417,15 @@ impl UserData {
     }
 
     pub fn record(&mut self, reading: &str, surface: &str) {
+        self.record_with_preference_context(reading, surface, None);
+    }
+
+    pub(crate) fn record_with_preference_context(
+        &mut self,
+        reading: &str,
+        surface: &str,
+        context: Option<(&str, &str)>,
+    ) {
         if !is_useful_history(reading, surface) {
             return;
         }
@@ -303,6 +434,7 @@ impl UserData {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let now = next_last_used(&self.history, wall_clock);
+        let preference_to_persist = self.confirm_history_preference(reading, surface, context, now);
         update_history(&mut self.history, reading, surface, now);
         trim_history(&mut self.history);
 
@@ -314,11 +446,25 @@ impl UserData {
         }
 
         let path = directory.join(HISTORY_FILE);
-        if write_history_optimistically(&path, reading, surface, now).is_ok()
+        let history_saved = write_history_optimistically(&path, reading, surface, now).is_ok();
+        if history_saved
             && let Ok(Some(bytes)) = read_optional(&path)
             && let Ok(history) = parse_history(&bytes)
         {
             self.history = history;
+        }
+        if history_saved
+            && let Some(preferred_surface) = preference_to_persist
+            && self.history_preferences_are_writable
+        {
+            let path = directory.join(HISTORY_PREFERENCES_FILE);
+            if write_history_preference_optimistically(&path, reading, &preferred_surface, now)
+                .is_ok()
+                && let Ok(Some(bytes)) = read_optional(&path)
+                && let Ok(preferences) = parse_history_preferences(&bytes)
+            {
+                self.history_preferences = preferences;
+            }
         }
     }
 
@@ -384,10 +530,11 @@ fn sort_completions(entries: &mut Vec<&HistoryEntry>) {
     });
 }
 
-fn sort_history(entries: &mut Vec<&HistoryEntry>) {
+fn sort_history(entries: &mut Vec<&HistoryEntry>, preferred_surface: Option<&str>) {
     entries.sort_unstable_by(|left, right| {
-        history_strength(right)
-            .cmp(&history_strength(left))
+        (preferred_surface == Some(right.surface.as_str()))
+            .cmp(&(preferred_surface == Some(left.surface.as_str())))
+            .then_with(|| history_strength(right).cmp(&history_strength(left)))
             .then_with(|| right.last_used.cmp(&left.last_used))
             .then_with(|| right.count.cmp(&left.count))
             .then_with(|| left.surface.cmp(&right.surface))
@@ -405,10 +552,97 @@ fn sort_context_history(entries: &mut Vec<&ContextHistoryEntry>) {
 }
 
 /// A single exceptional selection should not replace an established spelling.
-/// Once both spellings are established, recency remains the deciding signal so
-/// an intentional change in preference can still take effect.
+/// Without a confirmed preference, recency decides between established rows;
+/// the sidecar confirmation layer above freezes deliberate preference changes.
 fn history_strength(entry: &HistoryEntry) -> bool {
     entry.count >= MIN_ESTABLISHED_HISTORY_COUNT
+}
+
+fn update_history_preference(
+    preferences: &mut Vec<HistoryPreferenceEntry>,
+    reading: &str,
+    surface: &str,
+    last_used: u64,
+) {
+    if let Some(preference) = preferences
+        .iter_mut()
+        .find(|preference| preference.reading == reading)
+    {
+        surface.clone_into(&mut preference.surface);
+        preference.last_used = last_used;
+    } else {
+        preferences.push(HistoryPreferenceEntry {
+            reading: reading.to_owned(),
+            surface: surface.to_owned(),
+            last_used,
+        });
+    }
+}
+
+fn trim_history_preferences(preferences: &mut Vec<HistoryPreferenceEntry>) {
+    preferences.sort_unstable_by(|left, right| {
+        right
+            .last_used
+            .cmp(&left.last_used)
+            .then_with(|| left.reading.cmp(&right.reading))
+    });
+    preferences.truncate(MAX_HISTORY_PREFERENCES);
+}
+
+fn update_pending_history_preference(
+    preferences: &mut Vec<PendingHistoryPreference>,
+    reading: &str,
+    surface: &str,
+    context: Option<(&str, &str)>,
+) {
+    let context = context.map(
+        |(previous_reading, previous_surface)| HistoryPreferenceContext {
+            previous_reading: previous_reading.to_owned(),
+            previous_surface: previous_surface.to_owned(),
+        },
+    );
+    if let Some(preference) = preferences
+        .iter_mut()
+        .find(|preference| preference.reading == reading)
+    {
+        surface.clone_into(&mut preference.surface);
+        preference.context = context;
+    } else {
+        preferences.push(PendingHistoryPreference {
+            reading: reading.to_owned(),
+            surface: surface.to_owned(),
+            context,
+        });
+        if preferences.len() > MAX_HISTORY_PREFERENCES {
+            preferences.remove(0);
+        }
+    }
+}
+
+fn pending_history_context_matches(
+    pending: &PendingHistoryPreference,
+    context: Option<(&str, &str)>,
+) -> bool {
+    match (&pending.context, context) {
+        (None, None) => true,
+        (Some(pending), Some((previous_reading, previous_surface))) => {
+            pending.previous_reading == previous_reading
+                && pending.previous_surface == previous_surface
+        }
+        _ => false,
+    }
+}
+
+fn remove_pending_history_preference(
+    preferences: &mut Vec<PendingHistoryPreference>,
+    reading: &str,
+) {
+    if let Some(index) = preferences
+        .iter()
+        .position(|preference| preference.reading == reading)
+    {
+        preferences.swap_remove(index);
+    }
 }
 
 fn context_history_strength(entry: &ContextHistoryEntry) -> bool {
@@ -585,6 +819,36 @@ fn parse_history(bytes: &[u8]) -> Result<Vec<HistoryEntry>, ()> {
     Ok(entries)
 }
 
+fn parse_history_preferences(bytes: &[u8]) -> Result<Vec<HistoryPreferenceEntry>, ()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| ())?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || line == HISTORY_PREFERENCES_HEADER {
+            continue;
+        }
+        let mut columns = line.split('\t');
+        let reading = columns.next().ok_or(())?;
+        let surface = columns.next().ok_or(())?;
+        let last_used = columns.next().ok_or(())?.parse().map_err(|_| ())?;
+        if reading.is_empty()
+            || surface.is_empty()
+            || columns.next().is_some()
+            || entries.len() == MAX_HISTORY_PREFERENCES
+            || entries
+                .iter()
+                .any(|entry: &HistoryPreferenceEntry| entry.reading == reading)
+        {
+            return Err(());
+        }
+        entries.push(HistoryPreferenceEntry {
+            reading: reading.to_owned(),
+            surface: surface.to_owned(),
+            last_used,
+        });
+    }
+    Ok(entries)
+}
+
 fn parse_context_history(bytes: &[u8]) -> Result<Vec<ContextHistoryEntry>, ()> {
     let text = std::str::from_utf8(bytes).map_err(|_| ())?;
     let mut entries = Vec::new();
@@ -635,6 +899,20 @@ fn serialize_history(history: &[HistoryEntry]) -> Vec<u8> {
     output.into_bytes()
 }
 
+fn serialize_history_preferences(preferences: &[HistoryPreferenceEntry]) -> Vec<u8> {
+    let mut output = String::from(HISTORY_PREFERENCES_HEADER);
+    output.push('\n');
+    for preference in preferences {
+        output.push_str(&preference.reading);
+        output.push('\t');
+        output.push_str(&preference.surface);
+        output.push('\t');
+        output.push_str(&preference.last_used.to_string());
+        output.push('\n');
+    }
+    output.into_bytes()
+}
+
 fn serialize_context_history(history: &[ContextHistoryEntry]) -> Vec<u8> {
     let mut output = String::from(CONTEXT_HISTORY_HEADER);
     output.push('\n');
@@ -679,6 +957,38 @@ fn write_history_optimistically(
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
         "history changed while saving",
+    ))
+}
+
+fn write_history_preference_optimistically(
+    path: &Path,
+    reading: &str,
+    surface: &str,
+    last_used: u64,
+) -> io::Result<()> {
+    for _ in 0..3 {
+        let base = read_optional(path)?;
+        let mut preferences = match base.as_deref() {
+            Some(bytes) => parse_history_preferences(bytes).map_err(|()| {
+                io::Error::new(io::ErrorKind::InvalidData, "malformed history preferences")
+            })?,
+            None => Vec::new(),
+        };
+        let last_used = preferences
+            .iter()
+            .map(|preference| preference.last_used)
+            .max()
+            .map_or(last_used, |latest| last_used.max(latest.saturating_add(1)));
+        update_history_preference(&mut preferences, reading, surface, last_used);
+        trim_history_preferences(&mut preferences);
+        let proposed = serialize_history_preferences(&preferences);
+        if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "history preferences changed while saving",
     ))
 }
 
@@ -769,8 +1079,8 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_HISTORY_HEADER, HISTORY_HEADER, USER_DICTIONARY_HEADER, UserData,
-        atomic_replace_if_unchanged,
+        CONTEXT_HISTORY_HEADER, HISTORY_FILE, HISTORY_HEADER, HISTORY_PREFERENCES_FILE,
+        HISTORY_PREFERENCES_HEADER, USER_DICTIONARY_HEADER, UserData, atomic_replace_if_unchanged,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1033,6 +1343,84 @@ mod tests {
     }
 
     #[test]
+    fn repeated_alternative_switches_preference_without_unlocking_completion() {
+        let directory = test_directory("confirmed-preference");
+        fs::write(
+            directory.join(HISTORY_FILE),
+            format!("{HISTORY_HEADER}\nかんじ\t漢字\t100\t10\n"),
+        )
+        .unwrap();
+        let mut data = UserData::load(&directory);
+
+        data.record("かんじ", "感じ");
+        assert_eq!(data.exact_history_surfaces("かんじ"), ["漢字", "感じ"]);
+        assert_eq!(data.completion_surfaces("か", 5), ["漢字"]);
+        let frozen = fs::read_to_string(directory.join(HISTORY_PREFERENCES_FILE)).unwrap();
+        assert!(frozen.contains("かんじ\t漢字\t"));
+
+        data.record("かんじ", "感じ");
+        assert_eq!(data.exact_history_surfaces("かんじ"), ["感じ", "漢字"]);
+        assert_eq!(
+            data.completion_surfaces("か", 5),
+            ["漢字"],
+            "two confirmations must not bypass the five-use completion gate"
+        );
+
+        let reloaded = UserData::load(&directory);
+        assert_eq!(reloaded.exact_history_surfaces("かんじ"), ["感じ", "漢字"]);
+        let confirmed = fs::read_to_string(directory.join(HISTORY_PREFERENCES_FILE)).unwrap();
+        assert!(confirmed.contains("かんじ\t感じ\t"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn one_off_selection_does_not_revert_a_confirmed_preference() {
+        let directory = test_directory("confirmed-preference-revert");
+        fs::write(
+            directory.join(HISTORY_FILE),
+            format!("{HISTORY_HEADER}\nかんじ\t漢字\t100\t10\nかんじ\t感じ\t2\t20\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join(HISTORY_PREFERENCES_FILE),
+            format!("{HISTORY_PREFERENCES_HEADER}\nかんじ\t感じ\t20\n"),
+        )
+        .unwrap();
+        let mut data = UserData::load(&directory);
+
+        data.record("かんじ", "漢字");
+        assert_eq!(data.exact_history_surfaces("かんじ"), ["感じ", "漢字"]);
+        data.record("かんじ", "漢字");
+        assert_eq!(data.exact_history_surfaces("かんじ"), ["漢字", "感じ"]);
+
+        let reloaded = UserData::load(&directory);
+        assert_eq!(reloaded.exact_history_surfaces("かんじ"), ["漢字", "感じ"]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_history_preference_is_ignored() {
+        let directory = test_directory("stale-preference");
+        fs::write(
+            directory.join(HISTORY_FILE),
+            format!("{HISTORY_HEADER}\nかんじ\t漢字\t5\t10\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join(HISTORY_PREFERENCES_FILE),
+            format!("{HISTORY_PREFERENCES_HEADER}\nかんじ\t感じ\t20\n"),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        assert_eq!(data.exact_history_surfaces("かんじ"), ["漢字"]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn promoting_completion_updates_full_reading_and_persists_ranking() {
         let directory = test_directory("promote-completion");
         fs::write(
@@ -1168,6 +1556,27 @@ mod tests {
             fs::read_to_string(directory.join("history.tsv"))
                 .unwrap()
                 .contains("にほん\t日本\t1\t")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_history_preferences_are_preserved() {
+        let directory = test_directory("malformed-preferences");
+        let path = directory.join(HISTORY_PREFERENCES_FILE);
+        let malformed = b"not valid history preferences\n";
+        fs::write(&path, malformed).unwrap();
+        let mut data = UserData::load(&directory);
+
+        for _ in 0..2 {
+            data.record("かんじ", "漢字");
+        }
+
+        assert_eq!(fs::read(path).unwrap(), malformed);
+        assert!(
+            fs::read_to_string(directory.join(HISTORY_FILE))
+                .unwrap()
+                .contains("かんじ\t漢字\t2\t")
         );
         fs::remove_dir_all(directory).unwrap();
     }

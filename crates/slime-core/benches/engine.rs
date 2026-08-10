@@ -452,6 +452,37 @@ fn run_history_benchmarks(iterations: u64) {
         );
     }
 
+    let mut preferences = String::from("# slime-history-preferences-v1\n");
+    for index in 0..498 {
+        writeln!(preferences, "れきし{index}\t履歴{index}\t{index}")
+            .expect("write history preference benchmark row");
+    }
+    preferences.push_str("ほげ0\t補助0\t1000\nほげ1\t補助1\t1001\n");
+    fs::write(directory.join("history_preferences.tsv"), preferences)
+        .expect("write history preferences benchmark fixture");
+    let mut preferences_engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+    black_box(preferences_engine.set_preferences(EnginePreferences {
+        live_conversion: false,
+        history_completion: true,
+        history_learning: false,
+        dictionary_packs: 0,
+        private_mode: false,
+        date_format_mask: ALL_DATE_FORMATS,
+    }));
+    preferences_engine.set_external_context("彼らは更に自らの救命胴衣を他の兵士に", "た。");
+    assert_eq!(
+        preferences_engine
+            .conversion_candidates("わたし")
+            .first()
+            .map(String::as_str),
+        Some("渡し")
+    );
+    run(
+        "engine/contextual_conversion_history_on_500_entries_500_preferences",
+        iterations,
+        || query_and_clear(&mut preferences_engine, "watashi"),
+    );
+
     fs::remove_dir_all(directory).expect("remove history benchmark directory");
 }
 

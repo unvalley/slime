@@ -606,6 +606,8 @@ fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'st
             Some("カ国")
         }
         "だい" => structured_dai_surface(left_context),
+        "ひき" if trailing_counter_integer(left_context) => Some("匹"),
+        "つい" if trailing_counter_integer(left_context) => Some("対"),
         "げん" if trailing_percentage(left_context) => Some("減"),
         "ぞう" if trailing_percentage(left_context) => Some("増"),
         _ => None,
@@ -621,6 +623,14 @@ fn structured_dai_surface(left_context: &str) -> Option<&'static str> {
     } else {
         Some("台")
     }
+}
+
+fn trailing_counter_integer(left_context: &str) -> bool {
+    trailing_integer(left_context).is_some()
+        || left_context
+            .chars()
+            .next_back()
+            .is_some_and(is_japanese_numeric_character)
 }
 
 fn trailing_percentage(left_context: &str) -> bool {
@@ -4746,6 +4756,35 @@ mod tests {
         assert_eq!(
             dictionary.candidates_with_context("ぞう", "五％")[0].surface,
             "増"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ひき", "42")[0].surface,
+            "匹"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ひき", "四十二")[0].surface,
+            "匹"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ひき", "４２")[0].surface,
+            "匹"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("つい", "4")[0].surface,
+            "対"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("つい", "四")[0].surface,
+            "対"
+        );
+        assert_ne!(dictionary.candidates("ひき")[0].surface, "匹");
+        assert_ne!(
+            dictionary.candidates_with_context("ひき", "1.5")[0].surface,
+            "匹"
+        );
+        assert_ne!(
+            dictionary.candidates_with_context("つい", "-4")[0].surface,
+            "対"
         );
         assert_ne!(
             dictionary.candidates_with_context("げん", "-3%")[0].surface,

@@ -188,6 +188,12 @@ ASCII・全角の`%`直前が有効な整数、小数、全角数字、漢数字
 
 GSD trainの`0.5%減`を`源 → 減`へ1件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Release測定の中央値差は一致経路+0.802 µs、非一致経路+0.153 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 整数直後の「匹・対」
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)にならい、ASCII・全角・漢数字の整数直後だけ`ひき → 匹`、`つい → 対`を優先する。小数、負数、単独変換は従来順位を保ち、意味や表記方針が必要な`回・階`、`席・隻`、月数表記は対象外とする。
+
+GSD trainの`42匹`と`4対`を2件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Release測定の中央値差は一致経路-0.419 µs（測定誤差内）、非一致経路+0.094 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

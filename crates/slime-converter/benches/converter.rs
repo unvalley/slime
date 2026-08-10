@@ -14,6 +14,7 @@ fn main() {
     });
     run_document_context_benchmark(&dictionary, iterations);
     run_ordinal_generation_benchmark(&dictionary, iterations);
+    run_unambiguous_counter_benchmark(&dictionary, iterations);
     run_percentage_change_benchmark(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_noun_prefix_right_phrase_benchmark(&dictionary, iterations);
@@ -256,6 +257,19 @@ fn run_percentage_change_benchmark(dictionary: &Dictionary, iterations: u64) {
     );
     run("converter/percentage_change_nonmatch", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("げん"), black_box("-3%")));
+    });
+}
+
+fn run_unambiguous_counter_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/unambiguous_counter_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_context(black_box("ひき"), black_box("42")));
+        },
+    );
+    run("converter/unambiguous_counter_nonmatch", iterations, || {
+        black_box(dictionary.candidates_with_context(black_box("ひき"), black_box("1.5")));
     });
 }
 

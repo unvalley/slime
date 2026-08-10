@@ -352,6 +352,21 @@ Apple M3、Release、50,000回、warmup 1,000回を旧新交互に5組測定し�
 
 変化したのはGSD trainの`0.5%減`だけで、`源 → 減`へ修正した。artifactは増えない。Apple M3、Release、5,000回、warmup 1,000回を旧新の順序も反転して10組測定した中央値は、一致経路が41.036→41.838 µs/op（+0.802 µs）、負数による非一致経路が38.611→38.764 µs/op（+0.153 µs）だった。
 
+#### 整数直後の「匹・対」
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)と同様、数値を一般語とは別の構造として扱う。ASCII・全角・漢数字の整数直後だけ、`ひき`を`匹`、`つい`を`対`へ寄せる。小数、負数、単独変換には適用しない。`回・階`、`席・隻`、`か月・カ月・ヶ月`のように意味または表記方針が必要な助数表現は、数値だけでは決めない。
+
+| dataset | 変更前 acc@1 / MRR@10 | 匹・対対応後 acc@1 / MRR@10 | 候補配列の変化 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7149 / 0.8093 | **0.7160 / 0.8098** | 2件 | 2 / 0 |
+| GSD dev (331) | 0.8671 / 0.9104 | 0.8671 / 0.9104 | 0件 | 0 / 0 |
+| GSD test (323) | 0.8854 / 0.9246 | 0.8854 / 0.9246 | 0件 | 0 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 0件 | 0 / 0 |
+
+GSD trainの`42匹`を`引き → 匹`、`4対`を`付い → 対`へ修正した。他5データセットは候補表層、cost、順序まで完全一致し、artifactは増えない。Apple M3、Release、5,000回、warmup 1,000回を旧新の順序も反転して10組測定した中央値は、一致経路が96.676→96.257 µs/op（-0.419 µs、測定誤差内）、小数による非一致経路が97.795→97.889 µs/op（+0.094 µs）だった。
+
 #### 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)は数値表記を通常語とは別の入力支援として扱う。[azooKey](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)も桁区切り、日時、時刻などを独立したSpecial Conversionとして実装する。Slimeでも一般の`たい`候補costを変えず、左末尾と右先頭がともに整数である`1｜たい｜1`型だけを構造化表記として扱う。

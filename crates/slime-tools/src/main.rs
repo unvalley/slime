@@ -862,6 +862,7 @@ struct EvaluationReport {
     min_cer_at_1: f64,
     min_cer_at_k: f64,
     latency_ms: LatencyReport,
+    top1_failures: Vec<Failure>,
     failures: Vec<Failure>,
 }
 
@@ -1614,6 +1615,7 @@ fn compute_report(
     let mut min_cer_at_1 = 0.0;
     let mut min_cer_at_k = 0.0;
     let mut latencies = Vec::with_capacity(outcomes.len());
+    let mut top1_failures = Vec::new();
     let mut failures = Vec::new();
 
     for (outcome_index, outcome) in outcomes.iter().enumerate() {
@@ -1676,6 +1678,15 @@ fn compute_report(
             .reduce(f64::min)
             .unwrap_or(1.0);
 
+        if rank != Some(0) && top1_failures.len() < options.failures {
+            top1_failures.push(Failure {
+                index: item.index.clone(),
+                context_text: item.context_text.clone(),
+                input: item.input.clone(),
+                expected_output: item.expected_output.clone(),
+                candidates: candidates.clone(),
+            });
+        }
         if rank.is_none() && failures.len() < options.failures {
             failures.push(Failure {
                 index: item.index.clone(),
@@ -1744,6 +1755,7 @@ fn compute_report(
         min_cer_at_1: min_cer_at_1 / total,
         min_cer_at_k: min_cer_at_k / total,
         latency_ms: latency_report(latencies),
+        top1_failures,
         failures,
     }
 }
@@ -1879,6 +1891,15 @@ fn print_report(report: &EvaluationReport) {
         "latency ms: p50={:.3} p95={:.3} p99={:.3} max={:.3}",
         report.latency_ms.p50, report.latency_ms.p95, report.latency_ms.p99, report.latency_ms.max
     );
+    if !report.top1_failures.is_empty() {
+        println!("top-1 failures (first {}):", report.top1_failures.len());
+        for failure in &report.top1_failures {
+            println!(
+                "  {} input={} expected={:?} candidates={:?}",
+                failure.index, failure.input, failure.expected_output, failure.candidates
+            );
+        }
+    }
     if !report.failures.is_empty() {
         println!("failures (first {}):", report.failures.len());
         for failure in &report.failures {
@@ -2010,11 +2031,11 @@ fn u64_to_f64(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextFilter, DatasetFormat, NeuralScoreMode, Options, base_cost_gap,
-        character_error_rate, katakana_to_hiragana, load_annotated_items, mean_logliks,
-        neural_candidate_cost_gap, neural_candidate_limit, neural_candidate_prefix_len,
-        normalize_for_evaluation, parse_anthy_line, percentile, rescored_surfaces,
-        should_score_neurally,
+        AjimeeItem, ContextFilter, DatasetFormat, ItemOutcome, NeuralScoreMode, Options,
+        base_cost_gap, character_error_rate, compute_report, katakana_to_hiragana,
+        load_annotated_items, mean_logliks, neural_candidate_cost_gap, neural_candidate_limit,
+        neural_candidate_prefix_len, normalize_for_evaluation, parse_anthy_line, percentile,
+        rescored_surfaces, should_score_neurally,
     };
     use slime_converter::Candidate;
     use std::fs;
@@ -2281,6 +2302,45 @@ mod tests {
             rescored_surfaces(&candidates, &logliks, 0.8, 1.0),
             ["第一", "第二"]
         );
+    }
+
+    #[test]
+    fn report_separates_top1_ranking_errors_from_missing_candidates() {
+        let item = AjimeeItem {
+            source_split: None,
+            index: "ranking-error".to_owned(),
+            context_text: "文脈".to_owned(),
+            right_context_text: String::new(),
+            input: "セイカイ".to_owned(),
+            expected_output: vec!["正解".to_owned()],
+        };
+        let outcome = ItemOutcome {
+            item: &item,
+            candidates: vec![
+                Candidate {
+                    surface: "誤り".to_owned(),
+                    cost: 1_000,
+                },
+                Candidate {
+                    surface: "正解".to_owned(),
+                    cost: 1_100,
+                },
+            ],
+            latency: Duration::ZERO,
+        };
+        let options = Options::parse(
+            ["ajimee", "items.json", "--failures", "10"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+
+        let report = compute_report(&[outcome], None, None, None, &options, None);
+
+        assert_eq!(report.top1_failures.len(), 1);
+        assert!(report.failures.is_empty());
+        assert_close(report.accuracy_at_1, 0.0);
+        assert_close(report.accuracy_at_k, 1.0);
     }
 
     #[test]

@@ -137,8 +137,9 @@ void slime_destroy(SlimeHandle *handle);
 uint32_t slime_enable_neural_rescoring(SlimeHandle *handle,
                                        const uint8_t *model_path,
                                        size_t model_path_len);
-/* Selects interpolation settings measured for the model class. Balanced keeps
-   the xsmall settings; high-accuracy is frozen for zenz-v3.2-small. */
+/* Selects interpolation and override-margin settings measured for the model
+   class. Balanced keeps the xsmall settings; high-accuracy is frozen for
+   zenz-v3.2-small. */
 uint32_t slime_enable_neural_rescoring_with_profile(
     SlimeHandle *handle, const uint8_t *model_path, size_t model_path_len,
     uint32_t profile);

@@ -673,19 +673,21 @@ Q4は5コーパス合計でQ5より9件top-1を落とし、独立domainのPUDで
 
 [azooKey Desktop](https://github.com/azooKey/azooKey-Desktop)がsmallモデルを製品資源として使い、v0.1.4でzenz-v3.2へ更新したことを踏まえ、[zenz-v3.2-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)を現行xsmallと比較した。公式配布commit `c67e03e07d215c869f591b274c1631170d3e11fe`はApache-2.0を宣言し、Q5_K_Mを95.1M parameter、73.9 MBと表示している。source SHA-256は`29c223d4c23327b80fd13ebb5ab2555057a46317997d5da391584ffbef0db673`、pre-tokenizer metadata修正後は`b660082fcbe8e538c4ccc1044f79c2c881364a25f8c9277a8b8f1dcf680e5b84`である。
 
-xsmallの製品profile（lambda 0.7、右文脈margin 0.1）に対し、smallはJWTD/GSD devだけでlambda 0.8を固定した。右文脈marginはGSD devで0 / 0.1 / 0.25 / 0.5 / 1を比較し、top-1同率内でMinCERが最良だった0.5を固定した。候補探索幅、base cost gate、短文5候補、9文字以上16候補、候補cost窓、EOS除外は同一である。
+xsmallの製品profile（lambda 0.7、右文脈なしmargin 0、右文脈あり0.1）に対し、smallはJWTD/GSD devだけでlambda 0.8を固定した。候補overrideのmarginはGSD devで0 / 0.1 / 0.25 / 0.5 / 1を比較し、top-1同率内でMinCERが最良だった0.5を固定した。smallでは右文脈の有無にかかわらず0.5を適用する。候補探索幅、base cost gate、短文5候補、9文字以上16候補、候補cost窓、EOS除外は同一である。
 
 | dataset | xsmall acc@1 / MRR | small acc@1 / MRR | top-1差 | small p95 |
 | --- | ---: | ---: | ---: | ---: |
 | JWTD dev 400件 | 0.4550 / 0.5574 | **0.5100 / 0.5922** | +22件 | 63.7 ms |
-| GSD dev 331件 | 0.8701 / 0.9162 | **0.8943 / 0.9260** | +8件 | 15.1 ms |
+| GSD dev 331件 | 0.8761 / 0.9198 | **0.8943 / 0.9260** | +6件 | 15.1 ms |
 | AJIMEE 200件 | 0.7300 / 0.7804 | **0.8000 / 0.8223** | +14件 | 90.1 ms |
-| GSD test 323件 | 0.8854 / 0.9241 | **0.9009 / 0.9310** | +5件 | 15.5 ms |
+| GSD test 323件 | 0.8854 / 0.9246 | **0.9009 / 0.9310** | +5件 | 15.5 ms |
 | PUD 446件 | 0.7444 / 0.7951 | **0.7668 / 0.8091** | +10件 | 23.2 ms |
 
 smallは調整に使わなかった3 held-outを含む全domainでtop-1とMRRを改善した。固定候補集合なのでacc@16は変わらない。修正後モデルは73,871,904 bytesで、xsmallの20,970,272 bytesより52,901,632 bytes大きい。AJIMEEのp95も約42 msから90 msへ増えるため、軽量profileを置換せず、精度優先の明示的な`high-accuracy` profileとして採用する。
 
-製品FFIは既存の`balanced`（0.7 / 0.1）をABI互換で維持し、`high-accuracy`（0.8 / 0.5）を明示選択できる。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
+製品経路の右文脈なしmarginを従来の一律0のままにした場合、GSD testは289/323（0.8947）だった。devで固定した0.5をhigh-accuracyへ適用すると、`住み`、`淳介`、`見積もり`、`主神`の4件を保護し、`感心`、`連隊`の2件が悪化して291/323（0.9009）となる。JWTD、AJIMEE、GSD devのtop-1は0と0.5で同率、右文脈を持つPUDは従来どおり0.5である。したがってABI互換の`balanced`は右文脈なし0を維持し、`high-accuracy`だけ0.5を全入力へ適用する。
+
+製品FFIは既存の`balanced`（lambda 0.7 / margin 0・0.1）をABI互換で維持し、`high-accuracy`（lambda 0.8 / margin 0.5・0.5）を明示選択できる。marginは右文脈なし・ありの順である。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
 
 v3.1のShareAlike問題はこのv3.2-small artifactには当てはまらない。一方、公式model cardはlicense metadata以外が空で、学習元の説明はない。Apache-2.0表示だけから第三者権利まで断定せず、実際の有償配布前には由来確認と法務レビューを残す。
 

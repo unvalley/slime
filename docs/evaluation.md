@@ -722,7 +722,7 @@ v3.1のShareAlike問題はこのv3.2-small artifactには当てはまらない�
 
 [azooKeyKanaKanjiConverterの現行`ZenzCandidateEvaluator`](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift#L286-L311)は、候補tokenがモデルの最尤tokenと食い違った最初の位置で`fixRequired(prefixConstraint:)`を返し、固定N-bestの外側を再探索する。Slimeでも同じ信号を評価した。候補ごとの全文尤度は従来どおり一度のdecodeで計算し、明示的な`high-accuracy` profileだけ、trie nodeごとの最尤tokenと最初の不一致prefixを追加取得する。復号不能な特殊tokenはその候補の診断だけを捨て、既存の尤度scoreを失敗させない。
 
-無制限にprefix制約を採用すると、モデルが局所的に好む表記へ長文の後半まで書き換える誤発火があった。このためJWTD devだけで、prefix 4文字以上、代替tokenとのlogit差2.0以上、制約付きlattice最大8件、元候補と同じ文字数、変更は連続2文字以内に固定した。ASCII英数字を含む変更は禁止する。これによりPUDで観測した`紀元前511 → 紀元前後11`を構造的に除外する。制約候補は元のニューラルwinnerを削除せず、その直前へ挿入する。`balanced`、履歴、ユーザー辞書、規則、入力ミス訂正の保護境界は変更しない。
+無制限にprefix制約を採用すると、モデルが局所的に好む表記へ長文の後半まで書き換える誤発火があった。このためJWTD devだけで、prefix 4文字以上、代替tokenとのlogit差2.0以上、制約付きlattice最大8件、元候補と同じ文字数、変更は連続2文字以内に当初固定した。ASCII英数字を含む変更は禁止する。これによりPUDで観測した`紀元前511 → 紀元前後11`を構造的に除外する。制約候補は元のニューラルwinnerを削除せず、その直前へ挿入する。`balanced`、履歴、ユーザー辞書、規則、入力ミス訂正の保護境界は変更しない。後述の再評価後、保持データ非回帰を確認してlogit差だけ1.5へ更新した。
 
 `neural_prefix_probe`で製品と同じhigh-accuracy候補数、cost窓、lambda、minimum marginを再現した。JWTDで閾値を固定した後、AJIMEE、PUD、GSDへ同じ条件を適用した。
 
@@ -765,6 +765,12 @@ azooKeyのZenz評価は候補とmodelの不一致をprefix制約へ変換し、�
 | GSD test 323件 | 300 | 300 | 0 / 0 |
 
 JWTDでは`推力偏光ノズル → 推力偏向ノズル`を追加で回収した。3回目のレビューは全5 datasetでtop-1を追加改善しなかったため、製品上限は初回を含む2回とする。2回目が発火したJWTD項目の追加model処理はReleaseでp50 49.5 ms / p95 56.9 msだった。全入力へ常時追加せず、初回の強いprefix信号と安全な格子候補が揃った場合だけ精度優先`high-accuracy` profileで実行する。
+
+### 2026-08-11 prefix確信差の再評価
+
+局所修正と1回再レビューを組み合わせた状態で、代替tokenの最小logit差をJWTD devだけで2.0から1.5へ下げた。安全条件、候補数、候補cost窓、ニューラル順位付けは変更しない。JWTDでは制約対象が24件から33件、実際の局所修正が8件から12件へ増え、top-1は224件から225件へ改善した。追加で`シリアスな間 → シリアスな曲`と`信託 → 神託`を回収し、`不 → ふ`を1件悪化させたため差し引き1件の改善である。
+
+閾値を1.5に固定した後、AJIMEEは168 / 200、PUDは346 / 446、GSD devは301 / 331、GSD testは300 / 323を維持し、各datasetのexact悪化数も増えなかった。1.5未満へは広げず、prefix 4文字以上、連続2文字以内、同じ文字数、ASCII英数字不変という構造的な安全条件を維持する。
 
 ### 2026-07-25 コスト上書きハックの除去とスコア尺度の一貫化
 

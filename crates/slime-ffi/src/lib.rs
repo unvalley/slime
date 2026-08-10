@@ -136,7 +136,7 @@ const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
 #[cfg(feature = "neural")]
 const PREFIX_CORRECTION_MIN_CHARACTERS: usize = 4;
 #[cfg(feature = "neural")]
-const PREFIX_CORRECTION_MIN_LOGIT_MARGIN: f32 = 2.0;
+const PREFIX_CORRECTION_MIN_LOGIT_MARGIN: f32 = 1.5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NeuralProfileParameters {
@@ -1752,6 +1752,31 @@ mod tests {
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, true), 0.5);
         assert_eq!(super::neural_profile_parameters(u32::MAX), None);
+    }
+
+    #[cfg(feature = "neural")]
+    #[test]
+    fn prefix_constraint_uses_frozen_length_and_margin() {
+        let mut diagnostic = slime_neural::PrefixDiagnostic {
+            prefix: "少額の紛".to_owned(),
+            candidate_token_index: 0,
+            candidate_logit: 0.0,
+            alternative_logit: 1.5,
+            alternative_is_eos: false,
+        };
+        assert_eq!(
+            super::prefix_constraint(&diagnostic).as_deref(),
+            Some("少額の紛")
+        );
+
+        diagnostic.alternative_logit = 1.499;
+        assert_eq!(super::prefix_constraint(&diagnostic), None);
+        diagnostic.alternative_logit = 1.5;
+        diagnostic.prefix = "少額の".to_owned();
+        assert_eq!(super::prefix_constraint(&diagnostic), None);
+        diagnostic.prefix = "少額の紛".to_owned();
+        diagnostic.alternative_is_eos = true;
+        assert_eq!(super::prefix_constraint(&diagnostic), None);
     }
 
     #[test]

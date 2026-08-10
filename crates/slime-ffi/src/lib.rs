@@ -131,9 +131,13 @@ pub type SlimeActionCallback = unsafe extern "C" fn(*mut c_void, *const SlimeAct
 pub type SlimeActionCallbackV2 = unsafe extern "C" fn(*mut c_void, *const SlimeActionViewV2);
 pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView);
 
+#[cfg(any(feature = "neural", test))]
+const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NeuralProfileParameters {
     candidate_weight: f64,
+    very_long_input_candidate_weight: f64,
     long_input_candidate_limit: usize,
     short_input_minimum_score_margin: f64,
     long_input_minimum_score_margin: f64,
@@ -143,6 +147,7 @@ struct NeuralProfileParameters {
 impl NeuralProfileParameters {
     const BALANCED: Self = Self {
         candidate_weight: 0.7,
+        very_long_input_candidate_weight: 0.7,
         long_input_candidate_limit: 16,
         short_input_minimum_score_margin: 0.0,
         long_input_minimum_score_margin: 0.0,
@@ -151,11 +156,21 @@ impl NeuralProfileParameters {
 
     const HIGH_ACCURACY: Self = Self {
         candidate_weight: 0.8,
+        very_long_input_candidate_weight: 0.74,
         long_input_candidate_limit: 32,
         short_input_minimum_score_margin: 0.5,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.5,
     };
+
+    #[cfg(any(feature = "neural", test))]
+    const fn candidate_weight_for(self, input_characters: usize, has_right_context: bool) -> f64 {
+        if !has_right_context && input_characters >= HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS {
+            self.very_long_input_candidate_weight
+        } else {
+            self.candidate_weight
+        }
+    }
 
     #[cfg(any(feature = "neural", test))]
     const fn minimum_score_margin(self, is_long_input: bool, has_right_context: bool) -> f64 {
@@ -619,9 +634,13 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let Some(service) = service.as_ref() else {
             return actions;
         };
+        let has_right_context = !request.right_context.is_empty();
         let minimum_margin = handle
             .neural_profile
-            .minimum_score_margin(request.is_long_input(), !request.right_context.is_empty());
+            .minimum_score_margin(request.is_long_input(), has_right_context);
+        let candidate_weight = handle
+            .neural_profile
+            .candidate_weight_for(request.reading.chars().count(), has_right_context);
         let score_request = slime_neural::ScoreRequest {
             context: request.context,
             right_context: request.right_context,
@@ -632,7 +651,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             && let Some(scored) = scored.first()
             && let Some(rescored_actions) = handle.engine.apply_candidate_rescore(
                 &scored.candidate_logliks,
-                handle.neural_profile.candidate_weight,
+                candidate_weight,
                 minimum_margin,
             )
         {
@@ -1619,6 +1638,9 @@ mod tests {
     fn neural_profiles_keep_measured_parameters_explicit() {
         let balanced = super::neural_profile_parameters(super::NEURAL_PROFILE_BALANCED).unwrap();
         assert_close(balanced.candidate_weight, 0.7);
+        assert_close(balanced.candidate_weight_for(19, false), 0.7);
+        assert_close(balanced.candidate_weight_for(20, false), 0.7);
+        assert_close(balanced.candidate_weight_for(20, true), 0.7);
         assert_eq!(balanced.long_input_candidate_limit, 16);
         assert_close(balanced.minimum_score_margin(false, false), 0.0);
         assert_close(balanced.minimum_score_margin(true, false), 0.0);
@@ -1628,6 +1650,9 @@ mod tests {
         let high_accuracy =
             super::neural_profile_parameters(super::NEURAL_PROFILE_HIGH_ACCURACY).unwrap();
         assert_close(high_accuracy.candidate_weight, 0.8);
+        assert_close(high_accuracy.candidate_weight_for(19, false), 0.8);
+        assert_close(high_accuracy.candidate_weight_for(20, false), 0.74);
+        assert_close(high_accuracy.candidate_weight_for(20, true), 0.8);
         assert_eq!(high_accuracy.long_input_candidate_limit, 32);
         assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);

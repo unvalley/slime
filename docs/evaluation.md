@@ -697,7 +697,13 @@ lambdaは0.8 / 0.825 / 0.85 / 0.875 / 0.9をJWTD/GSD devで比較した。0.875�
 
 32候補化後にもlambdaを再確認した。JWTD devでは0.9が0.8比で210件から211件へ改善したが、凍結後のAJIMEEは162件から161件へ悪化し、その1件は45文字の長文だった。短文だけ0.8を維持する入力長境界でも回避できないため、0.9は不採用とし0.8を維持する。
 
-製品FFIは既存の`balanced`（lambda 0.7 / 長文16候補 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（lambda 0.8 / 長文32候補 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。短文は両profileとも5候補、右文脈marginは入力長より優先し、KVセル数1024の上限は変更しない。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
+[azooKeyKanaKanjiConverterの候補評価](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/8e3a6eb89e088efd868aa28dadb74c697df4e6fb/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift)に近い診断として、候補tokenごとの`候補logit - 最大logit`を合計する方式と、最悪の1 tokenだけを使う方式もJWTD devで比較した。lambda 0.7では既存のEOS除外尤度 / token差合計 / 最悪tokenがacc@1 0.5300 / 0.5300 / 0.5300、MRR 0.6161 / 0.6160 / 0.6152だった。lambda 0.8では0.5250 / 0.5225 / 0.5225となり、既存方式を上回らないため製品コードへ残さない。
+
+既存のEOS除外尤度についてlambda 0.64〜0.80をJWTD devだけで再探索すると、0.74と0.75が214/400（0.5350）、MRR 0.6192で同率だったため、モデル依存を弱める0.74を仮固定した。GSD devは製品margin 0.5で0.74 / 0.75 / 0.8がすべて301/331（0.9094）だった。一律0.74はAJIMEEのtop-1とMRRを維持した一方、PUDを342件から341件へ1件悪化させたため不採用とした。
+
+変更したtop-1を入力長で分けると、JWTDの改善4件はすべて28文字以上、AJIMEEの改善1件は20文字以上で、AJIMEEの悪化1件は10文字だった。そこで右文脈なし・20文字以上だけ0.74、それ以外は0.8を維持する境界を固定した。20文字以上の部分集合はJWTD 295件で151件から155件、MRR 0.5994から0.6064、MinCER 0.0465から0.0462へ改善し、AJIMEE 108件で82件から83件、MRR 0.7813から0.7859、MinCER 0.0248から0.0245へ改善した。全体ではJWTDが210件から214件、AJIMEEが162件から163件となる。GSDは最大5文字、PUDは最大15文字で境界を通らず、右文脈ありも入力長にかかわらず0.8を維持するため、両held-outの順位は現行と同一である。
+
+製品FFIは既存の`balanced`（lambda 0.7 / 長文16候補 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（通常lambda 0.8、右文脈なし20文字以上だけ0.74 / 長文32候補 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。短文は両profileとも5候補、右文脈marginは入力長より優先し、KVセル数1024の上限は変更しない。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
 
 v3.1のShareAlike問題はこのv3.2-small artifactには当てはまらない。一方、公式model cardはlicense metadata以外が空で、学習元の説明はない。Apache-2.0表示だけから第三者権利まで断定せず、実際の有償配布前には由来確認と法務レビューを残す。
 

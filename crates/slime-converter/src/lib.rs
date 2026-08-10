@@ -837,6 +837,12 @@ fn surrounding_structured_notation(
     {
         return Some(("圏", DOCUMENT_STRUCTURED_NOTATION_PROMOTION));
     }
+    if reading == "き"
+        && right_context.starts_with("終了")
+        && trailing_ordinal_integer(left_context)
+    {
+        return Some(("期", DOCUMENT_STRUCTURED_NOTATION_PROMOTION));
+    }
     if reading == "し"
         && trailing_integer(left_context).is_some_and(|outs| outs <= 2)
         && BASE_STATE_PREFIXES
@@ -887,6 +893,10 @@ fn starts_with_score_integer(text: &str) -> bool {
         return false;
     }
     !matches!(characters.next(), Some('.' | '．'))
+}
+
+fn trailing_ordinal_integer(text: &str) -> bool {
+    strip_trailing_counter_integer(text).is_some_and(|prefix| prefix.ends_with('第'))
 }
 
 fn trailing_reach_measurement(text: &str) -> bool {
@@ -5168,6 +5178,8 @@ mod tests {
             DictionaryEntry::new("にち", "日", 2_500),
             DictionaryEntry::new("たい", "体", 0),
             DictionaryEntry::new("たい", "対", 2_500),
+            DictionaryEntry::new("き", "機", 0),
+            DictionaryEntry::new("き", "期", 2_500),
         ]);
 
         assert_eq!(
@@ -5194,6 +5206,14 @@ mod tests {
                 "対"
             );
         }
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("き", "第1", "終了後")[0].surface,
+            "期"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("き", "第1", "機能を示す")[0].surface,
+            "機"
+        );
         for (left_context, right_context) in [
             ("相手と", "1"),
             ("1", "人"),

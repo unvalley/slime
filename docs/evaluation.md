@@ -691,7 +691,11 @@ smallは調整に使わなかった3 held-outを含む全domainでtop-1とMRRを
 
 残る16 / 20 / 24 / 28 / 32候補をJWTD devで比較すると、top-1は204 / 206 / 206 / 208 / 210件、32候補のMRRは0.6140だったため、精度優先profileは32に固定した。同一条件のJWTD連続測定は16候補のp50 31.1 ms / p95 64.5 msから、32候補のp50 53.2 ms / p95 130.0 msへ増えた。凍結後のAJIMEEは160件から162件へ改善し、PUDはtop-1 342/446を維持してMRRが0.8091から0.8106へ改善した。GSD dev/testは全入力が9文字未満なので候補幅も結果も変わらない。
 
+32と64の間も見落とさないため40 / 48候補を追加測定した。JWTD devは211 / 212件まで改善したが、この測定帯のp95は32候補215.4 msに対して40候補272.1 ms、48候補342.6 msだった。最小の追加改善を得る40候補を凍結してheld-outへ適用すると、AJIMEEは162/200のまま、PUDも342/446のままで、PUDのMRRは0.810595から0.810585へ僅かに悪化した。AJIMEEのp95も374.2 msまで増えたため、追加1件のdev改善に対して遅延と独立指標が見合わず、40 / 48候補は不採用とした。
+
 lambdaは0.8 / 0.825 / 0.85 / 0.875 / 0.9をJWTD/GSD devで比較した。0.875はJWTDで+2件、GSD devで+1件だったが、凍結後のGSD testで0.8比-1件、0.9は-2件だったため不採用とした。単一係数を強めず、held-out非退行の0.8を維持する。
+
+32候補化後にもlambdaを再確認した。JWTD devでは0.9が0.8比で210件から211件へ改善したが、凍結後のAJIMEEは162件から161件へ悪化し、その1件は45文字の長文だった。短文だけ0.8を維持する入力長境界でも回避できないため、0.9は不採用とし0.8を維持する。
 
 製品FFIは既存の`balanced`（lambda 0.7 / 長文16候補 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（lambda 0.8 / 長文32候補 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。短文は両profileとも5候補、右文脈marginは入力長より優先し、KVセル数1024の上限は変更しない。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
 

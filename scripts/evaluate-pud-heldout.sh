@@ -16,7 +16,15 @@ fi
 
 actual_sha256=$(shasum -a 256 "$data_file" | awk '{print $1}')
 
-cargo run --release --quiet -p slime-tools --bin slime-evaluate -- \
+features=()
+for argument in "$@"; do
+  if [[ "$argument" == "--neural-model" || "$argument" == "--discriminative-teacher-model" ]]; then
+    features=(--features neural)
+  fi
+done
+
+# ${features[@]+...} keeps the empty array safe under macOS bash 3.2's set -u.
+cargo run --release --quiet -p slime-tools ${features[@]+"${features[@]}"} --bin slime-evaluate -- \
   ajimee --input "$data_file" \
   --dataset-name "UD Japanese PUD news/wiki independent held-out" \
   --dataset-revision "$revision" --dataset-sha256 "$actual_sha256" "$@"

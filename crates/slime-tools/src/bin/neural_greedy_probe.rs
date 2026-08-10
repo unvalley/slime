@@ -599,7 +599,29 @@ fn apply_prefix_correction(
         .into_iter()
         .next()?
         .surface;
-    bounded_local_substitution(current, &alternative, MAX_CHANGED_CHARACTERS).then_some(alternative)
+    (bounded_local_substitution(current, &alternative, MAX_CHANGED_CHARACTERS)
+        && preserves_kanji_from_hiragana_deconversion(current, &alternative))
+    .then_some(alternative)
+}
+
+fn preserves_kanji_from_hiragana_deconversion(current: &str, alternative: &str) -> bool {
+    current
+        .chars()
+        .zip(alternative.chars())
+        .all(|(current, alternative)| {
+            current == alternative || !is_kanji(current) || !is_hiragana(alternative)
+        })
+}
+
+fn is_kanji(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+fn is_hiragana(character: char) -> bool {
+    matches!(character, '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309F}')
 }
 
 fn apply_followup_prefix(

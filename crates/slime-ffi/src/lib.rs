@@ -2105,6 +2105,26 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_prefix_correction_preserves_kanji(handle: *mut super::SlimeHandle) {
+        // The first local correction fixes 使える to 仕える. A follow-up
+        // model preference for hiragana must not deconvert the final 不.
+        let mut capture = TypedCapture::default();
+        for character in "どのとききにおだのぶながにつかえることになったのかもふ".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("どの時期に織田信長に仕えることになったのかも不")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+        // SAFETY: The live handle is reset so this long fixture cannot become
+        // left context for the following independent conversion assertions.
+        assert_eq!(unsafe { slime_reset_context(handle) }, STATUS_OK);
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_generative_consensus(model: &str) {
         // Greedy generation agrees with an existing dictionary candidate, but
         // the cost/model interpolation narrowly keeps 制作 first. The bounded
@@ -2240,6 +2260,7 @@ mod tests {
         verify_neural_learning_strength(&model);
         verify_generative_consensus(&model);
         verify_context_contrast(handle);
+        verify_prefix_correction_preserves_kanji(handle);
         verify_prefix_correction(handle);
         verify_iterative_prefix_correction(handle);
         verify_generative_recall(handle);

@@ -820,7 +820,8 @@ impl SlimeEngine {
             current,
             &correction,
             PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
-        ) && !existing_candidates.contains(&correction))
+        ) && preserves_kanji_from_hiragana_deconversion(current, &correction)
+            && !existing_candidates.contains(&correction))
         .then_some(correction)
     }
 
@@ -2725,6 +2726,26 @@ fn bounded_local_substitution(current: &str, alternative: &str, maximum_changes:
         })
 }
 
+fn preserves_kanji_from_hiragana_deconversion(current: &str, alternative: &str) -> bool {
+    current
+        .chars()
+        .zip(alternative.chars())
+        .all(|(current, alternative)| {
+            current == alternative || !is_kanji(current) || !is_hiragana(alternative)
+        })
+}
+
+fn is_kanji(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+fn is_hiragana(character: char) -> bool {
+    matches!(character, '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309F}')
+}
+
 fn bounded_multi_region_substitution(current: &str, alternative: &str) -> bool {
     let current = current.chars().collect::<Vec<_>>();
     let alternative = alternative.chars().collect::<Vec<_>>();
@@ -2919,6 +2940,7 @@ mod tests {
         MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY,
         UserData, bounded_local_substitution, bundled_dictionary, candidate_rescore_order,
         candidate_rescore_order_for_state, date_time_candidates, katakana_candidate,
+        preserves_kanji_from_hiragana_deconversion,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
@@ -5545,6 +5567,19 @@ mod tests {
         assert!(bounded_local_substitution("奨学の問題", "少額の問題", 2));
         assert!(!bounded_local_substitution("紀元前511", "紀元前後11", 2));
         assert!(!bounded_local_substitution("abc版", "abd版", 2));
+    }
+
+    #[test]
+    fn local_correction_never_deconverts_kanji_to_hiragana() {
+        assert!(!preserves_kanji_from_hiragana_deconversion("不", "ふ"));
+        assert!(preserves_kanji_from_hiragana_deconversion(
+            "奨学の問題",
+            "少額の問題"
+        ));
+        assert!(preserves_kanji_from_hiragana_deconversion(
+            "セウ知る",
+            "セウシル"
+        ));
     }
 
     #[test]

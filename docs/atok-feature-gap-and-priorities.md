@@ -258,7 +258,7 @@ GSD devは1件改善・悪化0、GSD train・test、AJIMEE、JWTDは候補順を
 
 品質面では、BF16から直接生成したQ4_K_MはQ5_K_Mより4,430,368 bytes（21.13%）小さいが、製品条件でGSD dev 3件、GSD test 1件、PUD 5件のtop-1を落とした。AJIMEE/JWTDは同率でも複数domain非悪化を満たさないため不採用とする。現時点ではQ5を評価専用の任意モデルに留め、モデルをSlimeの標準bundleへ含めない。
 
-その後、[zenz-v3.2-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)の公式配布commitがApache-2.0を宣言していることを確認した。95.1M parameterのQ5_K_Mをsmall専用profileで評価すると、現行xsmallの製品条件比でJWTD dev +22件、GSD dev +6件、AJIMEE +14件、GSD test +5件、PUD +10件となり、5 datasetすべてのtop-1とMRRが改善した。high-accuracyではdevで固定した候補override margin 0.5を右文脈なしにも適用し、GSD testの製品条件を289/323から291/323へ改善する。詳細値とchecksumは[evaluation.md](evaluation.md)に記録する。
+その後、[zenz-v3.2-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)の公式配布commitがApache-2.0を宣言していることを確認した。95.1M parameterのQ5_K_Mをsmall専用profileで評価すると、現行xsmallの製品条件比でJWTD dev +22件、GSD dev +6件、AJIMEE +14件、GSD test +5件、PUD +10件となり、5 datasetすべてのtop-1とMRRが改善した。high-accuracyでは既存の9文字境界を信頼度にも使い、短文margin 0.5でGSD testを289/323から291/323へ改善しつつ、長文margin 0でJWTDの204/400を維持する。詳細値とchecksumは[evaluation.md](evaluation.md)に記録する。
 
 これにより、ShareAlikeを含むv3.1を商用同梱候補にする必要はなくなった。v3.2-smallは明示的な`high-accuracy` profileとして実装し、モデルを含まない通常buildと既存xsmall向け`balanced` profileは維持する。ただし公式model cardには学習元の説明がないため、Apache-2.0 metadataだけで第三者権利まで断定せず、有償配布前の由来確認と法務レビューは残す。
 

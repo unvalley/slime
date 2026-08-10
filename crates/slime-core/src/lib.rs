@@ -132,6 +132,14 @@ pub struct CandidateRescoreRequest {
     pub candidates: Vec<String>,
 }
 
+impl CandidateRescoreRequest {
+    /// Whether this request uses the engine's measured long-input rescore path.
+    #[must_use]
+    pub fn is_long_input(&self) -> bool {
+        self.reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Composing,
@@ -4077,6 +4085,7 @@ mod tests {
         assert_eq!(request.reading, "にほん");
         assert_eq!(request.context, "直前");
         assert_eq!(request.right_context, "直後");
+        assert!(!request.is_long_input());
         assert_eq!(request.candidates.len(), 3);
         let promoted = request.candidates[1].clone();
         let scores: Vec<_> = request
@@ -4132,6 +4141,7 @@ mod tests {
         let request = engine
             .candidate_rescore_request()
             .expect("ambiguous dictionary candidates should be scoreable");
+        assert!(!request.is_long_input());
         assert_eq!(
             request.candidates.len(),
             super::SHORT_RESCORE_CANDIDATE_LIMIT
@@ -4168,6 +4178,7 @@ mod tests {
         let request = engine
             .candidate_rescore_request()
             .expect("long ambiguous readings should expose the expanded pool");
+        assert!(request.is_long_input());
         assert_eq!(
             request.candidates,
             (0..super::LONG_RESCORE_CANDIDATE_LIMIT)

@@ -134,29 +134,34 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NeuralProfileParameters {
     candidate_weight: f64,
-    minimum_score_margin: f64,
+    short_input_minimum_score_margin: f64,
+    long_input_minimum_score_margin: f64,
     right_context_minimum_score_margin: f64,
 }
 
 impl NeuralProfileParameters {
     const BALANCED: Self = Self {
         candidate_weight: 0.7,
-        minimum_score_margin: 0.0,
+        short_input_minimum_score_margin: 0.0,
+        long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.1,
     };
 
     const HIGH_ACCURACY: Self = Self {
         candidate_weight: 0.8,
-        minimum_score_margin: 0.5,
+        short_input_minimum_score_margin: 0.5,
+        long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.5,
     };
 
     #[cfg(any(feature = "neural", test))]
-    const fn minimum_score_margin(self, has_right_context: bool) -> f64 {
+    const fn minimum_score_margin(self, is_long_input: bool, has_right_context: bool) -> f64 {
         if has_right_context {
             self.right_context_minimum_score_margin
+        } else if is_long_input {
+            self.long_input_minimum_score_margin
         } else {
-            self.minimum_score_margin
+            self.short_input_minimum_score_margin
         }
     }
 }
@@ -611,7 +616,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         };
         let minimum_margin = handle
             .neural_profile
-            .minimum_score_margin(!request.right_context.is_empty());
+            .minimum_score_margin(request.is_long_input(), !request.right_context.is_empty());
         let score_request = slime_neural::ScoreRequest {
             context: request.context,
             right_context: request.right_context,
@@ -1609,14 +1614,18 @@ mod tests {
     fn neural_profiles_keep_measured_parameters_explicit() {
         let balanced = super::neural_profile_parameters(super::NEURAL_PROFILE_BALANCED).unwrap();
         assert_close(balanced.candidate_weight, 0.7);
-        assert_close(balanced.minimum_score_margin(false), 0.0);
-        assert_close(balanced.minimum_score_margin(true), 0.1);
+        assert_close(balanced.minimum_score_margin(false, false), 0.0);
+        assert_close(balanced.minimum_score_margin(true, false), 0.0);
+        assert_close(balanced.minimum_score_margin(false, true), 0.1);
+        assert_close(balanced.minimum_score_margin(true, true), 0.1);
 
         let high_accuracy =
             super::neural_profile_parameters(super::NEURAL_PROFILE_HIGH_ACCURACY).unwrap();
         assert_close(high_accuracy.candidate_weight, 0.8);
-        assert_close(high_accuracy.minimum_score_margin(false), 0.5);
-        assert_close(high_accuracy.minimum_score_margin(true), 0.5);
+        assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
+        assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
+        assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
+        assert_close(high_accuracy.minimum_score_margin(true, true), 0.5);
         assert_eq!(super::neural_profile_parameters(u32::MAX), None);
     }
 

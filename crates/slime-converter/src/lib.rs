@@ -606,6 +606,8 @@ fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'st
             Some("カ国")
         }
         "だい" => structured_dai_surface(left_context),
+        "げん" if trailing_percentage(left_context) => Some("減"),
+        "ぞう" if trailing_percentage(left_context) => Some("増"),
         _ => None,
     }
 }
@@ -619,6 +621,30 @@ fn structured_dai_surface(left_context: &str) -> Option<&'static str> {
     } else {
         Some("台")
     }
+}
+
+fn trailing_percentage(left_context: &str) -> bool {
+    left_context
+        .strip_suffix('%')
+        .or_else(|| left_context.strip_suffix('％'))
+        .is_some_and(has_trailing_numeric_surface)
+}
+
+fn has_trailing_numeric_surface(text: &str) -> bool {
+    if let Some((prefix, _)) = split_trailing_decimal(text) {
+        return if let Some(integer_prefix) = prefix
+            .strip_suffix('.')
+            .or_else(|| prefix.strip_suffix('．'))
+        {
+            split_trailing_decimal(integer_prefix)
+                .is_some_and(|(prefix, _)| !matches!(prefix.chars().next_back(), Some('-' | '−')))
+        } else {
+            !matches!(prefix.chars().next_back(), Some('-' | '−'))
+        };
+    }
+    text.chars()
+        .next_back()
+        .is_some_and(is_japanese_numeric_character)
 }
 
 fn surrounding_structured_notation_surface(
@@ -4699,6 +4725,31 @@ mod tests {
         assert_eq!(
             dictionary.candidates_with_context("だい", "第1.5")[0].surface,
             "第"
+        );
+        assert_ne!(dictionary.candidates("げん")[0].surface, "減");
+        assert_eq!(
+            dictionary.candidates_with_context("げん", "0.5%")[0].surface,
+            "減"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("げん", "0.5％")[0].surface,
+            "減"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ぞう", "12%")[0].surface,
+            "増"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ぞう", "５％")[0].surface,
+            "増"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ぞう", "五％")[0].surface,
+            "増"
+        );
+        assert_ne!(
+            dictionary.candidates_with_context("げん", "-3%")[0].surface,
+            "減"
         );
     }
 

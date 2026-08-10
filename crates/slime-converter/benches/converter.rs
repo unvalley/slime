@@ -14,6 +14,7 @@ fn main() {
     });
     run_document_context_benchmark(&dictionary, iterations);
     run_ordinal_generation_benchmark(&dictionary, iterations);
+    run_percentage_change_benchmark(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_noun_prefix_right_phrase_benchmark(&dictionary, iterations);
     run("converter/segmented_phrase", iterations, || {
@@ -243,6 +244,19 @@ fn run_ordinal_generation_benchmark(dictionary: &Dictionary, iterations: u64) {
             black_box(dictionary.candidates_with_context(black_box("だい"), black_box("33")));
         },
     );
+}
+
+fn run_percentage_change_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/percentage_change_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_context(black_box("げん"), black_box("0.5%")));
+        },
+    );
+    run("converter/percentage_change_nonmatch", iterations, || {
+        black_box(dictionary.candidates_with_context(black_box("げん"), black_box("-3%")));
+    });
 }
 
 fn run_ideographic_suffix_context_benchmark(dictionary: &Dictionary, iterations: u64) {

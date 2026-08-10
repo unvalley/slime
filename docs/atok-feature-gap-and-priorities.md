@@ -182,6 +182,12 @@ GSD trainで`敵視して`を1件、診断済みのGSD testで`長居して`、`
 
 GSD trainの`第33代`を1件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Mozcの専用助数詞POSを数値へ一律接続する案は`1字 → 一時`と`一突き → 一月`を強めたため採用しなかった。Release測定の中央値差は序数経路+0.116 µs、通常の台数経路+0.126 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 割合直後の「増・減」
+
+ASCII・全角の`%`直前が有効な整数、小数、全角数字、漢数字の場合だけ、後続の`ぞう`を`増`、`げん`を`減`へ寄せる。候補生成とword costは変えず、負数や数字のない`%`は通常変換へ残す。
+
+GSD trainの`0.5%減`を`源 → 減`へ1件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Release測定の中央値差は一致経路+0.802 µs、非一致経路+0.153 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

@@ -141,6 +141,7 @@ struct DictionaryDocumentContextRanker<'a> {
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     strong_left_phrase_evidence: StrongLeftPhraseEvidence,
     right_function_word_costs: Vec<DocumentContextualCost<'a>>,
+    right_particle_costs: Vec<DocumentContextualCost<'a>>,
     right_grammar_costs: Vec<DocumentContextualCost<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
@@ -209,6 +210,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             strong_left_phrase_evidence,
             right_function_word_costs: dictionary
                 .document_right_function_word_costs(reading, right_context),
+            right_particle_costs: dictionary.document_right_particle_costs(reading, right_context),
             right_grammar_costs: dictionary.document_right_grammar_costs(reading, right_context),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
@@ -256,6 +258,26 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP
                     .saturating_sub(contextual.relative_cost)
                     .clamp(0, DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn right_particle_promotion(&self, conversion: &Conversion) -> i32 {
+        if !self.right_phrase_promotions.is_empty()
+            || self.strong_left_phrase_evidence == StrongLeftPhraseEvidence::Present
+        {
+            return 0;
+        }
+        self.right_particle_costs
+            .iter()
+            .filter(|contextual| {
+                conversion.segments.len() == 1 && contextual.surface == conversion.surface
+            })
+            .map(|contextual| {
+                DOCUMENT_RIGHT_PARTICLE_PROMOTION_CAP
+                    .saturating_sub(contextual.relative_cost)
+                    .clamp(0, DOCUMENT_RIGHT_PARTICLE_PROMOTION_CAP)
             })
             .max()
             .unwrap_or(0)
@@ -316,6 +338,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max()
             .unwrap_or(0);
         let right_function_word_promotion = self.right_function_word_promotion(conversion);
+        let right_particle_promotion = self.right_particle_promotion(conversion);
         let right_grammar_promotion = self.right_grammar_promotion(conversion);
         let notation_promotion =
             if structured_notation_matches(left_context, reading, &conversion.surface) {
@@ -394,7 +417,11 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         repeated_cost
             .saturating_add(boundary_adjustment)
             .saturating_sub(specialized_promotion)
-            .saturating_sub(right_phrase_promotion.max(right_function_word_promotion))
+            .saturating_sub(
+                right_phrase_promotion
+                    .max(right_function_word_promotion)
+                    .max(right_particle_promotion),
+            )
             .saturating_sub(right_inflection_promotion)
             .saturating_sub(right_auxiliary_promotion)
             .saturating_sub(right_grammar_promotion.max(unique_right_grammar_promotion))
@@ -578,6 +605,7 @@ const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 1_000;
 const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP: i32 = 1_100;
+const DOCUMENT_RIGHT_PARTICLE_PROMOTION_CAP: i32 = 1_600;
 const DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
@@ -671,6 +699,7 @@ fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'st
         "ひき" if trailing_counter_integer(left_context) => Some("匹"),
         "つい" if trailing_counter_integer(left_context) => Some("対"),
         "はい" if trailing_win_loss_record(left_context) => Some("敗"),
+        "せん" if trailing_fractional_yen(left_context) => Some("銭"),
         "げん" if trailing_percentage(left_context) => Some("減"),
         "ぞう" if trailing_percentage(left_context) => Some("増"),
         _ => None,
@@ -699,6 +728,17 @@ fn trailing_win_loss_record(left_context: &str) -> bool {
     prefix
         .strip_suffix('勝')
         .is_some_and(trailing_counter_integer)
+}
+
+fn trailing_fractional_yen(left_context: &str) -> bool {
+    let Some((prefix, fraction)) = split_trailing_decimal(left_context) else {
+        return false;
+    };
+    fraction <= 99
+        && prefix
+            .strip_suffix('円')
+            .and_then(trailing_numeric_surface)
+            .is_some()
 }
 
 fn strip_trailing_counter_integer(text: &str) -> Option<&str> {
@@ -2038,6 +2078,58 @@ impl Dictionary {
             return Vec::new();
         }
         let Some(right_left_ids) = document_right_function_word_left_ids(right_context) else {
+            return Vec::new();
+        };
+
+        let connection = ConnectionMatrix::bundled();
+        let mut costs = Vec::<DocumentContextualCost<'s>>::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading
+                || !entry
+                    .surface
+                    .chars()
+                    .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+            {
+                return;
+            }
+            let transition_cost = right_left_ids
+                .iter()
+                .map(|left_id| connection.cost(entry.right_id, *left_id))
+                .min()
+                .unwrap_or(i32::MAX);
+            if let Some(contextual) = costs
+                .iter_mut()
+                .find(|contextual| contextual.surface == entry.surface)
+            {
+                contextual.relative_cost = contextual.relative_cost.min(transition_cost);
+            } else {
+                costs.push(DocumentContextualCost {
+                    surface: entry.surface,
+                    relative_cost: transition_cost,
+                });
+            }
+        });
+        if let Some(minimum) = costs
+            .iter()
+            .map(|contextual| contextual.relative_cost)
+            .min()
+        {
+            for contextual in &mut costs {
+                contextual.relative_cost = contextual.relative_cost.saturating_sub(minimum);
+            }
+        }
+        costs
+    }
+
+    fn document_right_particle_costs<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Vec<DocumentContextualCost<'s>> {
+        if !self.uses_connection_costs {
+            return Vec::new();
+        }
+        let Some(right_left_ids) = document_right_particle_left_ids(right_context) else {
             return Vec::new();
         };
 
@@ -3715,6 +3807,22 @@ fn document_right_function_word_left_ids(right_context: &str) -> Option<&'static
     ])
 }
 
+fn document_right_particle_left_ids(right_context: &str) -> Option<&'static [u16]> {
+    // Keep this table narrower than the full particle inventory. Common forms
+    // such as の, が, and と also follow verbs and names often enough that a
+    // connection-only promotion can reverse otherwise correct homophones.
+    if starts_with_copula(right_context) || starts_with_de_connective_continuation(right_context) {
+        return None;
+    }
+    if right_context.starts_with("まで") {
+        return Some(&[314]);
+    }
+    match right_context.chars().next()? {
+        'で' => Some(&[168, 349, 370, 420]),
+        _ => None,
+    }
+}
+
 fn starts_with_suru_inflection(right_context: &str) -> bool {
     if right_context.starts_with("する") {
         return true;
@@ -5154,6 +5262,11 @@ mod tests {
                 .surface,
             "隻"
         );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("せん", "139円78", "で引けた")[0]
+                .surface,
+            "銭"
+        );
         assert_ne!(
             dictionary.candidates_with_surrounding_context("し", "さらに3", "一塁から")[0].surface,
             "死"
@@ -5293,6 +5406,40 @@ mod tests {
                 < surface_position(&with_function_word, "負う"),
             "the POS boundary may prefer verbs over nouns but must not reverse semantic peers"
         );
+    }
+
+    #[test]
+    fn surrounding_context_uses_pos_connections_before_bounded_particles() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            (
+                "おしゃれ",
+                "店内のインテリアはとっても",
+                "で雰囲気があります。",
+                "お洒落",
+            ),
+            ("じこ", "文総裁の長男と二男は", "で死亡した。", "事故"),
+            (
+                "らいか",
+                "再稼働する原発がなければ、",
+                "までに停止する。",
+                "来夏",
+            ),
+            (
+                "きせん",
+                "ロシア極東サハリンから",
+                "で国後島に到着した。",
+                "汽船",
+            ),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
     }
 
     #[test]

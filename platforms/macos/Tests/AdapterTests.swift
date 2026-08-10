@@ -872,6 +872,7 @@ enum AdapterTests {
                 InstalledDictionaryPack(
                     id: "sample-pro",
                     formatVersion: 2,
+                    candidateMode: "standard",
                     name: "サンプル Pro",
                     version: "2026.08.1",
                     license: "Proprietary",

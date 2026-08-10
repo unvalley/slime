@@ -144,6 +144,7 @@ struct DomainDictionaryWord: Decodable, Identifiable, Equatable {
 struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
     let id: String
     let formatVersion: Int?
+    let candidateMode: String?
     let name: String
     let version: String
     let license: String
@@ -156,6 +157,7 @@ struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
     init(
         id: String,
         formatVersion: Int? = nil,
+        candidateMode: String? = nil,
         name: String,
         version: String,
         license: String,
@@ -167,6 +169,7 @@ struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
     ) {
         self.id = id
         self.formatVersion = formatVersion
+        self.candidateMode = candidateMode
         self.name = name
         self.version = version
         self.license = license

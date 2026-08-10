@@ -1274,6 +1274,8 @@ pub unsafe extern "C" fn slime_installed_dictionary_packs(
             write_json_string(&mut output, &pack.id);
             write!(output, ",\"formatVersion\":{}", pack.format_version)
                 .expect("writing to String cannot fail");
+            output.push_str(",\"candidateMode\":");
+            write_json_string(&mut output, pack.candidate_mode.as_str());
             output.push_str(",\"name\":");
             write_json_string(&mut output, &pack.name);
             output.push_str(",\"version\":");
@@ -3269,6 +3271,7 @@ mod tests {
         let json = unsafe { copy_buffer(&catalog) };
         assert!(json.contains("\"id\":\"sample-general\""), "{json}");
         assert!(json.contains("\"formatVersion\":3"), "{json}");
+        assert!(json.contains("\"candidateMode\":\"standard\""), "{json}");
         assert!(
             json.contains("\"provenance\":\"fixture/generated/sample-general\""),
             "{json}"

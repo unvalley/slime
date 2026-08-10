@@ -19,7 +19,7 @@ use live_conversion::Decision as LiveConversionDecision;
 use session_history::SessionHistory;
 
 pub use dictionary_packs::{
-    DictionaryPackInfo, DictionaryPackLoadError, DictionaryPackTrust,
+    DictionaryPackCandidateMode, DictionaryPackInfo, DictionaryPackLoadError, DictionaryPackTrust,
     DictionaryPackVerificationKey, DictionaryPackVersionFloor, DictionaryPackWord,
     validate_dictionary_pack,
 };
@@ -52,6 +52,7 @@ const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
+const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
 const PREFIX_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
 const PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS: usize = 2;
 
@@ -122,10 +123,10 @@ pub struct CandidateDetail {
 
 /// Immutable input for an optional external candidate scorer.
 ///
-/// Only ordinary dictionary candidates are exposed here. Candidates promoted
-/// by the user dictionary, history, an installed context rule, or typo
-/// correction remain outside this request and cannot be displaced by an
-/// external model.
+/// Base dictionary candidates and model-rescore-only supplemental entries can
+/// be exposed here. Candidates promoted by the user dictionary, history, an
+/// installed context rule, or typo correction remain outside this request and
+/// cannot be displaced by an external model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateRescoreRequest {
     pub context: String,
@@ -209,6 +210,7 @@ struct CandidateCorrection {
 struct CandidateRescoreState {
     request: CandidateRescoreRequest,
     candidates: Vec<Candidate>,
+    model_supplemental: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -237,6 +239,7 @@ pub struct Snapshot {
 #[derive(Clone, Debug)]
 pub struct SlimeEngine {
     dictionary: Dictionary,
+    model_rescore_dictionary: Option<Dictionary>,
     romaji: RomajiComposer,
     reading: String,
     raw_input: String,
@@ -269,6 +272,7 @@ impl SlimeEngine {
     pub fn new(dictionary: Dictionary) -> Self {
         Self {
             dictionary,
+            model_rescore_dictionary: None,
             romaji: RomajiComposer::new(),
             reading: String::new(),
             raw_input: String::new(),
@@ -325,8 +329,10 @@ impl SlimeEngine {
     ) -> Self {
         let installed_packs =
             DictionaryPackStore::load_with_trust(user_data.directory(), &dictionary_pack_trust);
-        let dictionary = bundled_dictionary_with_packs(0, &user_data, &installed_packs);
+        let (dictionary, model_rescore_dictionary) =
+            bundled_dictionaries_with_packs(0, &user_data, &installed_packs);
         let mut engine = Self::with_user_data(dictionary, user_data);
+        engine.model_rescore_dictionary = model_rescore_dictionary;
         engine.installed_packs = installed_packs;
         engine.dictionary_pack_trust = dictionary_pack_trust;
         engine.uses_bundled_dictionary = true;
@@ -343,7 +349,7 @@ impl SlimeEngine {
         if self.uses_bundled_dictionary
             && self.preferences.dictionary_packs != preferences.dictionary_packs
         {
-            self.dictionary = bundled_dictionary_with_packs(
+            (self.dictionary, self.model_rescore_dictionary) = bundled_dictionaries_with_packs(
                 preferences.dictionary_packs,
                 &self.user_data,
                 &self.installed_packs,
@@ -366,7 +372,7 @@ impl SlimeEngine {
             &self.dictionary_pack_trust,
         );
         if self.uses_bundled_dictionary {
-            self.dictionary = bundled_dictionary_with_packs(
+            (self.dictionary, self.model_rescore_dictionary) = bundled_dictionaries_with_packs(
                 self.preferences.dictionary_packs,
                 &self.user_data,
                 &self.installed_packs,
@@ -426,12 +432,13 @@ impl SlimeEngine {
             .map(|state| state.request.clone())
     }
 
-    /// Widens the pending external-scoring pool for a long explicit reading.
+    /// Prepares the pending pool after an optional scorer becomes ready.
     ///
-    /// Interactive adapters call this only after their local scorer is ready.
-    /// The visible ten-candidate result remains untouched unless scoring
-    /// succeeds. A missing or not-yet-ready optional model cannot add latency,
-    /// and a scoring failure cannot partially publish the deeper result.
+    /// Long readings receive a wider bounded search. Short readings are
+    /// revisited only when a model-rescore-only dictionary pack is installed.
+    /// The visible result remains untouched unless scoring succeeds. A missing
+    /// or not-yet-ready optional model cannot add latency, and a scoring
+    /// failure cannot partially publish the prepared result.
     pub fn prepare_extended_candidate_rescore(&mut self) {
         self.prepare_extended_candidate_rescore_with_limit(
             DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES,
@@ -450,8 +457,8 @@ impl SlimeEngine {
         );
     }
 
-    /// Prepares a profile-selected long-reading pool with an optional
-    /// high-accuracy confidence override.
+    /// Prepares a profile-selected pool with an optional high-accuracy
+    /// confidence override and model-only supplemental vocabulary.
     ///
     /// The override applies only to long readings without right context. It
     /// never bypasses personalized, rule-based, typo-correction, or
@@ -463,37 +470,40 @@ impl SlimeEngine {
         confidence_bypass_candidates: usize,
         bypass_long_input_confidence: bool,
     ) {
+        let is_long_input = self.reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS;
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.selected != 0
-            || self.reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            || (!is_long_input && self.model_rescore_dictionary.is_none())
             || !self.candidate_corrections.is_empty()
         {
             return;
         }
         let reading = self.reading.clone();
-        let candidate_limit = requested_candidates.clamp(
-            LONG_RESCORE_CANDIDATE_LIMIT,
-            MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
-        );
-        if let Some(current) = self.candidate_rescore.as_ref() {
-            let context = current.request.context.clone();
-            let right_context = current.request.right_context.clone();
-            let dictionary_candidates = self.dictionary_candidates_for_context(
+        let candidate_limit = if is_long_input {
+            requested_candidates.clamp(
+                LONG_RESCORE_CANDIDATE_LIMIT,
+                MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
+            )
+        } else {
+            SHORT_RESCORE_CANDIDATE_LIMIT
+        };
+        if self.candidate_rescore.is_some() {
+            self.candidate_rescore = self.prepared_rescore_from_current(
                 &reading,
-                Some(candidate_limit),
-                (!context.is_empty()).then_some(context.as_str()),
-                &right_context,
-            );
-            self.candidate_rescore = candidate_rescore_state_with_limit(
-                &reading,
-                &context,
-                &right_context,
-                false,
-                &dictionary_candidates,
                 candidate_limit,
                 bypass_long_input_confidence,
             );
             return;
+        }
+        if self.model_rescore_dictionary.is_some() {
+            self.candidate_rescore = self.prepared_rescore_without_current(
+                &reading,
+                candidate_limit,
+                bypass_long_input_confidence,
+            );
+            if self.candidate_rescore.is_some() || !is_long_input {
+                return;
+            }
         }
         if !bypass_long_input_confidence
             || self
@@ -507,15 +517,84 @@ impl SlimeEngine {
             LONG_RESCORE_CANDIDATE_LIMIT,
             MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
         );
-        self.candidate_rescore = self
-            .conversion_candidate_set_for_reading_with_limit_and_context_policy(
-                &reading,
-                Some(confidence_bypass_limit),
+        self.candidate_rescore = self.prepared_rescore_without_current(
+            &reading,
+            confidence_bypass_limit,
+            bypass_long_input_confidence,
+        );
+    }
+
+    fn prepared_rescore_from_current(
+        &self,
+        reading: &str,
+        candidate_limit: usize,
+        bypass_long_input_confidence: bool,
+    ) -> Option<CandidateRescoreState> {
+        let current = self.candidate_rescore.as_ref()?;
+        let base_winner = current.candidates.first()?.clone();
+        let context = &current.request.context;
+        let right_context = &current.request.right_context;
+        let previous_surface = (!context.is_empty()).then_some(context.as_str());
+        let base_candidates = Self::dictionary_candidates_for_context_from(
+            &self.dictionary,
+            reading,
+            Some(candidate_limit),
+            previous_surface,
+            right_context,
+        );
+        let model_dictionary = self
+            .model_rescore_dictionary
+            .as_ref()
+            .unwrap_or(&self.dictionary);
+        let model_candidates = Self::dictionary_candidates_for_context_from(
+            model_dictionary,
+            reading,
+            Some(candidate_limit),
+            previous_surface,
+            right_context,
+        );
+        let state = candidate_rescore_state_with_limit(
+            reading,
+            context,
+            right_context,
+            false,
+            &model_candidates,
+            candidate_limit,
+            bypass_long_input_confidence,
+        )?;
+        anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)
+    }
+
+    fn prepared_rescore_without_current(
+        &self,
+        reading: &str,
+        candidate_limit: usize,
+        bypass_long_input_confidence: bool,
+    ) -> Option<CandidateRescoreState> {
+        let (previous_surface, right_context) = self.conversion_contexts(None);
+        let base_candidates = Self::dictionary_candidates_for_context_from(
+            &self.dictionary,
+            reading,
+            Some(candidate_limit),
+            previous_surface,
+            right_context,
+        );
+        let base_winner = base_candidates.first()?.clone();
+        let model_dictionary = self
+            .model_rescore_dictionary
+            .as_ref()
+            .unwrap_or(&self.dictionary);
+        let state = self
+            .conversion_candidate_set_for_reading_with_limit_and_context_policy_from(
+                model_dictionary,
+                reading,
+                Some(candidate_limit),
                 None,
                 bypass_long_input_confidence,
-                Some(confidence_bypass_limit),
+                Some(candidate_limit),
             )
-            .rescore;
+            .rescore?;
+        anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)
     }
 
     /// Applies model log-likelihoods to the pending dictionary-only request.
@@ -578,8 +657,13 @@ impl SlimeEngine {
         {
             return None;
         }
-        let (_, _, selected) =
-            candidate_rescore_order(&state.candidates, log_likelihoods, lambda, minimum_margin)?;
+        let (_, _, selected) = candidate_rescore_order(
+            &state.candidates,
+            &state.model_supplemental,
+            log_likelihoods,
+            lambda,
+            minimum_margin,
+        )?;
         let prefix = prefix_constraints[selected].as_deref()?;
         let current = &state.candidates[selected].surface;
         let correction = self.constrained_local_correction(
@@ -657,8 +741,13 @@ impl SlimeEngine {
             return None;
         }
 
-        let (order, margin_protects_base, selected) =
-            candidate_rescore_order(&state.candidates, log_likelihoods, lambda, minimum_margin)?;
+        let (order, margin_protects_base, selected) = candidate_rescore_order(
+            &state.candidates,
+            &state.model_supplemental,
+            log_likelihoods,
+            lambda,
+            minimum_margin,
+        )?;
 
         let mut pending_candidates = self.candidates.clone();
         let existing_positions: Vec<_> = state
@@ -1012,8 +1101,8 @@ impl SlimeEngine {
         .surfaces
     }
 
-    fn dictionary_candidates_for_context(
-        &self,
+    fn dictionary_candidates_for_context_from(
+        dictionary: &Dictionary,
         reading: &str,
         dictionary_limit: Option<usize>,
         previous_surface: Option<&str>,
@@ -1021,13 +1110,13 @@ impl SlimeEngine {
     ) -> Vec<Candidate> {
         if previous_surface.is_some() || !right_context.is_empty() {
             return match dictionary_limit {
-                Some(limit) => self.dictionary.candidates_with_surrounding_context_limit(
+                Some(limit) => dictionary.candidates_with_surrounding_context_limit(
                     reading,
                     previous_surface.unwrap_or_default(),
                     right_context,
                     limit,
                 ),
-                None => self.dictionary.candidates_with_surrounding_context(
+                None => dictionary.candidates_with_surrounding_context(
                     reading,
                     previous_surface.unwrap_or_default(),
                     right_context,
@@ -1035,8 +1124,8 @@ impl SlimeEngine {
             };
         }
         match dictionary_limit {
-            Some(limit) => self.dictionary.candidates_with_limit(reading, limit),
-            None => self.dictionary.candidates(reading),
+            Some(limit) => dictionary.candidates_with_limit(reading, limit),
+            None => dictionary.candidates(reading),
         }
     }
 
@@ -1082,6 +1171,25 @@ impl SlimeEngine {
         bypass_long_input_confidence: bool,
         rescore_candidate_limit: Option<usize>,
     ) -> ConversionCandidateSet {
+        self.conversion_candidate_set_for_reading_with_limit_and_context_policy_from(
+            &self.dictionary,
+            reading,
+            dictionary_limit,
+            explicit_previous_surface,
+            bypass_long_input_confidence,
+            rescore_candidate_limit,
+        )
+    }
+
+    fn conversion_candidate_set_for_reading_with_limit_and_context_policy_from(
+        &self,
+        dictionary: &Dictionary,
+        reading: &str,
+        dictionary_limit: Option<usize>,
+        explicit_previous_surface: Option<&str>,
+        bypass_long_input_confidence: bool,
+        rescore_candidate_limit: Option<usize>,
+    ) -> ConversionCandidateSet {
         let mut candidates = Vec::new();
         let (previous_surface, right_context) = self.conversion_contexts(explicit_previous_surface);
         let (contextual_history, established_history, transient_history) =
@@ -1105,7 +1213,8 @@ impl SlimeEngine {
         // is also a normal dictionary candidate the context model may still
         // prefer a more natural conversion.
         let mut has_protected_candidates = !candidates.is_empty();
-        let dictionary_candidates = self.dictionary_candidates_for_context(
+        let dictionary_candidates = Self::dictionary_candidates_for_context_from(
+            dictionary,
             reading,
             dictionary_limit,
             previous_surface,
@@ -2239,20 +2348,28 @@ impl SlimeEngine {
 
 #[cfg(test)]
 fn bundled_dictionary(dictionary_packs: u32, user_data: &UserData) -> Dictionary {
-    bundled_dictionary_with_packs(dictionary_packs, user_data, &DictionaryPackStore::default())
+    bundled_dictionaries_with_packs(dictionary_packs, user_data, &DictionaryPackStore::default()).0
 }
 
-fn bundled_dictionary_with_packs(
+fn bundled_dictionaries_with_packs(
     dictionary_packs: u32,
     user_data: &UserData,
     installed_packs: &DictionaryPackStore,
-) -> Dictionary {
+) -> (Dictionary, Option<Dictionary>) {
     let mut layers = domain_dictionaries::layers(dictionary_packs);
     layers.extend(installed_packs.layers());
     if let Some(user_layer) = domain_dictionaries::user_layer(user_data.dictionary_entries()) {
         layers.push(user_layer);
     }
-    Dictionary::bundled_with_layers(layers)
+    let standard = Dictionary::bundled_with_layers(layers.clone());
+    let supplemental_layers = installed_packs.model_rescore_layers(&standard);
+    if supplemental_layers.is_empty() {
+        return (standard, None);
+    }
+    let mut model_layers = layers;
+    model_layers.extend(supplemental_layers);
+    let model_rescore = Dictionary::bundled_with_layers(model_layers);
+    (standard, Some(model_rescore))
 }
 
 fn candidate_rescore_state(
@@ -2366,18 +2483,52 @@ fn candidate_rescore_state_with_limit(
                 .map(|candidate| candidate.surface.clone())
                 .collect(),
         },
+        model_supplemental: vec![false; candidates.len()],
         candidates,
     })
 }
 
+fn anchor_model_rescore_state(
+    mut state: CandidateRescoreState,
+    base_winner: Candidate,
+    base_candidates: &[Candidate],
+    candidate_limit: usize,
+) -> Option<CandidateRescoreState> {
+    state
+        .candidates
+        .retain(|candidate| candidate.surface != base_winner.surface);
+    state.candidates.insert(0, base_winner);
+    state.candidates.truncate(candidate_limit);
+    if state.candidates.len() < 2 {
+        return None;
+    }
+    state.model_supplemental = state
+        .candidates
+        .iter()
+        .map(|candidate| {
+            !base_candidates
+                .iter()
+                .any(|base| base.surface == candidate.surface)
+        })
+        .collect();
+    state.request.candidates = state
+        .candidates
+        .iter()
+        .map(|candidate| candidate.surface.clone())
+        .collect();
+    Some(state)
+}
+
 fn candidate_rescore_order(
     candidates: &[Candidate],
+    model_supplemental: &[bool],
     log_likelihoods: &[f64],
     lambda: f64,
     minimum_margin: f64,
 ) -> Option<(Vec<usize>, bool, usize)> {
     if candidates.is_empty()
         || candidates.len() != log_likelihoods.len()
+        || candidates.len() != model_supplemental.len()
         || !(0.0..=1.0).contains(&lambda)
         || !lambda.is_finite()
         || minimum_margin < 0.0
@@ -2397,7 +2548,13 @@ fn candidate_rescore_order(
     let mut order = (0..candidates.len()).collect::<Vec<_>>();
     order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
     let top = *order.first()?;
-    let margin_protects_base = top != 0 && combined[top] - combined[0] < minimum_margin;
+    let required_margin = minimum_margin
+        + if model_supplemental[top] {
+            MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN
+        } else {
+            0.0
+        };
+    let margin_protects_base = top != 0 && combined[top] - combined[0] < required_margin;
     let selected = if margin_protects_base { 0 } else { top };
     Some((order, margin_protects_base, selected))
 }
@@ -2588,8 +2745,8 @@ mod tests {
         DictionaryPackTrust, DictionaryPackVerificationKey, DictionaryPackVersionFloor,
         DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision,
         MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY,
-        UserData, bounded_local_substitution, bundled_dictionary, date_time_candidates,
-        katakana_candidate,
+        UserData, bounded_local_substitution, bundled_dictionary, candidate_rescore_order,
+        date_time_candidates, katakana_candidate,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
@@ -2646,6 +2803,32 @@ mod tests {
                  # minimum-slime-version: 0.1.0\n\
                  # published-at: 2026-08-08\n\
                  # provenance: fixture/generated/sample-context\n\
+                 # payload-sha256: {digest}\n\
+                 # entries\n\
+                 {payload}"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_model_rescore_pack(directory: &std::path::Path) {
+        let pack_directory = directory.join("dictionary-packs");
+        fs::create_dir_all(&pack_directory).unwrap();
+        let payload = "てすとようご\t補助試験語甲\t500\n\
+てすとようご\t補助試験語乙\t550\n";
+        let digest = lower_hex(&Sha256::digest(payload.as_bytes()));
+        fs::write(
+            pack_directory.join("sample-model-rescore.slime-dict"),
+            format!(
+                "# slime-dictionary-pack-v4\n\
+                 # id: sample-model-rescore\n\
+                 # name: 補助語彙サンプル\n\
+                 # version: 2026.08.1\n\
+                 # license: Example-Test-Only\n\
+                 # minimum-slime-version: 0.1.0\n\
+                 # published-at: 2026-08-11\n\
+                 # provenance: fixture/generated/sample-model-rescore\n\
+                 # candidate-mode: model-rescore-only\n\
                  # payload-sha256: {digest}\n\
                  # entries\n\
                  {payload}"
@@ -4440,6 +4623,34 @@ mod tests {
     }
 
     #[test]
+    fn supplemental_model_candidate_requires_an_additional_margin() {
+        let candidates = [
+            Candidate {
+                surface: "基本".to_owned(),
+                cost: 1_000,
+            },
+            Candidate {
+                surface: "補助".to_owned(),
+                cost: 1_000,
+            },
+        ];
+        let (_, ordinary_protected, ordinary_selected) =
+            candidate_rescore_order(&candidates, &[false, false], &[0.0, 0.4], 0.8, 0.0).unwrap();
+        assert!(!ordinary_protected);
+        assert_eq!(ordinary_selected, 1);
+
+        let (_, supplemental_protected, supplemental_selected) =
+            candidate_rescore_order(&candidates, &[false, true], &[0.0, 0.4], 0.8, 0.0).unwrap();
+        assert!(supplemental_protected);
+        assert_eq!(supplemental_selected, 0);
+
+        let (_, confident_protected, confident_selected) =
+            candidate_rescore_order(&candidates, &[false, true], &[0.0, 2.0], 0.8, 0.0).unwrap();
+        assert!(!confident_protected);
+        assert_eq!(confident_selected, 1);
+    }
+
+    #[test]
     fn external_scoring_exposes_the_full_short_candidate_pool() {
         let entries = (0_i32..12)
             .map(|index| {
@@ -4469,6 +4680,77 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!request.candidates.contains(&"コウホ".to_owned()));
+    }
+
+    #[test]
+    fn model_rescore_dictionary_is_invisible_until_ready_and_can_supply_short_candidate() {
+        let standard_entries = vec![
+            DictionaryEntry::new("しんたく", "信託", 1_000),
+            DictionaryEntry::new("しんたく", "新宅", 1_100),
+        ];
+        let mut model_entries = standard_entries.clone();
+        model_entries.push(DictionaryEntry::new("しんたく", "神託", 1_050));
+        let mut engine = SlimeEngine::new(Dictionary::new(standard_entries));
+        engine.model_rescore_dictionary = Some(Dictionary::new(model_entries));
+
+        type_text(&mut engine, "shintaku");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().candidates[0], "信託");
+        assert!(!engine.snapshot().candidates.contains(&"神託".to_owned()));
+
+        engine.prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, true);
+        let request = engine
+            .candidate_rescore_request()
+            .expect("ready scorer should receive supplemental short vocabulary");
+        assert!(request.candidates.contains(&"神託".to_owned()));
+        let scores: Vec<_> = request
+            .candidates
+            .iter()
+            .map(|candidate| if candidate == "神託" { 0.0 } else { -10.0 })
+            .collect();
+        engine
+            .apply_candidate_rescore(&scores, 0.7, 0.1)
+            .expect("aligned model scores should publish supplemental candidate");
+        assert_eq!(engine.snapshot().candidates[0], "神託");
+    }
+
+    #[test]
+    fn installed_model_rescore_pack_never_changes_unscored_candidates() {
+        let directory = test_directory("model-rescore-pack");
+        write_model_rescore_pack(&directory);
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+
+        type_text(&mut engine, "tesutoyougo");
+        engine.handle(InputEvent::Space);
+        let unscored = engine.snapshot().candidates;
+        assert!(!unscored.contains(&"補助試験語甲".to_owned()));
+        assert!(!unscored.contains(&"補助試験語乙".to_owned()));
+
+        engine.prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, true);
+        let request = engine
+            .candidate_rescore_request()
+            .expect("ready scorer should activate installed supplemental pack");
+        assert!(request.candidates.contains(&"補助試験語甲".to_owned()));
+        assert!(request.candidates.contains(&"補助試験語乙".to_owned()));
+        assert_eq!(engine.snapshot().candidates, unscored);
+        assert_eq!(request.candidates[0], unscored[0]);
+        let scores: Vec<_> = request
+            .candidates
+            .iter()
+            .map(|candidate| {
+                if candidate == "補助試験語乙" {
+                    0.0
+                } else {
+                    -10.0
+                }
+            })
+            .collect();
+        engine
+            .apply_candidate_rescore(&scores, 0.7, 0.1)
+            .expect("successful scoring should publish supplemental pack candidate");
+        assert_eq!(engine.snapshot().candidates[0], "補助試験語乙");
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4715,6 +4997,7 @@ mod tests {
                     .map(|candidate| candidate.surface.clone())
                     .collect(),
             },
+            model_supplemental: vec![false; candidates.len()],
             candidates,
         });
         engine
@@ -4748,6 +5031,7 @@ mod tests {
                 reading: engine.reading.clone(),
                 candidates: vec![candidate.surface.clone()],
             },
+            model_supplemental: vec![false],
             candidates: vec![candidate],
         });
 
@@ -4791,6 +5075,7 @@ mod tests {
                 reading: engine.reading.clone(),
                 candidates: vec![candidate.surface.clone()],
             },
+            model_supplemental: vec![false],
             candidates: vec![candidate],
         });
 
@@ -4838,6 +5123,7 @@ mod tests {
                 reading: engine.reading.clone(),
                 candidates: vec![candidate.surface.clone()],
             },
+            model_supplemental: vec![false],
             candidates: vec![candidate],
         });
 

@@ -24,7 +24,8 @@ const USAGE: &str = concat!(
     "  slime-dictionary-pack validate <pack.slime-dict> [...]\n",
     "  slime-dictionary-pack build --id ID --name NAME --version VERSION --license LICENSE \\\n",
     "    --minimum-slime-version VERSION --published-at YYYY-MM-DD --provenance VALUE \\\n",
-    "    [--entries INPUT.tsv] [--context-rules INPUT.tsv] --output OUTPUT.slime-dict [--json]\n",
+    "    [--entries INPUT.tsv] [--context-rules INPUT.tsv] [--model-rescore-only] \\\n",
+    "    --output OUTPUT.slime-dict [--json]\n",
     "  slime-dictionary-pack verify-signed --data-dir PATH --verification-keys KEYS.tsv \\\n",
     "    --version-floors FLOORS.tsv --expected-packs N [--json]"
 );
@@ -62,7 +63,7 @@ fn validate_command(arguments: impl Iterator<Item = String>) -> Result<(), Strin
         let info = slime_core::validate_dictionary_pack(&source)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         println!(
-            "v{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "v{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             info.format_version,
             info.id,
             info.name,
@@ -71,7 +72,8 @@ fn validate_command(arguments: impl Iterator<Item = String>) -> Result<(), Strin
             info.minimum_slime_version.as_deref().unwrap_or("-"),
             info.published_at.as_deref().unwrap_or("-"),
             info.entry_count,
-            info.context_rule_count
+            info.context_rule_count,
+            info.candidate_mode.as_str()
         );
     }
     Ok(())
@@ -88,6 +90,7 @@ struct BuildOptions {
     provenance: String,
     entries: Option<PathBuf>,
     context_rules: Option<PathBuf>,
+    model_rescore_only: bool,
     output: PathBuf,
     json: bool,
 }
@@ -242,6 +245,7 @@ fn parse_build_options(arguments: impl Iterator<Item = String>) -> Result<BuildO
     let mut entries = None;
     let mut context_rules = None;
     let mut output = None;
+    let mut model_rescore_only = false;
     let mut json = false;
     let mut arguments = arguments;
 
@@ -274,6 +278,10 @@ fn parse_build_options(arguments: impl Iterator<Item = String>) -> Result<BuildO
                 PathBuf::from(next_value(&mut arguments)?),
                 "--context-rules",
             )?,
+            "--model-rescore-only" if !model_rescore_only => model_rescore_only = true,
+            "--model-rescore-only" => {
+                return Err("build option --model-rescore-only is duplicated".to_owned());
+            }
             "--output" => set_once(
                 &mut output,
                 PathBuf::from(next_value(&mut arguments)?),
@@ -295,6 +303,7 @@ fn parse_build_options(arguments: impl Iterator<Item = String>) -> Result<BuildO
         provenance: required(provenance, "--provenance")?,
         entries,
         context_rules,
+        model_rescore_only,
         output: required(output, "--output")?,
         json,
     })
@@ -365,8 +374,94 @@ fn verify_signed_packs(options: &VerifySignedOptions) -> Result<VerifySignedRepo
 
 fn build_pack(options: &BuildOptions) -> Result<BuildReport, String> {
     validate_output_path(&options.output)?;
+    let (entries, context_rules) = read_build_inputs(options)?;
+    let format_version = if options.model_rescore_only {
+        4
+    } else if options.context_rules.is_some() {
+        3
+    } else {
+        2
+    };
+    let mut payload = String::new();
+    for entry in &entries {
+        writeln!(
+            payload,
+            "{}\t{}\t{}",
+            entry.reading, entry.surface, entry.cost
+        )
+        .expect("writing to a String cannot fail");
+    }
+    if format_version == 3 {
+        payload.push_str("# context-rules\n");
+        for rule in &context_rules {
+            writeln!(
+                payload,
+                "{}\t{}\t{}\t{}",
+                rule.previous_surface, rule.reading, rule.surface, rule.priority
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+
+    let content_sha256 = sha256_hex(payload.as_bytes());
+    let digest_key = if format_version >= 3 {
+        "payload-sha256"
+    } else {
+        "entries-sha256"
+    };
+    let candidate_mode = if options.model_rescore_only {
+        "# candidate-mode: model-rescore-only\n"
+    } else {
+        ""
+    };
+    let source = format!(
+        "# slime-dictionary-pack-v{format_version}\n\
+         # id: {}\n\
+         # name: {}\n\
+         # version: {}\n\
+         # license: {}\n\
+         # minimum-slime-version: {}\n\
+         # published-at: {}\n\
+         # provenance: {}\n\
+         {candidate_mode}\
+         # {digest_key}: {content_sha256}\n\
+         # entries\n\
+         {payload}",
+        options.id,
+        options.name,
+        options.version,
+        options.license,
+        options.minimum_slime_version,
+        options.published_at,
+        options.provenance
+    );
+    if source.len() > usize::try_from(MAX_INPUT_BYTES).expect("input limit fits usize") {
+        return Err("generated dictionary pack exceeds the byte limit".to_owned());
+    }
+    let info = slime_core::validate_dictionary_pack(&source)
+        .map_err(|error| format!("generated dictionary pack is invalid: {error}"))?;
+    let pack_sha256 = info.pack_sha256.clone();
+    write_new_atomic(&options.output, source.as_bytes())?;
+
+    Ok(BuildReport {
+        format_version: info.format_version,
+        entry_count: info.entry_count,
+        context_rule_count: info.context_rule_count,
+        pack_bytes: source.len(),
+        content_sha256,
+        pack_sha256,
+    })
+}
+
+fn read_build_inputs(options: &BuildOptions) -> Result<(Vec<Entry>, Vec<ContextRule>), String> {
     if options.entries.is_none() && options.context_rules.is_none() {
         return Err("build requires --entries or --context-rules".to_owned());
+    }
+    if options.model_rescore_only && options.context_rules.is_some() {
+        return Err("--model-rescore-only cannot be combined with --context-rules".to_owned());
+    }
+    if options.model_rescore_only && options.entries.is_none() {
+        return Err("--model-rescore-only requires --entries".to_owned());
     }
     let mut entries = options
         .entries
@@ -396,75 +491,7 @@ fn build_pack(options: &BuildOptions) -> Result<BuildReport, String> {
                 &right.surface,
             ))
     });
-
-    let format_version = if options.context_rules.is_some() {
-        3
-    } else {
-        2
-    };
-    let mut payload = String::new();
-    for entry in &entries {
-        writeln!(
-            payload,
-            "{}\t{}\t{}",
-            entry.reading, entry.surface, entry.cost
-        )
-        .expect("writing to a String cannot fail");
-    }
-    if format_version == 3 {
-        payload.push_str("# context-rules\n");
-        for rule in &context_rules {
-            writeln!(
-                payload,
-                "{}\t{}\t{}\t{}",
-                rule.previous_surface, rule.reading, rule.surface, rule.priority
-            )
-            .expect("writing to a String cannot fail");
-        }
-    }
-
-    let content_sha256 = sha256_hex(payload.as_bytes());
-    let digest_key = if format_version == 3 {
-        "payload-sha256"
-    } else {
-        "entries-sha256"
-    };
-    let source = format!(
-        "# slime-dictionary-pack-v{format_version}\n\
-         # id: {}\n\
-         # name: {}\n\
-         # version: {}\n\
-         # license: {}\n\
-         # minimum-slime-version: {}\n\
-         # published-at: {}\n\
-         # provenance: {}\n\
-         # {digest_key}: {content_sha256}\n\
-         # entries\n\
-         {payload}",
-        options.id,
-        options.name,
-        options.version,
-        options.license,
-        options.minimum_slime_version,
-        options.published_at,
-        options.provenance
-    );
-    if source.len() > usize::try_from(MAX_INPUT_BYTES).expect("input limit fits usize") {
-        return Err("generated dictionary pack exceeds the byte limit".to_owned());
-    }
-    let info = slime_core::validate_dictionary_pack(&source)
-        .map_err(|error| format!("generated dictionary pack is invalid: {error}"))?;
-    let pack_sha256 = info.pack_sha256.clone();
-    write_new_atomic(&options.output, source.as_bytes())?;
-
-    Ok(BuildReport {
-        format_version: info.format_version,
-        entry_count: info.entry_count,
-        context_rule_count: info.context_rule_count,
-        pack_bytes: source.len(),
-        content_sha256,
-        pack_sha256,
-    })
+    Ok((entries, context_rules))
 }
 
 fn read_entries(path: &Path) -> Result<Vec<Entry>, String> {
@@ -690,6 +717,7 @@ mod tests {
             provenance: "fixture/generated/sample-context".to_owned(),
             entries: Some(directory.path().join("entries.tsv")),
             context_rules: Some(directory.path().join("context.tsv")),
+            model_rescore_only: false,
             output: directory.path().join(output_name),
             json: false,
         }
@@ -832,6 +860,28 @@ mod tests {
         assert!(source.starts_with("# slime-dictionary-pack-v2\n"));
         assert!(source.contains("# entries-sha256: "));
         assert!(!source.contains("# context-rules"));
+    }
+
+    #[test]
+    fn builds_v4_model_rescore_only_pack() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("entries.tsv"), "しんたく\t神託\n").unwrap();
+        let mut build_options = options(&directory, "supplemental.slime-dict");
+        build_options.context_rules = None;
+        build_options.model_rescore_only = true;
+
+        let report = build_pack(&build_options).unwrap();
+        let source = fs::read_to_string(&build_options.output).unwrap();
+        assert_eq!(report.format_version, 4);
+        assert!(source.starts_with("# slime-dictionary-pack-v4\n"));
+        assert!(source.contains("# candidate-mode: model-rescore-only\n"));
+        assert!(source.contains("# payload-sha256: "));
+        assert_eq!(
+            slime_core::validate_dictionary_pack(&source)
+                .unwrap()
+                .candidate_mode,
+            slime_core::DictionaryPackCandidateMode::ModelRescoreOnly
+        );
     }
 
     #[test]

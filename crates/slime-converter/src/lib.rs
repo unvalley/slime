@@ -1173,6 +1173,20 @@ impl Dictionary {
         found
     }
 
+    /// Returns whether an exact reading-surface pair is already present.
+    ///
+    /// Supplemental dictionary builders use this to avoid reintroducing base
+    /// entries with different costs, which could alter unrelated lattice paths
+    /// even when the rendered word is not new vocabulary.
+    #[must_use]
+    pub fn has_exact_entry(&self, reading: &str, surface: &str) -> bool {
+        let mut found = false;
+        self.for_each_exact(reading, |entry| {
+            found |= entry.surface == surface;
+        });
+        found
+    }
+
     /// Reports whether an exact reading and surface pair carries Mozc's region
     /// proper-noun POS. Evaluation tools use this to reject tokenizer splits
     /// that accidentally reinterpret pieces of an administrative place name.
@@ -6455,6 +6469,8 @@ mod tests {
         let dictionary = Dictionary::bundled_with_layers(vec![layer]);
 
         assert_eq!(dictionary.layer_count(), 2);
+        assert!(dictionary.has_exact_entry("らすとげんご", "Rust言語"));
+        assert!(!dictionary.has_exact_entry("らすとげんご", "ラスト言語"));
         assert_eq!(dictionary.candidates("らすとげんご")[0].surface, "Rust言語");
         assert_eq!(
             dictionary

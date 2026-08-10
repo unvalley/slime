@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
-use slime_converter::DictionaryLayer;
+use slime_converter::{Dictionary, DictionaryLayer};
 
 use crate::domain_dictionaries::{MAX_DOMAIN_WORD_COST, MIN_DOMAIN_WORD_COST, supplemental_entry};
 
@@ -13,6 +13,7 @@ const PACK_FILE_EXTENSION: &str = "slime-dict";
 const PACK_HEADER_V1: &str = "# slime-dictionary-pack-v1";
 const PACK_HEADER_V2: &str = "# slime-dictionary-pack-v2";
 const PACK_HEADER_V3: &str = "# slime-dictionary-pack-v3";
+const PACK_HEADER_V4: &str = "# slime-dictionary-pack-v4";
 const PACK_ENTRIES_MARKER: &str = "# entries";
 const PACK_CONTEXT_RULES_MARKER: &str = "# context-rules";
 const PACK_SIGNATURE_HEADER_V1: &str = "# slime-dictionary-signature-v1";
@@ -224,6 +225,30 @@ pub struct DictionaryPackInfo {
     pub pack_sha256: String,
     pub entry_count: usize,
     pub context_rule_count: usize,
+    pub candidate_mode: DictionaryPackCandidateMode,
+}
+
+/// Controls when entries from an installed dictionary pack join conversion.
+///
+/// Model-rescore-only packs are invisible to ordinary conversion. Their
+/// entries join the candidate pool only after an optional local scorer is
+/// ready, so a large supplemental vocabulary cannot perturb the base winner
+/// when the model is unavailable or scoring fails.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DictionaryPackCandidateMode {
+    #[default]
+    Standard,
+    ModelRescoreOnly,
+}
+
+impl DictionaryPackCandidateMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::ModelRescoreOnly => "model-rescore-only",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +315,7 @@ struct PackMetadata {
     provenance: Option<String>,
     entries_sha256: Option<String>,
     payload_sha256: Option<String>,
+    candidate_mode: Option<String>,
 }
 
 impl PackMetadata {
@@ -306,6 +332,7 @@ impl PackMetadata {
             "provenance" => set_once(&mut self.provenance, value, key, line_number),
             "entries-sha256" => set_once(&mut self.entries_sha256, value, key, line_number),
             "payload-sha256" => set_once(&mut self.payload_sha256, value, key, line_number),
+            "candidate-mode" => set_once(&mut self.candidate_mode, value, key, line_number),
             _ => Err(format!("line {line_number} has unknown metadata {key:?}")),
         }
     }
@@ -366,6 +393,7 @@ impl DictionaryPackStore {
     pub(crate) fn layers(&self) -> Vec<DictionaryLayer> {
         self.packs
             .iter()
+            .filter(|pack| pack.info.candidate_mode == DictionaryPackCandidateMode::Standard)
             .map(|pack| {
                 let entries = pack
                     .entries
@@ -376,6 +404,27 @@ impl DictionaryPackStore {
                     .collect();
                 DictionaryLayer::new(&pack.info.id, &pack.info.name, entries)
             })
+            .collect()
+    }
+
+    pub(crate) fn model_rescore_layers(&self, base: &Dictionary) -> Vec<DictionaryLayer> {
+        self.packs
+            .iter()
+            .filter(|pack| {
+                pack.info.candidate_mode == DictionaryPackCandidateMode::ModelRescoreOnly
+            })
+            .map(|pack| {
+                let entries = pack
+                    .entries
+                    .iter()
+                    .filter(|entry| !base.has_exact_entry(&entry.reading, &entry.surface))
+                    .map(|entry| {
+                        supplemental_entry(&entry.reading, &entry.surface, entry.word_cost)
+                    })
+                    .collect();
+                DictionaryLayer::new(&pack.info.id, &pack.info.name, entries)
+            })
+            .filter(|layer| layer.entry_count() != 0)
             .collect()
     }
 
@@ -623,10 +672,11 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
         PACK_HEADER_V1 => 1,
         PACK_HEADER_V2 => 2,
         PACK_HEADER_V3 => 3,
+        PACK_HEADER_V4 => 4,
         _ => {
             return Err(format!(
-                "first line must be {PACK_HEADER_V1:?}, {PACK_HEADER_V2:?}, or \
-                 {PACK_HEADER_V3:?}"
+                "first line must be {PACK_HEADER_V1:?}, {PACK_HEADER_V2:?}, \
+                 {PACK_HEADER_V3:?}, or {PACK_HEADER_V4:?}"
             ));
         }
     };
@@ -643,22 +693,47 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
         context_rules,
         ..
     } = content;
-    let id = required(metadata.id, "id")?;
-    let name = required(metadata.name, "name")?;
-    let version = required(metadata.version, "version")?;
-    let license = required(metadata.license, "license")?;
+    let PackMetadata {
+        id,
+        name,
+        version,
+        license,
+        minimum_slime_version,
+        published_at,
+        provenance,
+        entries_sha256,
+        payload_sha256,
+        candidate_mode,
+    } = metadata;
+    let id = required(id, "id")?;
+    let name = required(name, "name")?;
+    let version = required(version, "version")?;
+    let license = required(license, "license")?;
     validate_metadata(&id, &name, &version, &license)?;
     let validated = validate_versioned_metadata(
         source,
         format_version,
-        metadata.minimum_slime_version,
-        metadata.published_at,
-        metadata.provenance,
-        metadata.entries_sha256,
-        metadata.payload_sha256,
+        VersionedPackMetadata {
+            minimum_slime_version,
+            published_at,
+            provenance,
+            entries_sha256,
+            payload_sha256,
+            candidate_mode,
+        },
     )?;
     if entries.is_empty() && (format_version < 3 || context_rules.is_empty()) {
         return Err("dictionary pack has no entries".to_owned());
+    }
+    if validated.candidate_mode == DictionaryPackCandidateMode::ModelRescoreOnly {
+        if entries.is_empty() {
+            return Err("model-rescore-only dictionary pack has no entries".to_owned());
+        }
+        if !context_rules.is_empty() {
+            return Err(
+                "model-rescore-only dictionary pack cannot contain context rules".to_owned(),
+            );
+        }
     }
 
     Ok(DictionaryPack {
@@ -676,6 +751,7 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
             pack_sha256: sha256_hex(source.as_bytes()),
             entry_count: entries.len(),
             context_rule_count: context_rules.len(),
+            candidate_mode: validated.candidate_mode,
         },
         entries,
         context_rules,
@@ -760,9 +836,9 @@ impl PackContent {
         format_version: u8,
         line_number: usize,
     ) -> Result<(), String> {
-        if format_version != 3 {
+        if format_version < 3 {
             return Err(format!(
-                "line {line_number} context rules require the v3 pack header"
+                "line {line_number} context rules require a v3 or newer pack header"
             ));
         }
         if self.section != PackSection::Entries {
@@ -970,25 +1046,40 @@ struct ValidatedPackMetadata {
     provenance: Option<String>,
     entries_sha256: Option<String>,
     payload_sha256: Option<String>,
+    candidate_mode: DictionaryPackCandidateMode,
 }
 
-fn validate_versioned_metadata(
-    source: &str,
-    format_version: u8,
+struct VersionedPackMetadata {
     minimum_slime_version: Option<String>,
     published_at: Option<String>,
     provenance: Option<String>,
     entries_sha256: Option<String>,
     payload_sha256: Option<String>,
+    candidate_mode: Option<String>,
+}
+
+fn validate_versioned_metadata(
+    source: &str,
+    format_version: u8,
+    metadata: VersionedPackMetadata,
 ) -> Result<ValidatedPackMetadata, String> {
+    let VersionedPackMetadata {
+        minimum_slime_version,
+        published_at,
+        provenance,
+        entries_sha256,
+        payload_sha256,
+        candidate_mode,
+    } = metadata;
     if format_version == 1 {
         if minimum_slime_version.is_some()
             || published_at.is_some()
             || provenance.is_some()
             || entries_sha256.is_some()
             || payload_sha256.is_some()
+            || candidate_mode.is_some()
         {
-            return Err("versioned metadata requires a v2 or v3 pack header".to_owned());
+            return Err("versioned metadata requires a v2 or newer pack header".to_owned());
         }
         return Ok(ValidatedPackMetadata {
             minimum_slime_version: None,
@@ -996,8 +1087,24 @@ fn validate_versioned_metadata(
             provenance: None,
             entries_sha256: None,
             payload_sha256: None,
+            candidate_mode: DictionaryPackCandidateMode::Standard,
         });
     }
+
+    let candidate_mode = if format_version == 4 {
+        match required(candidate_mode, "candidate-mode")?.as_str() {
+            "standard" => DictionaryPackCandidateMode::Standard,
+            "model-rescore-only" => DictionaryPackCandidateMode::ModelRescoreOnly,
+            _ => {
+                return Err("candidate-mode must be standard or model-rescore-only".to_owned());
+            }
+        }
+    } else {
+        if candidate_mode.is_some() {
+            return Err("candidate-mode requires the v4 pack header".to_owned());
+        }
+        DictionaryPackCandidateMode::Standard
+    };
 
     let minimum_slime_version = required(minimum_slime_version, "minimum-slime-version")?;
     let published_at = required(published_at, "published-at")?;
@@ -1035,9 +1142,11 @@ fn validate_versioned_metadata(
             validate_digest("entries-sha256", &expected, &actual_sha256)?;
             (Some(actual_sha256), None)
         }
-        3 => {
+        3 | 4 => {
             if entries_sha256.is_some() {
-                return Err("entries-sha256 is replaced by payload-sha256 in v3".to_owned());
+                return Err(
+                    "entries-sha256 is replaced by payload-sha256 in v3 and newer".to_owned(),
+                );
             }
             let expected = required(payload_sha256, "payload-sha256")?;
             validate_digest("payload-sha256", &expected, &actual_sha256)?;
@@ -1052,6 +1161,7 @@ fn validate_versioned_metadata(
         provenance: Some(provenance),
         entries_sha256,
         payload_sha256,
+        candidate_mode,
     })
 }
 
@@ -1113,11 +1223,13 @@ fn load_error(path: &Path, message: String) -> DictionaryPackLoadError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DictionaryPackStore, DictionaryPackTrust, DictionaryPackVerificationKey,
-        DictionaryPackVersionFloor, MAX_PACKS, MAX_VERIFICATION_KEYS, PACK_DIRECTORY_NAME,
-        pack_signature_path, parse_pack, sha256_hex, validate_dictionary_pack,
+        DictionaryPackCandidateMode, DictionaryPackStore, DictionaryPackTrust,
+        DictionaryPackVerificationKey, DictionaryPackVersionFloor, MAX_PACKS,
+        MAX_VERIFICATION_KEYS, PACK_DIRECTORY_NAME, pack_signature_path, parse_pack, sha256_hex,
+        validate_dictionary_pack,
     };
     use ed25519_dalek::{Signer, SigningKey};
+    use slime_converter::{Dictionary, DictionaryEntry};
     use std::fs;
 
     const VALID_PACK: &str = "\
@@ -1154,6 +1266,60 @@ mod tests {
         assert_eq!(pack.info.payload_sha256, None);
         assert_eq!(pack.entries[1].word_cost, 6000);
         assert_eq!(validate_dictionary_pack(VALID_PACK).unwrap(), pack.info);
+    }
+
+    #[test]
+    fn validates_v4_model_rescore_only_pack_and_separates_its_layer() {
+        let payload = "しんたく\t神託\t500\n";
+        let digest = sha256_hex(payload.as_bytes());
+        let source = format!(
+            "# slime-dictionary-pack-v4\n\
+             # id: supplemental-general\n\
+             # name: 補助一般語彙\n\
+             # version: 2026.08.1\n\
+             # license: Apache-2.0\n\
+             # minimum-slime-version: 0.1.0\n\
+             # published-at: 2026-08-11\n\
+             # provenance: fixture/generated/supplemental-general\n\
+             # candidate-mode: model-rescore-only\n\
+             # payload-sha256: {digest}\n\
+             # entries\n\
+             {payload}"
+        );
+        let pack = parse_pack(&source).unwrap();
+        assert_eq!(pack.info.format_version, 4);
+        assert_eq!(
+            pack.info.candidate_mode,
+            DictionaryPackCandidateMode::ModelRescoreOnly
+        );
+        let store = DictionaryPackStore {
+            packs: vec![pack],
+            context_rules: Vec::new(),
+            errors: Vec::new(),
+        };
+        assert!(store.layers().is_empty());
+        assert_eq!(
+            store
+                .model_rescore_layers(&Dictionary::new(Vec::new()))
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .model_rescore_layers(&Dictionary::new(vec![DictionaryEntry::new(
+                    "しんたく",
+                    "神託",
+                    500,
+                )]))
+                .is_empty()
+        );
+        assert!(
+            validate_dictionary_pack(&source.replace(
+                "# candidate-mode: model-rescore-only\n",
+                "# candidate-mode: invalid\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

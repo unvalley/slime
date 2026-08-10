@@ -16,6 +16,8 @@ static REVERSE_READINGS: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mozc-reverse-readings.bin"));
 
 const ENTRIES_HEADER_BYTES: usize = 16;
+const REVERSE_NON_PERSON_CONTEXT_FLAG: u16 = 1 << 15;
+const REVERSE_WORD_COST_MASK: u16 = REVERSE_NON_PERSON_CONTEXT_FLAG - 1;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompactEntry {
@@ -47,7 +49,7 @@ impl CompactDictionary {
         static INSTANCE: OnceLock<CompactDictionary> = OnceLock::new();
         INSTANCE.get_or_init(|| {
             assert_eq!(&ENTRIES[0..4], b"UDE1", "bundled dictionary magic");
-            assert_eq!(&REVERSE_BLOCKS[0..4], b"RDE1", "reverse dictionary magic");
+            assert_eq!(&REVERSE_BLOCKS[0..4], b"RDE2", "reverse dictionary magic");
             let entry_count =
                 u32::from_le_bytes(ENTRIES[4..8].try_into().expect("header slice")) as usize;
             let max_reading_bytes =
@@ -110,9 +112,10 @@ impl CompactDictionary {
             let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
                 .expect("valid reverse reading UTF-8")
                 .to_owned();
-            let cost = u16::from_le_bytes([REVERSE_BLOCKS[cursor], REVERSE_BLOCKS[cursor + 1]]);
+            let encoded_cost =
+                u16::from_le_bytes([REVERSE_BLOCKS[cursor], REVERSE_BLOCKS[cursor + 1]]);
             cursor += 2;
-            readings.push((reading, i32::from(cost)));
+            readings.push((reading, i32::from(encoded_cost & REVERSE_WORD_COST_MASK)));
         }
         readings
     }
@@ -151,6 +154,26 @@ impl CompactDictionary {
         surface: &str,
         suffix: &str,
     ) -> Option<i32> {
+        self.joined_surface_reading_suffix_cost_with_policy(prefix, surface, suffix, false)
+    }
+
+    /// Returns the lowest matching cost backed by a non-person-name entry.
+    pub(crate) fn joined_non_person_surface_reading_suffix_cost(
+        &self,
+        prefix: &str,
+        surface: &str,
+        suffix: &str,
+    ) -> Option<i32> {
+        self.joined_surface_reading_suffix_cost_with_policy(prefix, surface, suffix, true)
+    }
+
+    fn joined_surface_reading_suffix_cost_with_policy(
+        &self,
+        prefix: &str,
+        surface: &str,
+        suffix: &str,
+        require_non_person: bool,
+    ) -> Option<i32> {
         let mut node = self.reverse_fst.root();
         let mut output = fst::raw::Output::zero();
         for byte in prefix.bytes().chain(surface.bytes()) {
@@ -171,9 +194,13 @@ impl CompactDictionary {
             let length = usize::try_from(read_reverse_varint(&mut cursor)).expect("reading length");
             let reading = std::str::from_utf8(&REVERSE_READINGS[offset..offset + length])
                 .expect("valid reverse reading UTF-8");
-            let cost = u16::from_le_bytes([REVERSE_BLOCKS[cursor], REVERSE_BLOCKS[cursor + 1]]);
+            let encoded_cost =
+                u16::from_le_bytes([REVERSE_BLOCKS[cursor], REVERSE_BLOCKS[cursor + 1]]);
             cursor += 2;
-            if reading.ends_with(suffix) {
+            if (!require_non_person || encoded_cost & REVERSE_NON_PERSON_CONTEXT_FLAG != 0)
+                && reading.ends_with(suffix)
+            {
+                let cost = encoded_cost & REVERSE_WORD_COST_MASK;
                 best_cost =
                     Some(best_cost.map_or(i32::from(cost), |best: i32| best.min(i32::from(cost))));
             }
@@ -400,6 +427,34 @@ mod tests {
             dictionary.joined_surface_reading_suffix_cost("アイランドセンター", "駅", "えき"),
             None,
             "long proper-name stems must stay outside the context index"
+        );
+    }
+
+    #[test]
+    fn context_phrase_evidence_excludes_person_names_without_hiding_reconversion() {
+        let dictionary = CompactDictionary::bundled();
+
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("諏訪", "湖", "こ"),
+            Some(4_559)
+        );
+        assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("諏訪", "子", "こ"),
+            Some(5_490)
+        );
+        assert_eq!(
+            dictionary.joined_non_person_surface_reading_suffix_cost("諏訪", "湖", "こ"),
+            Some(4_559)
+        );
+        assert_eq!(
+            dictionary.joined_non_person_surface_reading_suffix_cost("諏訪", "子", "こ"),
+            None
+        );
+        assert!(
+            dictionary
+                .readings_for_surface("諏訪子")
+                .iter()
+                .any(|(reading, _)| reading == "すわこ")
         );
     }
 

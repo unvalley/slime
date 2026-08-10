@@ -49,7 +49,7 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
         .filter_map(|entry| entry.surface.chars().next())
         .collect::<HashSet<_>>();
     let general_noun_single_character_suffixes = general_noun_single_character_surfaces(by_reading);
-    let mut by_surface = BTreeMap::<&str, Vec<(&str, u16)>>::new();
+    let mut by_surface = BTreeMap::<&str, Vec<(&str, u16, bool)>>::new();
     for (reading, entries) in by_reading {
         for entry in entries {
             let context_phrase_entry = is_context_phrase_entry(
@@ -62,10 +62,11 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
             {
                 continue;
             }
-            by_surface
-                .entry(&entry.surface)
-                .or_default()
-                .push((reading, entry.word_cost));
+            by_surface.entry(&entry.surface).or_default().push((
+                reading,
+                entry.word_cost,
+                is_non_person_context_evidence_entry(entry),
+            ));
         }
     }
 
@@ -74,12 +75,14 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
     let mut reading_offsets = HashMap::<&str, (usize, usize)>::new();
     let mut fst_builder = fst::raw::Builder::memory();
     for (surface, mut readings) in by_surface {
-        readings.sort_unstable_by(|left, right| (left.1, left.0).cmp(&(right.1, right.0)));
+        readings.sort_unstable_by(|left, right| {
+            (left.1, left.0, !left.2).cmp(&(right.1, right.0, !right.2))
+        });
         let mut seen = HashSet::with_capacity(readings.len());
-        readings.retain(|(reading, _)| seen.insert(*reading));
+        readings.retain(|(reading, _, _)| seen.insert(*reading));
         let block_offset = blocks.len() as u64;
         push_varint(&mut blocks, readings.len() as u64);
-        for (reading, word_cost) in readings {
+        for (reading, word_cost, non_person_context_eligible) in readings {
             let (offset, length) = *reading_offsets.entry(reading).or_insert_with(|| {
                 let offset = reading_pool.len();
                 reading_pool.extend_from_slice(reading.as_bytes());
@@ -87,13 +90,19 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
             });
             push_varint(&mut blocks, offset as u64);
             push_varint(&mut blocks, length as u64);
-            blocks.extend_from_slice(&word_cost.to_le_bytes());
+            assert!(word_cost < REVERSE_NON_PERSON_CONTEXT_FLAG);
+            let encoded_cost = if non_person_context_eligible {
+                word_cost | REVERSE_NON_PERSON_CONTEXT_FLAG
+            } else {
+                word_cost
+            };
+            blocks.extend_from_slice(&encoded_cost.to_le_bytes());
         }
         fst_builder
             .insert(surface.as_bytes(), block_offset)
             .expect("insert sorted surface into reverse FST");
     }
-    blocks[0..4].copy_from_slice(b"RDE1");
+    blocks[0..4].copy_from_slice(b"RDE2");
     fs::write(
         out.join("mozc-reverse.fst"),
         fst_builder.into_inner().expect("finish reverse FST"),
@@ -102,6 +111,16 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
     fs::write(out.join("mozc-reverse.bin"), blocks).expect("write reverse blocks");
     fs::write(out.join("mozc-reverse-readings.bin"), reading_pool)
         .expect("write reverse reading pool");
+}
+
+fn is_non_person_context_evidence_entry(entry: &Entry) -> bool {
+    !matches!(
+        entry.left_id,
+        MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
+    ) && !matches!(
+        entry.right_id,
+        MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
+    )
 }
 
 fn general_noun_single_character_surfaces(
@@ -273,6 +292,7 @@ fn write_compact_dictionary(by_reading: BTreeMap<String, Vec<Entry>>, out: &Path
 
 const ENTRIES_HEADER_BYTES: usize = 16;
 const REVERSE_HEADER_BYTES: usize = 8;
+const REVERSE_NON_PERSON_CONTEXT_FLAG: u16 = 1 << 15;
 // Keep explicit reconversion broad enough for ordinary writing without
 // embedding low-confidence proper-name and spelling variants that dominate
 // the full Mozc source size. User and installed dictionaries are always
@@ -313,6 +333,8 @@ const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 const MOZC_GENERAL_NOUN_SUFFIX_POS_ID: u16 = 1_949;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START: u16 = 1_936;
 const MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END: u16 = 1_998;
+const MOZC_PERSONAL_GIVEN_NAME_POS_ID: u16 = 1_922;
+const MOZC_PERSONAL_SURNAME_POS_ID: u16 = 1_923;
 
 fn is_bounded_ideographic_compound(surface: &str) -> bool {
     let mut characters = surface.chars();

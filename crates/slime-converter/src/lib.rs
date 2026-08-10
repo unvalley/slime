@@ -1726,6 +1726,39 @@ impl Dictionary {
         candidate_surface: &str,
         allows_single_character_prefix: bool,
     ) -> Option<i32> {
+        self.document_phrase_word_cost_with_policy(
+            left_context,
+            reading,
+            candidate_surface,
+            allows_single_character_prefix,
+            false,
+        )
+    }
+
+    fn document_non_person_phrase_word_cost(
+        &self,
+        left_context: &str,
+        reading: &str,
+        candidate_surface: &str,
+        allows_single_character_prefix: bool,
+    ) -> Option<i32> {
+        self.document_phrase_word_cost_with_policy(
+            left_context,
+            reading,
+            candidate_surface,
+            allows_single_character_prefix,
+            true,
+        )
+    }
+
+    fn document_phrase_word_cost_with_policy(
+        &self,
+        left_context: &str,
+        reading: &str,
+        candidate_surface: &str,
+        allows_single_character_prefix: bool,
+        require_non_person: bool,
+    ) -> Option<i32> {
         let compact = self.bundled?;
         let context_start = left_context
             .char_indices()
@@ -1742,11 +1775,20 @@ impl Dictionary {
             {
                 break;
             }
-            if let Some(word_cost) = compact.joined_surface_reading_suffix_cost(
-                &context_tail[index..],
-                candidate_surface,
-                reading,
-            ) {
+            let word_cost = if require_non_person {
+                compact.joined_non_person_surface_reading_suffix_cost(
+                    &context_tail[index..],
+                    candidate_surface,
+                    reading,
+                )
+            } else {
+                compact.joined_surface_reading_suffix_cost(
+                    &context_tail[index..],
+                    candidate_surface,
+                    reading,
+                )
+            };
+            if let Some(word_cost) = word_cost {
                 best_word_cost =
                     Some(best_word_cost.map_or(word_cost, |best: i32| best.min(word_cost)));
             }
@@ -1761,6 +1803,14 @@ impl Dictionary {
         candidate_surface: &str,
         allows_single_character_prefix: bool,
     ) -> bool {
+        let candidate_has_non_person_phrase = self
+            .document_non_person_phrase_word_cost(
+                left_context,
+                reading,
+                candidate_surface,
+                allows_single_character_prefix,
+            )
+            .is_some_and(|word_cost| word_cost < DOCUMENT_PHRASE_COST_CEILING);
         let mut candidate_is_exact = false;
         let mut has_competing_phrase = false;
         self.for_each_exact(reading, |entry| {
@@ -1771,13 +1821,22 @@ impl Dictionary {
                 candidate_is_exact = true;
                 return;
             }
-            has_competing_phrase = self
-                .document_phrase_word_cost(
+            let competing_word_cost = if candidate_has_non_person_phrase {
+                self.document_non_person_phrase_word_cost(
                     left_context,
                     reading,
                     entry.surface,
                     allows_single_character_prefix,
                 )
+            } else {
+                self.document_phrase_word_cost(
+                    left_context,
+                    reading,
+                    entry.surface,
+                    allows_single_character_prefix,
+                )
+            };
+            has_competing_phrase = competing_word_cost
                 .is_some_and(|word_cost| word_cost < DOCUMENT_PHRASE_COST_CEILING);
         });
         candidate_is_exact && !has_competing_phrase
@@ -5058,6 +5117,27 @@ mod tests {
             dictionary.candidates_with_context("かき", "防御")[0].surface,
             "垣",
             "a kanji word ending in 御 is not an honorific boundary"
+        );
+    }
+
+    #[test]
+    fn document_context_does_not_treat_a_person_name_as_competing_phrase_evidence() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "こ",
+                "日本初のスケート競技大会となった諏訪",
+                "一周スケート大会"
+            )[0]
+            .surface,
+            "湖"
+        );
+        assert!(
+            dictionary
+                .readings_for_surface("諏訪子")
+                .iter()
+                .any(|reading| reading == "すわこ")
         );
     }
 

@@ -4849,6 +4849,18 @@ mod tests {
     }
 
     #[test]
+    fn document_context_promotes_katakana_general_noun_compounds() {
+        let dictionary = Dictionary::bundled();
+
+        let candidates = dictionary.candidates_with_surrounding_context(
+            "きん",
+            "米国でリステリア",
+            "が繁殖した。",
+        );
+        assert_eq!(candidates[0].surface, "菌");
+    }
+
+    #[test]
     fn document_context_promotes_honorific_noun_phrase_continuations() {
         let dictionary = Dictionary::bundled();
 

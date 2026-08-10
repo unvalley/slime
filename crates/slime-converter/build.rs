@@ -48,6 +48,7 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
         })
         .filter_map(|entry| entry.surface.chars().next())
         .collect::<HashSet<_>>();
+    let general_noun_single_character_suffixes = general_noun_single_character_surfaces(by_reading);
     let mut by_surface = BTreeMap::<&str, Vec<(&str, u16)>>::new();
     for (reading, entries) in by_reading {
         for entry in entries {
@@ -62,6 +63,13 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
                     && is_bounded_katakana_stem_compound(
                         &entry.surface,
                         &productive_single_character_suffixes,
+                    ))
+                || (entry.word_cost <= MAX_KATAKANA_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST
+                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+                    && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+                    && is_bounded_katakana_stem_compound(
+                        &entry.surface,
+                        &general_noun_single_character_suffixes,
                     ))
                 || (entry.word_cost <= MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST
                     && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
@@ -128,6 +136,21 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
     fs::write(out.join("mozc-reverse.bin"), blocks).expect("write reverse blocks");
     fs::write(out.join("mozc-reverse-readings.bin"), reading_pool)
         .expect("write reverse reading pool");
+}
+
+fn general_noun_single_character_surfaces(
+    by_reading: &BTreeMap<String, Vec<Entry>>,
+) -> HashSet<char> {
+    by_reading
+        .values()
+        .flatten()
+        .filter(|entry| {
+            entry.surface.chars().count() == 1
+                && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+                && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+        })
+        .filter_map(|entry| entry.surface.chars().next())
+        .collect()
 }
 
 fn read_entries_by_reading(tsv_path: &Path) -> BTreeMap<String, Vec<Entry>> {
@@ -248,6 +271,11 @@ const MAX_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 // the broad suffix band so other suffix classes and proper names stay out.
 const MAX_IDEOGRAPHIC_SUFFIX_CONTEXT_PHRASE_WORD_COST: u16 = 7_550;
 const MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST: u16 = 7_700;
+// Some technical compounds end in an ordinary noun rather than Mozc's noun-
+// suffix class (for example リステリア菌). Require both the complete phrase
+// and its one-character tail to be general nouns, and use the tighter common-
+// phrase cost band so proper names and weak spellings stay excluded.
+const MAX_KATAKANA_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST: u16 = 7_500;
 // Admit a narrow band of lower-frequency all-kanji common nouns as context
 // evidence only. This keeps names and kana-mixed spellings out of the bundled

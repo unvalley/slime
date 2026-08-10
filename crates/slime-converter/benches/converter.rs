@@ -12,8 +12,7 @@ fn main() {
     run("converter/candidate_window_single_word", iterations, || {
         black_box(dictionary.candidates(black_box("にほん")));
     });
-    run_document_context_benchmark(&dictionary, iterations);
-    run_left_phrase_conflict_benchmarks(&dictionary, iterations);
+    run_phrase_context_benchmarks(&dictionary, iterations);
     run_numeric_context_benchmarks(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_honorific_prefix_context_benchmark(&dictionary, iterations);
@@ -125,6 +124,12 @@ fn run_n_best_benchmarks(dictionary: &Dictionary, iterations: u64) {
     run("converter/n_best_long_32", iterations, || {
         black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(32)));
     });
+}
+
+fn run_phrase_context_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run_document_context_benchmark(dictionary, iterations);
+    run_left_phrase_conflict_benchmarks(dictionary, iterations);
+    run_katakana_general_noun_phrase_benchmarks(dictionary, iterations);
 }
 
 fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
@@ -245,6 +250,27 @@ fn run_left_phrase_conflict_benchmarks(dictionary: &Dictionary, iterations: u64)
             black_box("で注文する"),
         ));
     });
+}
+
+fn run_katakana_general_noun_phrase_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run("converter/katakana_general_noun_phrase", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("きん"),
+            black_box("米国でリステリア"),
+            black_box("が繁殖した。"),
+        ));
+    });
+    run(
+        "converter/katakana_general_noun_phrase_miss",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("きん"),
+                black_box("記事ではアマトリチャーナ"),
+                black_box("を紹介した。"),
+            ));
+        },
+    );
 }
 
 fn run_ordinal_generation_benchmark(dictionary: &Dictionary, iterations: u64) {

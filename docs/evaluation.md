@@ -343,6 +343,16 @@ GSD trainのtop-1正解数は1,411→1,413へ増え、正解順位が変わっ�
 
 Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。強い辞書句と一般境界が競合する`strong_left_phrase_conflict`の中央値は773.630→789.011 µs/op（+15.381 µs、+2.0%）、事前gateで辞書句探索を省く`weak_left_phrase_conflict`は90.470→90.257 µs/op（-0.213 µs、測定誤差内）だった。
 
+#### 外来語幹に続く一文字の一般名詞
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は単語単体の頻度だけでなく、単語同士のつながりと文章の自然さを変換に利用する。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も語彙costと左右接続costを同じ経路で扱う。SlimeのMozc辞書には`リステリア菌`が完全語として存在するが、末尾の`菌`は生産的な名詞接尾語POSではなく一般名詞POSであるため、従来の文脈用逆引き索引から除外され、`米国でリステリア + きん`では孤立costの低い`金`が優先されていた。
+
+対象をカタカナ2〜8文字と一文字の漢字からなる完全辞書語に限定し、完全語と末尾語がともに一般名詞POS、完全語の辞書costが7,500以下の場合だけ文脈用逆引き索引へ加えた。候補生成、N-best幅、既存word costは変更しない。cost上限を8,000まで広げる実験では追加改善がなかったため、より狭い7,500を採用した。
+
+GSD trainではtop-1正解数が1,413→1,414、acc@1が0.7284→0.7289、MRR@10が0.8177→0.8180へ増えた。候補配列が変わったのは`米国でリステリア + きん`のtop-1が`金 → 菌`となった1件だけで、正解順位の悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補表層、cost、順序まで完全一致した。recall@10も0.9711で不変であり、候補追加ではなく既存候補の文脈順位改善である。
+
+逆引きFST・block・reading資材の合計増加は3,763 bytesだった。Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。該当する`katakana_general_noun_phrase`の中央値は198.645→194.609 µs/op（-4.036 µs、測定誤差内）、非該当の`katakana_general_noun_phrase_miss`は203.677→204.074 µs/op（+0.398 µs、+0.2%、測定誤差内）だった。
+
 #### サ変名詞に続く一文字の一般名詞接尾語
 
 [ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)が重視する文法と単語のつながり、[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)が使う左右接続IDを参考に、Mozc辞書にある完全な三文字複合語を文脈証拠として使う範囲を広げた。対象は全て漢字、左POSがサ変名詞、右POSが一般名詞接尾語、辞書cost 7,550以下を同時に満たすentryだけである。候補やword costは追加せず、文脈用の逆引き索引だけを拡張する。

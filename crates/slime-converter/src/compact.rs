@@ -387,6 +387,11 @@ mod tests {
             Some(7_602)
         );
         assert_eq!(
+            dictionary.joined_surface_reading_suffix_cost("リステリア", "菌", "きん"),
+            Some(7_453),
+            "a bounded katakana stem plus a common-noun suffix remains usable as phrase evidence"
+        );
+        assert_eq!(
             dictionary.joined_surface_reading_suffix_cost("アイスクリーム", "屋", "や"),
             None,
             "the katakana compound cost band must remain bounded"

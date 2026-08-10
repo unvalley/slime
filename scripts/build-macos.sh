@@ -11,6 +11,7 @@ executable="$macos_dir/Slime"
 codesign_identity="${SLIME_CODESIGN_IDENTITY:-}"
 neural_model="${SLIME_NEURAL_MODEL:-}"
 neural_model_license="${SLIME_NEURAL_MODEL_LICENSE:-}"
+neural_profile="${SLIME_NEURAL_PROFILE:-}"
 production_polar_organization_id="6a332eb2-129e-4a1b-92fe-8ec7777780df"
 production_polar_benefit_id="e014726e-23a8-4a99-a212-e44adc349c1e"
 production_polar_checkout_url="https://buy.polar.sh/polar_cl_asAsYJgLTkAhiius7JmEbgTIPRpEb4r4H8Unz2x9us2"
@@ -47,9 +48,19 @@ if [[ -n "$neural_model" ]]; then
     echo "SLIME_NEURAL_MODEL_LICENSE must name the model's redistributable license" >&2
     exit 1
   fi
+  if [[ -z "$neural_profile" ]]; then
+    neural_profile="balanced"
+  fi
+  case "$neural_profile" in
+    balanced|high-accuracy) ;;
+    *) echo "SLIME_NEURAL_PROFILE must be balanced or high-accuracy" >&2; exit 1 ;;
+  esac
   neural_enabled=true
 elif [[ -n "$neural_model_license" ]]; then
   echo "SLIME_NEURAL_MODEL_LICENSE requires SLIME_NEURAL_MODEL" >&2
+  exit 1
+elif [[ -n "$neural_profile" ]]; then
+  echo "SLIME_NEURAL_PROFILE requires SLIME_NEURAL_MODEL" >&2
   exit 1
 fi
 
@@ -127,6 +138,9 @@ if [[ "$billing_environment" != "development" ]]; then
   /usr/libexec/PlistBuddy -c "Add :SlimePolarOrganizationID string $billing_organization_id" "$contents_dir/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SlimePolarBenefitID string $billing_benefit_id" "$contents_dir/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SlimePolarCheckoutURL string $billing_checkout_url" "$contents_dir/Info.plist"
+fi
+if [[ "$neural_enabled" == true ]]; then
+  /usr/libexec/PlistBuddy -c "Add :SlimeNeuralProfile string $neural_profile" "$contents_dir/Info.plist"
 fi
 cp "$workspace_dir/platforms/macos/Resources/PkgInfo" "$contents_dir/PkgInfo"
 # The Mozc-derived dictionary notices must accompany binary redistributions.

@@ -1,6 +1,18 @@
 import Foundation
 
 final class RustEngine {
+    enum NeuralProfile: String {
+        case balanced
+        case highAccuracy = "high-accuracy"
+
+        fileprivate var ffiValue: UInt32 {
+            switch self {
+            case .balanced: SLIME_NEURAL_PROFILE_BALANCED.rawValue
+            case .highAccuracy: SLIME_NEURAL_PROFILE_HIGH_ACCURACY.rawValue
+            }
+        }
+    }
+
     enum Event {
         case character(Unicode.Scalar)
         case space
@@ -87,7 +99,8 @@ final class RustEngine {
         dataDirectory: URL = UserDataStore.shared.directoryURL,
         dictionaryPackVerificationKeys: String? = nil,
         dictionaryPackVersionFloors: String? = nil,
-        neuralModelURL: URL? = nil
+        neuralModelURL: URL? = nil,
+        neuralProfile: NeuralProfile? = nil
     ) throws {
         let path = Array(dataDirectory.path.utf8)
         let configuredKeys = dictionaryPackVerificationKeys
@@ -134,9 +147,18 @@ final class RustEngine {
         let configuredNeuralModel = neuralModelURL
             ?? Bundle.main.url(forResource: "SlimeNeuralModel", withExtension: "gguf")
         if let configuredNeuralModel {
+            let configuredNeuralProfile = neuralProfile
+                ?? (Bundle.main.object(forInfoDictionaryKey: "SlimeNeuralProfile") as? String)
+                    .flatMap(NeuralProfile.init(rawValue:))
+                ?? .balanced
             let modelPath = Array(configuredNeuralModel.path.utf8)
             let status = modelPath.withUnsafeBufferPointer { buffer in
-                slime_enable_neural_rescoring(handle, buffer.baseAddress, buffer.count)
+                slime_enable_neural_rescoring_with_profile(
+                    handle,
+                    buffer.baseAddress,
+                    buffer.count,
+                    configuredNeuralProfile.ffiValue
+                )
             }
             guard status == SLIME_STATUS_OK.rawValue else {
                 slime_destroy(handle)

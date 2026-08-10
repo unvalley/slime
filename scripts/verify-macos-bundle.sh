@@ -17,6 +17,21 @@ test "$(< "$bundle_dir/Contents/PkgInfo")" = "APPL????"
 plutil -lint "$bundle_dir/Contents/Info.plist"
 codesign --verify --deep --strict "$bundle_dir"
 
+neural_model="${SLIME_NEURAL_MODEL:-}"
+if [[ -n "$neural_model" ]]; then
+  neural_profile="${SLIME_NEURAL_PROFILE:-balanced}"
+  test -s "$bundle_dir/Contents/Resources/SlimeNeuralModel.gguf"
+  test -s "$bundle_dir/Contents/Resources/SlimeNeuralModel-LICENSE.txt"
+  test "$(/usr/libexec/PlistBuddy -c 'Print :SlimeNeuralProfile' "$bundle_dir/Contents/Info.plist")" = "$neural_profile"
+else
+  test ! -e "$bundle_dir/Contents/Resources/SlimeNeuralModel.gguf"
+  test ! -e "$bundle_dir/Contents/Resources/SlimeNeuralModel-LICENSE.txt"
+  if /usr/libexec/PlistBuddy -c 'Print :SlimeNeuralProfile' "$bundle_dir/Contents/Info.plist" >/dev/null 2>&1; then
+    echo "model-free bundle must not declare SlimeNeuralProfile" >&2
+    exit 1
+  fi
+fi
+
 entitlements="$(codesign -d --entitlements - "$bundle_dir" 2>/dev/null)"
 if [[ "$entitlements" != *"com.apple.security.get-task-allow"* ]]; then
   echo "development input method entitlement is missing" >&2

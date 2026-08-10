@@ -66,6 +66,10 @@ pub const STATUS_NEURAL_UNAVAILABLE: u32 = 7;
 pub const STATUS_NEURAL_LOAD_FAILED: u32 = 8;
 pub const STATUS_NEURAL_MODEL_CONFLICT: u32 = 9;
 pub const STATUS_NEURAL_PREPARING: u32 = 10;
+pub const STATUS_INVALID_NEURAL_PROFILE: u32 = 11;
+
+pub const NEURAL_PROFILE_BALANCED: u32 = 0;
+pub const NEURAL_PROFILE_HIGH_ACCURACY: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +134,10 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 pub struct SlimeHandle {
     engine: SlimeEngine,
     neural_enabled: bool,
+    #[cfg(feature = "neural")]
+    neural_candidate_weight: f64,
+    #[cfg(feature = "neural")]
+    neural_right_context_minimum_score_margin: f64,
 }
 
 #[cfg(feature = "neural")]
@@ -145,10 +153,6 @@ static NEURAL_MODEL_PATH: OnceLock<PathBuf> = OnceLock::new();
 static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "neural")]
-const NEURAL_CANDIDATE_WEIGHT: f64 = 0.7;
-#[cfg(feature = "neural")]
-const NEURAL_RIGHT_CONTEXT_MINIMUM_SCORE_MARGIN: f64 = 0.1;
-#[cfg(feature = "neural")]
 const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 16;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
@@ -162,6 +166,10 @@ fn new_handle(engine: SlimeEngine) -> SlimeHandle {
     SlimeHandle {
         engine,
         neural_enabled: false,
+        #[cfg(feature = "neural")]
+        neural_candidate_weight: 0.7,
+        #[cfg(feature = "neural")]
+        neural_right_context_minimum_score_margin: 0.1,
     }
 }
 
@@ -377,10 +385,41 @@ pub unsafe extern "C" fn slime_enable_neural_rescoring(
     model_path: *const u8,
     model_path_len: usize,
 ) -> u32 {
+    // SAFETY: This function forwards the caller's pointer contract unchanged.
+    unsafe {
+        slime_enable_neural_rescoring_with_profile(
+            handle,
+            model_path,
+            model_path_len,
+            NEURAL_PROFILE_BALANCED,
+        )
+    }
+}
+
+/// Enables neural rescoring with a measured model-size profile.
+///
+/// `balanced` preserves the xsmall model's established interpolation. The
+/// `high-accuracy` profile uses the settings frozen for zenz-v3.2-small.
+/// Keeping the choice explicit avoids guessing from a file name or size.
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed IME handle. `model_path`
+/// must reference readable UTF-8 bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_enable_neural_rescoring_with_profile(
+    handle: *mut SlimeHandle,
+    model_path: *const u8,
+    model_path_len: usize,
+    profile: u32,
+) -> u32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if handle.is_null() {
             return STATUS_NULL_HANDLE;
         }
+        let Some(profile_parameters) = neural_profile_parameters(profile) else {
+            return STATUS_INVALID_NEURAL_PROFILE;
+        };
         // SAFETY: The caller promises readable bytes for this call.
         let Some(model_path) = (unsafe { utf8_from_raw_parts(model_path, model_path_len) }) else {
             return STATUS_INVALID_UTF8;
@@ -391,22 +430,35 @@ pub unsafe extern "C" fn slime_enable_neural_rescoring(
 
         #[cfg(not(feature = "neural"))]
         {
-            let _ = model_path;
+            let _ = (model_path, profile_parameters);
             STATUS_NEURAL_UNAVAILABLE
         }
 
         #[cfg(feature = "neural")]
         {
+            let (candidate_weight, right_context_minimum_score_margin) = profile_parameters;
             let model_path = Path::new(model_path);
             let status = prepare_neural_service(model_path);
             if status == STATUS_OK {
                 // SAFETY: The caller promises a live, exclusively accessed handle.
-                unsafe { &mut *handle }.neural_enabled = true;
+                let handle = unsafe { &mut *handle };
+                handle.neural_enabled = true;
+                handle.neural_candidate_weight = candidate_weight;
+                handle.neural_right_context_minimum_score_margin =
+                    right_context_minimum_score_margin;
             }
             status
         }
     }));
     result.unwrap_or(STATUS_PANIC)
+}
+
+const fn neural_profile_parameters(profile: u32) -> Option<(f64, f64)> {
+    match profile {
+        NEURAL_PROFILE_BALANCED => Some((0.7, 0.1)),
+        NEURAL_PROFILE_HIGH_ACCURACY => Some((0.8, 0.5)),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "neural")]
@@ -537,7 +589,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let minimum_margin = if request.right_context.is_empty() {
             0.0
         } else {
-            NEURAL_RIGHT_CONTEXT_MINIMUM_SCORE_MARGIN
+            handle.neural_right_context_minimum_score_margin
         };
         let score_request = slime_neural::ScoreRequest {
             context: request.context,
@@ -549,7 +601,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             && let Some(scored) = scored.first()
             && let Some(rescored_actions) = handle.engine.apply_candidate_rescore(
                 &scored.candidate_logliks,
-                NEURAL_CANDIDATE_WEIGHT,
+                handle.neural_candidate_weight,
                 minimum_margin,
             )
         {
@@ -1507,6 +1559,8 @@ fn write_optional_json_string(output: &mut String, value: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "neural"))]
+    use super::slime_enable_neural_rescoring;
     use super::{
         ACTION_COMMIT, ACTION_SHOW_CANDIDATES, ACTION_UPDATE_PREEDIT,
         CANDIDATE_ANNOTATION_CORRECTION, CANDIDATE_ANNOTATION_NUMBER, EVENT_ACCEPT_CANDIDATE,
@@ -1516,7 +1570,7 @@ mod tests {
         SlimeStringView, slime_begin_reconversion, slime_buffer_destroy,
         slime_conversion_candidates, slime_create, slime_create_with_data_dir,
         slime_create_with_signed_data_dir, slime_create_with_signed_data_dir_and_version_floors,
-        slime_destroy, slime_domain_dictionary_words, slime_enable_neural_rescoring,
+        slime_destroy, slime_domain_dictionary_words, slime_enable_neural_rescoring_with_profile,
         slime_installed_dictionary_pack_words, slime_installed_dictionary_packs,
         slime_neural_rescoring_status, slime_process, slime_process_actions,
         slime_process_actions_v2, slime_record_external_selection, slime_reset_context,
@@ -1525,6 +1579,32 @@ mod tests {
     };
     use std::ffi::c_void;
     use std::fs;
+
+    #[test]
+    fn neural_profiles_keep_measured_parameters_explicit() {
+        assert_eq!(
+            super::neural_profile_parameters(super::NEURAL_PROFILE_BALANCED),
+            Some((0.7, 0.1))
+        );
+        assert_eq!(
+            super::neural_profile_parameters(super::NEURAL_PROFILE_HIGH_ACCURACY),
+            Some((0.8, 0.5))
+        );
+        assert_eq!(super::neural_profile_parameters(u32::MAX), None);
+    }
+
+    #[test]
+    fn invalid_neural_profile_is_rejected_before_loading() {
+        let handle = slime_create();
+        let path = b"model.gguf";
+        // SAFETY: The handle and path are live for this synchronous call.
+        let status = unsafe {
+            slime_enable_neural_rescoring_with_profile(handle, path.as_ptr(), path.len(), u32::MAX)
+        };
+        assert_eq!(status, super::STATUS_INVALID_NEURAL_PROFILE);
+        // SAFETY: The handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
 
     unsafe fn copy_buffer(buffer: &SlimeBuffer) -> String {
         // SAFETY: Tests read a live buffer before handing it back to its destructor.
@@ -1549,6 +1629,19 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    unsafe fn enable_high_accuracy_neural(handle: *mut super::SlimeHandle, model: &str) -> u32 {
+        // SAFETY: The caller passes a live handle and model string for this synchronous call.
+        unsafe {
+            slime_enable_neural_rescoring_with_profile(
+                handle,
+                model.as_ptr(),
+                model.len(),
+                super::NEURAL_PROFILE_HIGH_ACCURACY,
+            )
+        }
+    }
+
+    #[cfg(feature = "neural")]
     #[test]
     #[ignore = "requires SLIME_NEURAL_TEST_MODEL"]
     fn neural_feature_loads_and_processes_an_explicit_conversion() {
@@ -1556,7 +1649,7 @@ mod tests {
             .expect("SLIME_NEURAL_TEST_MODEL must name a compatible GGUF model");
         let handle = slime_create();
         // SAFETY: The handle and model path are live for this synchronous call.
-        let status = unsafe { slime_enable_neural_rescoring(handle, model.as_ptr(), model.len()) };
+        let status = unsafe { enable_high_accuracy_neural(handle, &model) };
         assert_eq!(status, STATUS_OK);
         // A cold llama.cpp/Metal initialization can include shader compilation
         // and exceed 30 seconds on an otherwise busy development machine.

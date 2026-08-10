@@ -108,6 +108,12 @@ enum SlimeStatus {
   SLIME_STATUS_NEURAL_LOAD_FAILED = 8,
   SLIME_STATUS_NEURAL_MODEL_CONFLICT = 9,
   SLIME_STATUS_NEURAL_PREPARING = 10,
+  SLIME_STATUS_INVALID_NEURAL_PROFILE = 11,
+};
+
+enum SlimeNeuralProfile {
+  SLIME_NEURAL_PROFILE_BALANCED = 0,
+  SLIME_NEURAL_PROFILE_HIGH_ACCURACY = 1,
 };
 
 SlimeHandle *slime_create(void);
@@ -131,6 +137,11 @@ void slime_destroy(SlimeHandle *handle);
 uint32_t slime_enable_neural_rescoring(SlimeHandle *handle,
                                        const uint8_t *model_path,
                                        size_t model_path_len);
+/* Selects interpolation settings measured for the model class. Balanced keeps
+   the xsmall settings; high-accuracy is frozen for zenz-v3.2-small. */
+uint32_t slime_enable_neural_rescoring_with_profile(
+    SlimeHandle *handle, const uint8_t *model_path, size_t model_path_len,
+    uint32_t profile);
 uint32_t slime_neural_rescoring_status(void);
 SlimeBuffer slime_process(SlimeHandle *handle, uint32_t event_kind, uint32_t value);
 /* Calls callback synchronously for each action. All views are borrowed only

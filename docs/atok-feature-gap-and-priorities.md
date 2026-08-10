@@ -258,9 +258,13 @@ GSD devは1件改善・悪化0、GSD train・test、AJIMEE、JWTDは候補順を
 
 品質面では、BF16から直接生成したQ4_K_MはQ5_K_Mより4,430,368 bytes（21.13%）小さいが、製品条件でGSD dev 3件、GSD test 1件、PUD 5件のtop-1を落とした。AJIMEE/JWTDは同率でも複数domain非悪化を満たさないため不採用とする。現時点ではQ5を評価専用の任意モデルに留め、モデルをSlimeの標準bundleへ含めない。
 
+その後、[zenz-v3.2-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)の公式配布commitがApache-2.0を宣言していることを確認した。95.1M parameterのQ5_K_Mをsmall専用profileで評価すると、現行xsmall比でJWTD dev +22件、GSD dev +8件、AJIMEE +14件、GSD test +5件、PUD +10件となり、5 datasetすべてのtop-1とMRRが改善した。詳細値とchecksumは[evaluation.md](evaluation.md)に記録する。
+
+これにより、ShareAlikeを含むv3.1を商用同梱候補にする必要はなくなった。v3.2-smallは明示的な`high-accuracy` profileとして実装し、モデルを含まない通常buildと既存xsmall向け`balanced` profileは維持する。ただし公式model cardには学習元の説明がないため、Apache-2.0 metadataだけで第三者権利まで断定せず、有償配布前の由来確認と法務レビューは残す。
+
 ## 次の実装順
 
-1. 複数domainで意味的同音語を改善でき、配布条件を製品として履行できるローカルrankerを学習・評価する。現行zenzモデルは任意指定に留め、Slime製品へ同梱しない。
+1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。
 2. 組織名・地名は、辞書にない語だけをライセンス・頻度付きoptional packとして評価し、初回top-1を変えない改善だけを採用する。
 3. 入力ミス訂正と学習強度の実利用false positiveを固定データへ追加する。
 4. macOSを再インストールし、TextEditで逐次入力、候補操作、再変換、private/secure inputを確認する。

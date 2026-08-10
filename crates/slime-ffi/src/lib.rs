@@ -133,6 +133,10 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 
 #[cfg(any(feature = "neural", test))]
 const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
+#[cfg(feature = "neural")]
+const PREFIX_CORRECTION_MIN_CHARACTERS: usize = 4;
+#[cfg(feature = "neural")]
+const PREFIX_CORRECTION_MIN_LOGIT_MARGIN: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NeuralProfileParameters {
@@ -144,6 +148,7 @@ struct NeuralProfileParameters {
     short_input_minimum_score_margin: f64,
     long_input_minimum_score_margin: f64,
     right_context_minimum_score_margin: f64,
+    prefix_correction: bool,
 }
 
 impl NeuralProfileParameters {
@@ -156,6 +161,7 @@ impl NeuralProfileParameters {
         short_input_minimum_score_margin: 0.0,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.1,
+        prefix_correction: false,
     };
 
     const HIGH_ACCURACY: Self = Self {
@@ -167,6 +173,7 @@ impl NeuralProfileParameters {
         short_input_minimum_score_margin: 0.5,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.5,
+        prefix_correction: true,
     };
 
     #[cfg(any(feature = "neural", test))]
@@ -657,14 +664,50 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             input_katakana: full_katakana(&request.reading),
             candidates: request.candidates,
         };
-        if let Ok(scored) = service.rescorer.score_all(&[score_request])
-            && let Some(scored) = scored.first()
-            && let Some(rescored_actions) = handle.engine.apply_candidate_rescore(
+        let scored = if handle.neural_profile.prefix_correction {
+            service
+                .rescorer
+                .score_all_with_prefix_diagnostics(&[score_request])
+        } else {
+            service.rescorer.score_all(&[score_request])
+        };
+        let Ok(scored) = scored else {
+            return actions;
+        };
+        let Some(scored) = scored.first() else {
+            return actions;
+        };
+        let rescored_actions = if handle.neural_profile.prefix_correction {
+            let constraints = scored
+                .first_mismatch_prefixes
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic.as_ref().and_then(|diagnostic| {
+                        (!diagnostic.alternative_is_eos
+                            && diagnostic.prefix.chars().count()
+                                >= PREFIX_CORRECTION_MIN_CHARACTERS
+                            && diagnostic.alternative_logit - diagnostic.candidate_logit
+                                >= PREFIX_CORRECTION_MIN_LOGIT_MARGIN)
+                            .then(|| diagnostic.prefix.clone())
+                    })
+                })
+                .collect::<Vec<_>>();
+            handle
+                .engine
+                .apply_candidate_rescore_with_prefix_constraints(
+                    &scored.candidate_logliks,
+                    &constraints,
+                    candidate_weight,
+                    minimum_margin,
+                )
+        } else {
+            handle.engine.apply_candidate_rescore(
                 &scored.candidate_logliks,
                 candidate_weight,
                 minimum_margin,
             )
-        {
+        };
+        if let Some(rescored_actions) = rescored_actions {
             return rescored_actions;
         }
     }
@@ -1654,6 +1697,7 @@ mod tests {
         assert_eq!(balanced.long_input_candidate_limit, 16);
         assert_eq!(balanced.confidence_bypass_candidate_limit, 8);
         assert!(!balanced.bypass_long_input_confidence);
+        assert!(!balanced.prefix_correction);
         assert_close(balanced.minimum_score_margin(false, false), 0.0);
         assert_close(balanced.minimum_score_margin(true, false), 0.0);
         assert_close(balanced.minimum_score_margin(false, true), 0.1);
@@ -1668,6 +1712,7 @@ mod tests {
         assert_eq!(high_accuracy.long_input_candidate_limit, 32);
         assert_eq!(high_accuracy.confidence_bypass_candidate_limit, 8);
         assert!(high_accuracy.bypass_long_input_confidence);
+        assert!(high_accuracy.prefix_correction);
         assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
@@ -1775,15 +1820,7 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
-    #[test]
-    #[ignore = "requires SLIME_NEURAL_TEST_MODEL"]
-    fn neural_feature_loads_and_processes_an_explicit_conversion() {
-        let model = std::env::var("SLIME_NEURAL_TEST_MODEL")
-            .expect("SLIME_NEURAL_TEST_MODEL must name a compatible GGUF model");
-        let handle = slime_create();
-        // SAFETY: The handle and model path are live for this synchronous call.
-        let status = unsafe { enable_high_accuracy_neural(handle, &model) };
-        assert_eq!(status, STATUS_OK);
+    fn wait_for_neural_model() {
         // A cold llama.cpp/Metal initialization can include shader compilation
         // and exceed 30 seconds on an otherwise busy development machine.
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
@@ -1795,36 +1832,99 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(slime_neural_rescoring_status(), STATUS_OK);
-        verify_confident_long_neural_conversion(&model);
-        let expanded_candidate_latency = {
-            let service = super::NEURAL_SERVICE
-                .get()
-                .expect("neural service should be initialized")
-                .lock()
-                .expect("neural service lock should not be poisoned");
-            let service = service.as_ref().expect("neural service should be loaded");
-            let request = slime_neural::ScoreRequest {
-                context: String::new(),
-                right_context: String::new(),
-                input_katakana: "チョウブンショウニ".to_owned(),
-                candidates: (0..super::NEURAL_MAX_PARALLEL_CANDIDATES)
-                    .map(|index| format!("長文候補{index}"))
-                    .collect(),
-            };
-            let scored = service
-                .rescorer
-                .score_all(&[request])
-                .expect("the product runtime bound should score the expanded pool");
-            assert_eq!(
-                scored[0].candidate_logliks.len(),
-                super::NEURAL_MAX_PARALLEL_CANDIDATES
-            );
-            scored[0].latency
+    }
+
+    #[cfg(feature = "neural")]
+    fn verify_prefix_correction(handle: *mut super::SlimeHandle) {
+        // The first-pass N-best winner contains 奨学, while the model's
+        // constrained local alternative recovers 少額 without changing the
+        // rest of the long sentence.
+        let mut capture = TypedCapture::default();
+        for character in
+            "どうほうにおいては、ちんりょうかいていのふんそうのうちでもしょうがくのふんそうについては"
+                .chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("同法においては、賃料改定の紛争のうちでも少額の紛争については")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+    }
+
+    #[cfg(feature = "neural")]
+    fn measure_prefix_diagnostics() {
+        let service = super::NEURAL_SERVICE
+            .get()
+            .expect("neural service should be initialized")
+            .lock()
+            .expect("neural service lock should not be poisoned");
+        let service = service.as_ref().expect("neural service should be loaded");
+        let request = || slime_neural::ScoreRequest {
+            context: String::new(),
+            right_context: String::new(),
+            input_katakana: "チョウブンショウニ".to_owned(),
+            candidates: (0..super::NEURAL_MAX_PARALLEL_CANDIDATES)
+                .map(|index| format!("長文候補{index}"))
+                .collect(),
         };
+        let expanded = service
+            .rescorer
+            .score_all(&[request()])
+            .expect("the product runtime bound should score the expanded pool");
+        assert_eq!(
+            expanded[0].candidate_logliks.len(),
+            super::NEURAL_MAX_PARALLEL_CANDIDATES
+        );
         eprintln!(
             "ffi neural expanded-candidate conversion: {:.3}ms",
-            expanded_candidate_latency.as_secs_f64() * 1_000.0
+            expanded[0].latency.as_secs_f64() * 1_000.0
         );
+
+        let mut standard = Vec::with_capacity(10);
+        let mut diagnostic = Vec::with_capacity(10);
+        for _ in 0..10 {
+            standard.push(
+                service
+                    .rescorer
+                    .score_all(&[request()])
+                    .expect("standard scorer should succeed")[0]
+                    .latency,
+            );
+            diagnostic.push(
+                service
+                    .rescorer
+                    .score_all_with_prefix_diagnostics(&[request()])
+                    .expect("diagnostic scorer should succeed")[0]
+                    .latency,
+            );
+        }
+        standard.sort_unstable();
+        diagnostic.sort_unstable();
+        eprintln!(
+            "ffi neural prefix diagnostics: standard_p50={:.3}ms diagnostic_p50={:.3}ms delta={:.3}ms",
+            standard[5].as_secs_f64() * 1_000.0,
+            diagnostic[5].as_secs_f64() * 1_000.0,
+            diagnostic[5].saturating_sub(standard[5]).as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[cfg(feature = "neural")]
+    #[test]
+    #[ignore = "requires SLIME_NEURAL_TEST_MODEL"]
+    fn neural_feature_loads_and_processes_an_explicit_conversion() {
+        let model = std::env::var("SLIME_NEURAL_TEST_MODEL")
+            .expect("SLIME_NEURAL_TEST_MODEL must name a compatible GGUF model");
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        let status = unsafe { enable_high_accuracy_neural(handle, &model) };
+        assert_eq!(status, STATUS_OK);
+        wait_for_neural_model();
+        verify_confident_long_neural_conversion(&model);
+        verify_prefix_correction(handle);
+        measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";
         // SAFETY: The handle and both UTF-8 strings are live for this call.

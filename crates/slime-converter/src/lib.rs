@@ -2797,6 +2797,32 @@ impl Dictionary {
         }
     }
 
+    /// Returns complete conversion paths whose rendered surface starts with
+    /// `surface_prefix`. The constraint is applied while expanding the lattice
+    /// so paths that disagree with it do not consume the beam.
+    #[must_use]
+    pub fn convert_n_best_with_surface_prefix(
+        &self,
+        reading: &str,
+        surface_prefix: &str,
+        limit: usize,
+    ) -> Vec<Conversion> {
+        if reading.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        if surface_prefix.is_empty() {
+            return self.convert_n_best(reading, limit);
+        }
+        if u16::try_from(surface_prefix.len()).is_err() {
+            return Vec::new();
+        }
+        if self.uses_connection_costs {
+            self.convert_n_best_connected_with_surface_prefix(reading, Some(surface_prefix), limit)
+        } else {
+            self.convert_n_best_heuristic_with_surface_prefix(reading, Some(surface_prefix), limit)
+        }
+    }
+
     #[must_use]
     pub fn convert_best(&self, reading: &str) -> Option<Conversion> {
         if self.uses_connection_costs {
@@ -2998,6 +3024,15 @@ impl Dictionary {
     }
 
     fn convert_n_best_connected(&self, reading: &str, limit: usize) -> Vec<Conversion> {
+        self.convert_n_best_connected_with_surface_prefix(reading, None, limit)
+    }
+
+    fn convert_n_best_connected_with_surface_prefix(
+        &self,
+        reading: &str,
+        surface_prefix: Option<&str>,
+        limit: usize,
+    ) -> Vec<Conversion> {
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
         let synthetic_by_start = synthetic_entries_by_start(reading, &synthetic_arena);
@@ -3028,6 +3063,7 @@ impl Dictionary {
                     entry.surface,
                     (entry.left_id, entry.right_id),
                     entry.word_cost,
+                    surface_prefix,
                     limit,
                 );
             });
@@ -3043,6 +3079,7 @@ impl Dictionary {
                     synthetic.surface,
                     (synthetic.left_id, synthetic.right_id),
                     synthetic.cost,
+                    surface_prefix,
                     limit,
                 );
             }
@@ -3054,6 +3091,7 @@ impl Dictionary {
                 &mut arena,
                 &mut lattice,
                 connection,
+                surface_prefix,
                 limit,
             );
         }
@@ -3061,6 +3099,11 @@ impl Dictionary {
         let mut completed: Vec<_> = lattice[reading.len()]
             .states
             .iter()
+            .filter(|&&node| {
+                surface_prefix.is_none_or(|prefix| {
+                    usize::from(arena[node].matched_prefix_bytes) == prefix.len()
+                })
+            })
             .map(|&node| {
                 (
                     node,
@@ -3075,6 +3118,15 @@ impl Dictionary {
     }
 
     fn convert_n_best_heuristic(&self, reading: &str, limit: usize) -> Vec<Conversion> {
+        self.convert_n_best_heuristic_with_surface_prefix(reading, None, limit)
+    }
+
+    fn convert_n_best_heuristic_with_surface_prefix(
+        &self,
+        reading: &str,
+        surface_prefix: Option<&str>,
+        limit: usize,
+    ) -> Vec<Conversion> {
         let mut arena = Vec::<NBestNode<'_>>::with_capacity(n_best_arena_capacity(reading, limit));
         let mut lattice: Vec<NBestBucket> = (0..=reading.len())
             .map(|_| NBestBucket::default())
@@ -3111,12 +3163,15 @@ impl Dictionary {
                             segment_cost,
                             right_id: 0,
                             total_cost: segment_cost,
+                            matched_prefix_bytes: 0,
                         },
+                        surface_prefix,
                         limit,
                     );
                 } else {
                     for &predecessor in &predecessors {
                         let total_cost = arena[predecessor].total_cost.saturating_add(segment_cost);
+                        let matched_prefix_bytes = arena[predecessor].matched_prefix_bytes;
                         insert_n_best_node(
                             &mut arena,
                             &mut lattice[start + relative_end],
@@ -3128,7 +3183,9 @@ impl Dictionary {
                                 segment_cost,
                                 right_id: 0,
                                 total_cost,
+                                matched_prefix_bytes,
                             },
+                            surface_prefix,
                             limit,
                         );
                     }
@@ -3141,6 +3198,7 @@ impl Dictionary {
                 &predecessors,
                 &mut arena,
                 &mut lattice,
+                surface_prefix,
                 limit,
             );
         }
@@ -3148,6 +3206,11 @@ impl Dictionary {
         let mut completed: Vec<_> = lattice[reading.len()]
             .states
             .iter()
+            .filter(|&&node| {
+                surface_prefix.is_none_or(|prefix| {
+                    usize::from(arena[node].matched_prefix_bytes) == prefix.len()
+                })
+            })
             .map(|&node| (node, arena[node].total_cost))
             .collect();
         completed.sort_unstable_by_key(|(_, cost)| *cost);
@@ -3268,6 +3331,7 @@ struct NBestNode<'a> {
     surface: &'a str,
     segment_cost: i32,
     right_id: u16,
+    matched_prefix_bytes: u16,
     total_cost: i32,
 }
 
@@ -3295,6 +3359,7 @@ impl NodeIndex {
 const _: () = assert!(std::mem::size_of::<LatticeNode<'static>>() <= 64);
 const _: () = assert!(std::mem::size_of::<NBestNode<'static>>() <= 64);
 
+#[allow(clippy::too_many_arguments)]
 fn insert_connected_unknown<'a>(
     reading: &'a str,
     start: usize,
@@ -3302,6 +3367,7 @@ fn insert_connected_unknown<'a>(
     arena: &mut Vec<NBestNode<'a>>,
     lattice: &mut [NBestBucket],
     connection: ConnectionMatrix,
+    surface_prefix: Option<&str>,
     limit: usize,
 ) {
     let Some(character) = reading[start..].chars().next() else {
@@ -3324,7 +3390,9 @@ fn insert_connected_unknown<'a>(
                 segment_cost: UNKNOWN_COST,
                 right_id: UNKNOWN_POS_ID,
                 total_cost,
+                matched_prefix_bytes: 0,
             },
+            surface_prefix,
             limit,
         );
         return;
@@ -3348,7 +3416,9 @@ fn insert_connected_unknown<'a>(
                 segment_cost: UNKNOWN_COST,
                 right_id: UNKNOWN_POS_ID,
                 total_cost,
+                matched_prefix_bytes: previous.matched_prefix_bytes,
             },
+            surface_prefix,
             limit,
         );
     }
@@ -3360,6 +3430,7 @@ fn insert_heuristic_unknown<'a>(
     predecessors: &[usize],
     arena: &mut Vec<NBestNode<'a>>,
     lattice: &mut [NBestBucket],
+    surface_prefix: Option<&str>,
     limit: usize,
 ) {
     let Some(character) = reading[start..].chars().next() else {
@@ -3379,7 +3450,9 @@ fn insert_heuristic_unknown<'a>(
                 segment_cost: UNKNOWN_COST,
                 right_id: 0,
                 total_cost: UNKNOWN_COST,
+                matched_prefix_bytes: 0,
             },
+            surface_prefix,
             limit,
         );
         return;
@@ -3398,7 +3471,9 @@ fn insert_heuristic_unknown<'a>(
                 segment_cost: UNKNOWN_COST,
                 right_id: 0,
                 total_cost,
+                matched_prefix_bytes: arena[predecessor].matched_prefix_bytes,
             },
+            surface_prefix,
             limit,
         );
     }
@@ -3406,6 +3481,28 @@ fn insert_heuristic_unknown<'a>(
 
 /// Inserts one word (dictionary or synthetic) into the n-best lattice,
 /// fanning out over every predecessor state at `start`.
+fn advance_surface_prefix(
+    surface_prefix: Option<&str>,
+    matched_bytes: u16,
+    surface: &str,
+) -> Option<u16> {
+    let Some(prefix) = surface_prefix else {
+        return Some(0);
+    };
+    let matched_bytes = usize::from(matched_bytes);
+    if matched_bytes == prefix.len() {
+        return u16::try_from(matched_bytes).ok();
+    }
+    let remaining = &prefix[matched_bytes..];
+    if remaining.starts_with(surface) {
+        u16::try_from(matched_bytes + surface.len()).ok()
+    } else if surface.starts_with(remaining) {
+        u16::try_from(prefix.len()).ok()
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_connected_word<'a>(
     arena: &mut Vec<NBestNode<'a>>,
@@ -3417,6 +3514,7 @@ fn insert_connected_word<'a>(
     surface: &'a str,
     (left_id, right_id): (u16, u16),
     word_cost: i32,
+    surface_prefix: Option<&str>,
     limit: usize,
 ) {
     if start == 0 {
@@ -3434,7 +3532,9 @@ fn insert_connected_word<'a>(
                 segment_cost: word_cost,
                 right_id,
                 total_cost,
+                matched_prefix_bytes: 0,
             },
+            surface_prefix,
             limit,
         );
         return;
@@ -3458,7 +3558,9 @@ fn insert_connected_word<'a>(
                 segment_cost: word_cost,
                 right_id,
                 total_cost,
+                matched_prefix_bytes: previous.matched_prefix_bytes,
             },
+            surface_prefix,
             limit,
         );
     }
@@ -3467,9 +3569,18 @@ fn insert_connected_word<'a>(
 fn insert_n_best_node<'a>(
     arena: &mut Vec<NBestNode<'a>>,
     bucket: &mut NBestBucket,
-    candidate: NBestNode<'a>,
+    mut candidate: NBestNode<'a>,
+    surface_prefix: Option<&str>,
     limit_per_state: usize,
 ) {
+    let Some(matched_prefix_bytes) = advance_surface_prefix(
+        surface_prefix,
+        candidate.matched_prefix_bytes,
+        candidate.surface,
+    ) else {
+        return;
+    };
+    candidate.matched_prefix_bytes = matched_prefix_bytes;
     // Every target bucket is finalized before it becomes a predecessor. A
     // replacement can therefore reuse its arena slot without invalidating a
     // path which has already captured that index.
@@ -4466,8 +4577,10 @@ mod tests {
                     surface,
                     segment_cost: total_cost,
                     right_id,
+                    matched_prefix_bytes: 0,
                     total_cost,
                 },
+                None,
                 1,
             );
         }
@@ -4485,8 +4598,10 @@ mod tests {
                 surface: "worse",
                 segment_cost: 80,
                 right_id: 9,
+                matched_prefix_bytes: 0,
                 total_cost: 80,
             },
+            None,
             1,
         );
         assert_eq!(arena.len(), 8);
@@ -4502,8 +4617,10 @@ mod tests {
                 surface: "better",
                 segment_cost: 5,
                 right_id: 9,
+                matched_prefix_bytes: 0,
                 total_cost: 5,
             },
+            None,
             1,
         );
         assert_eq!(bucket.worst_position, 6);
@@ -4519,8 +4636,10 @@ mod tests {
                 surface: "seven replacement",
                 segment_cost: 60,
                 right_id: 7,
+                matched_prefix_bytes: 0,
                 total_cost: 60,
             },
+            None,
             1,
         );
         assert_eq!(bucket.states.len(), 8);
@@ -4888,6 +5007,56 @@ mod tests {
 
         assert!(surfaces.contains(&"橋で食べる"), "surfaces: {surfaces:?}");
         assert!(surfaces.contains(&"箸で食べる"), "surfaces: {surfaces:?}");
+    }
+
+    #[test]
+    fn surface_prefix_constraint_prunes_cheaper_incompatible_paths() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あ", "亜", 10),
+            DictionaryEntry::new("あ", "阿", 20),
+            DictionaryEntry::new("い", "伊", 10),
+        ]);
+
+        let conversions = dictionary.convert_n_best_with_surface_prefix("あい", "阿", 5);
+
+        assert_eq!(conversions[0].surface, "阿伊");
+        assert!(
+            conversions
+                .iter()
+                .all(|conversion| conversion.surface.starts_with("阿"))
+        );
+    }
+
+    #[test]
+    fn surface_prefix_constraint_can_end_inside_a_dictionary_surface() {
+        let dictionary = Dictionary::new(vec![DictionaryEntry::new("あい", "愛情", 10)]);
+
+        let conversions = dictionary.convert_n_best_with_surface_prefix("あい", "愛", 5);
+
+        assert_eq!(conversions[0].surface, "愛情");
+        assert!(
+            dictionary
+                .convert_n_best_with_surface_prefix("あい", "不一致", 5)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn connected_surface_prefix_constraint_keeps_only_matching_paths() {
+        let dictionary = Dictionary::bundled();
+
+        let conversions = dictionary.convert_n_best_with_surface_prefix("はしでたべる", "箸", 10);
+
+        assert!(
+            conversions
+                .iter()
+                .any(|conversion| conversion.surface == "箸で食べる")
+        );
+        assert!(
+            conversions
+                .iter()
+                .all(|conversion| conversion.surface.starts_with("箸"))
+        );
     }
 
     #[test]

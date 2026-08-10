@@ -52,6 +52,8 @@ const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
+const PREFIX_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
+const PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -529,10 +531,44 @@ impl SlimeEngine {
         lambda: f64,
         minimum_margin: f64,
     ) -> Option<Vec<SlimeAction>> {
+        self.apply_candidate_rescore_internal(log_likelihoods, None, lambda, minimum_margin)
+    }
+
+    /// Applies model scores and optional model-directed surface prefixes.
+    ///
+    /// Prefixes are aligned with the pending request. A prefix can replace the
+    /// rescored winner only when constrained lattice search changes at most
+    /// two adjacent characters and leaves the rest of the candidate intact.
+    /// This keeps token-level model disagreement from rewriting unrelated
+    /// parts of a long sentence.
+    pub fn apply_candidate_rescore_with_prefix_constraints(
+        &mut self,
+        log_likelihoods: &[f64],
+        prefix_constraints: &[Option<String>],
+        lambda: f64,
+        minimum_margin: f64,
+    ) -> Option<Vec<SlimeAction>> {
+        self.apply_candidate_rescore_internal(
+            log_likelihoods,
+            Some(prefix_constraints),
+            lambda,
+            minimum_margin,
+        )
+    }
+
+    fn apply_candidate_rescore_internal(
+        &mut self,
+        log_likelihoods: &[f64],
+        prefix_constraints: Option<&[Option<String>]>,
+        lambda: f64,
+        minimum_margin: f64,
+    ) -> Option<Vec<SlimeAction>> {
         let state = self.candidate_rescore.take()?;
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.selected != 0
             || state.candidates.len() != log_likelihoods.len()
+            || prefix_constraints
+                .is_some_and(|constraints| constraints.len() != state.candidates.len())
             || !(0.0..=1.0).contains(&lambda)
             || !lambda.is_finite()
             || minimum_margin < 0.0
@@ -587,14 +623,41 @@ impl SlimeEngine {
             })
             .collect();
         order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
-        if order
-            .first()
-            .is_some_and(|&top| top != 0 && combined[top] - combined[0] < minimum_margin)
-        {
+        let top = *order.first()?;
+        let margin_protects_base = top != 0 && combined[top] - combined[0] < minimum_margin;
+        let selected = if margin_protects_base { 0 } else { top };
+        let prefix_correction = prefix_constraints
+            .and_then(|constraints| constraints[selected].as_deref())
+            .and_then(|prefix| {
+                let current = &state.candidates[selected].surface;
+                let correction = self
+                    .dictionary
+                    .convert_n_best_with_surface_prefix(
+                        &state.request.reading,
+                        prefix,
+                        PREFIX_CONSTRAINED_CANDIDATE_LIMIT,
+                    )
+                    .into_iter()
+                    .next()?
+                    .surface;
+                (bounded_local_substitution(
+                    current,
+                    &correction,
+                    PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+                ) && !pending_candidates.contains(&correction))
+                .then_some(correction)
+            });
+        if margin_protects_base && prefix_correction.is_none() {
             return Some(self.candidate_actions());
         }
+        let correction_position = *positions.first()?;
         for (position, candidate_index) in positions.into_iter().zip(order) {
-            pending_candidates[position].clone_from(&state.candidates[candidate_index].surface);
+            if !margin_protects_base {
+                pending_candidates[position].clone_from(&state.candidates[candidate_index].surface);
+            }
+        }
+        if let Some(correction) = prefix_correction {
+            pending_candidates.insert(correction_position, correction);
         }
         self.candidates = pending_candidates;
         Some(self.candidate_actions())
@@ -2231,6 +2294,30 @@ fn candidate_rescore_state_with_limit(
     })
 }
 
+fn bounded_local_substitution(current: &str, alternative: &str, maximum_changes: usize) -> bool {
+    let current = current.chars().collect::<Vec<_>>();
+    let alternative = alternative.chars().collect::<Vec<_>>();
+    if current.len() != alternative.len() {
+        return false;
+    }
+    let changed = current
+        .iter()
+        .zip(&alternative)
+        .enumerate()
+        .filter_map(|(index, (current, alternative))| {
+            (current != alternative).then_some((index, *current, *alternative))
+        })
+        .collect::<Vec<_>>();
+    let Some((&(first, _, _), &(last, _, _))) = changed.first().zip(changed.last()) else {
+        return false;
+    };
+    changed.len() <= maximum_changes
+        && last - first + 1 == changed.len()
+        && changed.iter().all(|&(_, current, alternative)| {
+            !current.is_ascii_alphanumeric() && !alternative.is_ascii_alphanumeric()
+        })
+}
+
 fn select_candidate_corrections(
     ranked: Vec<(CandidateCorrection, (u8, i32))>,
     limit: usize,
@@ -2393,7 +2480,8 @@ mod tests {
         DictionaryPackTrust, DictionaryPackVerificationKey, DictionaryPackVersionFloor,
         DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision,
         MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY,
-        UserData, bundled_dictionary, date_time_candidates, katakana_candidate,
+        UserData, bounded_local_substitution, bundled_dictionary, date_time_candidates,
+        katakana_candidate,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
@@ -4529,6 +4617,92 @@ mod tests {
         assert_eq!(engine.candidates[1], "ニホン");
         assert!(engine.candidates.contains(&"日本".to_owned()));
         assert!(engine.candidates.contains(&"二本".to_owned()));
+    }
+
+    #[test]
+    fn model_prefix_can_insert_a_bounded_local_correction() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "少額", 20),
+            DictionaryEntry::new("もんだい", "問題", 10),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["奨学の問題".to_owned()];
+        let candidate = Candidate {
+            surface: "奨学の問題".to_owned(),
+            cost: 100,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![candidate.surface.clone()],
+            },
+            candidates: vec![candidate],
+        });
+
+        engine
+            .apply_candidate_rescore_with_prefix_constraints(
+                &[0.0],
+                &[Some("少".to_owned())],
+                0.8,
+                0.0,
+            )
+            .expect("aligned prefix correction should apply");
+
+        assert_eq!(engine.candidates[0], "少額の問題");
+        assert!(engine.candidates.contains(&"奨学の問題".to_owned()));
+        assert!(
+            engine
+                .handle(InputEvent::Enter)
+                .contains(&SlimeAction::Commit("少額の問題".to_owned()))
+        );
+    }
+
+    #[test]
+    fn model_prefix_cannot_rewrite_a_second_distant_region() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "少額", 20),
+            DictionaryEntry::new("もんだい", "課題", 10),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["奨学の問題".to_owned()];
+        let candidate = Candidate {
+            surface: "奨学の問題".to_owned(),
+            cost: 100,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![candidate.surface.clone()],
+            },
+            candidates: vec![candidate],
+        });
+
+        engine
+            .apply_candidate_rescore_with_prefix_constraints(
+                &[0.0],
+                &[Some("少".to_owned())],
+                0.8,
+                0.0,
+            )
+            .expect("valid scores should still apply");
+
+        assert_eq!(engine.candidates[0], "奨学の問題");
+        assert!(!engine.candidates.contains(&"少額の課題".to_owned()));
+    }
+
+    #[test]
+    fn bounded_local_correction_never_reinterprets_ascii_alphanumerics() {
+        assert!(bounded_local_substitution("奨学の問題", "少額の問題", 2));
+        assert!(!bounded_local_substitution("紀元前511", "紀元前後11", 2));
+        assert!(!bounded_local_substitution("abc版", "abd版", 2));
     }
 
     #[test]

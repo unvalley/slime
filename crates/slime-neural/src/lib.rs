@@ -57,6 +57,20 @@ pub struct ScoredItem {
     pub candidate_token_counts: Vec<usize>,
     /// Wall-clock time spent scoring this item (prefix + all candidates).
     pub latency: Duration,
+    /// First token where the model's most likely continuation differs from
+    /// each candidate. Populated only by the explicit diagnostic API.
+    pub first_mismatch_prefixes: Vec<Option<PrefixDiagnostic>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrefixDiagnostic {
+    /// Candidate prefix followed by the model's preferred next token. When
+    /// `alternative_is_eos` is true, this is the candidate prefix before EOS.
+    pub prefix: String,
+    pub candidate_token_index: usize,
+    pub candidate_logit: f32,
+    pub alternative_logit: f32,
+    pub alternative_is_eos: bool,
 }
 
 pub struct Rescorer {
@@ -129,6 +143,30 @@ impl Rescorer {
     /// configured token position exceeds `i32`, both of which violate the
     /// validated model and bounded-context contract.
     pub fn score_all(&self, requests: &[ScoreRequest]) -> Result<Vec<ScoredItem>, String> {
+        self.score_all_internal(requests, false)
+    }
+
+    /// Scores requests and reports the model's first preferred alternative
+    /// prefix for every candidate. This performs additional vocabulary scans
+    /// and should be enabled only by an explicit high-accuracy policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when context creation or decoding fails. An individual
+    /// alternative token that cannot be rendered as UTF-8 is omitted without
+    /// discarding the candidate scores.
+    pub fn score_all_with_prefix_diagnostics(
+        &self,
+        requests: &[ScoreRequest],
+    ) -> Result<Vec<ScoredItem>, String> {
+        self.score_all_internal(requests, true)
+    }
+
+    fn score_all_internal(
+        &self,
+        requests: &[ScoreRequest],
+        diagnose_prefixes: bool,
+    ) -> Result<Vec<ScoredItem>, String> {
         let sequence_count = u32::try_from(self.max_parallel_candidates)
             .map_err(|_| "parallel candidate count does not fit u32".to_owned())?;
         let context_params = LlamaContextParams::default()
@@ -149,7 +187,15 @@ impl Rescorer {
         let mut timing = Timing::default();
         let scored: Result<Vec<ScoredItem>, String> = requests
             .iter()
-            .map(|request| self.score_item(&mut context, &mut batch, request, &mut timing))
+            .map(|request| {
+                self.score_item(
+                    &mut context,
+                    &mut batch,
+                    request,
+                    &mut timing,
+                    diagnose_prefixes,
+                )
+            })
             .collect();
         if std::env::var_os("SLIME_NEURAL_TIMING").is_some() {
             eprintln!(
@@ -167,6 +213,7 @@ impl Rescorer {
         batch: &mut LlamaBatch,
         request: &ScoreRequest,
         timing: &mut Timing,
+        diagnose_prefixes: bool,
     ) -> Result<ScoredItem, String> {
         let started = Instant::now();
         let prompt = build_prompt(
@@ -196,6 +243,7 @@ impl Rescorer {
                 candidate_logliks: vec![0.0; request.candidates.len()],
                 candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
                 latency: started.elapsed(),
+                first_mismatch_prefixes: vec![None; request.candidates.len()],
             });
         }
 
@@ -224,6 +272,8 @@ impl Rescorer {
         let mut logliks = Vec::with_capacity(candidate_tokens.len());
         let mut candidate_logliks = Vec::with_capacity(candidate_tokens.len());
         let mut first_token_scores: Option<LogDistribution> = None;
+        let mut first_token_maximum: Option<(LlamaToken, f32)> = None;
+        let mut first_mismatch_prefixes = Vec::with_capacity(candidate_tokens.len());
         for (chunk_index, chunk) in candidate_tokens
             .chunks(self.max_parallel_candidates)
             .enumerate()
@@ -283,14 +333,25 @@ impl Rescorer {
             };
             if merged_prefix {
                 first_token_scores = Some(LogDistribution::from_logits(logits_row(0)));
+                if diagnose_prefixes {
+                    first_token_maximum = Some(maximum_token(logits_row(0)));
+                }
             }
             let first_token_scores = first_token_scores
                 .as_ref()
                 .expect("prefix distribution captured in the first chunk");
+            let node_maxima = diagnose_prefixes
+                .then(|| {
+                    (0..trie.nodes.len())
+                        .map(|node| maximum_token(logits_row(candidate_row_base + node)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             for (tokens, path) in chunk.iter().zip(&trie.candidate_paths) {
                 let Some(first) = tokens.first() else {
                     logliks.push(f64::NEG_INFINITY);
                     candidate_logliks.push(f64::NEG_INFINITY);
+                    first_mismatch_prefixes.push(None);
                     continue;
                 };
                 let mut loglik = first_token_scores.log_probability(*first);
@@ -305,6 +366,53 @@ impl Rescorer {
                 let final_node = *path.last().expect("non-empty candidate has a trie path");
                 loglik += token_log_probability(logits_row(candidate_row_base + final_node), eos);
                 logliks.push(loglik);
+
+                if diagnose_prefixes {
+                    let first_maximum =
+                        first_token_maximum.expect("prefix maximum captured in the first chunk");
+                    let mismatch = tokens.iter().enumerate().find_map(|(index, &token)| {
+                        let (alternative, alternative_logit, candidate_logit) = if index == 0 {
+                            (
+                                first_maximum.0,
+                                first_maximum.1,
+                                first_token_scores.logit(token),
+                            )
+                        } else {
+                            let preceding_node = path[index - 1];
+                            let maximum = node_maxima[preceding_node];
+                            (
+                                maximum.0,
+                                maximum.1,
+                                logits_row(candidate_row_base + preceding_node)[token_index(token)],
+                            )
+                        };
+                        (alternative != token).then_some((
+                            index,
+                            alternative,
+                            candidate_logit,
+                            alternative_logit,
+                        ))
+                    });
+                    let diagnostic = mismatch.and_then(
+                        |(index, alternative, candidate_logit, alternative_logit)| {
+                            let alternative_is_eos = alternative == eos;
+                            let mut prefix_tokens = tokens[..index].to_vec();
+                            if !alternative_is_eos {
+                                prefix_tokens.push(alternative);
+                            }
+                            Some(PrefixDiagnostic {
+                                prefix: self.tokens_to_string(&prefix_tokens).ok()?,
+                                candidate_token_index: index,
+                                candidate_logit,
+                                alternative_logit,
+                                alternative_is_eos,
+                            })
+                        },
+                    );
+                    first_mismatch_prefixes.push(diagnostic);
+                } else {
+                    first_mismatch_prefixes.push(None);
+                }
             }
             timing.scoring += scoring_started.elapsed();
         }
@@ -314,7 +422,21 @@ impl Rescorer {
             candidate_logliks,
             candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
             latency: started.elapsed(),
+            first_mismatch_prefixes,
         })
+    }
+
+    fn tokens_to_string(&self, tokens: &[LlamaToken]) -> Result<String, String> {
+        let mut bytes = Vec::with_capacity(tokens.len().saturating_mul(4));
+        for &token in tokens {
+            let piece = self
+                .model
+                .token_to_piece_bytes(token, 32, false, None)
+                .map_err(|error| format!("failed to decode alternative token: {error}"))?;
+            bytes.extend_from_slice(&piece);
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| format!("alternative prefix is not valid UTF-8: {error}"))
     }
 }
 
@@ -461,8 +583,23 @@ fn vector_max(values: &[f32]) -> f32 {
 }
 
 fn token_log_probability(logits: &[f32], token: LlamaToken) -> f64 {
-    let index = usize::try_from(token.0).expect("token id is non-negative");
-    f64::from(logits[index]) - log_sum_exp(logits)
+    f64::from(logits[token_index(token)]) - log_sum_exp(logits)
+}
+
+fn token_index(token: LlamaToken) -> usize {
+    usize::try_from(token.0).expect("token id is non-negative")
+}
+
+fn maximum_token(logits: &[f32]) -> (LlamaToken, f32) {
+    let (index, &logit) = logits
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .expect("model vocabulary is non-empty");
+    (
+        LlamaToken(i32::try_from(index).expect("vocabulary index fits i32")),
+        logit,
+    )
 }
 
 /// A log-softmax view over one logits vector, copied out so it survives later
@@ -481,8 +618,11 @@ impl LogDistribution {
     }
 
     fn log_probability(&self, token: LlamaToken) -> f64 {
-        let index = usize::try_from(token.0).expect("token id is non-negative");
-        f64::from(self.logits[index]) - self.log_normalizer
+        f64::from(self.logit(token)) - self.log_normalizer
+    }
+
+    fn logit(&self, token: LlamaToken) -> f32 {
+        self.logits[token_index(token)]
     }
 }
 

@@ -718,6 +718,26 @@ JWTDでは`自身がある → 自信がある`、`行動を借りて → 講堂
 
 v3.1のShareAlike問題はこのv3.2-small artifactには当てはまらない。一方、公式model cardはlicense metadata以外が空で、学習元の説明はない。Apache-2.0表示だけから第三者権利まで断定せず、実際の有償配布前には由来確認と法務レビューを残す。
 
+### 2026-08-11 モデル指示prefixによる局所再探索
+
+[azooKeyKanaKanjiConverterの現行`ZenzCandidateEvaluator`](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift#L286-L311)は、候補tokenがモデルの最尤tokenと食い違った最初の位置で`fixRequired(prefixConstraint:)`を返し、固定N-bestの外側を再探索する。Slimeでも同じ信号を評価した。候補ごとの全文尤度は従来どおり一度のdecodeで計算し、明示的な`high-accuracy` profileだけ、trie nodeごとの最尤tokenと最初の不一致prefixを追加取得する。復号不能な特殊tokenはその候補の診断だけを捨て、既存の尤度scoreを失敗させない。
+
+無制限にprefix制約を採用すると、モデルが局所的に好む表記へ長文の後半まで書き換える誤発火があった。このためJWTD devだけで、prefix 4文字以上、代替tokenとのlogit差2.0以上、制約付きlattice最大8件、元候補と同じ文字数、変更は連続2文字以内に固定した。ASCII英数字を含む変更は禁止する。これによりPUDで観測した`紀元前511 → 紀元前後11`を構造的に除外する。制約候補は元のニューラルwinnerを削除せず、その直前へ挿入する。`balanced`、履歴、ユーザー辞書、規則、入力ミス訂正の保護境界は変更しない。
+
+`neural_prefix_probe`で製品と同じhigh-accuracy候補数、cost窓、lambda、minimum marginを再現した。JWTDで閾値を固定した後、AJIMEE、PUD、GSDへ同じ条件を適用した。
+
+| dataset | 現行top-1 | 局所再探索top-1 | 改善 / exact悪化 |
+| --- | ---: | ---: | ---: |
+| JWTD dev 400件 | 221 / 400（0.5525） | **223 / 400（0.5575）** | 3 / 1 |
+| AJIMEE held-out 200件 | 165 / 200（0.8250） | **168 / 200（0.8400）** | 3 / 0 |
+| PUD held-out 446件 | 342 / 446（0.7668） | **346 / 446（0.7758）** | 4 / 0 |
+| GSD dev 331件 | 296 / 331（0.8943） | 296 / 331（0.8943） | 0 / 0 |
+| GSD test 323件 | 291 / 323（0.9009） | 291 / 323（0.9009） | 0 / 0 |
+
+JWTDのexact悪化1件は`マンネルヘイム十字勲章受賞 → マンネルヘイム十字勲章受章`である。評価goldと異なるため悪化として数え、表記の妥当性とは分けて人手確認対象に残す。改善例は`奨学の紛争 → 少額の紛争`、`補給してしまう → 捕球してしまう`、`地球参加 → 地球讃歌`、`検討をつけた → 見当をつけた`である。
+
+実製品FFIの20回warm測定では`ラーメンには自信があるが`がp50 38.8 ms / p95 53.7 ms / max 65.1 msだった。同じ16候補を10回ずつ交互に測った通常score / prefix診断scoreのp50は27.6 / 26.8 msで、この条件では追加の全語彙走査は測定ノイズを超える増加を示さなかった。二回目のモデルdecodeは行わない。JWTDで制約が閾値を通った24件の制約付きlatticeはp50 3.0 ms / p95 6.4 msで、通常変換の候補beamを消費しない。
+
 ### 2026-07-25 コスト上書きハックの除去とスコア尺度の一貫化
 
 `いいかんじ`が`いい漢字`へ変換される不具合の調査で、must-passを通すための語別ハックが変換全体を歪めていたことが判明した。次の方針へ改めた。

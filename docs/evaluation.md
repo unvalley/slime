@@ -703,7 +703,18 @@ lambdaは0.8 / 0.825 / 0.85 / 0.875 / 0.9をJWTD/GSD devで比較した。0.875�
 
 変更したtop-1を入力長で分けると、JWTDの改善4件はすべて28文字以上、AJIMEEの改善1件は20文字以上で、AJIMEEの悪化1件は10文字だった。そこで右文脈なし・20文字以上だけ0.74、それ以外は0.8を維持する境界を固定した。20文字以上の部分集合はJWTD 295件で151件から155件、MRR 0.5994から0.6064、MinCER 0.0465から0.0462へ改善し、AJIMEE 108件で82件から83件、MRR 0.7813から0.7859、MinCER 0.0248から0.0245へ改善した。全体ではJWTDが210件から214件、AJIMEEが162件から163件となる。GSDは最大5文字、PUDは最大15文字で境界を通らず、右文脈ありも入力長にかかわらず0.8を維持するため、両held-outの順位は現行と同一である。
 
-製品FFIは既存の`balanced`（lambda 0.7 / 長文16候補 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（通常lambda 0.8、右文脈なし20文字以上だけ0.74 / 長文32候補 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。短文は両profileとも5候補、右文脈marginは入力長より優先し、KVセル数1024の上限は変更しない。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
+長文の候補回収をさらに調べるため、通常N-bestと最良パスの文節境界を保った表記variantを同じ32枠で比較した。JWTDのoracleはN-best 32で313/400、完全な和集合で315/400、通常30件と固定文節2件では314/400だった。しかし追加回収した`異存ありません`はsmallモデルで2位までしか上がらず、全体top-1も変わらなかった。追加候補生成だけを製品へ残す根拠がないため、この方式は不採用とした。
+
+一方、base上位2件のcost差が1,000を超えるだけでニューラル評価を省略していた長文を、`high-accuracy`かつ右文脈なしの場合だけ評価すると、候補集合を変えずに両コーパスで改善した。
+
+| dataset | 従来 acc@1 / MRR | 長文gate解除 acc@1 / MRR | top-1差 | 変更内訳 |
+| --- | ---: | ---: | ---: | ---: |
+| JWTD dev 400件 | 0.5350 / 0.6192 | **0.5525 / 0.6317** | +7件 | 7改善 / 0悪化 |
+| AJIMEE held-out 200件 | 0.8150 / 0.8377 | **0.8250 / 0.8435** | +2件 | 2改善 / 0悪化 |
+
+JWTDでは`自身がある → 自信がある`、`行動を借りて → 講堂を借りて`、`資料が残されて → 史料が残されて`、AJIMEEでは`種類販売業免許 → 酒類販売業免許`、`音声を取り戻し → 温情を取り戻し`を修正した。MinCERもJWTD 0.0565→0.0550、AJIMEE 0.0258→0.0242へ改善した。9件の正解候補はすべて8位以内だったため、従来gateで評価済みの曖昧長文は32候補を維持し、新たにgateを解除した入力だけ8候補に制限した。JWTDのニューラル評価対象は328→392件、評価候補は5,171→5,525件、AJIMEEは159→189件・2,407→2,551件となった。実製品FFIで新規改善例`ラーメンには自信があるが`を20回warm測定するとp50 81.3 ms / p95 89.1 ms / max 133.3 msで、32候補をそのまま使う試作のp50 263.2 ms / p95 482.0 msから大幅に抑えた。精度と引き換えの追加推論は明示的な`high-accuracy`だけに限定し、`balanced`、9文字未満、右文脈あり、履歴・ユーザー辞書・規則・入力ミス訂正の候補は従来gateを維持する。GSD dev/testとPUDは全件が右文脈付きで、この条件を通らない。
+
+製品FFIは既存の`balanced`（lambda 0.7 / 長文16候補 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（通常lambda 0.8、右文脈なし20文字以上だけ0.74 / 長文32候補 / 右文脈なし長文はbase confidence gateを解除し、その場合だけ8候補 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。短文は両profileとも5候補、右文脈marginは入力長より優先し、KVセル数1024の上限は変更しない。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
 
 v3.1のShareAlike問題はこのv3.2-small artifactには当てはまらない。一方、公式model cardはlicense metadata以外が空で、学習元の説明はない。Apache-2.0表示だけから第三者権利まで断定せず、実際の有償配布前には由来確認と法務レビューを残す。
 

@@ -139,6 +139,8 @@ struct NeuralProfileParameters {
     candidate_weight: f64,
     very_long_input_candidate_weight: f64,
     long_input_candidate_limit: usize,
+    confidence_bypass_candidate_limit: usize,
+    bypass_long_input_confidence: bool,
     short_input_minimum_score_margin: f64,
     long_input_minimum_score_margin: f64,
     right_context_minimum_score_margin: f64,
@@ -149,6 +151,8 @@ impl NeuralProfileParameters {
         candidate_weight: 0.7,
         very_long_input_candidate_weight: 0.7,
         long_input_candidate_limit: 16,
+        confidence_bypass_candidate_limit: 8,
+        bypass_long_input_confidence: false,
         short_input_minimum_score_margin: 0.0,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.1,
@@ -158,6 +162,8 @@ impl NeuralProfileParameters {
         candidate_weight: 0.8,
         very_long_input_candidate_weight: 0.74,
         long_input_candidate_limit: 32,
+        confidence_bypass_candidate_limit: 8,
+        bypass_long_input_confidence: true,
         short_input_minimum_score_margin: 0.5,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.5,
@@ -622,9 +628,13 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
 
     #[cfg(feature = "neural")]
     if let Some(service) = NEURAL_SERVICE.get() {
-        handle.engine.prepare_extended_candidate_rescore_with_limit(
-            handle.neural_profile.long_input_candidate_limit,
-        );
+        handle
+            .engine
+            .prepare_extended_candidate_rescore_with_limit_and_confidence(
+                handle.neural_profile.long_input_candidate_limit,
+                handle.neural_profile.confidence_bypass_candidate_limit,
+                handle.neural_profile.bypass_long_input_confidence,
+            );
         let Some(request) = handle.engine.candidate_rescore_request() else {
             return actions;
         };
@@ -1642,6 +1652,8 @@ mod tests {
         assert_close(balanced.candidate_weight_for(20, false), 0.7);
         assert_close(balanced.candidate_weight_for(20, true), 0.7);
         assert_eq!(balanced.long_input_candidate_limit, 16);
+        assert_eq!(balanced.confidence_bypass_candidate_limit, 8);
+        assert!(!balanced.bypass_long_input_confidence);
         assert_close(balanced.minimum_score_margin(false, false), 0.0);
         assert_close(balanced.minimum_score_margin(true, false), 0.0);
         assert_close(balanced.minimum_score_margin(false, true), 0.1);
@@ -1654,6 +1666,8 @@ mod tests {
         assert_close(high_accuracy.candidate_weight_for(20, false), 0.74);
         assert_close(high_accuracy.candidate_weight_for(20, true), 0.8);
         assert_eq!(high_accuracy.long_input_candidate_limit, 32);
+        assert_eq!(high_accuracy.confidence_bypass_candidate_limit, 8);
+        assert!(high_accuracy.bypass_long_input_confidence);
         assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
@@ -1710,6 +1724,57 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_confident_long_neural_conversion(model: &str) {
+        let handle = slime_create();
+        // SAFETY: The handle and already-loaded model path are live for this call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        let mut capture = TypedCapture::default();
+        for character in "らーめんにはじしんがあるが".chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        let cold_started = std::time::Instant::now();
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        eprintln!(
+            "ffi neural confident long conversion: {:.3}ms",
+            cold_started.elapsed().as_secs_f64() * 1_000.0
+        );
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("ラーメンには自信があるが")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+
+        let mut latencies = Vec::with_capacity(20);
+        for _ in 0..20 {
+            // SAFETY: The handle is live and exclusively accessed.
+            assert_eq!(unsafe { slime_reset_context(handle) }, STATUS_OK);
+            for character in "らーめんにはじしんがあるが".chars() {
+                process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+            }
+            let started = std::time::Instant::now();
+            process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+            latencies.push(started.elapsed());
+            assert_eq!(
+                capture.candidates.first().map(String::as_str),
+                Some("ラーメンには自信があるが")
+            );
+            process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+        }
+        latencies.sort_unstable();
+        eprintln!(
+            "ffi neural confident long warm: p50={:.3}ms p95={:.3}ms max={:.3}ms",
+            latencies[10].as_secs_f64() * 1_000.0,
+            latencies[18].as_secs_f64() * 1_000.0,
+            latencies[19].as_secs_f64() * 1_000.0
+        );
+        // SAFETY: The handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     #[test]
     #[ignore = "requires SLIME_NEURAL_TEST_MODEL"]
     fn neural_feature_loads_and_processes_an_explicit_conversion() {
@@ -1730,6 +1795,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(slime_neural_rescoring_status(), STATUS_OK);
+        verify_confident_long_neural_conversion(&model);
         let expanded_candidate_latency = {
             let service = super::NEURAL_SERVICE
                 .get()

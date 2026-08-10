@@ -242,6 +242,10 @@ struct Options {
     neural_long_input_max_candidates: Option<usize>,
     neural_max_candidate_cost_gap: Option<i32>,
     neural_long_input_max_candidate_cost_gap: Option<i32>,
+    neural_force_long_input_scoring: bool,
+    neural_forced_long_input_max_candidates: Option<usize>,
+    neural_very_long_input_min_characters: Option<usize>,
+    neural_very_long_input_lambda: Option<f64>,
     lambdas: Vec<f64>,
     neural_min_margins: Vec<f64>,
     neural_score_modes: Vec<NeuralScoreMode>,
@@ -289,6 +293,10 @@ impl Options {
             neural_long_input_max_candidates: None,
             neural_max_candidate_cost_gap: None,
             neural_long_input_max_candidate_cost_gap: None,
+            neural_force_long_input_scoring: false,
+            neural_forced_long_input_max_candidates: None,
+            neural_very_long_input_min_characters: None,
+            neural_very_long_input_lambda: None,
             lambdas: Vec::new(),
             neural_min_margins: Vec::new(),
             neural_score_modes: Vec::new(),
@@ -398,6 +406,31 @@ impl Options {
                             "--neural-long-input-max-candidate-cost-gap",
                             arguments.next(),
                         )?);
+                }
+                "--neural-force-long-input-scoring" => {
+                    options.neural_force_long_input_scoring = true;
+                }
+                "--neural-forced-long-input-max-candidates" => {
+                    let maximum = parse_positive(
+                        "--neural-forced-long-input-max-candidates",
+                        arguments.next(),
+                    )?;
+                    if maximum < 2 {
+                        return Err(
+                            "--neural-forced-long-input-max-candidates must be at least 2"
+                                .to_owned(),
+                        );
+                    }
+                    options.neural_forced_long_input_max_candidates = Some(maximum);
+                }
+                "--neural-very-long-input-min-characters" => {
+                    options.neural_very_long_input_min_characters = Some(parse_positive(
+                        "--neural-very-long-input-min-characters",
+                        arguments.next(),
+                    )?);
+                }
+                "--neural-very-long-input-lambda" => {
+                    options.neural_very_long_input_lambda = Some(parse_lambda(arguments.next())?);
                 }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
                 "--neural-min-margin" => options.neural_min_margins.push(parse_non_negative_f64(
@@ -524,6 +557,45 @@ impl Options {
                     .to_owned(),
             );
         }
+        if options.neural_force_long_input_scoring
+            && (options.neural_model.is_none()
+                || options.neural_long_input_min_characters.is_none())
+        {
+            return Err(
+                "--neural-force-long-input-scoring requires --neural-model and --neural-long-input-min-characters"
+                .to_owned(),
+            );
+        }
+        if options.neural_forced_long_input_max_candidates.is_some()
+            && !options.neural_force_long_input_scoring
+        {
+            return Err(
+                "--neural-forced-long-input-max-candidates requires --neural-force-long-input-scoring"
+                    .to_owned(),
+            );
+        }
+        if let (Some(forced), Some(long)) = (
+            options.neural_forced_long_input_max_candidates,
+            options.neural_long_input_max_candidates,
+        ) && forced > long
+        {
+            return Err(
+                "--neural-forced-long-input-max-candidates cannot exceed --neural-long-input-max-candidates"
+                    .to_owned(),
+            );
+        }
+        if options.neural_very_long_input_min_characters.is_some()
+            != options.neural_very_long_input_lambda.is_some()
+        {
+            return Err(
+                "very-long-input neural weighting requires both --neural-very-long-input-min-characters and --neural-very-long-input-lambda"
+                    .to_owned(),
+            );
+        }
+        if options.neural_very_long_input_min_characters.is_some() && options.neural_model.is_none()
+        {
+            return Err("very-long-input neural weighting requires --neural-model".to_owned());
+        }
         if let (Some(short), Some(long)) = (
             options.neural_max_candidates,
             options.neural_long_input_max_candidates,
@@ -612,6 +684,10 @@ fn usage() -> String {
      [--neural-long-input-min-characters N] \
      [--neural-long-input-max-candidates N] \
      [--neural-long-input-max-candidate-cost-gap N] \
+     [--neural-force-long-input-scoring] \
+     [--neural-forced-long-input-max-candidates N] \
+     [--neural-very-long-input-min-characters N] \
+     [--neural-very-long-input-lambda X] \
      [--lambda X]... [--neural-min-margin X]... \
      [--neural-score-mode with-eos|without-eos|mean-with-eos|mean-without-eos]... \
      [--export-nbest path] \
@@ -632,7 +708,13 @@ fn usage() -> String {
      --neural-max-candidate-cost-gap \
      further restricts that prefix to candidates no more than N cost units \
      above the base winner. The corresponding long-input option replaces that \
-     cost gap at the same character boundary. --lambda selects interpolation \
+     cost gap at the same character boundary. \
+     --neural-force-long-input-scoring bypasses the top-two confidence gate for \
+     long inputs without right context. \
+     Its optional candidate limit applies only when that bypass is necessary. \
+     The very-long-input pair replaces lambda at its character boundary for \
+     inputs without right context. \
+     --lambda selects interpolation \
      weights; without it a default sweep runs. --neural-min-margin accepts a \
      new top candidate only when its interpolated score exceeds the base top by \
      at least X; it is repeatable and defaults to zero. --neural-score-mode \
@@ -829,6 +911,13 @@ struct EvaluationReport {
     neural_max_candidate_cost_gap: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_long_input_max_candidate_cost_gap: Option<i32>,
+    neural_force_long_input_scoring: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_forced_long_input_max_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_very_long_input_min_characters: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_very_long_input_lambda: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_scored_items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1072,12 +1161,16 @@ fn evaluate(
         let neural = score_neural_outcomes(
             &rescorer,
             &outcomes,
-            options.neural_max_cost_gap,
-            options.neural_max_candidates,
-            options.neural_long_input_min_characters,
-            options.neural_long_input_max_candidates,
-            options.neural_max_candidate_cost_gap,
-            options.neural_long_input_max_candidate_cost_gap,
+            NeuralScoringPolicy {
+                max_cost_gap: options.neural_max_cost_gap,
+                max_candidates: options.neural_max_candidates,
+                long_input_min_characters: options.neural_long_input_min_characters,
+                long_input_max_candidates: options.neural_long_input_max_candidates,
+                max_candidate_cost_gap: options.neural_max_candidate_cost_gap,
+                long_input_max_candidate_cost_gap: options.neural_long_input_max_candidate_cost_gap,
+                force_long_input_scoring: options.neural_force_long_input_scoring,
+                forced_long_input_max_candidates: options.neural_forced_long_input_max_candidates,
+            },
         )?;
         let mut reports = Vec::with_capacity(
             options.lambdas.len()
@@ -1340,8 +1433,7 @@ fn discriminative_teacher_expected(
             model_path.display()
         );
         let rescorer = neural::Rescorer::load(model_path)?;
-        let neural =
-            score_neural_outcomes(&rescorer, outcomes, None, None, None, None, None, None)?;
+        let neural = score_neural_outcomes(&rescorer, outcomes, NeuralScoringPolicy::default())?;
         Ok(outcomes
             .iter()
             .enumerate()
@@ -1387,33 +1479,52 @@ struct NeuralReportConfig<'a> {
 }
 
 #[cfg(feature = "neural")]
-fn score_neural_outcomes(
-    rescorer: &neural::Rescorer,
-    outcomes: &[ItemOutcome<'_>],
+#[derive(Clone, Copy, Default)]
+struct NeuralScoringPolicy {
     max_cost_gap: Option<i32>,
     max_candidates: Option<usize>,
     long_input_min_characters: Option<usize>,
     long_input_max_candidates: Option<usize>,
     max_candidate_cost_gap: Option<i32>,
     long_input_max_candidate_cost_gap: Option<i32>,
+    force_long_input_scoring: bool,
+    forced_long_input_max_candidates: Option<usize>,
+}
+
+#[cfg(feature = "neural")]
+fn score_neural_outcomes(
+    rescorer: &neural::Rescorer,
+    outcomes: &[ItemOutcome<'_>],
+    policy: NeuralScoringPolicy,
 ) -> Result<NeuralOutcome, String> {
     let candidate_counts: Vec<_> = outcomes
         .iter()
         .map(|outcome| {
-            if should_score_neurally(&outcome.candidates, max_cost_gap) {
-                neural_candidate_prefix_len(
-                    &outcome.candidates,
+            let is_forced_long_input = policy.force_long_input_scoring
+                && outcome.item.right_context_text.is_empty()
+                && policy
+                    .long_input_min_characters
+                    .is_some_and(|minimum| outcome.item.input.chars().count() >= minimum);
+            let normally_scored = should_score_neurally(&outcome.candidates, policy.max_cost_gap);
+            if is_forced_long_input || normally_scored {
+                let candidate_limit = if is_forced_long_input && !normally_scored {
+                    policy.forced_long_input_max_candidates
+                } else {
                     neural_candidate_limit(
                         &outcome.item.input,
-                        max_candidates,
-                        long_input_min_characters,
-                        long_input_max_candidates,
-                    ),
+                        policy.max_candidates,
+                        policy.long_input_min_characters,
+                        policy.long_input_max_candidates,
+                    )
+                };
+                neural_candidate_prefix_len(
+                    &outcome.candidates,
+                    candidate_limit,
                     neural_candidate_cost_gap(
                         &outcome.item.input,
-                        max_candidate_cost_gap,
-                        long_input_min_characters,
-                        long_input_max_candidate_cost_gap,
+                        policy.max_candidate_cost_gap,
+                        policy.long_input_min_characters,
+                        policy.long_input_max_candidate_cost_gap,
                     ),
                 )
             } else {
@@ -1600,6 +1711,20 @@ fn rescored_surfaces(
         .collect()
 }
 
+fn neural_lambda_for_item(item: &AjimeeItem, default: f64, options: &Options) -> f64 {
+    match (
+        options.neural_very_long_input_min_characters,
+        options.neural_very_long_input_lambda,
+    ) {
+        (Some(minimum), Some(lambda))
+            if item.right_context_text.is_empty() && item.input.chars().count() >= minimum =>
+        {
+            lambda
+        }
+        _ => default,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn compute_report(
     outcomes: &[ItemOutcome<'_>],
@@ -1624,7 +1749,7 @@ fn compute_report(
             (Some(neural), None, None) => rescored_surfaces(
                 &outcome.candidates,
                 neural.outcome.scores(outcome_index, neural.score_mode),
-                neural.lambda,
+                neural_lambda_for_item(item, neural.lambda, options),
                 neural.min_margin,
             ),
             (None, Some(discriminative), Some(weight)) => discriminative::rescored_surfaces(
@@ -1727,6 +1852,10 @@ fn compute_report(
         neural_long_input_max_candidates: options.neural_long_input_max_candidates,
         neural_max_candidate_cost_gap: options.neural_max_candidate_cost_gap,
         neural_long_input_max_candidate_cost_gap: options.neural_long_input_max_candidate_cost_gap,
+        neural_force_long_input_scoring: options.neural_force_long_input_scoring,
+        neural_forced_long_input_max_candidates: options.neural_forced_long_input_max_candidates,
+        neural_very_long_input_min_characters: options.neural_very_long_input_min_characters,
+        neural_very_long_input_lambda: options.neural_very_long_input_lambda,
         neural_scored_items: neural.map(|neural| neural.outcome.scored_items),
         neural_skipped_items: neural.map(|neural| outcomes.len() - neural.outcome.scored_items),
         neural_scored_candidates: neural.map(|neural| neural.outcome.scored_candidates),
@@ -1799,6 +1928,18 @@ fn print_neural_report(report: &EvaluationReport) {
         report.neural_long_input_max_candidate_cost_gap,
     ) {
         println!("neural long-input max candidate cost gap: {maximum} from {minimum} characters");
+    }
+    if report.neural_force_long_input_scoring {
+        println!("neural long-input confidence gate: bypassed");
+    }
+    if let Some(maximum) = report.neural_forced_long_input_max_candidates {
+        println!("neural forced long-input candidates: {maximum}");
+    }
+    if let (Some(minimum), Some(lambda)) = (
+        report.neural_very_long_input_min_characters,
+        report.neural_very_long_input_lambda,
+    ) {
+        println!("neural very-long-input lambda: {lambda:.2} from {minimum} characters");
     }
     if let Some(scored) = report.neural_scored_items {
         println!("neural scored items: {scored}");
@@ -2034,8 +2175,8 @@ mod tests {
         AjimeeItem, ContextFilter, DatasetFormat, ItemOutcome, NeuralScoreMode, Options,
         base_cost_gap, character_error_rate, compute_report, katakana_to_hiragana,
         load_annotated_items, mean_logliks, neural_candidate_cost_gap, neural_candidate_limit,
-        neural_candidate_prefix_len, normalize_for_evaluation, parse_anthy_line, percentile,
-        rescored_surfaces, should_score_neurally,
+        neural_candidate_prefix_len, neural_lambda_for_item, normalize_for_evaluation,
+        parse_anthy_line, percentile, rescored_surfaces, should_score_neurally,
     };
     use slime_converter::Candidate;
     use std::fs;
@@ -2165,6 +2306,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_long_input_neural_policy_options() {
+        let options = Options::parse(
+            [
+                "ajimee",
+                "items.json",
+                "--neural-model",
+                "model.gguf",
+                "--neural-max-candidates",
+                "5",
+                "--neural-long-input-min-characters",
+                "9",
+                "--neural-long-input-max-candidates",
+                "32",
+                "--neural-force-long-input-scoring",
+                "--neural-forced-long-input-max-candidates",
+                "8",
+                "--neural-very-long-input-min-characters",
+                "20",
+                "--neural-very-long-input-lambda",
+                "0.74",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert!(options.neural_force_long_input_scoring);
+        assert_eq!(options.neural_forced_long_input_max_candidates, Some(8));
+        assert_eq!(options.neural_very_long_input_min_characters, Some(20));
+        assert_eq!(options.neural_very_long_input_lambda, Some(0.74));
+    }
+
+    #[test]
     fn neural_cost_gap_gate_skips_confident_or_single_candidate_items() {
         let candidates = vec![
             Candidate {
@@ -2244,6 +2418,40 @@ mod tests {
             neural_candidate_limit("ニホン", Some(5), None, None),
             Some(5)
         );
+    }
+
+    #[test]
+    fn neural_lambda_changes_only_for_very_long_items_without_right_context() {
+        let options = Options::parse(
+            [
+                "ajimee",
+                "items.json",
+                "--neural-model",
+                "model.gguf",
+                "--neural-very-long-input-min-characters",
+                "20",
+                "--neural-very-long-input-lambda",
+                "0.74",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let mut item = AjimeeItem {
+            source_split: None,
+            index: "long".to_owned(),
+            context_text: String::new(),
+            right_context_text: String::new(),
+            input: "ア".repeat(20),
+            expected_output: vec!["亜".repeat(20)],
+        };
+
+        assert_close(neural_lambda_for_item(&item, 0.8, &options), 0.74);
+        item.right_context_text = "右文脈".to_owned();
+        assert_close(neural_lambda_for_item(&item, 0.8, &options), 0.8);
+        item.right_context_text.clear();
+        item.input = "ア".repeat(19);
+        assert_close(neural_lambda_for_item(&item, 0.8, &options), 0.8);
     }
 
     #[test]

@@ -441,41 +441,79 @@ impl SlimeEngine {
     /// The requested size is bounded so callers cannot expand the search or
     /// neural runtime beyond the product's measured 32-candidate ceiling.
     pub fn prepare_extended_candidate_rescore_with_limit(&mut self, requested_candidates: usize) {
+        self.prepare_extended_candidate_rescore_with_limit_and_confidence(
+            requested_candidates,
+            requested_candidates,
+            false,
+        );
+    }
+
+    /// Prepares a profile-selected long-reading pool with an optional
+    /// high-accuracy confidence override.
+    ///
+    /// The override applies only to long readings without right context. It
+    /// never bypasses personalized, rule-based, typo-correction, or
+    /// non-conversion candidates. Its separate candidate bound avoids paying
+    /// the full ambiguous-reading pool cost for an otherwise decisive input.
+    pub fn prepare_extended_candidate_rescore_with_limit_and_confidence(
+        &mut self,
+        requested_candidates: usize,
+        confidence_bypass_candidates: usize,
+        bypass_long_input_confidence: bool,
+    ) {
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.selected != 0
             || self.reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            || !self.candidate_corrections.is_empty()
         {
             return;
         }
-        let Some(current) = self.candidate_rescore.as_ref() else {
-            return;
-        };
-        let reading = current.request.reading.clone();
-        let context = current.request.context.clone();
-        let right_context = current.request.right_context.clone();
+        let reading = self.reading.clone();
         let candidate_limit = requested_candidates.clamp(
             LONG_RESCORE_CANDIDATE_LIMIT,
             MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
         );
-        let dictionary_candidates = if context.is_empty() && right_context.is_empty() {
-            self.dictionary
-                .candidates_with_limit(&reading, candidate_limit)
-        } else {
-            self.dictionary.candidates_with_surrounding_context_limit(
+        if let Some(current) = self.candidate_rescore.as_ref() {
+            let context = current.request.context.clone();
+            let right_context = current.request.right_context.clone();
+            let dictionary_candidates = self.dictionary_candidates_for_context(
+                &reading,
+                Some(candidate_limit),
+                (!context.is_empty()).then_some(context.as_str()),
+                &right_context,
+            );
+            self.candidate_rescore = candidate_rescore_state_with_limit(
                 &reading,
                 &context,
                 &right_context,
+                &[],
+                &dictionary_candidates,
                 candidate_limit,
-            )
-        };
-        self.candidate_rescore = candidate_rescore_state_with_limit(
-            &reading,
-            &context,
-            &right_context,
-            &[],
-            &dictionary_candidates,
-            candidate_limit,
+                bypass_long_input_confidence,
+            );
+            return;
+        }
+        if !bypass_long_input_confidence
+            || self
+                .session_history
+                .right_surface()
+                .is_some_and(|right| !right.is_empty())
+        {
+            return;
+        }
+        let confidence_bypass_limit = confidence_bypass_candidates.clamp(
+            LONG_RESCORE_CANDIDATE_LIMIT,
+            MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
         );
+        self.candidate_rescore = self
+            .conversion_candidate_set_for_reading_with_limit_and_context_policy(
+                &reading,
+                Some(confidence_bypass_limit),
+                None,
+                bypass_long_input_confidence,
+                Some(confidence_bypass_limit),
+            )
+            .rescore;
     }
 
     /// Applies model log-likelihoods to the pending dictionary-only request.
@@ -895,18 +933,25 @@ impl SlimeEngine {
         dictionary_limit: Option<usize>,
         explicit_previous_surface: Option<&str>,
     ) -> ConversionCandidateSet {
+        self.conversion_candidate_set_for_reading_with_limit_and_context_policy(
+            reading,
+            dictionary_limit,
+            explicit_previous_surface,
+            false,
+            None,
+        )
+    }
+
+    fn conversion_candidate_set_for_reading_with_limit_and_context_policy(
+        &self,
+        reading: &str,
+        dictionary_limit: Option<usize>,
+        explicit_previous_surface: Option<&str>,
+        bypass_long_input_confidence: bool,
+        rescore_candidate_limit: Option<usize>,
+    ) -> ConversionCandidateSet {
         let mut candidates = Vec::new();
-        let previous_surface = if self.preferences.private_mode {
-            None
-        } else {
-            explicit_previous_surface.or_else(|| self.session_history.previous_surface())
-        };
-        let right_context = if self.preferences.private_mode || explicit_previous_surface.is_some()
-        {
-            ""
-        } else {
-            self.session_history.right_surface().unwrap_or_default()
-        };
+        let (previous_surface, right_context) = self.conversion_contexts(explicit_previous_surface);
         let (contextual_history, established_history, transient_history) =
             if self.history_is_available() {
                 let contextual = self
@@ -978,12 +1023,14 @@ impl SlimeEngine {
                     promoted < CONTEXT_RULE_PROMOTION_LIMIT
                 });
         }
-        let rescore = candidate_rescore_state(
+        let rescore = candidate_rescore_state_with_optional_limit(
             reading,
             previous_surface.unwrap_or_default(),
             right_context,
             &candidates,
             &dictionary_candidates,
+            rescore_candidate_limit,
+            bypass_long_input_confidence,
         );
         for candidate in dictionary_candidates {
             push_unique(&mut candidates, candidate.surface);
@@ -997,6 +1044,23 @@ impl SlimeEngine {
             surfaces: candidates,
             rescore,
         }
+    }
+
+    fn conversion_contexts<'a>(
+        &'a self,
+        explicit_previous_surface: Option<&'a str>,
+    ) -> (Option<&'a str>, &'a str) {
+        if self.preferences.private_mode {
+            return (None, "");
+        }
+        let previous_surface =
+            explicit_previous_surface.or_else(|| self.session_history.previous_surface());
+        let right_context = explicit_previous_surface
+            .is_none()
+            .then(|| self.session_history.right_surface())
+            .flatten()
+            .unwrap_or_default();
+        (previous_surface, right_context)
     }
 
     fn conversion_candidates_with_corrections(
@@ -2058,6 +2122,7 @@ fn candidate_rescore_state(
     right_context: &str,
     protected_candidates: &[String],
     dictionary_candidates: &[Candidate],
+    bypass_long_input_confidence: bool,
 ) -> Option<CandidateRescoreState> {
     let candidate_limit = if reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS {
         LONG_RESCORE_CANDIDATE_LIMIT
@@ -2071,6 +2136,41 @@ fn candidate_rescore_state(
         protected_candidates,
         dictionary_candidates,
         candidate_limit,
+        bypass_long_input_confidence,
+    )
+}
+
+fn candidate_rescore_state_with_optional_limit(
+    reading: &str,
+    context: &str,
+    right_context: &str,
+    protected_candidates: &[String],
+    dictionary_candidates: &[Candidate],
+    candidate_limit: Option<usize>,
+    bypass_long_input_confidence: bool,
+) -> Option<CandidateRescoreState> {
+    candidate_limit.map_or_else(
+        || {
+            candidate_rescore_state(
+                reading,
+                context,
+                right_context,
+                protected_candidates,
+                dictionary_candidates,
+                bypass_long_input_confidence,
+            )
+        },
+        |candidate_limit| {
+            candidate_rescore_state_with_limit(
+                reading,
+                context,
+                right_context,
+                protected_candidates,
+                dictionary_candidates,
+                candidate_limit,
+                bypass_long_input_confidence,
+            )
+        },
     )
 }
 
@@ -2081,6 +2181,7 @@ fn candidate_rescore_state_with_limit(
     protected_candidates: &[String],
     dictionary_candidates: &[Candidate],
     candidate_limit: usize,
+    bypass_long_input_confidence: bool,
 ) -> Option<CandidateRescoreState> {
     if !protected_candidates.is_empty() {
         return None;
@@ -2108,7 +2209,12 @@ fn candidate_rescore_state_with_limit(
         .skip(1)
         .map(|candidate| candidate.cost)
         .min()?;
-    if alternative.saturating_sub(first).max(0) > RESCORE_MAX_BASE_COST_GAP {
+    let bypasses_base_confidence = bypass_long_input_confidence
+        && right_context.is_empty()
+        && reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS;
+    if alternative.saturating_sub(first).max(0) > RESCORE_MAX_BASE_COST_GAP
+        && !bypasses_base_confidence
+    {
         return None;
     }
     Some(CandidateRescoreState {
@@ -4276,6 +4382,73 @@ mod tests {
                 .len(),
             super::MAX_EXTENDED_LONG_RESCORE_CANDIDATES
         );
+    }
+
+    #[test]
+    fn high_accuracy_scorer_bypasses_confidence_only_for_left_context_long_input() {
+        let reading = "ちょうぶんしょうに";
+        let dictionary = || {
+            Dictionary::new(
+                (0_i32..20)
+                    .map(|index| {
+                        DictionaryEntry::new(
+                            reading,
+                            format!("長文候補{index}"),
+                            if index == 0 {
+                                1_000
+                            } else {
+                                2_190 + index * 10
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let mut engine = SlimeEngine::new(dictionary());
+        type_text(&mut engine, "choubunshouni");
+        engine.handle(InputEvent::Space);
+
+        assert!(engine.candidate_rescore_request().is_none());
+        engine.prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, false);
+        assert!(engine.candidate_rescore_request().is_none());
+        engine.prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, true);
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("high-accuracy long input should bypass base confidence")
+                .candidates,
+            (0..8)
+                .map(|index| format!("長文候補{index}"))
+                .collect::<Vec<_>>()
+        );
+
+        let mut with_right_context = SlimeEngine::new(dictionary());
+        with_right_context.set_external_context("", "ました。");
+        type_text(&mut with_right_context, "choubunshouni");
+        with_right_context.handle(InputEvent::Space);
+        with_right_context
+            .prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, true);
+        assert!(with_right_context.candidate_rescore_request().is_none());
+
+        let directory = test_directory("long-rescore-protected-history");
+        fs::write(
+            directory.join("history.tsv"),
+            format!("# slime-history-v1\n{reading}\t履歴候補\t5\t10\n"),
+        )
+        .unwrap();
+        let mut with_history =
+            SlimeEngine::with_user_data(dictionary(), UserData::load(&directory));
+        with_history.set_preferences(EnginePreferences {
+            history_completion: true,
+            history_learning: true,
+            ..EnginePreferences::default()
+        });
+        type_text(&mut with_history, "choubunshouni");
+        with_history.handle(InputEvent::Space);
+        assert_eq!(with_history.snapshot().candidates[0], "履歴候補");
+        with_history.prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, true);
+        assert!(with_history.candidate_rescore_request().is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

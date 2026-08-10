@@ -175,10 +175,14 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         left_context: &str,
         right_context: &str,
     ) -> Self {
-        // Mozc gives 最 its own productive superlative-prefix POS. Checking
-        // the surface here avoids a reverse-dictionary scan on every
-        // conversion while keeping ordinary one-character word endings out.
-        let allows_single_character_phrase_prefix = left_context.ends_with('最');
+        // Mozc gives 最 its own productive superlative-prefix POS, while full
+        // dictionary entries capture honorific forms such as お菓子. Checking the
+        // prefix surface keeps this bounded without a reverse scan on every
+        // conversion. A following copula keeps ambiguous inflected forms out.
+        let left_context_ends_with_honorific_prefix =
+            matches!(left_context.chars().next_back(), Some('お' | 'ご' | '御'));
+        let allows_single_character_phrase_prefix = left_context.ends_with('最')
+            || (left_context_ends_with_honorific_prefix && !starts_with_copula(right_context));
         Self {
             dictionary,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
@@ -3489,6 +3493,12 @@ fn starts_with_polite_auxiliary(right_context: &str) -> bool {
         .any(|prefix| right_context.starts_with(prefix))
 }
 
+fn starts_with_copula(right_context: &str) -> bool {
+    ["でした", "でしょう", "です", "だ", "である", "では", "じゃ"]
+        .iter()
+        .any(|prefix| right_context.starts_with(prefix))
+}
+
 fn document_right_function_word_left_ids(right_context: &str) -> Option<&'static [u16]> {
     if right_context.starts_with("こと") {
         return Some(&[MOZC_KOTO_NON_INDEPENDENT_NOUN_POS_ID]);
@@ -4623,6 +4633,32 @@ mod tests {
         assert_ne!(
             dictionary.candidates_with_context("しかい", "多数の番組")[0].surface,
             "司会"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_honorific_noun_phrase_continuations() {
+        let dictionary = Dictionary::bundled();
+
+        assert_ne!(dictionary.candidates("かし")[0].surface, "菓子");
+        assert_eq!(
+            dictionary.candidates_with_context("かし", "仏具店にはお")[0].surface,
+            "菓子"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "かね",
+                "被害者から騙し取ったお",
+                "を含める"
+            )[0]
+            .surface,
+            "金"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("はなし", "期待通りのお", "でした")[0]
+                .surface,
+            "話し",
+            "a following copula must not reinterpret an inflected verb as an honorific noun"
         );
     }
 

@@ -677,7 +677,7 @@ Windows（技術スパイク中）:
 - 商用可能な複数domain corpusを確保した後のcontext/class bigram（UD GSD exactは同一domain +6.81ptだが汎化なし、JWTD+GSD固定合成もGSD test +1.24ptに対しAJIMEE -3.0ptでNo-Go）
 - Linux IBus
 - optional neural N-best rescoring
-- balanced corpusを用意してから再設計するN-best専用student（25.6M teacherは品質Go・latency No-Go、1MB hashと1.74M bi-encoderの蒸留はheld-out No-Go）
+- balanced corpusを用意してから再設計するN-best専用student（22.5M teacherは品質Go・latency No-Go、1MB hashと1.74M bi-encoderの蒸留はheld-out No-Go）
 
 ### 不採用（初期版）
 

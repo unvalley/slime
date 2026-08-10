@@ -611,7 +611,7 @@ N-bestを10件、ユーザー履歴なし、追加辞書なしで測定した。
 
 ### 2026-07-20 ニューラルN-best rescoring（Phase 2 Step 1 フィージビリティ）
 
-[phase2-context-model-survey.md](phase2-context-model-survey.md)の第一候補「小型ニューラルLMによるN-best rescoring」を、学習なしの公開モデル**zenz-v3.1-xsmall**（GPT-2系 25.6Mパラメータ、Q5_K_M量子化 21 MB、CC BY-SA 4.0）で検証した。実行方法:
+[phase2-context-model-survey.md](phase2-context-model-survey.md)の第一候補「小型ニューラルLMによるN-best rescoring」を、学習なしの公開モデル**zenz-v3.1-xsmall**（GPT-2系22.5Mパラメータ、Q5_K_M量子化20,970,272 bytes、CC BY-SA 4.0）で検証した。実行方法:
 
 ```sh
 just fetch-neural-model   # GGUF取得 + pre-tokenizerメタデータ修正（要uvx）
@@ -635,7 +635,23 @@ devset 400件でのλスイープ: λ=0（rescoringなし）のacc@1 0.293に対
 
 latency（M3、Metal）: 全体でp50 24.7 ms、p95 86.3 ms、p99 116.0 ms。rescoringの追加分はp50でおよそ+11 ms（バッチ投入約1.5 ms + GPU計算と同期・スコアリング約8.5 ms）。実装上の知見: (1) Metalのdecodeは非同期で、コストはlogits取得時の同期に現れる。(2) `llama_get_logits_ith`は呼び出しごとに同期するため、出力バッファ先頭を1回だけ取得して行を直接インデックスする。(3) softmax正規化はベクトル化可能な多項式exp近似で計算する（スカラーlibm expはdecodeと同程度の時間を消費していた）。
 
-判断材料: 品質面はGo（+12pt、残存誤りの型に直効）。latencyはp95 20 ms予算を超過しており、製品組み込みには (a) 候補間コスト差が大きい場合のスキップ、(b) 文脈KVキャッシュの会話内再利用、(c) より小さい量子化・蒸留モデル、のいずれかが必要。ライセンスはCC BY-SA 4.0のため製品bundleへの同梱は要判断で、評価専用に留めている。継続死条件・次段はサーベイの実装ステップ2以降（自前学習）を参照。
+判断材料: 品質面はGo（+12pt、残存誤りの型に直効）。latencyはp95 20 ms予算を超過しており、製品組み込みには (a) 候補間コスト差が大きい場合のスキップ、(b) 文脈KVキャッシュの会話内再利用、(c) より小さい量子化・蒸留モデル、のいずれかが必要。CC BY-SA 4.0は商用利用を許すが、配布時は帰属・変更表示・ShareAlike等の履行と、アプリ本体から分離する境界の法務確認が必要なため、現状は評価専用に留めている。継続死条件・次段はサーベイの実装ステップ2以降（自前学習）を参照。
+
+### 2026-08-10 Q4_K_M量子化の製品gate
+
+配布サイズを下げるため、[zenz-v3.1-xsmallの公式BF16 checkpoint](https://huggingface.co/Miwa-Keita/zenz-v3.1-xsmall)からllama.cpp `5f55650a78f92aff4d48d671423e888fac0469ff`でQ4_K_Mを直接生成した。Q5からの再量子化は行っていない。Q5は20,970,272 bytes（19.999 MiB）、Q4は16,539,904 bytes（15.774 MiB）で、4,430,368 bytes、21.13%縮小した。比較したSHA-256はQ5 `aca732ea1a5f49a3f2ce677053bb7a977249aed0d4ed92ad37271fd1d2b9e8c9`、Q4 `6428ad81b8396f1efcaff092ace7cd55885f83a75f65428592ac0db6e98c001f`。
+
+探索幅16、短文5候補、9文字以上16候補、base上位2件のcost差1,000、候補cost差1,500、長文2,500、lambda 0.7、EOS除外を固定した。GSD/PUDは右文脈がある製品条件としてmin margin 0.1、右文脈のないAJIMEE/JWTDは0を使用した。
+
+| dataset | Q5_K_M acc@1 / MRR | Q4_K_M acc@1 / MRR | top-1差 |
+| --- | ---: | ---: | ---: |
+| GSD dev 331件 | **0.8580 / 0.9092** | 0.8489 / 0.9044 | -3件 |
+| GSD test 323件 | **0.8638 / 0.9197** | 0.8607 / 0.9160 | -1件 |
+| AJIMEE 200件 | 0.6950 / 0.7600 | **0.6950 / 0.7611** | 0件 |
+| JWTD dev 400件 | 0.4475 / 0.5500 | **0.4475 / 0.5516** | 0件 |
+| PUD 446件 | **0.7130 / 0.7803** | 0.7018 / 0.7739 | -5件 |
+
+Q4は5コーパス合計でQ5より9件top-1を落とし、独立domainのPUDでも-1.12ptだった。AJIMEE/JWTDのMRR微増では複数domain非悪化のgateを満たせない。速度もGSDではQ4が短い一方、長文中心のAJIMEE/JWTDではQ4が一貫して速くならなかった。変換精度を優先してQ4は不採用とし、artifactを製品bundleやrepositoryへ追加しない。
 
 ### 2026-07-25 コスト上書きハックの除去とスコア尺度の一貫化
 
@@ -661,7 +677,7 @@ latency（M3、Metal）: 全体でp50 24.7 ms、p95 86.3 ms、p99 116.0 ms。res
 
 この結果は「LLMが必須」を意味しない。小規模な頻度表や数百例の判別学習では、残っている意味的な同音異義語を一般化できないことを示す。原著で改善したstructured SVMは約4万文、Mozcは大規模コーパスと約3,000クラスを使っており、今回の学習規模とは桁が異なる。
 
-次の比較対象は、(1) ライセンスを確認できる数万文以上の形態素注釈データで学習したphrase/POS classモデル、(2) 既に+12ptを確認した25.6MパラメータのN-best専用ニューラルrankerの蒸留・高速化、とする。後者は文章生成やクラウド送信を行うLLM機能ではなく、候補10件を採点するローカルの小型言語モデルである。採用条件はAJIMEEだけでなく開発セットとbalanced corpusでも改善し、p95 latency、配布サイズ、ライセンスの全条件を満たすこととする。
+次の比較対象は、(1) ライセンスを確認できる数万文以上の形態素注釈データで学習したphrase/POS classモデル、(2) 既に+12ptを確認した22.5MパラメータのN-best専用ニューラルrankerの蒸留・高速化、とする。後者は文章生成やクラウド送信を行うLLM機能ではなく、候補10件を採点するローカルの小型言語モデルである。採用条件はAJIMEEだけでなく開発セットとbalanced corpusでも改善し、p95 latency、配布サイズ、ライセンスの全条件を満たすこととする。
 
 実装面では、`CandidateRanker::ranking_cost_with_context`、注釈済み`surface/reading`コーパスを直接評価できる`annotated`形式、旧ranker APIとの互換性だけを残した。これにより次のモデルを同じN-best・指標・latency測定で比較できる。
 
@@ -669,7 +685,7 @@ latency（M3、Metal）: 全体でp50 24.7 ms、p95 86.3 ms、p99 116.0 ms。res
 
 ### 2026-08-02 ニューラルrankerのconfidence gate
 
-25.6M rankerの全件実行を避ける第一段として、既存ラティスの第1候補と次点候補のcost差が閾値を超える場合はニューラル採点を省略する方式を、JWTD-train dev 400件で比較した。`--neural-max-cost-gap N`はこの評価専用gateであり、製品コードにはまだ組み込んでいない。M3、Q5_K_M、lambda 0.8の同一環境・同一条件で連続測定した結果:
+22.5M rankerの全件実行を避ける第一段として、既存ラティスの第1候補と次点候補のcost差が閾値を超える場合はニューラル採点を省略する方式を、JWTD-train dev 400件で比較した。`--neural-max-cost-gap N`はこの評価専用gateであり、製品コードにはまだ組み込んでいない。M3、Q5_K_M、lambda 0.8の同一環境・同一条件で連続測定した結果:
 
 | 最大cost差 | 採点件数 | 省略率 | acc@1 | MRR@10 | p50 | p95 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -805,7 +821,7 @@ Common Voice由来の複合語859件では`initial=849 / expanded=1 / compound=3
 
 AJIMEEではMRRとMinCERはbaseline（0.627、0.068）より改善したが、主指標のtop-1完全一致が悪化した。分離devだけの大幅改善を根拠に製品へ入れると、Wikipedia修正窓の表記傾向へ過適合する。数万件級へ増やすだけでは、局所文字素性が意味的同音異義語を一般化できないという問題は解けない。
 
-### 2026-08-02 25.6M teacherから1MB studentへの順位蒸留
+### 2026-08-02 22.5M teacherから1MB studentへの順位蒸留
 
 正解表記ではなく、品質効果が確認済みのzenz-v3.1-xsmallがlambda 0.8で選んだN-best先頭候補をteacher labelとして、同じ1MB hashed perceptronへ蒸留した。teacherは学習時だけ使い、student推論は文字素性の加算だけである。
 
@@ -830,7 +846,7 @@ zenz-v3.1-xsmall（lambda 0.8）の先頭候補をteacher labelとした10,000�
 | held-out AJIMEE 200件 | 0.5300 | **0.5200** | 0.6216 | baseline MRR 0.6236、-1.0pt |
 | UD Japanese GSD外部dev 331件 | 0.6405 | **0.5921** | 0.7270 | 凍結weight 0.5、-4.84pt |
 
-10候補を採点する単体latencyはApple GPUでp50 3.62 ms、p95 6.86 ms、重みは6,956,261 bytes（FP32。parameter数からのFP16概算3.48 MB）だった。速度とサイズは25.6M teacherより大幅に改善したが、held-outの主指標を悪化させたため製品へは組み込まない。候補生成自体も同じAJIMEEでp95約26 msを要するため、単純な常時追加は全体20 ms予算にも収まらない。
+10候補を採点する単体latencyはApple GPUでp50 3.62 ms、p95 6.86 ms、重みは6,956,261 bytes（FP32。parameter数からのFP16概算3.48 MB）だった。速度とサイズは22.5M teacherより大幅に改善したが、held-outの主指標を悪化させたため製品へは組み込まない。候補生成自体も同じAJIMEEでp95約26 msを要するため、単純な常時追加は全体20 ms予算にも収まらない。
 
 固定devで+1.92pt出てもheld-outで反転し、後述のnews/blog外部devではさらに大きく悪化した。同じJWTD修正窓10,000件へのteacher蒸留をモデル拡大だけで続ける根拠はない。AJIMEEはこの設定の最終報告に一度使用済みなので、以後の調整には戻さない。
 

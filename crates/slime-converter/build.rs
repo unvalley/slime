@@ -52,45 +52,11 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
     let mut by_surface = BTreeMap::<&str, Vec<(&str, u16)>>::new();
     for (reading, entries) in by_reading {
         for entry in entries {
-            let context_phrase_entry = (entry.word_cost <= MAX_CONTEXT_PHRASE_WORD_COST
-                && (MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START..=MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END)
-                    .contains(&entry.right_id))
-                || (entry.word_cost <= MAX_IDEOGRAPHIC_SUFFIX_CONTEXT_PHRASE_WORD_COST
-                    && entry.left_id == MOZC_VERBAL_NOUN_POS_ID
-                    && entry.right_id == MOZC_GENERAL_NOUN_SUFFIX_POS_ID
-                    && is_three_character_ideographic_compound(&entry.surface))
-                || (entry.word_cost <= MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST
-                    && is_bounded_katakana_stem_compound(
-                        &entry.surface,
-                        &productive_single_character_suffixes,
-                    ))
-                || (entry.word_cost <= MAX_KATAKANA_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST
-                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                    && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
-                    && is_bounded_katakana_stem_compound(
-                        &entry.surface,
-                        &general_noun_single_character_suffixes,
-                    ))
-                || (entry.word_cost <= MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST
-                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                    && entry.right_id == MOZC_VERBAL_NOUN_POS_ID
-                    && is_bounded_ideographic_compound(&entry.surface))
-                || (entry.word_cost <= MAX_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST
-                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                    && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
-                    && is_bounded_ideographic_compound(&entry.surface))
-                || (entry.word_cost <= MAX_SIBLING_CONTEXT_PHRASE_WORD_COST
-                    && is_bounded_sibling_compound(&entry.surface))
-                || (entry.word_cost <= MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST
-                    && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                    && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
-                    && is_bounded_coordination_phrase(&entry.surface))
-                || (entry.word_cost <= MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST
-                    && ((entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                        && entry.right_id == MOZC_GENERAL_NOUN_POS_ID)
-                        || (entry.left_id == MOZC_VERBAL_NOUN_POS_ID
-                            && entry.right_id == MOZC_VERBAL_NOUN_POS_ID))
-                    && is_bounded_genitive_phrase(&entry.surface));
+            let context_phrase_entry = is_context_phrase_entry(
+                entry,
+                &productive_single_character_suffixes,
+                &general_noun_single_character_suffixes,
+            );
             if entry.surface == *reading
                 || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)
             {
@@ -151,6 +117,59 @@ fn general_noun_single_character_surfaces(
         })
         .filter_map(|entry| entry.surface.chars().next())
         .collect()
+}
+
+fn is_context_phrase_entry(
+    entry: &Entry,
+    productive_single_character_suffixes: &HashSet<char>,
+    general_noun_single_character_suffixes: &HashSet<char>,
+) -> bool {
+    (entry.word_cost <= MAX_CONTEXT_PHRASE_WORD_COST
+        && (MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_START..=MOZC_PRODUCTIVE_NOUN_SUFFIX_ID_END)
+            .contains(&entry.right_id))
+        || (entry.word_cost <= MAX_IDEOGRAPHIC_SUFFIX_CONTEXT_PHRASE_WORD_COST
+            && entry.left_id == MOZC_VERBAL_NOUN_POS_ID
+            && entry.right_id == MOZC_GENERAL_NOUN_SUFFIX_POS_ID
+            && is_three_character_ideographic_compound(&entry.surface))
+        || (entry.word_cost <= MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST
+            && is_bounded_katakana_stem_compound(
+                &entry.surface,
+                productive_single_character_suffixes,
+            ))
+        || (entry.word_cost <= MAX_KATAKANA_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST
+            && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+            && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+            && is_bounded_katakana_stem_compound(
+                &entry.surface,
+                general_noun_single_character_suffixes,
+            ))
+        || (entry.word_cost <= MAX_KATAKANA_IDEOGRAPHIC_TAIL_CONTEXT_PHRASE_WORD_COST
+            && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+            && entry.right_id == MOZC_GENERAL_NOUN_SUFFIX_POS_ID
+            && is_bounded_katakana_ideographic_tail_compound(
+                &entry.surface,
+                productive_single_character_suffixes,
+            ))
+        || (entry.word_cost <= MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST
+            && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+            && entry.right_id == MOZC_VERBAL_NOUN_POS_ID
+            && is_bounded_ideographic_compound(&entry.surface))
+        || (entry.word_cost <= MAX_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST
+            && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+            && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+            && is_bounded_ideographic_compound(&entry.surface))
+        || (entry.word_cost <= MAX_SIBLING_CONTEXT_PHRASE_WORD_COST
+            && is_bounded_sibling_compound(&entry.surface))
+        || (entry.word_cost <= MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST
+            && entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+            && entry.right_id == MOZC_GENERAL_NOUN_POS_ID
+            && is_bounded_coordination_phrase(&entry.surface))
+        || (entry.word_cost <= MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST
+            && ((entry.left_id == MOZC_GENERAL_NOUN_POS_ID
+                && entry.right_id == MOZC_GENERAL_NOUN_POS_ID)
+                || (entry.left_id == MOZC_VERBAL_NOUN_POS_ID
+                    && entry.right_id == MOZC_VERBAL_NOUN_POS_ID))
+            && is_bounded_genitive_phrase(&entry.surface))
 }
 
 fn read_entries_by_reading(tsv_path: &Path) -> BTreeMap<String, Vec<Entry>> {
@@ -276,6 +295,11 @@ const MAX_KATAKANA_CONTEXT_PHRASE_WORD_COST: u16 = 7_700;
 // and its one-character tail to be general nouns, and use the tighter common-
 // phrase cost band so proper names and weak spellings stay excluded.
 const MAX_KATAKANA_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
+// Mixed compounds such as a foreign-word stem plus a short ideographic noun
+// can carry the same productive final suffix while costing more as a complete
+// phrase. Bound both scripts and the ideographic tail before widening the
+// context-only band; this does not add conversion entries or alter word costs.
+const MAX_KATAKANA_IDEOGRAPHIC_TAIL_CONTEXT_PHRASE_WORD_COST: u16 = 8_400;
 const MAX_GENERAL_VERBAL_NOUN_COMPOUND_WORD_COST: u16 = 7_500;
 // Admit a narrow band of lower-frequency all-kanji common nouns as context
 // evidence only. This keeps names and kana-mixed spellings out of the bundled
@@ -375,6 +399,39 @@ fn is_bounded_katakana_stem_compound(
         }
     }
     letters >= 2
+}
+
+fn is_bounded_katakana_ideographic_tail_compound(
+    surface: &str,
+    productive_single_character_suffixes: &HashSet<char>,
+) -> bool {
+    let characters = surface.chars().collect::<Vec<_>>();
+    if !(4..=9).contains(&characters.len())
+        || !characters
+            .last()
+            .is_some_and(|suffix| productive_single_character_suffixes.contains(suffix))
+    {
+        return false;
+    }
+    let Some(ideographic_start) = characters
+        .iter()
+        .position(|character| is_cjk_ideograph(*character))
+    else {
+        return false;
+    };
+    let katakana_stem = &characters[..ideographic_start];
+    let ideographic_tail = &characters[ideographic_start..];
+    (2..=8).contains(&katakana_stem.len())
+        && (2..=3).contains(&ideographic_tail.len())
+        && katakana_stem
+            .iter()
+            .all(|character| matches!(character, '\u{30a0}'..='\u{30ff}'))
+        && katakana_stem
+            .iter()
+            .filter(|character| !matches!(character, 'ー' | '・'))
+            .count()
+            >= 2
+        && ideographic_tail.iter().copied().all(is_cjk_ideograph)
 }
 
 fn is_cjk_ideograph(character: char) -> bool {

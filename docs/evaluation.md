@@ -343,6 +343,25 @@ GSD trainのtop-1正解数は1,411→1,413へ増え、正解順位が変わっ�
 
 Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。強い辞書句と一般境界が競合する`strong_left_phrase_conflict`の中央値は773.630→789.011 µs/op（+15.381 µs、+2.0%）、事前gateで辞書句探索を省く`weak_left_phrase_conflict`は90.470→90.257 µs/op（-0.213 µs、測定誤差内）だった。
 
+#### 一意な左辞書句の追加昇格
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は、単語のつながりと統計的な文脈を組み合わせて文章として自然な候補を選ぶ。[ATOK Hyper Hybrid Engine 2](https://atok.com/features/hhe2/)は、学習済み候補より文脈上自然な候補を優先する場合があることも明示している。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[通常変換のViterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)でも、語彙costと左右接続costを同じ経路で扱う。
+
+Slimeの通常の左辞書句補正は最大3,500で、`資金｜なん`、`三國｜し`、`オクタン｜か`、`遠野｜しき`のように完全な辞書句が一つだけ存在しても、孤立時に高頻度な同音候補へ届かない場合があった。そこで、現在の読みと左文脈を連結する完全辞書句の表層が一意で、右文脈に別の完全辞書句がない場合だけ、cost ceilingを11,500、補正上限を5,200へ広げた。`価値観`と`価値感`のように複数の完全辞書句が競合する場合は、元の辞書cost差と3,500上限を維持する。分割変換の表層、候補生成、N-best幅、word costは変更しない。
+
+また、左文脈末尾の`御`を無条件に敬語接頭辞と扱っていたため、`防御｜かき`が辞書語`御垣`の証拠を誤って得ていた。直前文字が漢字なら`御`を語中とみなし、単独の`御`、`お`、`ご`だけを既存の敬語境界として残した。
+
+| dataset | 変更前 acc@1 / MRR@10 | 一意句昇格後 acc@1 / MRR@10 | 候補表層順の変化 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7309 / 0.8191 | **0.7330 / 0.8204** | 5件 | 4 / 0 |
+| GSD dev (331) | 0.8671 / 0.9115 | 0.8671 / 0.9115 | 0件 | 0 / 0 |
+| GSD test (323) | 0.8947 / 0.9331 | 0.8947 / 0.9331 | 0件 | 0 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 0件 | 0 / 0 |
+
+GSD trainのtop-1正解数は1,418→1,422へ増えた。5件目の候補表層変化は`防御｜かき`から不正な`垣`がtop-10外へ下がったもので、正解順位の悪化はない。Apple M3、Release、GSD train 1,940件を旧新交互に8組測定した中央値はp50 0.5353→0.5396 ms（+0.0044 ms、+0.8%）、p95 1.9767→1.9755 ms（-0.0012 ms、測定誤差内）だった。完全辞書句が見つかった場合だけ競合句を調べる遅延判定にし、非該当入力の先行走査を避けている。
+
 #### 外来語幹に続く一文字の一般名詞
 
 [ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は単語単体の頻度だけでなく、単語同士のつながりと文章の自然さを変換に利用する。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も語彙costと左右接続costを同じ経路で扱う。SlimeのMozc辞書には`リステリア菌`が完全語として存在するが、末尾の`菌`は生産的な名詞接尾語POSではなく一般名詞POSであるため、従来の文脈用逆引き索引から除外され、`米国でリステリア + きん`では孤立costの低い`金`が優先されていた。
@@ -352,6 +371,14 @@ Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定し�
 GSD trainではtop-1正解数が1,413→1,414、acc@1が0.7284→0.7289、MRR@10が0.8177→0.8180へ増えた。候補配列が変わったのは`米国でリステリア + きん`のtop-1が`金 → 菌`となった1件だけで、正解順位の悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補表層、cost、順序まで完全一致した。recall@10も0.9711で不変であり、候補追加ではなく既存候補の文脈順位改善である。
 
 逆引きFST・block・reading資材の合計増加は3,763 bytesだった。Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。該当する`katakana_general_noun_phrase`の中央値は198.645→194.609 µs/op（-4.036 µs、測定誤差内）、非該当の`katakana_general_noun_phrase_miss`は203.677→204.074 µs/op（+0.398 µs、+0.2%、測定誤差内）だった。
+
+#### 外来語幹と短い漢字語尾からなる複合語
+
+一文字語尾だけでなく、`アマチュア天文家`のようにカタカナ語幹と2〜3文字の漢字語尾からなる完全辞書語も、従来の文脈用逆引き索引には含まれない場合があった。対象を全長4〜9文字、先頭のカタカナ幹2〜8文字、末尾の漢字2〜3文字、最終文字が生産的な名詞接尾辞、完全語の左右POSが一般名詞から一般名詞接尾語、word cost 8,400以下に限定した。該当する92 entryのうち、既存のreconversion cost帯を超える90 entryだけが実質的な追加対象である。候補やword costは追加せず、文脈用の逆引き索引だけを拡張する。
+
+GSD testでは`アマチュア天文｜か`が`化 → 家`となり、top-1正解数は289→290、acc@1は0.8947→0.8978、MRR@10は0.9331→0.9347へ改善した。候補表層、cost、順序が変わったのはこの1件だけで、GSD train/dev、AJIMEE、JWTD、PUDは完全一致した。逆引きFST・block・reading資材の合計増加は3,105 bytesである。
+
+Apple M3、Release、GSD train 1,940件を旧新交互に8組測定した中央値はp50 0.2158→0.2154 ms（-0.0004 ms）、p95 0.5195→0.5178 ms（-0.0017 ms）で、いずれも測定誤差内だった。
 
 #### サ変名詞に続く一文字の一般名詞接尾語
 

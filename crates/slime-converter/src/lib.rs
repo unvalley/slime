@@ -5085,6 +5085,22 @@ mod tests {
     }
 
     #[test]
+    fn document_context_promotes_katakana_ideographic_tail_compounds() {
+        let dictionary = Dictionary::bundled();
+
+        assert_ne!(dictionary.candidates("か")[0].surface, "家");
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "か",
+                "各地のアマチュア天文",
+                "が観測した。",
+            )[0]
+            .surface,
+            "家"
+        );
+    }
+
+    #[test]
     fn document_context_promotes_honorific_noun_phrase_continuations() {
         let dictionary = Dictionary::bundled();
 

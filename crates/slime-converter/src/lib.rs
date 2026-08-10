@@ -140,6 +140,7 @@ struct DictionaryDocumentContextRanker<'a> {
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_function_word_costs: Vec<DocumentContextualCost<'a>>,
+    right_grammar_costs: Vec<DocumentContextualCost<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
     unique_right_grammar_surface: Option<&'a str>,
@@ -194,6 +195,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             ),
             right_function_word_costs: dictionary
                 .document_right_function_word_costs(reading, right_context),
+            right_grammar_costs: dictionary.document_right_grammar_costs(reading, right_context),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
             right_auxiliary_costs: dictionary
@@ -245,6 +247,21 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             .unwrap_or(0)
     }
 
+    fn right_grammar_promotion(&self, conversion: &Conversion) -> i32 {
+        self.right_grammar_costs
+            .iter()
+            .filter(|contextual| {
+                conversion.segments.len() == 1 && contextual.surface == conversion.surface
+            })
+            .map(|contextual| {
+                DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP
+                    .saturating_sub(contextual.relative_cost)
+                    .clamp(0, DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     fn unique_right_grammar_promotion(&self, conversion: &Conversion) -> i32 {
         if conversion.segments.len() != 1
             || self.unique_right_grammar_surface != Some(conversion.surface.as_str())
@@ -285,6 +302,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max()
             .unwrap_or(0);
         let right_function_word_promotion = self.right_function_word_promotion(conversion);
+        let right_grammar_promotion = self.right_grammar_promotion(conversion);
         let notation_promotion =
             if structured_notation_matches(left_context, reading, &conversion.surface) {
                 DOCUMENT_STRUCTURED_NOTATION_PROMOTION
@@ -363,7 +381,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(right_phrase_promotion.max(right_function_word_promotion))
             .saturating_sub(right_inflection_promotion)
             .saturating_sub(right_auxiliary_promotion)
-            .saturating_sub(unique_right_grammar_promotion)
+            .saturating_sub(right_grammar_promotion.max(unique_right_grammar_promotion))
             .saturating_sub(unique_right_suru_promotion)
     }
 }
@@ -544,6 +562,7 @@ const DOCUMENT_BOUNDARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 1_000;
 const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP: i32 = 1_100;
+const DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
 const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
@@ -1976,6 +1995,63 @@ impl Dictionary {
         {
             for contextual in &mut costs {
                 contextual.relative_cost = contextual.relative_cost.saturating_sub(minimum);
+            }
+        }
+        costs
+    }
+
+    fn document_right_grammar_costs<'s>(
+        &'s self,
+        reading: &str,
+        right_context: &str,
+    ) -> Vec<DocumentContextualCost<'s>> {
+        if !self.uses_connection_costs
+            || starts_with_polite_auxiliary(right_context)
+            || right_context.starts_with("させ")
+        {
+            return Vec::new();
+        }
+        let Some(right_pos_id) = document_right_grammar_pos_id(right_context) else {
+            return Vec::new();
+        };
+
+        let connection = ConnectionMatrix::bundled();
+        let mut costs = Vec::<DocumentContextualCost<'s>>::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == reading
+                || !entry
+                    .surface
+                    .chars()
+                    .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+            {
+                return;
+            }
+            let transition_cost = connection.cost(entry.right_id, right_pos_id);
+            if let Some(contextual) = costs
+                .iter_mut()
+                .find(|contextual| contextual.surface == entry.surface)
+            {
+                contextual.relative_cost = contextual.relative_cost.min(transition_cost);
+            } else {
+                costs.push(DocumentContextualCost {
+                    surface: entry.surface,
+                    relative_cost: transition_cost,
+                });
+            }
+        });
+        if let Some(minimum) = costs
+            .iter()
+            .map(|contextual| contextual.relative_cost)
+            .min()
+        {
+            for contextual in &mut costs {
+                contextual.relative_cost = if contextual.relative_cost
+                    <= minimum.saturating_add(DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN)
+                {
+                    0
+                } else {
+                    DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP
+                };
             }
         }
         costs
@@ -3494,9 +3570,43 @@ fn starts_with_polite_auxiliary(right_context: &str) -> bool {
 }
 
 fn starts_with_copula(right_context: &str) -> bool {
-    ["でした", "でしょう", "です", "だ", "である", "では", "じゃ"]
-        .iter()
-        .any(|prefix| right_context.starts_with(prefix))
+    [
+        "でした",
+        "でしょう",
+        "です",
+        "だ",
+        "であっ",
+        "であり",
+        "である",
+        "であれ",
+        "であろ",
+        "でない",
+        "でなか",
+        "でなく",
+        "では",
+        "じゃ",
+    ]
+    .iter()
+    .any(|prefix| right_context.starts_with(prefix))
+}
+
+fn starts_with_de_connective_continuation(right_context: &str) -> bool {
+    [
+        "でい",
+        "でお",
+        "でく",
+        "でしま",
+        "でみ",
+        "でもら",
+        "であげ",
+        "でほし",
+        "でる",
+        "でた",
+        "でます",
+        "でました",
+    ]
+    .iter()
+    .any(|prefix| right_context.starts_with(prefix))
 }
 
 fn document_right_function_word_left_ids(right_context: &str) -> Option<&'static [u16]> {
@@ -3552,7 +3662,7 @@ fn starts_with_suru_inflection(right_context: &str) -> bool {
 }
 
 fn document_right_grammar_pos_id(right_context: &str) -> Option<u16> {
-    if right_context.starts_with("たい") {
+    if right_context.starts_with("たい") || starts_with_copula(right_context) {
         return None;
     }
     if right_context.starts_with("られ") {
@@ -3582,7 +3692,7 @@ fn document_right_grammar_pos_id(right_context: &str) -> Option<u16> {
     if right_context.starts_with('て') {
         return Some(MOZC_TE_CONNECTIVE_PARTICLE_POS_ID);
     }
-    if right_context.starts_with('で') {
+    if starts_with_de_connective_continuation(right_context) {
         return Some(MOZC_DE_CONNECTIVE_PARTICLE_POS_ID);
     }
     right_context
@@ -5101,6 +5211,48 @@ mod tests {
             "模試",
             "ambiguous compatible verb surfaces require semantic evidence"
         );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_grammar_compatible_forms_without_broad_de_matching() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            ("たけ", "スポーツにも", "ている。", "長け"),
+            ("わけ", "インクは、大きく", "てビン入りと", "分け"),
+            ("こん", "いつも割りと", "でる。", "混ん"),
+            (
+                "しん",
+                "管理していたデボルとポポルも",
+                "でしまった。",
+                "死ん",
+            ),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
+
+        for (reading, left_context, right_context, expected) in [
+            ("きき", "放送やオーディオ", "での音楽", "機器"),
+            ("うみ", "かつて浅い", "であった。", "海"),
+            (
+                "たいき",
+                "スペアとしてバックステージに",
+                "させていた。",
+                "待機",
+            ),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
     }
 
     #[test]

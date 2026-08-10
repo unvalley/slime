@@ -593,8 +593,34 @@ fn run_unique_right_grammar_benchmark(dictionary: &Dictionary, iterations: u64) 
 
 fn run_right_grammar_benchmarks(dictionary: &Dictionary, iterations: u64) {
     run_unique_right_grammar_benchmark(dictionary, iterations);
+    run_compatible_right_grammar_benchmark(dictionary, iterations);
     run_right_function_word_benchmark(dictionary, iterations);
     run_unique_right_suru_benchmark(dictionary, iterations);
+}
+
+fn run_compatible_right_grammar_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/compatible_right_grammar_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("わけ"),
+                black_box("インクは、大きく"),
+                black_box("てビン入りと"),
+            ));
+        },
+    );
+    run(
+        "converter/compatible_right_grammar_nonmatch",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("きき"),
+                black_box("放送やオーディオ"),
+                black_box("での音楽"),
+            ));
+        },
+    );
 }
 
 fn run_right_function_word_benchmark(dictionary: &Dictionary, iterations: u64) {

@@ -301,6 +301,27 @@ trainでは`夜こと → 寄ること`、`得こと → 解くこと`、`近い
 
 Apple M3、Release、50,000回、warmup 1,000回を旧新交互に5組測定した。対象経路`right_function_word_candidates`の中央値は106.383→110.333 µs/op（+3.950 µs）、非該当経路`right_function_word_nonmatch`は109.050→108.894 µs/op（-0.156 µs、測定誤差内）だった。文法語のPOSは変換ごとの辞書検索ではなく、同梱Mozc接続行列と同じ名前付きIDスライスから取得する。
 
+#### 活用接続の互換候補グループ
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は一般的な文法と単語のつながりを変換へ使い、[ATOK 2026の機能説明](https://atok.com/features/)も助詞・助動詞を含む文の変換改善を挙げている。[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)は各entryに`lcid`と`rcid`を保持し、[通常変換のViterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)で直前entryの`rcid`と次entryの`lcid`に対応する接続重みを加える。Slimeにも一意な右文法接続を昇格する規則はあったが、同じ活用型の候補が複数ある場合は証拠を捨てるため、`竹ている`、`訳て`、`今でる`、`新でしまった`のように名詞候補が活用語尾の直前へ残っていた。
+
+右文脈が活用語尾または接続助詞`た・て`で始まる場合、現在の読みに完全一致する漢字候補の右POSから、Mozc接続行列上の後続POSへのcostを比較する。最良接続との差が1,000以内の候補を「文法的に互換」として同じ1,500 costだけ昇格し、それ以外は動かさない。生の接続costで互換候補同士の意味順位を決めず、既存の一意接続補正がある場合も大きい方だけを使うため、文法証拠の二重加算はしない。
+
+`で`は格助詞・助動詞との曖昧性が大きいため、`でいる・でおく・でくる・でしまう・でみる・でもらう・であげる・でほしい・でる・でた・でます`に相当する後続だけを接続助詞として扱う。`機器での音楽`の格助詞、`海であった`などのコピュラ、既存の丁寧語規則、`待機させていた`で悪化した`させ`は対象外にした。昇格上限は1,000、1,500、2,000を比較し、1,000はtrainの改善が1件少なく、2,000は`差し`の正解順位を1位から4位へ落としたため、非回帰だった1,500を採用した。
+
+| dataset | 変更前 acc@1 / MRR@10 | 互換接続後 acc@1 / MRR@10 | 候補配列の変化 | 正解順位改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7191 / 0.8120 | **0.7273 / 0.8172** | 251件 | 27 / 0 |
+| GSD dev (331) | 0.8671 / 0.9104 | 0.8671 / **0.9115** | 28件 | 3 / 0 |
+| GSD test (323) | 0.8854 / 0.9246 | **0.8916 / 0.9292** | 35件 | 4 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 2件 | 0 / 0 |
+
+GSD trainではtop-1正解数が1,395→1,411、testでは286→288へ増えた。代表例は`竹ている → 長けている`、`訳て → 分けて`、`今でる → 混んでる`、`新でしまった → 死んでしまった`である。AJIMEEとJWTDは候補表層、cost、順序まで完全一致し、PUDの2件もtop-1と正解順位は変わらない。
+
+Apple M3、Release、5,000回、warmup 1,000回を旧新交互に10組測定した。対象経路`compatible_right_grammar_candidates`の中央値は99.231→102.520 µs/op（+3.289 µs、+3.3%）、非該当の`compatible_right_grammar_nonmatch`は188.438→186.026 µs/op（-2.412 µs、測定誤差内）だった。
+
 #### サ変名詞に続く一文字の一般名詞接尾語
 
 [ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)が重視する文法と単語のつながり、[azooKeyの辞書形式](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/dicdata_format.md)と[Viterbi更新](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)が使う左右接続IDを参考に、Mozc辞書にある完全な三文字複合語を文脈証拠として使う範囲を広げた。対象は全て漢字、左POSがサ変名詞、右POSが一般名詞接尾語、辞書cost 7,550以下を同時に満たすentryだけである。候補やword costは追加せず、文脈用の逆引き索引だけを拡張する。

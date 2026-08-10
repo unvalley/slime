@@ -55,6 +55,12 @@ const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
 const PREFIX_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
 const PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS: usize = 2;
+const GENERATIVE_MIN_READING_CHARACTERS: usize = 6;
+const GENERATIVE_MAX_READING_CHARACTERS: usize = 32;
+const GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
+const GENERATIVE_MIN_CHANGED_REGIONS: usize = 2;
+const GENERATIVE_MAX_CHANGED_REGIONS: usize = 4;
+const GENERATIVE_MAX_CHANGED_CHARACTERS_PER_REGION: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -611,6 +617,88 @@ impl SlimeEngine {
         minimum_margin: f64,
     ) -> Option<Vec<SlimeAction>> {
         self.apply_candidate_rescore_internal(log_likelihoods, None, None, lambda, minimum_margin)
+    }
+
+    /// Whether the pending request is inside the bounded generative-recall
+    /// reading window. Callers can avoid model generation outside this gate;
+    /// [`Self::prepare_generative_rescore_candidate`] repeats the validation.
+    #[must_use]
+    pub fn candidate_rescore_supports_generative_recall(&self) -> bool {
+        self.candidate_kind == Some(CandidateKind::Conversion)
+            && self.selected == 0
+            && self.candidate_rescore.as_ref().is_some_and(|state| {
+                (GENERATIVE_MIN_READING_CHARACTERS..=GENERATIVE_MAX_READING_CHARACTERS)
+                    .contains(&state.request.reading.chars().count())
+            })
+    }
+
+    /// Adds one model-generated surface to the pending rescore request after
+    /// proving that it is a complete, bounded path through the base lattice.
+    ///
+    /// The generated text is never accepted directly. It must preserve the
+    /// surface length and ASCII alphanumerics, change two to four disjoint
+    /// regions of at most two characters each, and stay inside the same cost
+    /// window as ordinary model candidates. The candidate is marked as model
+    /// supplemental, so the usual additional score margin still applies.
+    pub fn prepare_generative_rescore_candidate(
+        &mut self,
+        generated_surface: &str,
+    ) -> Option<CandidateRescoreRequest> {
+        if self.candidate_kind != Some(CandidateKind::Conversion) || self.selected != 0 {
+            return None;
+        }
+        let state = self.candidate_rescore.as_ref()?;
+        let reading = &state.request.reading;
+        let reading_characters = reading.chars().count();
+        if !(GENERATIVE_MIN_READING_CHARACTERS..=GENERATIVE_MAX_READING_CHARACTERS)
+            .contains(&reading_characters)
+            || state
+                .candidates
+                .iter()
+                .any(|candidate| candidate.surface == generated_surface)
+            || !bounded_multi_region_substitution(
+                &state.candidates.first()?.surface,
+                generated_surface,
+            )
+        {
+            return None;
+        }
+        let conversion = self
+            .dictionary
+            .convert_n_best_with_surface_prefix(
+                reading,
+                generated_surface,
+                GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT,
+            )
+            .into_iter()
+            .find(|conversion| conversion.surface == generated_surface)?;
+        let maximum_cost_gap = if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
+            LONG_RESCORE_MAX_CANDIDATE_COST_GAP
+        } else {
+            RESCORE_MAX_CANDIDATE_COST_GAP
+        };
+        if conversion
+            .cost
+            .saturating_sub(state.candidates.first()?.cost)
+            .max(0)
+            > maximum_cost_gap
+        {
+            return None;
+        }
+
+        let state = self.candidate_rescore.as_mut()?;
+        if state.candidates.len() >= MAX_EXTENDED_LONG_RESCORE_CANDIDATES {
+            state.candidates.pop();
+            state.model_supplemental.pop();
+            state.request.candidates.pop();
+        }
+        state.candidates.push(Candidate {
+            surface: conversion.surface.clone(),
+            cost: conversion.cost,
+        });
+        state.model_supplemental.push(true);
+        state.request.candidates.push(conversion.surface);
+        Some(state.request.clone())
     }
 
     /// Applies model scores and optional model-directed surface prefixes.
@@ -2593,6 +2681,36 @@ fn bounded_local_substitution(current: &str, alternative: &str, maximum_changes:
         && changed.iter().all(|&(_, current, alternative)| {
             !current.is_ascii_alphanumeric() && !alternative.is_ascii_alphanumeric()
         })
+}
+
+fn bounded_multi_region_substitution(current: &str, alternative: &str) -> bool {
+    let current = current.chars().collect::<Vec<_>>();
+    let alternative = alternative.chars().collect::<Vec<_>>();
+    if current.len() != alternative.len() {
+        return false;
+    }
+    let mut regions = 0usize;
+    let mut region_characters = 0usize;
+    for (&current, &alternative) in current.iter().zip(&alternative) {
+        if current == alternative {
+            region_characters = 0;
+            continue;
+        }
+        if current.is_ascii_alphanumeric() || alternative.is_ascii_alphanumeric() {
+            return false;
+        }
+        if region_characters == 0 {
+            regions += 1;
+            if regions > GENERATIVE_MAX_CHANGED_REGIONS {
+                return false;
+            }
+        }
+        region_characters += 1;
+        if region_characters > GENERATIVE_MAX_CHANGED_CHARACTERS_PER_REGION {
+            return false;
+        }
+    }
+    regions >= GENERATIVE_MIN_CHANGED_REGIONS
 }
 
 fn select_candidate_corrections(
@@ -5206,6 +5324,96 @@ mod tests {
 
         assert_eq!(engine.candidates[0], "奨学の問題");
         assert!(!engine.candidates.contains(&"少額の課題".to_owned()));
+    }
+
+    #[test]
+    fn generated_surface_can_join_rescore_only_after_bounded_lattice_validation() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "奨学", 10),
+            DictionaryEntry::new("しょうがく", "少額", 20),
+            DictionaryEntry::new("もんだい", "問題", 10),
+            DictionaryEntry::new("もんだい", "課題", 20),
+        ]);
+        let base_conversion = dictionary
+            .convert_n_best_with_surface_prefix("しょうがくのもんだい", "奨学の問題", 1)
+            .into_iter()
+            .next()
+            .expect("base lattice path");
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["奨学の問題".to_owned()];
+        let base = Candidate {
+            surface: "奨学の問題".to_owned(),
+            cost: base_conversion.cost,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![base.surface.clone()],
+            },
+            model_supplemental: vec![false],
+            candidates: vec![base],
+        });
+
+        let request = engine
+            .prepare_generative_rescore_candidate("少額の課題")
+            .expect("two bounded regions backed by the lattice should join rescoring");
+        assert_eq!(request.candidates, ["奨学の問題", "少額の課題"]);
+        assert_eq!(
+            engine
+                .candidate_rescore
+                .as_ref()
+                .expect("pending rescore state")
+                .model_supplemental,
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn generated_surface_rejects_local_arbitrary_and_ascii_changes() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "奨学", 10),
+            DictionaryEntry::new("しょうがく", "少額", 20),
+            DictionaryEntry::new("もんだい", "問題", 10),
+            DictionaryEntry::new("もんだい", "課題", 20),
+            DictionaryEntry::new("abc", "abd", 20),
+        ]);
+        let state = || {
+            let base = Candidate {
+                surface: "奨学の問題".to_owned(),
+                cost: 100,
+            };
+            CandidateRescoreState {
+                request: CandidateRescoreRequest {
+                    context: String::new(),
+                    right_context: String::new(),
+                    reading: "しょうがくのもんだい".to_owned(),
+                    candidates: vec![base.surface.clone()],
+                },
+                model_supplemental: vec![false],
+                candidates: vec![base],
+            }
+        };
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["奨学の問題".to_owned()];
+
+        for rejected in ["少額の問題", "少額の架空"] {
+            engine.candidate_rescore = Some(state());
+            assert_eq!(
+                engine.prepare_generative_rescore_candidate(rejected),
+                None,
+                "{rejected} must remain outside the rescore pool"
+            );
+        }
+        assert!(!super::bounded_multi_region_substitution(
+            "abcの問題",
+            "abdの課題"
+        ));
     }
 
     #[test]

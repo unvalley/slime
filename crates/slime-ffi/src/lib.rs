@@ -137,6 +137,8 @@ const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
 const PREFIX_CORRECTION_MIN_CHARACTERS: usize = 4;
 #[cfg(feature = "neural")]
 const PREFIX_CORRECTION_MIN_LOGIT_MARGIN: f32 = 1.5;
+#[cfg(feature = "neural")]
+const GENERATIVE_RECALL_MAX_OUTPUT_TOKENS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NeuralProfileParameters {
@@ -149,6 +151,7 @@ struct NeuralProfileParameters {
     long_input_minimum_score_margin: f64,
     right_context_minimum_score_margin: f64,
     prefix_correction: bool,
+    generative_recall: bool,
 }
 
 impl NeuralProfileParameters {
@@ -162,6 +165,7 @@ impl NeuralProfileParameters {
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.1,
         prefix_correction: false,
+        generative_recall: false,
     };
 
     const HIGH_ACCURACY: Self = Self {
@@ -174,6 +178,7 @@ impl NeuralProfileParameters {
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.5,
         prefix_correction: true,
+        generative_recall: true,
     };
 
     #[cfg(any(feature = "neural", test))]
@@ -658,12 +663,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let candidate_weight = handle
             .neural_profile
             .candidate_weight_for(request.reading.chars().count(), has_right_context);
-        let score_request = slime_neural::ScoreRequest {
-            context: request.context,
-            right_context: request.right_context,
-            input_katakana: full_katakana(&request.reading),
-            candidates: request.candidates,
-        };
+        let score_request = prepare_generative_score_request(handle, service, request);
         let scored = if handle.neural_profile.prefix_correction {
             service
                 .rescorer
@@ -713,6 +713,42 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         }
     }
     actions
+}
+
+#[cfg(feature = "neural")]
+fn prepare_generative_score_request(
+    handle: &mut SlimeHandle,
+    service: &NeuralService,
+    request: slime_core::CandidateRescoreRequest,
+) -> slime_neural::ScoreRequest {
+    let mut score_request = neural_score_request(request);
+    if handle.neural_profile.generative_recall
+        && handle.engine.candidate_rescore_supports_generative_recall()
+        && let Ok(generated) = service.rescorer.generate_greedy_outputs(
+            std::slice::from_ref(&score_request),
+            GENERATIVE_RECALL_MAX_OUTPUT_TOKENS,
+        )
+        && let Some(generated) = generated.first()
+        && generated.stopped_at_eos
+        && let Some(extended) = handle
+            .engine
+            .prepare_generative_rescore_candidate(&generated.surface)
+    {
+        score_request = neural_score_request(extended);
+    }
+    score_request
+}
+
+#[cfg(feature = "neural")]
+fn neural_score_request(
+    request: slime_core::CandidateRescoreRequest,
+) -> slime_neural::ScoreRequest {
+    slime_neural::ScoreRequest {
+        context: request.context,
+        right_context: request.right_context,
+        input_katakana: full_katakana(&request.reading),
+        candidates: request.candidates,
+    }
 }
 
 #[cfg(feature = "neural")]
@@ -1734,6 +1770,7 @@ mod tests {
         assert_eq!(balanced.confidence_bypass_candidate_limit, 8);
         assert!(!balanced.bypass_long_input_confidence);
         assert!(!balanced.prefix_correction);
+        assert!(!balanced.generative_recall);
         assert_close(balanced.minimum_score_margin(false, false), 0.0);
         assert_close(balanced.minimum_score_margin(true, false), 0.0);
         assert_close(balanced.minimum_score_margin(false, true), 0.1);
@@ -1749,6 +1786,7 @@ mod tests {
         assert_eq!(high_accuracy.confidence_bypass_candidate_limit, 8);
         assert!(high_accuracy.bypass_long_input_confidence);
         assert!(high_accuracy.prefix_correction);
+        assert!(high_accuracy.generative_recall);
         assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
@@ -2009,6 +2047,23 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_generative_recall(handle: *mut super::SlimeHandle) {
+        // The correct surface is outside the ordinary rescored pool and needs
+        // two disjoint lattice changes from its cost winner. Greedy output is
+        // accepted only after the core validates that complete lattice path.
+        let mut capture = TypedCapture::default();
+        for character in "『せかいれきしたいけい・いぎりすし".chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("『世界歴史大系・イギリス史")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+    }
+
+    #[cfg(feature = "neural")]
     fn measure_prefix_diagnostics() {
         let service = super::NEURAL_SERVICE
             .get()
@@ -2080,6 +2135,7 @@ mod tests {
         verify_neural_learning_strength(&model);
         verify_prefix_correction(handle);
         verify_iterative_prefix_correction(handle);
+        verify_generative_recall(handle);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

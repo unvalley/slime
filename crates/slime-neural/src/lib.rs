@@ -73,6 +73,18 @@ pub struct PrefixDiagnostic {
     pub alternative_is_eos: bool,
 }
 
+/// One bounded greedy completion produced directly from a conversion prompt.
+///
+/// Callers must still validate the surface against their conversion lattice;
+/// this API deliberately exposes model output rather than treating it as a
+/// trusted conversion candidate.
+pub struct GeneratedOutput {
+    pub surface: String,
+    pub token_count: usize,
+    pub stopped_at_eos: bool,
+    pub latency: Duration,
+}
+
 pub struct Rescorer {
     model: LlamaModel,
     // The backend must outlive every model and context created from it. Rust
@@ -160,6 +172,130 @@ impl Rescorer {
         requests: &[ScoreRequest],
     ) -> Result<Vec<ScoredItem>, String> {
         self.score_all_internal(requests, true)
+    }
+
+    /// Greedily generates one bounded surface for each conversion prompt.
+    ///
+    /// This is intentionally separate from candidate rescoring: generated
+    /// text is untrusted until a caller proves that the complete surface is a
+    /// valid path through its dictionary lattice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when context creation, tokenization, decoding, or
+    /// rendering a generated token fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if validated runtime buffer sizes or bounded token
+    /// positions do not fit the platform integer types expected by llama.cpp.
+    pub fn generate_greedy_outputs(
+        &self,
+        requests: &[ScoreRequest],
+        maximum_output_tokens: usize,
+    ) -> Result<Vec<GeneratedOutput>, String> {
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(self.kv_cells))
+            .with_n_batch(self.kv_cells)
+            .with_n_ubatch(self.kv_cells)
+            .with_n_seq_max(1)
+            .with_kv_unified(true);
+        let mut context = self
+            .model
+            .new_context(&self.backend, context_params)
+            .map_err(|error| format!("failed to create generation context: {error}"))?;
+        let mut batch = LlamaBatch::new(
+            usize::try_from(self.kv_cells).expect("kv cells fit usize"),
+            1,
+        );
+        requests
+            .iter()
+            .map(|request| {
+                self.generate_greedy_item(&mut context, &mut batch, request, maximum_output_tokens)
+            })
+            .collect()
+    }
+
+    fn generate_greedy_item(
+        &self,
+        context: &mut LlamaContext<'_>,
+        batch: &mut LlamaBatch,
+        request: &ScoreRequest,
+        maximum_output_tokens: usize,
+    ) -> Result<GeneratedOutput, String> {
+        let started = Instant::now();
+        let prompt = build_prompt(
+            &request.context,
+            &request.right_context,
+            &request.input_katakana,
+        );
+        let prefix_tokens = self
+            .model
+            .str_to_token(&prompt, AddBos::Never)
+            .map_err(|error| format!("failed to tokenize generation prompt: {error}"))?;
+        let available_tokens = MAX_POSITIONS
+            .saturating_sub(prefix_tokens.len())
+            .saturating_sub(1);
+        let output_limit = maximum_output_tokens.min(available_tokens);
+        if prefix_tokens.is_empty() || output_limit == 0 {
+            return Ok(GeneratedOutput {
+                surface: String::new(),
+                token_count: 0,
+                stopped_at_eos: false,
+                latency: started.elapsed(),
+            });
+        }
+
+        context.clear_kv_cache();
+        batch.clear();
+        let sequence = [0];
+        let last_prefix_index = prefix_tokens.len() - 1;
+        for (index, token) in prefix_tokens.iter().enumerate() {
+            batch
+                .add(
+                    *token,
+                    position(index),
+                    &sequence,
+                    index == last_prefix_index,
+                )
+                .map_err(|error| format!("failed to build generation prefix: {error}"))?;
+        }
+        context
+            .decode(batch)
+            .map_err(|error| format!("failed to decode generation prefix: {error}"))?;
+
+        let mut generated = Vec::with_capacity(output_limit);
+        let mut stopped_at_eos = false;
+        while generated.len() < output_limit {
+            let token = maximum_token(context.get_logits()).0;
+            if self.model.is_eog_token(token) {
+                stopped_at_eos = true;
+                break;
+            }
+            generated.push(token);
+            if generated.len() == output_limit {
+                break;
+            }
+            batch.clear();
+            batch
+                .add(
+                    token,
+                    position(prefix_tokens.len() + generated.len() - 1),
+                    &sequence,
+                    true,
+                )
+                .map_err(|error| format!("failed to build generation step: {error}"))?;
+            context
+                .decode(batch)
+                .map_err(|error| format!("failed to decode generation step: {error}"))?;
+        }
+
+        Ok(GeneratedOutput {
+            surface: self.tokens_to_string(&generated)?,
+            token_count: generated.len(),
+            stopped_at_eos,
+            latency: started.elapsed(),
+        })
     }
 
     fn score_all_internal(
@@ -340,13 +476,13 @@ impl Rescorer {
             let first_token_scores = first_token_scores
                 .as_ref()
                 .expect("prefix distribution captured in the first chunk");
-            let node_maxima = diagnose_prefixes
-                .then(|| {
-                    (0..trie.nodes.len())
-                        .map(|node| maximum_token(logits_row(candidate_row_base + node)))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let node_maxima = if diagnose_prefixes {
+                (0..trie.nodes.len())
+                    .map(|node| maximum_token(logits_row(candidate_row_base + node)))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             for (tokens, path) in chunk.iter().zip(&trie.candidate_paths) {
                 let Some(first) = tokens.first() else {
                     logliks.push(f64::NEG_INFINITY);

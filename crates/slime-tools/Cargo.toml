@@ -82,3 +82,8 @@ path = "src/pack_startup_evaluation.rs"
 name = "neural_prefix_probe"
 path = "src/bin/neural_prefix_probe.rs"
 required-features = ["neural"]
+
+[[bin]]
+name = "neural_greedy_probe"
+path = "src/bin/neural_greedy_probe.rs"
+required-features = ["neural"]

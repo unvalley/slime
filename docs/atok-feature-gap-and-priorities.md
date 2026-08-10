@@ -278,13 +278,16 @@ GSD devは1件改善・悪化0、GSD train・test、AJIMEE、JWTDは候補順を
 
 これにより、ShareAlikeを含むv3.1を商用同梱候補にする必要はなくなった。v3.2-smallは明示的な`high-accuracy` profileとして実装し、モデルを含まない通常buildと既存xsmall向け`balanced` profileは維持する。ただし公式model cardには学習元の説明がないため、Apache-2.0 metadataだけで第三者権利まで断定せず、有償配布前の由来確認と法務レビューは残す。
 
+候補集合外の誤りに対しては、zenz-v3.2-smallのgreedy表層を直接採用せず、完全な辞書lattice path、同じ文字数、ASCII英数字不変、2〜4個の離れた局所変更、各2文字以内、通常cost窓、追加marginをすべて満たす1候補だけを`high-accuracy`の再採点へ加えた。読みは6〜32文字に限定する。JWTDは2回prefix後の225 / 400から227 / 400、PUDは346 / 446から347 / 446へ改善し、AJIMEEとGSD dev/testを維持した。ATOKの継続的な変換強度と同様に、モデルの一度の出力だけで辞書・履歴の境界を越えない。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。
-2. 組織名・地名は、辞書にない語だけをライセンス・頻度付きoptional packとして評価し、初回top-1を変えない改善だけを採用する。
-3. 入力ミス訂正と学習強度の実利用false positiveを固定データへ追加する。
-4. macOSを再インストールし、TextEditで逐次入力、候補操作、再変換、private/secure inputを確認する。
-5. Windowsは署名以外の実機動作をVMで先に閉じ、配布可能という表現は署名・install/update/uninstall完了まで使わない。
+2. 辞書制約付き生成と再採点で別々に作るllama contextを共有し、high-accuracyの追加61〜106 msを削減する。精度5 dataset非悪化を維持する。
+3. 組織名・地名は、辞書にない語だけをライセンス・頻度付きoptional packとして評価し、初回top-1を変えない改善だけを採用する。
+4. 入力ミス訂正と学習強度の実利用false positiveを固定データへ追加する。
+5. macOSを再インストールし、TextEditで逐次入力、候補操作、再変換、private/secure inputを確認する。
+6. Windowsは署名以外の実機動作をVMで先に閉じ、配布可能という表現は署名・install/update/uninstall完了まで使わない。
 
 ## 公式資料
 

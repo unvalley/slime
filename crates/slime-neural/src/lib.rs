@@ -155,7 +155,7 @@ impl Rescorer {
     /// configured token position exceeds `i32`, both of which violate the
     /// validated model and bounded-context contract.
     pub fn score_all(&self, requests: &[ScoreRequest]) -> Result<Vec<ScoredItem>, String> {
-        self.score_all_internal(requests, false)
+        self.score_all_internal(requests, false, None)
     }
 
     /// Scores requests and reports the model's first preferred alternative
@@ -171,7 +171,30 @@ impl Rescorer {
         &self,
         requests: &[ScoreRequest],
     ) -> Result<Vec<ScoredItem>, String> {
-        self.score_all_internal(requests, true)
+        self.score_all_internal(requests, true, None)
+    }
+
+    /// Scores candidates with prefix diagnostics and amplifies only the score
+    /// contribution attributable to surrounding context.
+    ///
+    /// For contextual requests this compares the normal score with a second
+    /// score using the same reading and candidates but no surrounding text:
+    /// `full + weight * (full - context_ablated)`. Both passes reuse one llama
+    /// context. Requests without surrounding context need only the normal pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `weight` is negative or non-finite, or when model
+    /// context creation, tokenization, batching, or decoding fails.
+    pub fn score_all_with_prefix_diagnostics_and_context_contrast(
+        &self,
+        requests: &[ScoreRequest],
+        weight: f64,
+    ) -> Result<Vec<ScoredItem>, String> {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err("context contrast weight must be finite and non-negative".to_owned());
+        }
+        self.score_all_internal(requests, true, Some(weight))
     }
 
     /// Greedily generates one bounded surface for each conversion prompt.
@@ -302,6 +325,7 @@ impl Rescorer {
         &self,
         requests: &[ScoreRequest],
         diagnose_prefixes: bool,
+        context_contrast_weight: Option<f64>,
     ) -> Result<Vec<ScoredItem>, String> {
         let sequence_count = u32::try_from(self.max_parallel_candidates)
             .map_err(|_| "parallel candidate count does not fit u32".to_owned())?;
@@ -324,13 +348,43 @@ impl Rescorer {
         let scored: Result<Vec<ScoredItem>, String> = requests
             .iter()
             .map(|request| {
-                self.score_item(
+                let mut scored = self.score_item(
                     &mut context,
                     &mut batch,
                     request,
                     &mut timing,
                     diagnose_prefixes,
-                )
+                )?;
+                // A neutral vector means the contextual prompt exceeded the
+                // model bound. Do not turn an ablated score into an inverted
+                // ranking when the primary score was deliberately skipped.
+                if let Some(weight) = context_contrast_weight
+                    && weight > 0.0
+                    && (!request.context.is_empty() || !request.right_context.is_empty())
+                    && scored.candidate_logliks.iter().any(|&loglik| loglik != 0.0)
+                {
+                    let context_ablated_request = ScoreRequest {
+                        context: String::new(),
+                        right_context: String::new(),
+                        input_katakana: request.input_katakana.clone(),
+                        candidates: request.candidates.clone(),
+                    };
+                    let context_ablated = self.score_item(
+                        &mut context,
+                        &mut batch,
+                        &context_ablated_request,
+                        &mut timing,
+                        false,
+                    )?;
+                    apply_context_contrast(
+                        &mut scored.candidate_logliks,
+                        &context_ablated.candidate_logliks,
+                        weight,
+                    )?;
+                    apply_context_contrast(&mut scored.logliks, &context_ablated.logliks, weight)?;
+                    scored.latency += context_ablated.latency;
+                }
+                Ok(scored)
             })
             .collect();
         if std::env::var_os("SLIME_NEURAL_TIMING").is_some() {
@@ -654,6 +708,20 @@ fn build_prompt(context: &str, right_context: &str, input_katakana: &str) -> Str
     prompt
 }
 
+fn apply_context_contrast(
+    contextual: &mut [f64],
+    context_ablated: &[f64],
+    weight: f64,
+) -> Result<(), String> {
+    if contextual.len() != context_ablated.len() {
+        return Err("context contrast scores are not candidate-aligned".to_owned());
+    }
+    for (contextual, context_ablated) in contextual.iter_mut().zip(context_ablated) {
+        *contextual += weight * (*contextual - context_ablated);
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Timing {
     candidate_decode: Duration,
@@ -766,7 +834,9 @@ impl LogDistribution {
 mod tests {
     use llama_cpp_2::token::LlamaToken;
 
-    use super::{CandidateTokenTrie, build_prompt, exp_approx, log_sum_exp};
+    use super::{
+        CandidateTokenTrie, apply_context_contrast, build_prompt, exp_approx, log_sum_exp,
+    };
 
     #[test]
     fn candidate_trie_shares_exact_token_prefixes() {
@@ -833,6 +903,19 @@ mod tests {
             maximum + sum.ln()
         };
         assert!((log_sum_exp(&logits) - exact).abs() < 1e-3);
+    }
+
+    #[test]
+    fn context_contrast_amplifies_only_contextual_score_delta() {
+        let mut contextual = vec![-1.0, -2.0, -4.0];
+        apply_context_contrast(&mut contextual, &[-1.5, -1.0, -5.0], 0.1).unwrap();
+        assert_eq!(contextual, [-0.95, -2.1, -3.9]);
+    }
+
+    #[test]
+    fn context_contrast_rejects_misaligned_candidates() {
+        let error = apply_context_contrast(&mut [-1.0, -2.0], &[-1.0], 0.1).unwrap_err();
+        assert_eq!(error, "context contrast scores are not candidate-aligned");
     }
 
     #[test]

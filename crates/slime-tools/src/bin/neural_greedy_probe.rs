@@ -29,6 +29,7 @@ const CONSTRAINED_CANDIDATES: usize = 8;
 const MAX_CHANGED_CHARACTERS: usize = 2;
 const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
+const CONTEXT_CONTRAST_WEIGHT: f64 = 0.1;
 
 #[derive(Debug, Deserialize)]
 struct Item {
@@ -146,6 +147,17 @@ fn run() -> Result<(), String> {
     let mut scored_items = rescorer
         .score_all_with_prefix_diagnostics(&score_requests)?
         .into_iter();
+    let context_ablated_requests = score_requests
+        .iter()
+        .filter(|request| !request.context.is_empty() || !request.right_context.is_empty())
+        .map(|request| ScoreRequest {
+            context: String::new(),
+            right_context: String::new(),
+            input_katakana: request.input_katakana.clone(),
+            candidates: request.candidates.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut context_ablated_items = rescorer.score_all(&context_ablated_requests)?.into_iter();
 
     let mut raw_correct = 0usize;
     let mut dictionary_backed = 0usize;
@@ -174,8 +186,12 @@ fn run() -> Result<(), String> {
     let mut consensus_correct = 0usize;
     let mut consensus_improvements = 0usize;
     let mut consensus_regressions = 0usize;
+    let mut context_contrast_correct = 0usize;
+    let mut context_contrast_improvements = 0usize;
+    let mut context_contrast_regressions = 0usize;
     let mut latencies = Vec::with_capacity(generated.len());
     let mut eligible_latencies = Vec::new();
+    let mut context_ablated_latencies = Vec::new();
     for ((((item, generated), ordinary), augmented), &original_count) in items
         .iter()
         .zip(&generated)
@@ -217,75 +233,134 @@ fn run() -> Result<(), String> {
         }
 
         let mut existing_generation_stats = None;
-        let (current_surface, augmented_surface, current_prefix, augmented_prefix) =
-            if original_count >= 2 {
-                let scored = scored_items
-                    .next()
-                    .expect("one score for each eligible candidate set");
-                let current_index = rescored_index(
-                    item,
-                    &augmented[..original_count],
-                    &scored.candidate_logliks[..original_count],
-                    false,
-                );
-                if let Some(generated_index) = augmented[..original_count]
-                    .iter()
-                    .position(|candidate| candidate.surface == generated.surface)
+        let mut contrast_generation_stats = None;
+        let (
+            current_surface,
+            augmented_surface,
+            current_prefix,
+            augmented_prefix,
+            contrast_surface,
+            contrast_prefix,
+        ) = if original_count >= 2 {
+            let scored = scored_items
+                .next()
+                .expect("one score for each eligible candidate set");
+            let context_ablated =
+                (!item.context_text.is_empty() || !item.right_context_text.is_empty()).then(|| {
+                    context_ablated_items
+                        .next()
+                        .expect("one ablated score for each contextual request")
+                });
+            if let Some(context_ablated) = &context_ablated {
+                context_ablated_latencies.push(context_ablated.latency);
+            }
+            let contrast_logliks = context_ablated.as_ref().map_or_else(
+                || scored.candidate_logliks.clone(),
+                |ablated| {
+                    scored
+                        .candidate_logliks
+                        .iter()
+                        .zip(&ablated.candidate_logliks)
+                        .map(|(full, ablated)| full + CONTEXT_CONTRAST_WEIGHT * (full - ablated))
+                        .collect::<Vec<_>>()
+                },
+            );
+            let current_index = rescored_index(
+                item,
+                &augmented[..original_count],
+                &scored.candidate_logliks[..original_count],
+                false,
+            );
+            if let Some(generated_index) = augmented[..original_count]
+                .iter()
+                .position(|candidate| candidate.surface == generated.surface)
+            {
+                let has_right_context = !item.right_context_text.is_empty();
+                let lambda = if !has_right_context
+                    && item.input.chars().count() >= VERY_LONG_INPUT_CHARACTERS
                 {
-                    let has_right_context = !item.right_context_text.is_empty();
-                    let lambda = if !has_right_context
-                        && item.input.chars().count() >= VERY_LONG_INPUT_CHARACTERS
-                    {
-                        0.74
-                    } else {
-                        0.8
-                    };
-                    let combined = |index: usize| {
-                        (1.0 - lambda) * (-f64::from(augmented[index].cost) / COST_LOG_SCALE)
-                            + lambda * scored.candidate_logliks[index]
-                    };
-                    existing_generation_stats = Some((
-                        generated_index + 1,
-                        current_index + 1,
-                        scored.candidate_logliks[generated_index]
-                            - scored.candidate_logliks[current_index],
-                        combined(generated_index) - combined(current_index),
-                        augmented[generated_index]
-                            .cost
-                            .saturating_sub(augmented[0].cost),
-                    ));
-                }
-                let current_surface = augmented[current_index].surface.clone();
-                let current_prefix = apply_prefix_correction(
-                    &dictionary,
-                    &reading,
-                    &current_surface,
-                    scored.first_mismatch_prefixes[current_index].as_ref(),
-                )
-                .unwrap_or_else(|| current_surface.clone());
-                let augmented_index = rescored_index(
-                    item,
-                    augmented,
-                    &scored.candidate_logliks,
-                    augmented.len() > original_count,
-                );
-                let augmented_surface = augmented[augmented_index].surface.clone();
-                let augmented_prefix = apply_prefix_correction(
-                    &dictionary,
-                    &reading,
-                    &augmented_surface,
-                    scored.first_mismatch_prefixes[augmented_index].as_ref(),
-                )
-                .unwrap_or_else(|| augmented_surface.clone());
-                (
-                    current_surface,
-                    augmented_surface,
-                    current_prefix,
-                    augmented_prefix,
-                )
-            } else {
-                (base.clone(), base.clone(), base.clone(), base.clone())
-            };
+                    0.74
+                } else {
+                    0.8
+                };
+                let combined = |index: usize| {
+                    (1.0 - lambda) * (-f64::from(augmented[index].cost) / COST_LOG_SCALE)
+                        + lambda * scored.candidate_logliks[index]
+                };
+                existing_generation_stats = Some((
+                    generated_index + 1,
+                    current_index + 1,
+                    scored.candidate_logliks[generated_index]
+                        - scored.candidate_logliks[current_index],
+                    combined(generated_index) - combined(current_index),
+                    augmented[generated_index]
+                        .cost
+                        .saturating_sub(augmented[0].cost),
+                ));
+            }
+            let current_surface = augmented[current_index].surface.clone();
+            let current_prefix = apply_prefix_correction(
+                &dictionary,
+                &reading,
+                &current_surface,
+                scored.first_mismatch_prefixes[current_index].as_ref(),
+            )
+            .unwrap_or_else(|| current_surface.clone());
+            let augmented_index = rescored_index(
+                item,
+                augmented,
+                &scored.candidate_logliks,
+                augmented.len() > original_count,
+            );
+            let augmented_surface = augmented[augmented_index].surface.clone();
+            let augmented_prefix = apply_prefix_correction(
+                &dictionary,
+                &reading,
+                &augmented_surface,
+                scored.first_mismatch_prefixes[augmented_index].as_ref(),
+            )
+            .unwrap_or_else(|| augmented_surface.clone());
+            let contrast_index = rescored_index(
+                item,
+                augmented,
+                &contrast_logliks,
+                augmented.len() > original_count,
+            );
+            if let Some(generated_index) = augmented[..original_count]
+                .iter()
+                .position(|candidate| candidate.surface == generated.surface)
+            {
+                contrast_generation_stats = Some((
+                    generated_index,
+                    contrast_logliks[generated_index] - contrast_logliks[contrast_index],
+                ));
+            }
+            let contrast_surface = augmented[contrast_index].surface.clone();
+            let contrast_prefix = apply_prefix_correction(
+                &dictionary,
+                &reading,
+                &contrast_surface,
+                scored.first_mismatch_prefixes[contrast_index].as_ref(),
+            )
+            .unwrap_or_else(|| contrast_surface.clone());
+            (
+                current_surface,
+                augmented_surface,
+                current_prefix,
+                augmented_prefix,
+                contrast_surface,
+                contrast_prefix,
+            )
+        } else {
+            (
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+            )
+        };
         let current_iterative = apply_followup_prefix(
             &rescorer,
             &dictionary,
@@ -304,6 +379,15 @@ fn run() -> Result<(), String> {
             &augmented_prefix,
         )?
         .unwrap_or_else(|| augmented_prefix.clone());
+        let contrast_iterative = apply_followup_prefix(
+            &rescorer,
+            &dictionary,
+            item,
+            &reading,
+            &contrast_surface,
+            &contrast_prefix,
+        )?
+        .unwrap_or_else(|| contrast_prefix.clone());
         let current_matches = matches_expected(&current_surface, &item.expected_output);
         let augmented_matches = matches_expected(&augmented_surface, &item.expected_output);
         current_rescore_correct += usize::from(current_matches);
@@ -342,6 +426,7 @@ fn run() -> Result<(), String> {
         })
         .flatten();
         let mut consensus_matches = augmented_iterative_matches;
+        let mut contrast_consensus_surface = contrast_iterative.clone();
         if let Some(generated_existing) = generated_existing {
             let generated_matches = matches_expected(generated_existing, &item.expected_output);
             existing_generated += 1;
@@ -360,6 +445,13 @@ fn run() -> Result<(), String> {
                 near_tie_regressions +=
                     usize::from(current_iterative_matches && !generated_matches);
                 consensus_matches = generated_matches;
+            }
+            if contrast_generation_stats.is_some_and(|(_, model_delta)| {
+                (GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE
+                    ..=GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE)
+                    .contains(&model_delta)
+            }) {
+                generated_existing.clone_into(&mut contrast_consensus_surface);
             }
             if current_iterative_matches != generated_matches {
                 let stats = existing_generation_stats.map_or_else(
@@ -390,6 +482,31 @@ fn run() -> Result<(), String> {
         consensus_correct += usize::from(consensus_matches);
         consensus_improvements += usize::from(!augmented_iterative_matches && consensus_matches);
         consensus_regressions += usize::from(augmented_iterative_matches && !consensus_matches);
+        let contrast_consensus_matches =
+            matches_expected(&contrast_consensus_surface, &item.expected_output);
+        context_contrast_correct += usize::from(contrast_consensus_matches);
+        context_contrast_improvements +=
+            usize::from(!consensus_matches && contrast_consensus_matches);
+        context_contrast_regressions +=
+            usize::from(consensus_matches && !contrast_consensus_matches);
+        if consensus_matches != contrast_consensus_matches {
+            println!(
+                "context_contrast_change\t{}\t{}\tcurrent={}\tcontrast={}\texpected={}",
+                item.index,
+                if contrast_consensus_matches {
+                    "improve"
+                } else {
+                    "regress"
+                },
+                if consensus_matches {
+                    item.expected_output.join(" | ")
+                } else {
+                    augmented_iterative.clone()
+                },
+                contrast_consensus_surface,
+                item.expected_output.join(" | "),
+            );
+        }
         if current_iterative_matches != augmented_iterative_matches {
             println!(
                 "iterative_change\t{}\t{}\tcurrent={}\taugmented={}\tgenerated={}\texpected={}",
@@ -407,9 +524,11 @@ fn run() -> Result<(), String> {
         }
     }
     debug_assert!(scored_items.next().is_none());
+    debug_assert!(context_ablated_items.next().is_none());
 
     latencies.sort_unstable();
     eligible_latencies.sort_unstable();
+    context_ablated_latencies.sort_unstable();
     println!("items={}", items.len());
     println!("base_top1={base_correct}");
     println!("raw_greedy_top1={raw_correct}");
@@ -437,6 +556,17 @@ fn run() -> Result<(), String> {
     println!("consensus_top1={consensus_correct}");
     println!("consensus_improvements={consensus_improvements}");
     println!("consensus_regressions={consensus_regressions}");
+    println!("context_contrast_consensus_top1={context_contrast_correct}");
+    println!("context_contrast_improvements={context_contrast_improvements}");
+    println!("context_contrast_regressions={context_contrast_regressions}");
+    println!(
+        "context_ablated_p50_ms={:.3}",
+        percentile_ms(&context_ablated_latencies, 50)
+    );
+    println!(
+        "context_ablated_p95_ms={:.3}",
+        percentile_ms(&context_ablated_latencies, 95)
+    );
     println!("stopped_at_eos={stopped_at_eos}");
     println!("generation_p50_ms={:.3}", percentile_ms(&latencies, 50));
     println!("generation_p95_ms={:.3}", percentile_ms(&latencies, 95));

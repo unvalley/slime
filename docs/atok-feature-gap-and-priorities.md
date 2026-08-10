@@ -282,6 +282,8 @@ GSD devは1件改善・悪化0、GSD train・test、AJIMEE、JWTDは候補順を
 
 同じgreedy出力が通常の辞書候補に既にある場合は候補を重複追加せず、通常winnerより候補尤度が0.1〜0.2だけ高い近接一致に限って順位信号として再利用した。JWTDは227→228、PUDは347→348へ各1件改善し、AJIMEEとGSD dev/testは不変、exact悪化0だった。生成beam幅2はJWTDの辞書付きoracleを増やしたものの最終top-1を追加改善せず、対象入力のp95を約114 msから151 msへ増やしたため不採用とした。
 
+候補内順位には、モデルが文脈なしでも好む一般頻度と、左右文脈による寄与が混在する。そこで同じ読み・候補を文脈なしでも採点し、差分の10%だけを通常尤度へ足す文脈対比を`high-accuracy`へ追加した。JWTD devで0.25以上が正解を落としたため0.1へ固定し、GSD dev 301→302、PUD 348→349、GSD test 300→301、JWTD 228とAJIMEE 168は維持、全件でexact悪化0だった。`乗せ→載せ`、`付か→突か`、`仮フォルニヤ→カリフォルニヤ`を修正した。`balanced`と文脈なし入力は二重採点せず、high-accuracyの文脈付き5候補ではmodel処理のp50が約11 ms増えた。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

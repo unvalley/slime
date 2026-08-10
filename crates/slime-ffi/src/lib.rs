@@ -152,6 +152,7 @@ struct NeuralProfileParameters {
     right_context_minimum_score_margin: f64,
     prefix_correction: bool,
     generative_recall: bool,
+    context_contrast_weight: f64,
 }
 
 impl NeuralProfileParameters {
@@ -166,6 +167,7 @@ impl NeuralProfileParameters {
         right_context_minimum_score_margin: 0.1,
         prefix_correction: false,
         generative_recall: false,
+        context_contrast_weight: 0.0,
     };
 
     const HIGH_ACCURACY: Self = Self {
@@ -179,6 +181,7 @@ impl NeuralProfileParameters {
         right_context_minimum_score_margin: 0.5,
         prefix_correction: true,
         generative_recall: true,
+        context_contrast_weight: 0.1,
     };
 
     #[cfg(any(feature = "neural", test))]
@@ -667,7 +670,10 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let scored = if handle.neural_profile.prefix_correction {
             service
                 .rescorer
-                .score_all_with_prefix_diagnostics(&[score_request])
+                .score_all_with_prefix_diagnostics_and_context_contrast(
+                    &[score_request],
+                    handle.neural_profile.context_contrast_weight,
+                )
         } else {
             service.rescorer.score_all(&[score_request])
         };
@@ -1771,6 +1777,7 @@ mod tests {
         assert!(!balanced.bypass_long_input_confidence);
         assert!(!balanced.prefix_correction);
         assert!(!balanced.generative_recall);
+        assert_close(balanced.context_contrast_weight, 0.0);
         assert_close(balanced.minimum_score_margin(false, false), 0.0);
         assert_close(balanced.minimum_score_margin(true, false), 0.0);
         assert_close(balanced.minimum_score_margin(false, true), 0.1);
@@ -1787,6 +1794,7 @@ mod tests {
         assert!(high_accuracy.bypass_long_input_confidence);
         assert!(high_accuracy.prefix_correction);
         assert!(high_accuracy.generative_recall);
+        assert_close(high_accuracy.context_contrast_weight, 0.1);
         assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
@@ -2064,6 +2072,39 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_context_contrast(handle: *mut super::SlimeHandle) {
+        // The unconditioned model and dictionary narrowly prefer 乗せ. The
+        // surrounding sentence specifically supports the written-form 載せ.
+        let left_context = "ちなみにここには";
+        let right_context = "きれませんでしたが,ラッパを吹いている天使はコンクリート製。 ";
+        // SAFETY: The handle and both UTF-8 strings are live for this call.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    handle,
+                    left_context.as_ptr(),
+                    left_context.len(),
+                    right_context.as_ptr(),
+                    right_context.len(),
+                )
+            },
+            STATUS_OK
+        );
+        let mut capture = TypedCapture::default();
+        for character in "のせ".chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(capture.candidates.first().map(String::as_str), Some("載せ"));
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+        // SAFETY: Empty live slices clear the external context synchronously.
+        assert_eq!(
+            unsafe { slime_set_external_context(handle, b"".as_ptr(), 0, b"".as_ptr(), 0) },
+            STATUS_OK
+        );
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_generative_consensus(model: &str) {
         // Greedy generation agrees with an existing dictionary candidate, but
         // the cost/model interpolation narrowly keeps 制作 first. The bounded
@@ -2143,6 +2184,45 @@ mod tests {
             diagnostic[5].as_secs_f64() * 1_000.0,
             diagnostic[5].saturating_sub(standard[5]).as_secs_f64() * 1_000.0,
         );
+
+        let contextual_request = || slime_neural::ScoreRequest {
+            context: "ちなみにここには".to_owned(),
+            right_context: "きれませんでしたが,ラッパを吹いている天使はコンクリート製。 "
+                .to_owned(),
+            input_katakana: "ノセ".to_owned(),
+            candidates: ["乗せ", "載せ", "の背", "能勢", "の瀬"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        let mut contextual = Vec::with_capacity(10);
+        let mut contrasted = Vec::with_capacity(10);
+        for _ in 0..10 {
+            contextual.push(
+                service
+                    .rescorer
+                    .score_all_with_prefix_diagnostics(&[contextual_request()])
+                    .expect("contextual diagnostic scorer should succeed")[0]
+                    .latency,
+            );
+            contrasted.push(
+                service
+                    .rescorer
+                    .score_all_with_prefix_diagnostics_and_context_contrast(
+                        &[contextual_request()],
+                        0.1,
+                    )
+                    .expect("context contrast scorer should succeed")[0]
+                    .latency,
+            );
+        }
+        contextual.sort_unstable();
+        contrasted.sort_unstable();
+        eprintln!(
+            "ffi neural context contrast: contextual_p50={:.3}ms contrasted_p50={:.3}ms delta={:.3}ms",
+            contextual[5].as_secs_f64() * 1_000.0,
+            contrasted[5].as_secs_f64() * 1_000.0,
+            contrasted[5].saturating_sub(contextual[5]).as_secs_f64() * 1_000.0,
+        );
     }
 
     #[cfg(feature = "neural")]
@@ -2159,6 +2239,7 @@ mod tests {
         verify_confident_long_neural_conversion(&model);
         verify_neural_learning_strength(&model);
         verify_generative_consensus(&model);
+        verify_context_contrast(handle);
         verify_prefix_correction(handle);
         verify_iterative_prefix_correction(handle);
         verify_generative_recall(handle);

@@ -681,22 +681,23 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             let constraints = scored
                 .first_mismatch_prefixes
                 .iter()
-                .map(|diagnostic| {
-                    diagnostic.as_ref().and_then(|diagnostic| {
-                        (!diagnostic.alternative_is_eos
-                            && diagnostic.prefix.chars().count()
-                                >= PREFIX_CORRECTION_MIN_CHARACTERS
-                            && diagnostic.alternative_logit - diagnostic.candidate_logit
-                                >= PREFIX_CORRECTION_MIN_LOGIT_MARGIN)
-                            .then(|| diagnostic.prefix.clone())
-                    })
-                })
+                .map(|diagnostic| diagnostic.as_ref().and_then(prefix_constraint))
                 .collect::<Vec<_>>();
-            handle
+            let followup_prefix = handle
                 .engine
-                .apply_candidate_rescore_with_prefix_constraints(
+                .candidate_rescore_prefix_followup_request(
                     &scored.candidate_logliks,
                     &constraints,
+                    candidate_weight,
+                    minimum_margin,
+                )
+                .and_then(|request| score_followup_prefix(service, request));
+            handle
+                .engine
+                .apply_candidate_rescore_with_prefix_constraints_and_followup(
+                    &scored.candidate_logliks,
+                    &constraints,
+                    followup_prefix.as_deref(),
                     candidate_weight,
                     minimum_margin,
                 )
@@ -712,6 +713,39 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         }
     }
     actions
+}
+
+#[cfg(feature = "neural")]
+fn prefix_constraint(diagnostic: &slime_neural::PrefixDiagnostic) -> Option<String> {
+    (!diagnostic.alternative_is_eos
+        && diagnostic.prefix.chars().count() >= PREFIX_CORRECTION_MIN_CHARACTERS
+        && diagnostic.alternative_logit - diagnostic.candidate_logit
+            >= PREFIX_CORRECTION_MIN_LOGIT_MARGIN)
+        .then(|| diagnostic.prefix.clone())
+}
+
+#[cfg(feature = "neural")]
+fn score_followup_prefix(
+    service: &NeuralService,
+    request: slime_core::CandidateRescoreRequest,
+) -> Option<String> {
+    let followup_request = slime_neural::ScoreRequest {
+        context: request.context,
+        right_context: request.right_context,
+        input_katakana: full_katakana(&request.reading),
+        candidates: request.candidates,
+    };
+    service
+        .rescorer
+        .score_all_with_prefix_diagnostics(&[followup_request])
+        .ok()?
+        .into_iter()
+        .next()?
+        .first_mismatch_prefixes
+        .into_iter()
+        .next()?
+        .as_ref()
+        .and_then(prefix_constraint)
 }
 
 #[cfg(feature = "neural")]
@@ -1928,6 +1962,26 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_iterative_prefix_correction(handle: *mut super::SlimeHandle) {
+        // The first review changes 偏光 to another local candidate. Reviewing
+        // that corrected surface once more recovers the contextually natural
+        // 偏向 without widening the ordinary N-best pool.
+        let mut capture = TypedCapture::default();
+        for character in
+            "えれぼんもそうびされておらず、しせいせいぎょはすいりょくへんこうのずるによりおこなう"
+                .chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("エレボンも装備されておらず、姿勢制御は推力偏向ノズルにより行う")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+    }
+
+    #[cfg(feature = "neural")]
     fn measure_prefix_diagnostics() {
         let service = super::NEURAL_SERVICE
             .get()
@@ -1998,6 +2052,7 @@ mod tests {
         verify_confident_long_neural_conversion(&model);
         verify_neural_learning_strength(&model);
         verify_prefix_correction(handle);
+        verify_iterative_prefix_correction(handle);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

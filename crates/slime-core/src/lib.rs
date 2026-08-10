@@ -531,7 +531,7 @@ impl SlimeEngine {
         lambda: f64,
         minimum_margin: f64,
     ) -> Option<Vec<SlimeAction>> {
-        self.apply_candidate_rescore_internal(log_likelihoods, None, lambda, minimum_margin)
+        self.apply_candidate_rescore_internal(log_likelihoods, None, None, lambda, minimum_margin)
     }
 
     /// Applies model scores and optional model-directed surface prefixes.
@@ -551,15 +551,99 @@ impl SlimeEngine {
         self.apply_candidate_rescore_internal(
             log_likelihoods,
             Some(prefix_constraints),
+            None,
             lambda,
             minimum_margin,
         )
+    }
+
+    /// Previews the first safe prefix correction as a one-candidate request.
+    ///
+    /// This does not consume or mutate the pending rescore state. A caller can
+    /// ask the same model to diagnose the corrected surface once more, then
+    /// pass that follow-up prefix to
+    /// [`Self::apply_candidate_rescore_with_prefix_constraints_and_followup`].
+    #[must_use]
+    pub fn candidate_rescore_prefix_followup_request(
+        &self,
+        log_likelihoods: &[f64],
+        prefix_constraints: &[Option<String>],
+        lambda: f64,
+        minimum_margin: f64,
+    ) -> Option<CandidateRescoreRequest> {
+        let state = self.candidate_rescore.as_ref()?;
+        if self.candidate_kind != Some(CandidateKind::Conversion)
+            || self.selected != 0
+            || state.candidates.len() != prefix_constraints.len()
+        {
+            return None;
+        }
+        let (_, _, selected) =
+            candidate_rescore_order(&state.candidates, log_likelihoods, lambda, minimum_margin)?;
+        let prefix = prefix_constraints[selected].as_deref()?;
+        let current = &state.candidates[selected].surface;
+        let correction = self.constrained_local_correction(
+            &state.request.reading,
+            current,
+            prefix,
+            &self.candidates,
+        )?;
+        Some(CandidateRescoreRequest {
+            context: state.request.context.clone(),
+            right_context: state.request.right_context.clone(),
+            reading: state.request.reading.clone(),
+            candidates: vec![correction],
+        })
+    }
+
+    /// Applies initial scores plus one optional follow-up prefix correction.
+    ///
+    /// Each correction is independently limited to the same adjacent
+    /// two-character substitution. If the follow-up is invalid, the safe
+    /// first correction is still applied.
+    pub fn apply_candidate_rescore_with_prefix_constraints_and_followup(
+        &mut self,
+        log_likelihoods: &[f64],
+        prefix_constraints: &[Option<String>],
+        followup_prefix_constraint: Option<&str>,
+        lambda: f64,
+        minimum_margin: f64,
+    ) -> Option<Vec<SlimeAction>> {
+        self.apply_candidate_rescore_internal(
+            log_likelihoods,
+            Some(prefix_constraints),
+            followup_prefix_constraint,
+            lambda,
+            minimum_margin,
+        )
+    }
+
+    fn constrained_local_correction(
+        &self,
+        reading: &str,
+        current: &str,
+        prefix: &str,
+        existing_candidates: &[String],
+    ) -> Option<String> {
+        let correction = self
+            .dictionary
+            .convert_n_best_with_surface_prefix(reading, prefix, PREFIX_CONSTRAINED_CANDIDATE_LIMIT)
+            .into_iter()
+            .next()?
+            .surface;
+        (bounded_local_substitution(
+            current,
+            &correction,
+            PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+        ) && !existing_candidates.contains(&correction))
+        .then_some(correction)
     }
 
     fn apply_candidate_rescore_internal(
         &mut self,
         log_likelihoods: &[f64],
         prefix_constraints: Option<&[Option<String>]>,
+        followup_prefix_constraint: Option<&str>,
         lambda: f64,
         minimum_margin: f64,
     ) -> Option<Vec<SlimeAction>> {
@@ -569,14 +653,12 @@ impl SlimeEngine {
             || state.candidates.len() != log_likelihoods.len()
             || prefix_constraints
                 .is_some_and(|constraints| constraints.len() != state.candidates.len())
-            || !(0.0..=1.0).contains(&lambda)
-            || !lambda.is_finite()
-            || minimum_margin < 0.0
-            || !minimum_margin.is_finite()
-            || log_likelihoods.iter().any(|score| !score.is_finite())
         {
             return None;
         }
+
+        let (order, margin_protects_base, selected) =
+            candidate_rescore_order(&state.candidates, log_likelihoods, lambda, minimum_margin)?;
 
         let mut pending_candidates = self.candidates.clone();
         let existing_positions: Vec<_> = state
@@ -613,40 +695,15 @@ impl SlimeEngine {
         }
         positions.sort_unstable();
 
-        let mut order: Vec<usize> = (0..state.candidates.len()).collect();
-        let combined: Vec<f64> = state
-            .candidates
-            .iter()
-            .zip(log_likelihoods)
-            .map(|(candidate, log_likelihood)| {
-                (1.0 - lambda) * (-f64::from(candidate.cost) / RESCORE_COST_LOG_SCALE)
-                    + lambda * log_likelihood
-            })
-            .collect();
-        order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
-        let top = *order.first()?;
-        let margin_protects_base = top != 0 && combined[top] - combined[0] < minimum_margin;
-        let selected = if margin_protects_base { 0 } else { top };
         let prefix_correction = prefix_constraints
             .and_then(|constraints| constraints[selected].as_deref())
             .and_then(|prefix| {
-                let current = &state.candidates[selected].surface;
-                let correction = self
-                    .dictionary
-                    .convert_n_best_with_surface_prefix(
-                        &state.request.reading,
-                        prefix,
-                        PREFIX_CONSTRAINED_CANDIDATE_LIMIT,
-                    )
-                    .into_iter()
-                    .next()?
-                    .surface;
-                (bounded_local_substitution(
-                    current,
-                    &correction,
-                    PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
-                ) && !pending_candidates.contains(&correction))
-                .then_some(correction)
+                self.constrained_local_correction(
+                    &state.request.reading,
+                    &state.candidates[selected].surface,
+                    prefix,
+                    &pending_candidates,
+                )
             });
         if margin_protects_base && prefix_correction.is_none() {
             return Some(self.candidate_actions());
@@ -658,7 +715,18 @@ impl SlimeEngine {
             }
         }
         if let Some(correction) = prefix_correction {
+            let followup_correction = followup_prefix_constraint.and_then(|prefix| {
+                self.constrained_local_correction(
+                    &state.request.reading,
+                    &correction,
+                    prefix,
+                    &pending_candidates,
+                )
+            });
             pending_candidates.insert(correction_position, correction);
+            if let Some(followup) = followup_correction {
+                pending_candidates.insert(correction_position, followup);
+            }
         }
         self.candidates = pending_candidates;
         Some(self.candidate_actions())
@@ -2300,6 +2368,38 @@ fn candidate_rescore_state_with_limit(
         },
         candidates,
     })
+}
+
+fn candidate_rescore_order(
+    candidates: &[Candidate],
+    log_likelihoods: &[f64],
+    lambda: f64,
+    minimum_margin: f64,
+) -> Option<(Vec<usize>, bool, usize)> {
+    if candidates.is_empty()
+        || candidates.len() != log_likelihoods.len()
+        || !(0.0..=1.0).contains(&lambda)
+        || !lambda.is_finite()
+        || minimum_margin < 0.0
+        || !minimum_margin.is_finite()
+        || log_likelihoods.iter().any(|score| !score.is_finite())
+    {
+        return None;
+    }
+    let combined = candidates
+        .iter()
+        .zip(log_likelihoods)
+        .map(|(candidate, log_likelihood)| {
+            (1.0 - lambda) * (-f64::from(candidate.cost) / RESCORE_COST_LOG_SCALE)
+                + lambda * log_likelihood
+        })
+        .collect::<Vec<_>>();
+    let mut order = (0..candidates.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| combined[right].total_cmp(&combined[left]));
+    let top = *order.first()?;
+    let margin_protects_base = top != 0 && combined[top] - combined[0] < minimum_margin;
+    let selected = if margin_protects_base { 0 } else { top };
+    Some((order, margin_protects_base, selected))
 }
 
 fn bounded_local_substitution(current: &str, alternative: &str, maximum_changes: usize) -> bool {
@@ -4667,6 +4767,54 @@ mod tests {
                 .handle(InputEvent::Enter)
                 .contains(&SlimeAction::Commit("少額の問題".to_owned()))
         );
+    }
+
+    #[test]
+    fn model_prefix_can_review_one_safe_correction_once() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "少額", 20),
+            DictionaryEntry::new("もんだい", "問題", 10),
+            DictionaryEntry::new("もんだい", "課題", 20),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["奨学の問題".to_owned()];
+        let candidate = Candidate {
+            surface: "奨学の問題".to_owned(),
+            cost: 100,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "前の文".to_owned(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![candidate.surface.clone()],
+            },
+            candidates: vec![candidate],
+        });
+
+        let constraints = [Some("少".to_owned())];
+        let followup = engine
+            .candidate_rescore_prefix_followup_request(&[0.0], &constraints, 0.8, 0.0)
+            .expect("the first safe correction should be reviewable");
+        assert_eq!(followup.context, "前の文");
+        assert_eq!(followup.candidates, ["少額の問題"]);
+        assert_eq!(engine.candidates, ["奨学の問題"]);
+
+        engine
+            .apply_candidate_rescore_with_prefix_constraints_and_followup(
+                &[0.0],
+                &constraints,
+                Some("少額の課"),
+                0.8,
+                0.0,
+            )
+            .expect("both independently bounded corrections should apply");
+
+        assert_eq!(engine.candidates[0], "少額の課題");
+        assert!(engine.candidates.contains(&"少額の問題".to_owned()));
+        assert!(engine.candidates.contains(&"奨学の問題".to_owned()));
     }
 
     #[test]

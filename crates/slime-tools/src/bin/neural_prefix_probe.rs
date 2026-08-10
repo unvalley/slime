@@ -23,6 +23,7 @@ const MIN_PREFIX_CHARACTERS: usize = 4;
 const MIN_LOGIT_MARGIN: f32 = 2.0;
 const MAX_CHANGED_CHARACTERS: usize = 2;
 const COST_LOG_SCALE: f64 = 500.0;
+const ITERATIVE_PREFIX_ROUNDS: usize = 2;
 
 #[derive(Debug, Deserialize)]
 struct Item {
@@ -121,6 +122,10 @@ fn run() -> Result<(), String> {
     let mut remaining_outside_scored_within_32 = 0usize;
     let mut latencies = Vec::with_capacity(requests.len());
     let mut constrained_latencies = Vec::new();
+    let mut iterative_correct = [0usize; ITERATIVE_PREFIX_ROUNDS];
+    let mut iterative_improvements = [0usize; ITERATIVE_PREFIX_ROUNDS];
+    let mut iterative_regressions = [0usize; ITERATIVE_PREFIX_ROUNDS];
+    let mut iterative_latencies = Vec::new();
 
     for ((item, candidates), &candidate_count) in
         items.iter().zip(&candidate_sets).zip(&candidate_counts)
@@ -129,6 +134,8 @@ fn run() -> Result<(), String> {
         let mut corrected = baseline.clone();
         let mut selected_index = 0usize;
         let mut selected_prefix = None;
+        let mut iterative_surfaces: [String; ITERATIVE_PREFIX_ROUNDS] =
+            std::array::from_fn(|_| baseline.clone());
         if candidate_count >= 2 {
             let scored = scored.next().expect("one score for each selected request");
             latencies.push(scored.latency);
@@ -136,6 +143,7 @@ fn run() -> Result<(), String> {
             selected_index = selected;
             baseline.clone_from(&candidates[selected].surface);
             corrected.clone_from(&baseline);
+            let reading = katakana_to_hiragana(&item.input);
             if let Some(diagnostic) = &scored.first_mismatch_prefixes[selected]
                 && !diagnostic.alternative_is_eos
                 && diagnostic.prefix.chars().count() >= MIN_PREFIX_CHARACTERS
@@ -143,7 +151,6 @@ fn run() -> Result<(), String> {
             {
                 eligible_constraints += 1;
                 selected_prefix = Some(diagnostic.prefix.clone());
-                let reading = katakana_to_hiragana(&item.input);
                 let constrained_started = Instant::now();
                 let alternative = dictionary
                     .convert_n_best_with_surface_prefix(
@@ -162,6 +169,56 @@ fn run() -> Result<(), String> {
                     applied_corrections += 1;
                 }
             }
+            iterative_surfaces.fill(corrected.clone());
+            if corrected != baseline {
+                let mut iterative = corrected.clone();
+                let mut seen = vec![baseline.clone(), corrected.clone()];
+                for round in 1..ITERATIVE_PREFIX_ROUNDS {
+                    let request = ScoreRequest {
+                        context: item.context_text.clone(),
+                        right_context: item.right_context_text.clone(),
+                        input_katakana: item.input.clone(),
+                        candidates: vec![iterative.clone()],
+                    };
+                    let started = Instant::now();
+                    let diagnostic = rescorer
+                        .score_all_with_prefix_diagnostics(&[request])?
+                        .remove(0)
+                        .first_mismatch_prefixes
+                        .remove(0);
+                    iterative_latencies.push(started.elapsed());
+                    let Some(diagnostic) = diagnostic else {
+                        break;
+                    };
+                    if diagnostic.alternative_is_eos
+                        || diagnostic.prefix.chars().count() < MIN_PREFIX_CHARACTERS
+                        || diagnostic.alternative_logit - diagnostic.candidate_logit
+                            < MIN_LOGIT_MARGIN
+                    {
+                        break;
+                    }
+                    let Some(alternative) = dictionary
+                        .convert_n_best_with_surface_prefix(
+                            &reading,
+                            &diagnostic.prefix,
+                            CONSTRAINED_CANDIDATES,
+                        )
+                        .into_iter()
+                        .next()
+                        .map(|conversion| conversion.surface)
+                    else {
+                        break;
+                    };
+                    if !bounded_local_substitution(&iterative, &alternative, MAX_CHANGED_CHARACTERS)
+                        || seen.contains(&alternative)
+                    {
+                        break;
+                    }
+                    iterative = alternative;
+                    seen.push(iterative.clone());
+                    iterative_surfaces[round..].fill(iterative.clone());
+                }
+            }
         }
 
         let was_correct = matches_expected(&baseline, &item.expected_output);
@@ -170,6 +227,21 @@ fn run() -> Result<(), String> {
         corrected_correct += usize::from(is_correct);
         improvements += usize::from(!was_correct && is_correct);
         regressions += usize::from(was_correct && !is_correct);
+        for (index, iterative) in iterative_surfaces.iter().enumerate() {
+            let iterative_is_correct = matches_expected(iterative, &item.expected_output);
+            iterative_correct[index] += usize::from(iterative_is_correct);
+            iterative_improvements[index] += usize::from(!was_correct && iterative_is_correct);
+            iterative_regressions[index] += usize::from(was_correct && !iterative_is_correct);
+        }
+        if iterative_surfaces[1] != corrected {
+            println!(
+                "iterative_change\t{}\tcurrent={}\titerative={}\texpected={}",
+                item.index,
+                corrected,
+                iterative_surfaces[1],
+                item.expected_output.join(" | "),
+            );
+        }
         if was_correct != is_correct {
             println!(
                 "change\t{}\t{}\tbaseline={}\tcorrected={}\texpected={}",
@@ -243,6 +315,24 @@ fn run() -> Result<(), String> {
     println!("remaining_outside_scored_within_32={remaining_outside_scored_within_32}");
     println!("remaining_rank_33_64={remaining_rank_33_64}");
     println!("remaining_missing_64={remaining_missing_64}");
+    for round in 0..ITERATIVE_PREFIX_ROUNDS {
+        println!(
+            "iterative_prefix_rounds={}\ttop1={}\timprovements={}\tregressions={}",
+            round + 1,
+            iterative_correct[round],
+            iterative_improvements[round],
+            iterative_regressions[round],
+        );
+    }
+    iterative_latencies.sort_unstable();
+    println!(
+        "iterative_prefix_p50_ms={:.3}",
+        percentile_ms(&iterative_latencies, 50)
+    );
+    println!(
+        "iterative_prefix_p95_ms={:.3}",
+        percentile_ms(&iterative_latencies, 95)
+    );
     println!("diagnostic_p50_ms={:.3}", percentile_ms(&latencies, 50));
     println!("diagnostic_p95_ms={:.3}", percentile_ms(&latencies, 95));
     constrained_latencies.sort_unstable();

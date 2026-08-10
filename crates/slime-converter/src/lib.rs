@@ -145,7 +145,7 @@ struct DictionaryDocumentContextRanker<'a> {
     unique_right_grammar_surface: Option<&'a str>,
     has_polite_right_context: bool,
     unique_right_suru_surface: Option<&'a str>,
-    surrounding_notation_surface: Option<&'static str>,
+    surrounding_notation: Option<(&'static str, i32)>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
     allows_single_character_phrase_prefix: bool,
@@ -199,7 +199,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             has_polite_right_context: starts_with_polite_auxiliary(right_context),
             unique_right_suru_surface: dictionary
                 .document_unique_right_suru_surface(reading, right_context),
-            surrounding_notation_surface: surrounding_structured_notation_surface(
+            surrounding_notation: surrounding_structured_notation(
                 left_context,
                 reading,
                 right_context,
@@ -282,12 +282,12 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .unwrap_or(0);
         let right_function_word_promotion = self.right_function_word_promotion(conversion);
         let notation_promotion =
-            if structured_notation_matches(left_context, reading, &conversion.surface)
-                || self.surrounding_notation_surface == Some(conversion.surface.as_str())
-            {
+            if structured_notation_matches(left_context, reading, &conversion.surface) {
                 DOCUMENT_STRUCTURED_NOTATION_PROMOTION
             } else {
-                0
+                self.surrounding_notation
+                    .filter(|(surface, _)| *surface == conversion.surface)
+                    .map_or(0, |(_, promotion)| promotion)
             };
         let numeric_counter_promotion = self
             .numeric_counter_promotions
@@ -528,6 +528,7 @@ const DOCUMENT_RIGHT_LONG_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION: i32 = 4_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
+const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
 const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
@@ -568,6 +569,28 @@ const MOZC_YOU_AUXILIARY_STEM_NOUN_POS_ID: u16 = 2_192;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
 const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
+const STRINGED_INSTRUMENT_PREFIXES: &[&str] = &[
+    "ギター",
+    "ベース",
+    "バイオリン",
+    "ヴァイオリン",
+    "チェロ",
+    "琴",
+    "箏",
+];
+const VESSEL_NOUN_PREFIXES: &[&str] = &["の客船", "の貨物船", "の帆船", "の船", "の艦", "の艇"];
+const BASE_STATE_PREFIXES: &[&str] = &[
+    "一塁",
+    "二塁",
+    "三塁",
+    "一、二塁",
+    "一・二塁",
+    "一、三塁",
+    "一・三塁",
+    "二、三塁",
+    "二・三塁",
+    "満塁",
+];
 
 fn document_region_suffix_promotion(reading: &str, surface: &str) -> i32 {
     match (reading, surface) {
@@ -608,6 +631,7 @@ fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'st
         "だい" => structured_dai_surface(left_context),
         "ひき" if trailing_counter_integer(left_context) => Some("匹"),
         "つい" if trailing_counter_integer(left_context) => Some("対"),
+        "はい" if trailing_win_loss_record(left_context) => Some("敗"),
         "げん" if trailing_percentage(left_context) => Some("減"),
         "ぞう" if trailing_percentage(left_context) => Some("増"),
         _ => None,
@@ -626,11 +650,30 @@ fn structured_dai_surface(left_context: &str) -> Option<&'static str> {
 }
 
 fn trailing_counter_integer(left_context: &str) -> bool {
-    trailing_integer(left_context).is_some()
-        || left_context
-            .chars()
-            .next_back()
-            .is_some_and(is_japanese_numeric_character)
+    strip_trailing_counter_integer(left_context).is_some()
+}
+
+fn trailing_win_loss_record(left_context: &str) -> bool {
+    let Some(prefix) = strip_trailing_counter_integer(left_context) else {
+        return false;
+    };
+    prefix
+        .strip_suffix('勝')
+        .is_some_and(trailing_counter_integer)
+}
+
+fn strip_trailing_counter_integer(text: &str) -> Option<&str> {
+    if let Some((prefix, _)) = split_trailing_decimal(text) {
+        return (!matches!(prefix.chars().next_back(), Some('.' | '．' | '-' | '−')))
+            .then_some(prefix);
+    }
+    let start = text
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_japanese_numeric_character(*character))
+        .last()
+        .map(|(index, _)| index)?;
+    Some(&text[..start])
 }
 
 fn trailing_percentage(left_context: &str) -> bool {
@@ -657,11 +700,11 @@ fn has_trailing_numeric_surface(text: &str) -> bool {
         .is_some_and(is_japanese_numeric_character)
 }
 
-fn surrounding_structured_notation_surface(
+fn surrounding_structured_notation(
     left_context: &str,
     reading: &str,
     right_context: &str,
-) -> Option<&'static str> {
+) -> Option<(&'static str, i32)> {
     if reading == "たい"
         && (trailing_integer(left_context).is_some()
             || left_context
@@ -670,13 +713,37 @@ fn surrounding_structured_notation_surface(
                 .is_some_and(is_japanese_numeric_character))
         && starts_with_score_integer(right_context)
     {
-        return Some("対");
+        return Some(("対", DOCUMENT_STRUCTURED_NOTATION_PROMOTION));
     }
     if reading == "けん"
         && (right_context.starts_with('内') || right_context.starts_with('外'))
         && trailing_reach_measurement(left_context)
     {
-        return Some("圏");
+        return Some(("圏", DOCUMENT_STRUCTURED_NOTATION_PROMOTION));
+    }
+    if reading == "し"
+        && trailing_integer(left_context).is_some_and(|outs| outs <= 2)
+        && BASE_STATE_PREFIXES
+            .iter()
+            .any(|prefix| right_context.starts_with(prefix))
+    {
+        return Some(("死", DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION));
+    }
+    if reading == "げん"
+        && trailing_counter_integer(left_context)
+        && STRINGED_INSTRUMENT_PREFIXES
+            .iter()
+            .any(|prefix| right_context.starts_with(prefix))
+    {
+        return Some(("弦", DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION));
+    }
+    if reading == "せき"
+        && trailing_counter_integer(left_context)
+        && VESSEL_NOUN_PREFIXES
+            .iter()
+            .any(|prefix| right_context.starts_with(prefix))
+    {
+        return Some(("隻", DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION));
     }
     None
 }
@@ -4789,6 +4856,56 @@ mod tests {
         assert_ne!(
             dictionary.candidates_with_context("げん", "-3%")[0].surface,
             "減"
+        );
+    }
+
+    #[test]
+    fn document_context_promotes_win_loss_record() {
+        let dictionary = Dictionary::bundled();
+
+        for context in ["2勝2", "２勝２", "二勝二"] {
+            assert_eq!(
+                dictionary.candidates_with_context("はい", context)[0].surface,
+                "敗"
+            );
+        }
+        assert_ne!(
+            dictionary.candidates_with_context("はい", "2")[0].surface,
+            "敗"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_structured_numeric_units() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("し", "さらに1", "一、二塁から")[0]
+                .surface,
+            "死"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("げん", "現在は7", "ギターを使う")[0]
+                .surface,
+            "弦"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("せき", "客船は3", "の客船で運航")[0]
+                .surface,
+            "隻"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context("し", "さらに3", "一塁から")[0].surface,
+            "死"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context("げん", "現在は7", "件を使う")[0]
+                .surface,
+            "弦"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context("せき", "客船は3", "の座席")[0].surface,
+            "隻"
         );
     }
 

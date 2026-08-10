@@ -194,6 +194,12 @@ GSD trainの`0.5%減`を`源 → 減`へ1件修正し、悪化は0件だった�
 
 GSD trainの`42匹`と`4対`を2件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Release測定の中央値差は一致経路-0.419 µs（測定誤差内）、非一致経路+0.094 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 前後構造で決めるスポーツ記録・数値単位
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、数値単独では曖昧な表記を前後構造が揃う場合だけ補正する。`n勝n敗`、0〜2アウトに塁上表記が続く`n死`、整数と弦楽器名に挟まれた`弦`、整数と船舶名に挟まれた`隻`を既存候補内で優先する。
+
+GSD trainの`1死一、二塁`、`2勝2敗`、`7弦ギター`、`3隻の客船`を4件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Release測定の中央値差は一致経路+0.324 µs、非一致経路+0.383 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

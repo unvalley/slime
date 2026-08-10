@@ -13,9 +13,7 @@ fn main() {
         black_box(dictionary.candidates(black_box("にほん")));
     });
     run_document_context_benchmark(&dictionary, iterations);
-    run_ordinal_generation_benchmark(&dictionary, iterations);
-    run_unambiguous_counter_benchmark(&dictionary, iterations);
-    run_percentage_change_benchmark(&dictionary, iterations);
+    run_numeric_context_benchmarks(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_noun_prefix_right_phrase_benchmark(&dictionary, iterations);
     run("converter/segmented_phrase", iterations, || {
@@ -247,6 +245,13 @@ fn run_ordinal_generation_benchmark(dictionary: &Dictionary, iterations: u64) {
     );
 }
 
+fn run_numeric_context_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run_ordinal_generation_benchmark(dictionary, iterations);
+    run_unambiguous_counter_benchmark(dictionary, iterations);
+    run_structured_numeric_unit_benchmark(dictionary, iterations);
+    run_percentage_change_benchmark(dictionary, iterations);
+}
+
 fn run_percentage_change_benchmark(dictionary: &Dictionary, iterations: u64) {
     run(
         "converter/percentage_change_context_candidates",
@@ -271,6 +276,31 @@ fn run_unambiguous_counter_benchmark(dictionary: &Dictionary, iterations: u64) {
     run("converter/unambiguous_counter_nonmatch", iterations, || {
         black_box(dictionary.candidates_with_context(black_box("ひき"), black_box("1.5")));
     });
+}
+
+fn run_structured_numeric_unit_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/structured_numeric_unit_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("げん"),
+                black_box("現在は7"),
+                black_box("ギターを使う"),
+            ));
+        },
+    );
+    run(
+        "converter/structured_numeric_unit_nonmatch",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("げん"),
+                black_box("現在は7"),
+                black_box("件を使う"),
+            ));
+        },
+    );
 }
 
 fn run_ideographic_suffix_context_benchmark(dictionary: &Dictionary, iterations: u64) {

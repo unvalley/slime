@@ -740,7 +740,11 @@ JWTDのexact悪化1件は`マンネルヘイム十字勲章受賞 → マンネ�
 
 ### 2026-08-11 学習強度とニューラル順位付けの境界
 
-局所再探索後にも誤ったままの項目を、同じ辞書で64候補まで再生成して分類した。JWTDは残り177件のうち103件が1〜32位、7件が33〜64位、67件が64位までに存在しなかった。AJIMEEは32件中11 / 3 / 18件、PUDは100件中51 / 6 / 43件だった。長文beamをさらに広げるより、既に32候補内にある正解の順位付けを優先する。`neural_prefix_probe INPUT.json MODEL.gguf --failures N`は、最終誤りごとに64候補内順位を出し、この分類を再現できる。
+局所再探索後にも誤ったままの項目を、同じ辞書で64候補まで再生成して分類した。JWTDは残り177件のうち103件が1〜32位、7件が33〜64位、67件が64位までに存在しなかった。103件を製品と同じ候補数・cost窓・confidence gateで再分解すると、正解が実際のニューラル採点対象内にあったのは80件、1〜32位にはあるが採点対象外だったのは23件だった。AJIMEEは32件中11 / 3 / 18件、PUDは100件中51 / 6 / 43件だった。長文beamをさらに広げるより、まず80件の順位付けを優先し、23件は候補投入境界の問題として分離する。`neural_prefix_probe INPUT.json MODEL.gguf --failures N`は、最終誤りごとに実際の採点候補数と64候補内順位を出し、集計でも`remaining_within_scored`と`remaining_outside_scored_within_32`を分ける。
+
+順位付け側では、同じJWTD devで次の一般案を比較した。候補token数への定数補正は現行221件を上回らず、正の補正ほど悪化した。モデル上位2 / 3候補それぞれの不一致prefixまで制約付き探索へ広げると、局所再探索後の223件から215 / 203件へ悪化した。最尤tokenに次ぐ2・3位tokenを同じ不一致位置で試す方式も223件のままだった。v3.2-smallとApache-2.0の[公式v3.2-xsmall](https://huggingface.co/Miwa-Keita/zenz-v3.2-xsmall-gguf/tree/4f5423f0fad41a73b1242eb96fe5c12ae4fdca83)の尤度ensembleは、small単独221件に対してxsmall重み0.05から220件へ低下し、その後も重みを増やすほど悪化したため、二重モデルruntimeへ進めなかった。
+
+最尤prefixで得た格子8候補をsmallで二段再評価する方式は、JWTD devを223件から225件へ改善し、GSD dev 301件を維持した。しかし条件固定後のAJIMEEは168件から166件へ悪化し、`軍 → 郡`、`要因 → 要員`を誤選択したため不採用とした。短文候補を5から8へ増やす、短文cost窓を1,500から2,500へ広げる、短文のbase confidence gateを解除する案も、採点対象を最大2件増やしただけでJWTDの223件を改善しなかった。held-outを見た後の語別・表記別guardは追加しない。
 
 [ATOKハイパーハイブリッドエンジン2](https://www.atok.com/features/2025/)は、直前に一度確定した表記を常に最優先にするのではなく、継続的な入力傾向を「変換強度」として学習し、自然な日本語を優先できるとしている。azooKeyの現行Zenz評価も、[学習候補tokenへ限定したpriority](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift#L171-L184)を加える一方、モデルとの制約衝突が続く場合は[メモリとユーザー辞書を外したretry](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/zenzai.swift#L501-L523)へ進む。いずれも、学習候補を無条件に固定する方式ではない。
 

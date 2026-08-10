@@ -117,6 +117,8 @@ fn run() -> Result<(), String> {
     let mut remaining_rank_1_32 = 0usize;
     let mut remaining_rank_33_64 = 0usize;
     let mut remaining_missing_64 = 0usize;
+    let mut remaining_within_scored = 0usize;
+    let mut remaining_outside_scored_within_32 = 0usize;
     let mut latencies = Vec::with_capacity(requests.len());
     let mut constrained_latencies = Vec::new();
 
@@ -193,7 +195,14 @@ fn run() -> Result<(), String> {
                 .position(|candidate| matches_expected(&candidate.surface, &item.expected_output))
                 .map(|index| index + 1);
             match rank64 {
-                Some(1..=SEARCH_LIMIT) => remaining_rank_1_32 += 1,
+                Some(rank @ 1..=SEARCH_LIMIT) => {
+                    remaining_rank_1_32 += 1;
+                    if rank <= candidate_count {
+                        remaining_within_scored += 1;
+                    } else {
+                        remaining_outside_scored_within_32 += 1;
+                    }
+                }
                 Some(_) => remaining_rank_33_64 += 1,
                 None => remaining_missing_64 += 1,
             }
@@ -201,9 +210,10 @@ fn run() -> Result<(), String> {
         };
         if !is_correct && reported_failures < failure_limit {
             println!(
-                "failure\t{}\tselected={}\tbaseline={}\tcorrected={}\texpected={}\trank64={}\tprefix={}",
+                "failure\t{}\tselected={}\tscored={}\tbaseline={}\tcorrected={}\texpected={}\trank64={}\tprefix={}",
                 item.index,
                 selected_index + 1,
+                candidate_count,
                 baseline,
                 corrected,
                 item.expected_output.join(" | "),
@@ -229,6 +239,8 @@ fn run() -> Result<(), String> {
     println!("eligible_constraints={eligible_constraints}");
     println!("applied_corrections={applied_corrections}");
     println!("remaining_rank_1_32={remaining_rank_1_32}");
+    println!("remaining_within_scored={remaining_within_scored}");
+    println!("remaining_outside_scored_within_32={remaining_outside_scored_within_32}");
     println!("remaining_rank_33_64={remaining_rank_33_64}");
     println!("remaining_missing_64={remaining_missing_64}");
     println!("diagnostic_p50_ms={:.3}", percentile_ms(&latencies, 50));

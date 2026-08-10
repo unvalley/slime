@@ -2,7 +2,7 @@
 
 対象: Rust製ローカル完結かな漢字変換エンジン(Mozc OSS辞書108万語 + 品詞クラスbigram + 語unigramコスト + Viterbi/N-best)
 制約: LM追加分 5〜15MB / 変換 p95 20ms以下(Apple Mシリーズ) / コールド起動 100ms以下 / ネットワークなし / Rust実装
-現状: 辞書のみの主要残存誤りは同音異義語の文脈選択。2026-08-10時点ではApache-2.0のzenz-v3.2-smallをN-best専用rankerとして使う`high-accuracy` profileがAJIMEE 200件でacc@1 80.0%、GSD test 90.1%、PUD 76.7%に達した。モデルなしの軽量経路は維持し、サイズ・遅延・学習元確認を別gateとして扱う。
+現状: 辞書のみの主要残存誤りは同音異義語の文脈選択。2026-08-10時点ではApache-2.0のzenz-v3.2-smallをN-best専用rankerとして使う`high-accuracy` profileがAJIMEE 200件でacc@1 81.0%、GSD test 90.1%、PUD 76.7%に達した。モデルなしの軽量経路は維持し、サイズ・遅延・学習元確認を別gateとして扱う。
 調査日: 2026-07-20
 
 ---

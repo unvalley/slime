@@ -134,6 +134,7 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NeuralProfileParameters {
     candidate_weight: f64,
+    long_input_candidate_limit: usize,
     short_input_minimum_score_margin: f64,
     long_input_minimum_score_margin: f64,
     right_context_minimum_score_margin: f64,
@@ -142,6 +143,7 @@ struct NeuralProfileParameters {
 impl NeuralProfileParameters {
     const BALANCED: Self = Self {
         candidate_weight: 0.7,
+        long_input_candidate_limit: 16,
         short_input_minimum_score_margin: 0.0,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.1,
@@ -149,6 +151,7 @@ impl NeuralProfileParameters {
 
     const HIGH_ACCURACY: Self = Self {
         candidate_weight: 0.8,
+        long_input_candidate_limit: 32,
         short_input_minimum_score_margin: 0.5,
         long_input_minimum_score_margin: 0.0,
         right_context_minimum_score_margin: 0.5,
@@ -186,7 +189,7 @@ static NEURAL_MODEL_PATH: OnceLock<PathBuf> = OnceLock::new();
 static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "neural")]
-const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 16;
+const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 32;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
 
@@ -604,7 +607,9 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
 
     #[cfg(feature = "neural")]
     if let Some(service) = NEURAL_SERVICE.get() {
-        handle.engine.prepare_extended_candidate_rescore();
+        handle.engine.prepare_extended_candidate_rescore_with_limit(
+            handle.neural_profile.long_input_candidate_limit,
+        );
         let Some(request) = handle.engine.candidate_rescore_request() else {
             return actions;
         };
@@ -1614,6 +1619,7 @@ mod tests {
     fn neural_profiles_keep_measured_parameters_explicit() {
         let balanced = super::neural_profile_parameters(super::NEURAL_PROFILE_BALANCED).unwrap();
         assert_close(balanced.candidate_weight, 0.7);
+        assert_eq!(balanced.long_input_candidate_limit, 16);
         assert_close(balanced.minimum_score_margin(false, false), 0.0);
         assert_close(balanced.minimum_score_margin(true, false), 0.0);
         assert_close(balanced.minimum_score_margin(false, true), 0.1);
@@ -1622,6 +1628,7 @@ mod tests {
         let high_accuracy =
             super::neural_profile_parameters(super::NEURAL_PROFILE_HIGH_ACCURACY).unwrap();
         assert_close(high_accuracy.candidate_weight, 0.8);
+        assert_eq!(high_accuracy.long_input_candidate_limit, 32);
         assert_close(high_accuracy.minimum_score_margin(false, false), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);

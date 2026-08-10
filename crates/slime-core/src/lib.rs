@@ -46,8 +46,8 @@ const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
 const SHORT_RESCORE_CANDIDATE_LIMIT: usize = 5;
 const LONG_RESCORE_CANDIDATE_LIMIT: usize = 8;
 const LONG_RESCORE_READING_CHARACTERS: usize = MAX_EXPANDED_READING_CHARACTERS + 1;
-const EXTENDED_LONG_RESCORE_N_BEST: usize = 16;
-const EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT: usize = 16;
+const DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 16;
+const MAX_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 32;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
@@ -431,6 +431,16 @@ impl SlimeEngine {
     /// succeeds. A missing or not-yet-ready optional model cannot add latency,
     /// and a scoring failure cannot partially publish the deeper result.
     pub fn prepare_extended_candidate_rescore(&mut self) {
+        self.prepare_extended_candidate_rescore_with_limit(
+            DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES,
+        );
+    }
+
+    /// Prepares a profile-selected long-reading pool for a ready local scorer.
+    ///
+    /// The requested size is bounded so callers cannot expand the search or
+    /// neural runtime beyond the product's measured 32-candidate ceiling.
+    pub fn prepare_extended_candidate_rescore_with_limit(&mut self, requested_candidates: usize) {
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.selected != 0
             || self.reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
@@ -443,15 +453,19 @@ impl SlimeEngine {
         let reading = current.request.reading.clone();
         let context = current.request.context.clone();
         let right_context = current.request.right_context.clone();
+        let candidate_limit = requested_candidates.clamp(
+            LONG_RESCORE_CANDIDATE_LIMIT,
+            MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
+        );
         let dictionary_candidates = if context.is_empty() && right_context.is_empty() {
             self.dictionary
-                .candidates_with_limit(&reading, EXTENDED_LONG_RESCORE_N_BEST)
+                .candidates_with_limit(&reading, candidate_limit)
         } else {
             self.dictionary.candidates_with_surrounding_context_limit(
                 &reading,
                 &context,
                 &right_context,
-                EXTENDED_LONG_RESCORE_N_BEST,
+                candidate_limit,
             )
         };
         self.candidate_rescore = candidate_rescore_state_with_limit(
@@ -460,7 +474,7 @@ impl SlimeEngine {
             &right_context,
             &[],
             &dictionary_candidates,
-            EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT,
+            candidate_limit,
         );
     }
 
@@ -4222,8 +4236,18 @@ mod tests {
 
     #[test]
     fn ready_external_scorer_can_prepare_a_deeper_long_reading_pool() {
-        let mut engine = SlimeEngine::bundled();
-        type_text(&mut engine, "sekairekishitaikeiigirisushi");
+        let reading = "ちょうぶんしょうに";
+        let entries = (0_i32..40)
+            .map(|index| {
+                DictionaryEntry::new(
+                    reading,
+                    format!("長文候補{index}"),
+                    1_000 + index.saturating_mul(10),
+                )
+            })
+            .collect();
+        let mut engine = SlimeEngine::new(Dictionary::new(entries));
+        type_text(&mut engine, "choubunshouni");
         engine.handle(InputEvent::Space);
 
         assert_eq!(
@@ -4241,7 +4265,16 @@ mod tests {
                 .expect("ready scorer should receive the deeper request")
                 .candidates
                 .len(),
-            super::EXTENDED_LONG_RESCORE_CANDIDATE_LIMIT
+            16
+        );
+        engine.prepare_extended_candidate_rescore_with_limit(usize::MAX);
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("ready scorer should receive the bounded maximum request")
+                .candidates
+                .len(),
+            super::MAX_EXTENDED_LONG_RESCORE_CANDIDATES
         );
     }
 

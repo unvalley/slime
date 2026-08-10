@@ -39,7 +39,7 @@ scripts/evaluate-ajimee.sh --top-k 10 --context all
 
 ### 2026-08-09 入力長に応じたニューラル候補幅
 
-製品のニューラル再順位付けは、8文字以下の短い読みを5候補まで採点する。9文字以上では、モデルの準備完了後に限って内部N-bestを16まで遅延探索し、最大16候補を採点する。候補は従来どおり、先頭候補とのcost差1500以内に限定する。モデル未使用・準備中・ロード失敗時は追加探索せず、採点失敗時も深い候補を初回10候補へ混ぜない。評価器では次の組み合わせで製品境界を再現する。
+製品のニューラル再順位付けは、8文字以下の短い読みを5候補まで採点する。9文字以上では、モデルの準備完了後に限って内部N-bestを遅延探索し、`balanced`は最大16候補、明示選択する`high-accuracy`は最大32候補を採点する。候補は従来どおり、先頭候補とのcost差で制限する。モデル未使用・準備中・ロード失敗時は追加探索せず、採点失敗時も深い候補を初回10候補へ混ぜない。次の組み合わせは`balanced`の製品境界を再現する。
 
 ```sh
 --top-k 16 \
@@ -673,23 +673,27 @@ Q4は5コーパス合計でQ5より9件top-1を落とし、独立domainのPUDで
 
 [azooKey Desktop](https://github.com/azooKey/azooKey-Desktop)がsmallモデルを製品資源として使い、v0.1.4でzenz-v3.2へ更新したことを踏まえ、[zenz-v3.2-small-gguf](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)を現行xsmallと比較した。公式配布commit `c67e03e07d215c869f591b274c1631170d3e11fe`はApache-2.0を宣言し、Q5_K_Mを95.1M parameter、73.9 MBと表示している。source SHA-256は`29c223d4c23327b80fd13ebb5ab2555057a46317997d5da391584ffbef0db673`、pre-tokenizer metadata修正後は`b660082fcbe8e538c4ccc1044f79c2c881364a25f8c9277a8b8f1dcf680e5b84`である。
 
-xsmallの製品profile（lambda 0.7、右文脈なしmargin 0、右文脈あり0.1）に対し、smallはJWTD/GSD devだけでlambda 0.8を固定した。候補overrideのmarginはGSD devで0 / 0.1 / 0.25 / 0.5 / 1を比較し、9文字未満ではtop-1同率内でMinCERが最良だった0.5を固定した。9文字以上では同じ既存の長文境界を使い、JWTD devのtop-1が202件から204件、MRRが0.5877から0.5922へ改善する0を固定した。右文脈ありは入力長によらず0.5を維持する。候補探索幅、base cost gate、短文5候補、9文字以上16候補、候補cost窓、EOS除外は同一である。
+xsmallの製品profile（lambda 0.7、右文脈なしmargin 0、右文脈あり0.1）に対し、smallはJWTD/GSD devだけでlambda 0.8を固定した。候補overrideのmarginはGSD devで0 / 0.1 / 0.25 / 0.5 / 1を比較し、9文字未満ではtop-1同率内でMinCERが最良だった0.5を固定した。9文字以上では同じ既存の長文境界を使い、JWTD devのtop-1が202件から204件、MRRが0.5877から0.5922へ改善する0を固定した。右文脈ありは入力長によらず0.5を維持する。まず候補探索幅16、base cost gate、短文5候補、候補cost窓、EOS除外を同一にしてモデルとmarginを比較し、その後にhigh-accuracyだけ長文候補幅を32へ拡張した。
 
 | dataset | xsmall acc@1 / MRR | small acc@1 / MRR | top-1差 | small p95 |
 | --- | ---: | ---: | ---: | ---: |
-| JWTD dev 400件 | 0.4550 / 0.5574 | **0.5100 / 0.5922** | +22件 | 63.7 ms |
+| JWTD dev 400件 | 0.4550 / 0.5574 | **0.5250 / 0.6140** | +28件 | 130.0 ms |
 | GSD dev 331件 | 0.8761 / 0.9198 | **0.8943 / 0.9260** | +6件 | 15.1 ms |
-| AJIMEE 200件 | 0.7300 / 0.7804 | **0.8000 / 0.8223** | +14件 | 90.1 ms |
+| AJIMEE 200件 | 0.7300 / 0.7804 | **0.8100 / 0.8352** | +16件 | 180.7 ms |
 | GSD test 323件 | 0.8854 / 0.9246 | **0.9009 / 0.9310** | +5件 | 15.5 ms |
-| PUD 446件 | 0.7444 / 0.7951 | **0.7668 / 0.8091** | +10件 | 23.2 ms |
+| PUD 446件 | 0.7444 / 0.7951 | **0.7668 / 0.8106** | +10件 | 26.6 ms |
 
-smallは調整に使わなかった3 held-outを含む全domainでtop-1とMRRを改善した。固定候補集合なのでacc@16は変わらない。修正後モデルは73,871,904 bytesで、xsmallの20,970,272 bytesより52,901,632 bytes大きい。AJIMEEのp95も約42 msから90 msへ増えるため、軽量profileを置換せず、精度優先の明示的な`high-accuracy` profileとして採用する。
+smallは調整に使わなかった3 held-outを含む全domainでtop-1とMRRを改善した。修正後モデルは73,871,904 bytesで、xsmallの20,970,272 bytesより52,901,632 bytes大きい。長文候補32ではAJIMEEのp95が180.7 msになるため、軽量profileを置換せず、遅延との交換で精度を選ぶ明示的な`high-accuracy` profileとして採用する。
 
 製品経路の右文脈なしmarginを一律0にした場合、GSD testは289/323（0.8947）だった。9文字未満へ0.5を適用すると、`住み`、`淳介`、`見積もり`、`主神`の4件を保護し、`感心`、`連隊`の2件が悪化して291/323（0.9009）となる。一方、9文字以上まで0.5にするとJWTDは204/400から202/400へ退行する。既存の9文字境界で長文だけ0へ戻すと、AJIMEEも160/200を維持しながらMRRが0.8211から0.8223へ改善する。右文脈を持つPUDは0.5のまま変更しない。
 
+候補幅は、まず辞書oracleを16 / 32 / 64で診断した。正解回収率はJWTDで0.7250 / 0.7825 / 0.8300、AJIMEEで0.8600 / 0.8850 / 0.9000、PUDで0.8812 / 0.8924 / 0.9036だった。一方、候補生成p95はJWTDで27.1 / 75.0 / 210.4 ms、AJIMEEで33.7 / 115.4 / 339.7 ms、PUDで4.2 / 13.7 / 42.2 msとなった。64は回収増分に対して長文の生成時間が大きすぎるため除外した。
+
+残る16 / 20 / 24 / 28 / 32候補をJWTD devで比較すると、top-1は204 / 206 / 206 / 208 / 210件、32候補のMRRは0.6140だったため、精度優先profileは32に固定した。同一条件のJWTD連続測定は16候補のp50 31.1 ms / p95 64.5 msから、32候補のp50 53.2 ms / p95 130.0 msへ増えた。凍結後のAJIMEEは160件から162件へ改善し、PUDはtop-1 342/446を維持してMRRが0.8091から0.8106へ改善した。GSD dev/testは全入力が9文字未満なので候補幅も結果も変わらない。
+
 lambdaは0.8 / 0.825 / 0.85 / 0.875 / 0.9をJWTD/GSD devで比較した。0.875はJWTDで+2件、GSD devで+1件だったが、凍結後のGSD testで0.8比-1件、0.9は-2件だったため不採用とした。単一係数を強めず、held-out非退行の0.8を維持する。
 
-製品FFIは既存の`balanced`（lambda 0.7 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（lambda 0.8 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。右文脈marginは入力長より優先する。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
+製品FFIは既存の`balanced`（lambda 0.7 / 長文16候補 / marginは短文0・長文0・右文脈0.1）をABI互換で維持し、`high-accuracy`（lambda 0.8 / 長文32候補 / marginは短文0.5・長文0・右文脈0.5）を明示選択できる。短文は両profileとも5候補、右文脈marginは入力長より優先し、KVセル数1024の上限は変更しない。通常buildはモデルを取得も同梱もしない。`just fetch-neural-model`はcommitとsource/fixed checksumを固定してsmallを評価cacheへ取得し、同梱buildにはApache-2.0全文、出典、metadata変更を記録した`crates/slime-neural/data/ZENZ_V3_2_SMALL_LICENSE.txt`と`SLIME_NEURAL_PROFILE=high-accuracy`を要求する。profileを省略した既存buildは互換性のため`balanced`になる。
 
 v3.1のShareAlike問題はこのv3.2-small artifactには当てはまらない。一方、公式model cardはlicense metadata以外が空で、学習元の説明はない。Apache-2.0表示だけから第三者権利まで断定せず、実際の有償配布前には由来確認と法務レビューを残す。
 

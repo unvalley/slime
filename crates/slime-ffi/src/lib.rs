@@ -1820,6 +1820,79 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn neural_history_handle(directory: &std::path::Path, model: &str) -> *mut super::SlimeHandle {
+        let path = directory.to_string_lossy();
+        // SAFETY: The path remains live for this synchronous creation call.
+        let handle = unsafe { slime_create_with_data_dir(path.as_ptr(), path.len()) };
+        assert!(!handle.is_null());
+        // SAFETY: The handle is live and exclusively accessed.
+        let options = unsafe {
+            slime_set_options_v5(
+                handle,
+                false,
+                true,
+                true,
+                0,
+                false,
+                slime_core::ALL_DATE_FORMATS,
+            )
+        };
+        // SAFETY: The options buffer is released exactly once.
+        unsafe { slime_buffer_destroy(options) };
+        // SAFETY: The handle and already-loaded model path are live for this call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        handle
+    }
+
+    #[cfg(feature = "neural")]
+    fn verify_neural_learning_strength(model: &str) {
+        let directory = std::env::temp_dir().join(format!(
+            "slime-ffi-neural-learning-strength-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let reading = "らーめんにはじしんがあるが";
+        let wrong = "ラーメンには自身があるが";
+
+        fs::write(
+            directory.join("history.tsv"),
+            format!("# slime-history-v1\n{reading}\t{wrong}\t1\t10\n"),
+        )
+        .unwrap();
+        let transient = neural_history_handle(&directory, model);
+        let mut capture = TypedCapture::default();
+        for character in reading.chars() {
+            process_typed_event(transient, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(transient, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("ラーメンには自信があるが")
+        );
+        // SAFETY: The handle is released exactly once.
+        unsafe { slime_destroy(transient) };
+
+        fs::write(
+            directory.join("history.tsv"),
+            format!("# slime-history-v1\n{reading}\t{wrong}\t5\t20\n"),
+        )
+        .unwrap();
+        let established = neural_history_handle(&directory, model);
+        let mut capture = TypedCapture::default();
+        for character in reading.chars() {
+            process_typed_event(established, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(established, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(capture.candidates.first().map(String::as_str), Some(wrong));
+        // SAFETY: The handle is released exactly once.
+        unsafe { slime_destroy(established) };
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "neural")]
     fn wait_for_neural_model() {
         // A cold llama.cpp/Metal initialization can include shader compilation
         // and exceed 30 seconds on an otherwise busy development machine.
@@ -1923,6 +1996,7 @@ mod tests {
         assert_eq!(status, STATUS_OK);
         wait_for_neural_model();
         verify_confident_long_neural_conversion(&model);
+        verify_neural_learning_strength(&model);
         verify_prefix_correction(handle);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";

@@ -50,12 +50,25 @@ fn run() -> Result<(), String> {
     let mut arguments = env::args_os().skip(1);
     let input_path = arguments
         .next()
-        .ok_or("usage: neural_prefix_probe INPUT.json MODEL.gguf")?;
+        .ok_or("usage: neural_prefix_probe INPUT.json MODEL.gguf [--failures N]")?;
     let model_path = arguments
         .next()
-        .ok_or("usage: neural_prefix_probe INPUT.json MODEL.gguf")?;
+        .ok_or("usage: neural_prefix_probe INPUT.json MODEL.gguf [--failures N]")?;
+    let failure_limit = match (arguments.next(), arguments.next()) {
+        (None, None) => 0,
+        (Some(flag), Some(value)) if flag == "--failures" => value
+            .to_str()
+            .ok_or("--failures must be UTF-8")?
+            .parse::<usize>()
+            .map_err(|error| format!("invalid --failures value: {error}"))?,
+        _ => {
+            return Err(
+                "usage: neural_prefix_probe INPUT.json MODEL.gguf [--failures N]".to_owned(),
+            );
+        }
+    };
     if arguments.next().is_some() {
-        return Err("usage: neural_prefix_probe INPUT.json MODEL.gguf".to_owned());
+        return Err("usage: neural_prefix_probe INPUT.json MODEL.gguf [--failures N]".to_owned());
     }
     let items: Vec<Item> = serde_json::from_str(
         &fs::read_to_string(Path::new(&input_path))
@@ -100,6 +113,10 @@ fn run() -> Result<(), String> {
     let mut regressions = 0usize;
     let mut eligible_constraints = 0usize;
     let mut applied_corrections = 0usize;
+    let mut reported_failures = 0usize;
+    let mut remaining_rank_1_32 = 0usize;
+    let mut remaining_rank_33_64 = 0usize;
+    let mut remaining_missing_64 = 0usize;
     let mut latencies = Vec::with_capacity(requests.len());
     let mut constrained_latencies = Vec::new();
 
@@ -108,10 +125,13 @@ fn run() -> Result<(), String> {
     {
         let mut baseline = candidates[0].surface.clone();
         let mut corrected = baseline.clone();
+        let mut selected_index = 0usize;
+        let mut selected_prefix = None;
         if candidate_count >= 2 {
             let scored = scored.next().expect("one score for each selected request");
             latencies.push(scored.latency);
             let selected = rescored_index(item, candidates, &scored.candidate_logliks);
+            selected_index = selected;
             baseline.clone_from(&candidates[selected].surface);
             corrected.clone_from(&baseline);
             if let Some(diagnostic) = &scored.first_mismatch_prefixes[selected]
@@ -120,6 +140,7 @@ fn run() -> Result<(), String> {
                 && diagnostic.alternative_logit - diagnostic.candidate_logit >= MIN_LOGIT_MARGIN
             {
                 eligible_constraints += 1;
+                selected_prefix = Some(diagnostic.prefix.clone());
                 let reading = katakana_to_hiragana(&item.input);
                 let constrained_started = Instant::now();
                 let alternative = dictionary
@@ -157,6 +178,40 @@ fn run() -> Result<(), String> {
                 item.expected_output.join(" | "),
             );
         }
+        let rank64 = if is_correct {
+            None
+        } else {
+            let reading = katakana_to_hiragana(&item.input);
+            let rank64 = dictionary
+                .candidates_with_surrounding_context_limit(
+                    &reading,
+                    &item.context_text,
+                    &item.right_context_text,
+                    64,
+                )
+                .iter()
+                .position(|candidate| matches_expected(&candidate.surface, &item.expected_output))
+                .map(|index| index + 1);
+            match rank64 {
+                Some(1..=SEARCH_LIMIT) => remaining_rank_1_32 += 1,
+                Some(_) => remaining_rank_33_64 += 1,
+                None => remaining_missing_64 += 1,
+            }
+            rank64
+        };
+        if !is_correct && reported_failures < failure_limit {
+            println!(
+                "failure\t{}\tselected={}\tbaseline={}\tcorrected={}\texpected={}\trank64={}\tprefix={}",
+                item.index,
+                selected_index + 1,
+                baseline,
+                corrected,
+                item.expected_output.join(" | "),
+                rank64.map_or_else(|| "missing".to_owned(), |rank| rank.to_string()),
+                selected_prefix.as_deref().unwrap_or("-"),
+            );
+            reported_failures += 1;
+        }
     }
     debug_assert!(scored.next().is_none());
     latencies.sort_unstable();
@@ -173,6 +228,9 @@ fn run() -> Result<(), String> {
     println!("regressions={regressions}");
     println!("eligible_constraints={eligible_constraints}");
     println!("applied_corrections={applied_corrections}");
+    println!("remaining_rank_1_32={remaining_rank_1_32}");
+    println!("remaining_rank_33_64={remaining_rank_33_64}");
+    println!("remaining_missing_64={remaining_missing_64}");
     println!("diagnostic_p50_ms={:.3}", percentile_ms(&latencies, 50));
     println!("diagnostic_p95_ms={:.3}", percentile_ms(&latencies, 95));
     constrained_latencies.sort_unstable();

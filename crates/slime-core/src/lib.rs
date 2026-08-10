@@ -488,7 +488,7 @@ impl SlimeEngine {
                 &reading,
                 &context,
                 &right_context,
-                &[],
+                false,
                 &dictionary_candidates,
                 candidate_limit,
                 bypass_long_input_confidence,
@@ -611,6 +611,7 @@ impl SlimeEngine {
                 insertion_position += 1;
             }
         }
+        positions.sort_unstable();
 
         let mut order: Vec<usize> = (0..state.candidates.len()).collect();
         let combined: Vec<f64> = state
@@ -1031,6 +1032,11 @@ impl SlimeEngine {
         );
         extend_unique(&mut candidates, contextual_history);
         extend_unique(&mut candidates, established_history);
+        // Explicit dictionary entries and repeated learning are durable user
+        // authority. A one-off history surface stays selectable, but when it
+        // is also a normal dictionary candidate the context model may still
+        // prefer a more natural conversion.
+        let mut has_protected_candidates = !candidates.is_empty();
         let dictionary_candidates = self.dictionary_candidates_for_context(
             reading,
             dictionary_limit,
@@ -1057,6 +1063,7 @@ impl SlimeEngine {
         for (key, surface) in &self.ascii_surfaces {
             if english_reverse::reverse_match(reading, key) == Some(ReverseMatch::Exact) {
                 push_unique(&mut candidates, surface.clone());
+                has_protected_candidates = true;
             }
         }
         if let Some(surface) = contextual_dictionary_winner {
@@ -1077,11 +1084,12 @@ impl SlimeEngine {
             let mut promoted = 0;
             self.installed_packs
                 .visit_contextual_surfaces(previous_surface, reading, |surface| {
-                    if dictionary_surfaces.contains(&surface)
-                        && !candidates.iter().any(|candidate| candidate == surface)
-                    {
-                        candidates.push(surface.to_owned());
-                        promoted += 1;
+                    if dictionary_surfaces.contains(&surface) {
+                        has_protected_candidates = true;
+                        if !candidates.iter().any(|candidate| candidate == surface) {
+                            candidates.push(surface.to_owned());
+                            promoted += 1;
+                        }
                     }
                     promoted < CONTEXT_RULE_PROMOTION_LIMIT
                 });
@@ -1090,7 +1098,7 @@ impl SlimeEngine {
             reading,
             previous_surface.unwrap_or_default(),
             right_context,
-            &candidates,
+            has_protected_candidates,
             &dictionary_candidates,
             rescore_candidate_limit,
             bypass_long_input_confidence,
@@ -2183,7 +2191,7 @@ fn candidate_rescore_state(
     reading: &str,
     context: &str,
     right_context: &str,
-    protected_candidates: &[String],
+    has_protected_candidates: bool,
     dictionary_candidates: &[Candidate],
     bypass_long_input_confidence: bool,
 ) -> Option<CandidateRescoreState> {
@@ -2196,7 +2204,7 @@ fn candidate_rescore_state(
         reading,
         context,
         right_context,
-        protected_candidates,
+        has_protected_candidates,
         dictionary_candidates,
         candidate_limit,
         bypass_long_input_confidence,
@@ -2207,7 +2215,7 @@ fn candidate_rescore_state_with_optional_limit(
     reading: &str,
     context: &str,
     right_context: &str,
-    protected_candidates: &[String],
+    has_protected_candidates: bool,
     dictionary_candidates: &[Candidate],
     candidate_limit: Option<usize>,
     bypass_long_input_confidence: bool,
@@ -2218,7 +2226,7 @@ fn candidate_rescore_state_with_optional_limit(
                 reading,
                 context,
                 right_context,
-                protected_candidates,
+                has_protected_candidates,
                 dictionary_candidates,
                 bypass_long_input_confidence,
             )
@@ -2228,7 +2236,7 @@ fn candidate_rescore_state_with_optional_limit(
                 reading,
                 context,
                 right_context,
-                protected_candidates,
+                has_protected_candidates,
                 dictionary_candidates,
                 candidate_limit,
                 bypass_long_input_confidence,
@@ -2241,12 +2249,12 @@ fn candidate_rescore_state_with_limit(
     reading: &str,
     context: &str,
     right_context: &str,
-    protected_candidates: &[String],
+    has_protected_candidates: bool,
     dictionary_candidates: &[Candidate],
     candidate_limit: usize,
     bypass_long_input_confidence: bool,
 ) -> Option<CandidateRescoreState> {
-    if !protected_candidates.is_empty() {
+    if has_protected_candidates {
         return None;
     }
     let base_cost = dictionary_candidates.first()?.cost;
@@ -4740,7 +4748,7 @@ mod tests {
     }
 
     #[test]
-    fn history_and_typo_corrections_are_never_exposed_to_external_scoring() {
+    fn established_history_and_typo_corrections_are_never_exposed_to_external_scoring() {
         let directory = test_directory("rescore-protected");
         fs::write(
             directory.join("history.tsv"),
@@ -4775,6 +4783,97 @@ mod tests {
                 .any(|candidate| candidate == "日本")
         );
         assert!(typo.candidate_rescore_request().is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_scoring_can_override_one_off_dictionary_history() {
+        let directory = test_directory("rescore-transient-history");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nかんじ\t感じ\t1\t10\n",
+        )
+        .unwrap();
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("かんじ", "漢字", 1_000),
+            DictionaryEntry::new("かんじ", "感じ", 1_100),
+        ]);
+        let mut engine = SlimeEngine::with_user_data(dictionary, UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            history_completion: true,
+            history_learning: true,
+            ..EnginePreferences::default()
+        });
+
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().candidates[0], "感じ");
+        assert_eq!(
+            engine
+                .candidate_rescore_request()
+                .expect("one-off dictionary history should remain scoreable")
+                .candidates,
+            ["漢字", "感じ"]
+        );
+
+        engine
+            .apply_candidate_rescore(&[0.0, -10.0], 0.8, 0.5)
+            .expect("aligned model scores should apply");
+        assert_eq!(engine.snapshot().candidates[0], "漢字");
+        assert!(engine.snapshot().candidates.contains(&"感じ".to_owned()));
+
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nかんじ\t感じ\t5\t20\n",
+        )
+        .unwrap();
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("かんじ", "漢字", 1_000),
+            DictionaryEntry::new("かんじ", "感じ", 1_100),
+        ]);
+        let mut established = SlimeEngine::with_user_data(dictionary, UserData::load(&directory));
+        established.set_preferences(EnginePreferences {
+            history_completion: true,
+            history_learning: true,
+            ..EnginePreferences::default()
+        });
+        type_text(&mut established, "kanji");
+        established.handle(InputEvent::Space);
+        assert_eq!(established.snapshot().candidates[0], "感じ");
+        assert!(established.candidate_rescore_request().is_none());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_scoring_keeps_one_off_custom_history_ahead_of_dictionary_candidates() {
+        let directory = test_directory("rescore-custom-transient-history");
+        fs::write(
+            directory.join("history.tsv"),
+            "# slime-history-v1\nかんじ\t私の表記\t1\t10\n",
+        )
+        .unwrap();
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("かんじ", "漢字", 1_000),
+            DictionaryEntry::new("かんじ", "感じ", 1_100),
+        ]);
+        let mut engine = SlimeEngine::with_user_data(dictionary, UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            history_completion: true,
+            history_learning: true,
+            ..EnginePreferences::default()
+        });
+
+        type_text(&mut engine, "kanji");
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().candidates[0], "私の表記");
+
+        engine
+            .apply_candidate_rescore(&[0.0, -10.0], 0.8, 0.5)
+            .expect("dictionary candidates should remain scoreable");
+        assert_eq!(engine.snapshot().candidates[0], "私の表記");
+        assert!(engine.snapshot().candidates.contains(&"漢字".to_owned()));
+
         fs::remove_dir_all(directory).unwrap();
     }
 

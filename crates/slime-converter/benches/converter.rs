@@ -13,6 +13,7 @@ fn main() {
         black_box(dictionary.candidates(black_box("にほん")));
     });
     run_document_context_benchmark(&dictionary, iterations);
+    run_ordinal_generation_benchmark(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_noun_prefix_right_phrase_benchmark(&dictionary, iterations);
     run("converter/segmented_phrase", iterations, || {
@@ -223,6 +224,23 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
                 black_box("き"),
                 black_box("カラフルで色合いがいいデザインがあったので"),
             ));
+        },
+    );
+}
+
+fn run_ordinal_generation_benchmark(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/ordinal_dai_generation_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_context(black_box("だい"), black_box("第33")));
+        },
+    );
+    run(
+        "converter/ordinal_dai_plain_device_context_candidates",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_context(black_box("だい"), black_box("33")));
         },
     );
 }

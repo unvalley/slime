@@ -176,6 +176,12 @@ GSD trainで`敵視して`を1件、診断済みのGSD testで`長居して`、`
 
 これによりGSD trainの`傍聴｜けん`を`権 → 券`へ1件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分は5,516 bytesだった。より広いcost帯はheld-outの誤候補`監査員`を強め、助詞への一般化も複数のtop-1回帰を起こしたため採用していない。Release測定の中央値差は一致経路+0.981 µs、非一致経路+1.410 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 「第n代」と通常の「n台」の区別
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)と同様、数値表記を一般の意味順位から分離する。整数直後の`だい`は従来どおり`台`とし、整数の直前が序数接頭辞`第`の場合だけ`代`を選ぶ。小数・負数には適用しない。
+
+GSD trainの`第33代`を1件修正し、悪化は0件だった。GSD dev/test、AJIMEE、JWTD、PUDは候補配列まで不変、artifact増分もない。Mozcの専用助数詞POSを数値へ一律接続する案は`1字 → 一時`と`一突き → 一月`を強めたため採用しなかった。Release測定の中央値差は序数経路+0.116 µs、通常の台数経路+0.126 µsだった。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 今回の実装: 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)を参考に、通常語のcost変更ではなく構造化表記として実装する。左右が整数の`1｜たい｜1`型に限って既存候補の`対`を優先し、小数や片側だけの数値には適用しない。

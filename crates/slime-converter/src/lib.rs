@@ -605,8 +605,19 @@ fn structured_notation_surface(left_context: &str, reading: &str) -> Option<&'st
         "かこく" if trailing_integer(left_context).is_some_and(|countries| countries <= 999) => {
             Some("カ国")
         }
-        "だい" if trailing_integer(left_context).is_some() => Some("台"),
+        "だい" => structured_dai_surface(left_context),
         _ => None,
+    }
+}
+
+fn structured_dai_surface(left_context: &str) -> Option<&'static str> {
+    let (prefix, _) = split_trailing_decimal(left_context)?;
+    if prefix.ends_with('第') {
+        Some("代")
+    } else if matches!(prefix.chars().next_back(), Some('.' | '．' | '-' | '−')) {
+        None
+    } else {
+        Some("台")
     }
 }
 
@@ -4670,6 +4681,10 @@ mod tests {
         );
         assert_eq!(dictionary.candidates("だい")[0].surface, "第");
         assert_eq!(
+            dictionary.candidates_with_context("だい", "第33")[0].surface,
+            "代"
+        );
+        assert_eq!(
             dictionary.candidates_with_context("だい", "4")[0].surface,
             "台"
         );
@@ -4679,6 +4694,10 @@ mod tests {
         );
         assert_eq!(
             dictionary.candidates_with_context("だい", "1.5")[0].surface,
+            "第"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("だい", "第1.5")[0].surface,
             "第"
         );
     }

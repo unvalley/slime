@@ -320,6 +320,23 @@ Apple M3、Release、50,000回、warmup 1,000回を旧新交互に5組測定し�
 
 逆引きartifactは5,516 bytes増えた。Apple M3、Release、10,000回、warmup 2,000回を旧新の順序も反転して10組測定した中央値は、一致経路が169.158→170.139 µs/op（+0.981 µs、+0.58%）、非一致経路が162.978→164.388 µs/op（+1.410 µs、+0.87%）だった。変換品質を最優先する現在の方針では許容するが、1%未満でも継続して性能予算へ記録する。
 
+#### 「第n代」と通常の「n台」の区別
+
+[ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)と[azooKeyのSpecial Conversion](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)にならい、数値表記を一般の意味順位とは別の構造として扱う。従来は整数直後の`だい`を常に`台`へ寄せていたため、序数接頭辞を含む`第33｜だい`まで`台`になっていた。末尾の整数を1回だけ解析し、直前が`第`なら`代`、それ以外の整数なら従来どおり`台`とする。小数、負数、`第1.5`には適用しない。
+
+[Mozcの品詞定義](https://github.com/google/mozc/blob/master/src/data/dictionary_oss/id.def)にある一般助数詞と`つ・周・回・時・月・次・階`の専用IDを全て数値へ接続する案も比較した。しかし、数値だけでは`1字`と`一時`、`一突き`と`一月`を区別できず、いずれも誤った専用助数詞を強めたため不採用とした。`二階`と`二回`のように両方が完全な辞書語である場合も、周辺の意味文脈なしでは決めない。
+
+| dataset | 変更前 acc@1 / MRR@10 | 序数区別後 acc@1 / MRR@10 | 候補配列の変化 | top-1改善 / 悪化 |
+| --- | ---: | ---: | ---: | ---: |
+| GSD train (1,940) | 0.7139 / 0.8086 | **0.7144 / 0.8090** | 1件 | 1 / 0 |
+| GSD dev (331) | 0.8671 / 0.9104 | 0.8671 / 0.9104 | 0件 | 0 / 0 |
+| GSD test (323) | 0.8854 / 0.9246 | 0.8854 / 0.9246 | 0件 | 0 / 0 |
+| AJIMEE (200) | 0.5300 / 0.6236 | 0.5300 / 0.6236 | 0件 | 0 / 0 |
+| JWTD dev (400) | 0.2950 / 0.4314 | 0.2950 / 0.4314 | 0件 | 0 / 0 |
+| PUD phrase (446) | 0.6547 / 0.7390 | 0.6547 / 0.7390 | 0件 | 0 / 0 |
+
+変化したのはGSD trainの`第33代`だけで、`台 → 代`へ修正した。artifactは増えない。Apple M3、Release、5,000回、warmup 1,000回を旧新の順序も反転して10組測定した中央値は、`第33代`経路が57.035→57.151 µs/op（+0.116 µs）、通常の`33台`経路が51.980→52.106 µs/op（+0.126 µs）で、いずれも約0.2%の測定差だった。
+
 #### 数字同士を結ぶ「対」
 
 [ATOKの数値入力支援](https://atok.com/other/support/howtouse/mac/ip/pgs/ip_num_assist.htm)は数値表記を通常語とは別の入力支援として扱う。[azooKey](https://github.com/azooKey/AzooKeyKanaKanjiConverter/tree/main/Sources/KanaKanjiConverterModule/ConverterAPI/SpecialConversion)も桁区切り、日時、時刻などを独立したSpecial Conversionとして実装する。Slimeでも一般の`たい`候補costを変えず、左末尾と右先頭がともに整数である`1｜たい｜1`型だけを構造化表記として扱う。

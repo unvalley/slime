@@ -2890,6 +2890,11 @@ fn candidate_rescore_state_with_limit(
     if has_protected_candidates {
         return None;
     }
+    if dictionary_candidates.first().is_some_and(|candidate| {
+        confirmed_parallel_percentage(context, right_context, &candidate.surface)
+    }) {
+        return None;
+    }
     let base_cost = dictionary_candidates.first()?.cost;
     // Multi-segment paths accumulate a wider base-cost spread than short
     // homophones. Let the ready local model inspect that bounded tail without
@@ -2935,6 +2940,71 @@ fn candidate_rescore_state_with_limit(
         generative_consensus: None,
         candidates,
     })
+}
+
+fn confirmed_parallel_percentage(left_context: &str, right_context: &str, surface: &str) -> bool {
+    fn is_decimal_digit(character: char) -> bool {
+        matches!(character, '0'..='9' | '０'..='９')
+    }
+
+    fn has_trailing_percentage(text: &str) -> bool {
+        let text = text.trim_end();
+        let Some(before_separator) = text
+            .strip_suffix('、')
+            .or_else(|| text.strip_suffix('，'))
+            .or_else(|| text.strip_suffix(','))
+        else {
+            return false;
+        };
+        let text = before_separator.trim_end();
+        let Some(before_percent) = text.strip_suffix('%').or_else(|| text.strip_suffix('％'))
+        else {
+            return false;
+        };
+        let mut characters = before_percent.chars().rev().peekable();
+        let mut fractional_digits = 0;
+        while characters
+            .peek()
+            .is_some_and(|character| is_decimal_digit(*character))
+        {
+            characters.next();
+            fractional_digits += 1;
+        }
+        if fractional_digits == 0 {
+            return false;
+        }
+        if characters
+            .peek()
+            .is_some_and(|character| matches!(character, '.' | '．' | '・'))
+        {
+            characters.next();
+            return characters.next().is_some_and(is_decimal_digit);
+        }
+        true
+    }
+
+    fn starts_with_fractional_percentage(text: &str) -> bool {
+        let mut characters = text.trim_start().chars();
+        if !characters
+            .next()
+            .is_some_and(|character| matches!(character, '.' | '．' | '・'))
+        {
+            return false;
+        }
+        let mut digits = 0;
+        for character in characters.by_ref() {
+            if is_decimal_digit(character) {
+                digits += 1;
+            } else {
+                return digits > 0 && matches!(character, '%' | '％');
+            }
+        }
+        false
+    }
+
+    has_trailing_percentage(left_context)
+        && starts_with_fractional_percentage(right_context)
+        && surface.chars().next_back().is_some_and(is_decimal_digit)
 }
 
 fn anchor_model_rescore_state(
@@ -5556,6 +5626,41 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!request.candidates.contains(&"コウホ".to_owned()));
+    }
+
+    #[test]
+    fn surrounding_percentage_series_protects_its_numeric_integer() {
+        assert!(super::confirmed_parallel_percentage(
+            "田老66・0%、",
+            "・6%と地域差が大きかった。",
+            "仙台39",
+        ));
+        assert!(!super::confirmed_parallel_percentage(
+            "感謝の言葉を述べ、",
+            "と答えた。",
+            "仙台39",
+        ));
+        assert!(!super::confirmed_parallel_percentage(
+            "田老66・0%",
+            "・6%と地域差が大きかった。",
+            "仙台39",
+        ));
+
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("せんだいさんきゅう", "仙台39", 1_000),
+            DictionaryEntry::new("せんだいさんきゅう", "仙台サンキュー", 1_100),
+        ]);
+        let mut ordinary = SlimeEngine::new(dictionary.clone());
+        type_text(&mut ordinary, "sendaisankyuu");
+        ordinary.handle(InputEvent::Space);
+        assert!(ordinary.candidate_rescore_request().is_some());
+
+        let mut contextual = SlimeEngine::new(dictionary);
+        contextual.set_external_context("田老66・0%、", "・6%と地域差が大きかった。");
+        type_text(&mut contextual, "sendaisankyuu");
+        contextual.handle(InputEvent::Space);
+        assert_eq!(contextual.snapshot().preedit, "仙台39");
+        assert!(contextual.candidate_rescore_request().is_none());
     }
 
     #[test]

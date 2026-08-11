@@ -2,6 +2,7 @@
 //! dictionary.
 
 mod compact;
+mod pronunciation;
 mod ranking;
 mod symbol_candidates;
 
@@ -10,6 +11,12 @@ pub use ranking::{CandidateRanker, CostOnlyRanker, DocumentContextRanker};
 use bumpalo::{Bump, collections::String as BumpString};
 use compact::CompactDictionary;
 use compact_str::CompactString;
+use pronunciation::{
+    MAX_ADDED_CONVERSIONS as LONG_VOWEL_MAX_ADDED_CONVERSIONS,
+    PATHS_PER_VARIANT as LONG_VOWEL_PATHS_PER_VARIANT, orthographic_long_vowel_variants,
+    remap_conversion as remap_pronunciation_conversion,
+    sort_and_deduplicate as sort_and_deduplicate_conversions,
+};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -3271,6 +3278,42 @@ impl Dictionary {
         if reading.is_empty() || limit == 0 {
             return Vec::new();
         }
+        let mut conversions = self.convert_n_best_exact(reading, limit);
+        let variants = orthographic_long_vowel_variants(reading);
+        if variants.is_empty() {
+            return conversions;
+        }
+        let exact_surfaces = conversions
+            .iter()
+            .map(|conversion| conversion.surface.clone())
+            .collect::<HashSet<_>>();
+        let mut pronunciation_conversions = Vec::new();
+        for variant in variants {
+            let variant_conversions = self
+                .convert_n_best_exact(&variant.reading, limit.min(LONG_VOWEL_PATHS_PER_VARIANT));
+            pronunciation_conversions.extend(
+                variant_conversions
+                    .into_iter()
+                    .filter_map(|conversion| {
+                        remap_pronunciation_conversion(
+                            conversion,
+                            reading,
+                            &variant.substituted_offsets,
+                        )
+                    })
+                    .filter(|conversion| !exact_surfaces.contains(&conversion.surface)),
+            );
+        }
+        sort_and_deduplicate_conversions(
+            &mut pronunciation_conversions,
+            LONG_VOWEL_MAX_ADDED_CONVERSIONS,
+        );
+        conversions.extend(pronunciation_conversions);
+        sort_and_deduplicate_conversions(&mut conversions, limit);
+        conversions
+    }
+
+    fn convert_n_best_exact(&self, reading: &str, limit: usize) -> Vec<Conversion> {
         if self.uses_connection_costs {
             self.convert_n_best_connected(reading, limit)
         } else {
@@ -3297,6 +3340,51 @@ impl Dictionary {
         if u16::try_from(surface_prefix.len()).is_err() {
             return Vec::new();
         }
+        let mut conversions =
+            self.convert_n_best_with_surface_prefix_exact(reading, surface_prefix, limit);
+        let variants = orthographic_long_vowel_variants(reading);
+        if variants.is_empty() {
+            return conversions;
+        }
+        let exact_surfaces = conversions
+            .iter()
+            .map(|conversion| conversion.surface.clone())
+            .collect::<HashSet<_>>();
+        let mut pronunciation_conversions = Vec::new();
+        for variant in variants {
+            let variant_conversions = self.convert_n_best_with_surface_prefix_exact(
+                &variant.reading,
+                surface_prefix,
+                limit.min(LONG_VOWEL_PATHS_PER_VARIANT),
+            );
+            pronunciation_conversions.extend(
+                variant_conversions
+                    .into_iter()
+                    .filter_map(|conversion| {
+                        remap_pronunciation_conversion(
+                            conversion,
+                            reading,
+                            &variant.substituted_offsets,
+                        )
+                    })
+                    .filter(|conversion| !exact_surfaces.contains(&conversion.surface)),
+            );
+        }
+        sort_and_deduplicate_conversions(
+            &mut pronunciation_conversions,
+            LONG_VOWEL_MAX_ADDED_CONVERSIONS,
+        );
+        conversions.extend(pronunciation_conversions);
+        sort_and_deduplicate_conversions(&mut conversions, limit);
+        conversions
+    }
+
+    fn convert_n_best_with_surface_prefix_exact(
+        &self,
+        reading: &str,
+        surface_prefix: &str,
+        limit: usize,
+    ) -> Vec<Conversion> {
         if self.uses_connection_costs {
             self.convert_n_best_connected_with_surface_prefix(reading, Some(surface_prefix), limit)
         } else {
@@ -3306,6 +3394,37 @@ impl Dictionary {
 
     #[must_use]
     pub fn convert_best(&self, reading: &str) -> Option<Conversion> {
+        let mut best = self.convert_best_exact(reading);
+        for variant in orthographic_long_vowel_variants(reading) {
+            let Some(conversion) =
+                self.convert_best_exact(&variant.reading)
+                    .and_then(|conversion| {
+                        remap_pronunciation_conversion(
+                            conversion,
+                            reading,
+                            &variant.substituted_offsets,
+                        )
+                    })
+            else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_some_and(|current| conversion.surface == current.surface)
+            {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current| conversion.cost < current.cost)
+            {
+                best = Some(conversion);
+            }
+        }
+        best
+    }
+
+    fn convert_best_exact(&self, reading: &str) -> Option<Conversion> {
         if self.uses_connection_costs {
             return self.convert_best_connected(reading);
         }
@@ -4974,7 +5093,12 @@ mod tests {
         DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
         MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, MOZC_VERBAL_NOUN_POS_ID, NBestBucket,
         NBestNode, UNKNOWN_POS_ID, document_context_ends_with_honorific_prefix,
-        document_region_suffix_promotion, insert_n_best_node, trailing_numeric_surface,
+        document_region_suffix_promotion, insert_n_best_node, orthographic_long_vowel_variants,
+        trailing_numeric_surface,
+    };
+    use crate::pronunciation::{
+        MAX_READING_CHARACTERS as LONG_VOWEL_MAX_READING_CHARACTERS,
+        MAX_VARIANTS as LONG_VOWEL_MAX_VARIANTS,
     };
 
     struct PreferSurface<'a>(&'a str);
@@ -5628,6 +5752,120 @@ mod tests {
 
         assert!(surfaces.contains(&"橋で食べる"), "surfaces: {surfaces:?}");
         assert!(surfaces.contains(&"箸で食べる"), "surfaces: {surfaces:?}");
+    }
+
+    #[test]
+    fn pronunciation_style_long_marks_recover_orthographic_dictionary_paths() {
+        let dictionary = Dictionary::bundled();
+        for (reading, expected) in [
+            ("ちゅーごく", "中国"),
+            ("しょとー", "諸島"),
+            ("ほのー", "炎"),
+            ("こーてー", "皇帝"),
+        ] {
+            let conversions = dictionary.convert_n_best(reading, 20);
+            let conversion = conversions
+                .iter()
+                .find(|conversion| conversion.surface == expected)
+                .unwrap_or_else(|| panic!("missing {reading} -> {expected}: {conversions:?}"));
+            assert_eq!(
+                conversion
+                    .segments
+                    .iter()
+                    .map(|segment| segment.reading.as_str())
+                    .collect::<String>(),
+                reading
+            );
+        }
+    }
+
+    #[test]
+    fn exact_foreign_words_outrank_orthographic_long_vowel_variants() {
+        let dictionary = Dictionary::bundled();
+        for (reading, expected) in [
+            ("らーめん", "ラーメン"),
+            ("ぱふぉーまんす", "パフォーマンス"),
+            ("こんぴゅーたー", "コンピューター"),
+            ("ぐれーど", "グレード"),
+        ] {
+            assert_eq!(dictionary.convert_best(reading).unwrap().surface, expected);
+            assert_eq!(dictionary.candidates(reading)[0].surface, expected);
+        }
+    }
+
+    #[test]
+    fn pronunciation_variants_do_not_rewrite_foreign_katakana_spans() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("とう", "トウ", 10),
+            DictionaryEntry::new("とらんす", "トランス", 10),
+            DictionaryEntry::new("こうか", "効果", 10),
+            DictionaryEntry::new("しあ", "シア", 10),
+            DictionaryEntry::new("にゅーす", "ニュース", 10),
+            DictionaryEntry::new("ぎょうかい", "業界", 10),
+        ]);
+
+        assert!(
+            dictionary
+                .convert_n_best("とー", 10)
+                .iter()
+                .all(|conversion| conversion.surface != "トウ")
+        );
+        assert!(
+            dictionary
+                .convert_n_best("とらんすこーかしあ", 20)
+                .iter()
+                .all(|conversion| conversion.surface != "トランス効果シア")
+        );
+        assert!(
+            dictionary
+                .convert_n_best("にゅーすぎょーかい", 20)
+                .iter()
+                .any(|conversion| conversion.surface == "ニュース業界")
+        );
+    }
+
+    #[test]
+    fn surface_prefix_search_can_use_an_orthographic_long_vowel_variant() {
+        let dictionary = Dictionary::bundled();
+        let conversions = dictionary.convert_n_best_with_surface_prefix("ちゅーごく", "中国", 5);
+
+        assert_eq!(conversions[0].surface, "中国");
+        assert_eq!(conversions[0].segments[0].reading, "ちゅーごく");
+    }
+
+    #[test]
+    fn pronunciation_long_vowel_variants_are_bounded_and_keep_partial_substitutions() {
+        let variants = orthographic_long_vowel_variants("めーるのせーのー");
+        let readings = variants
+            .iter()
+            .map(|variant| variant.reading.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(readings.contains(&"めーるのせいのー"));
+        assert!(readings.contains(&"めいるのせーのー"));
+        assert!(readings.contains(&"めーるのせーのう"));
+        assert!(readings.contains(&"めーるのせいのう"));
+        assert!(variants.len() <= LONG_VOWEL_MAX_VARIANTS);
+        assert!(orthographic_long_vowel_variants("こーこーこーこーこー").is_empty());
+        assert!(
+            orthographic_long_vowel_variants(&format!(
+                "{}こー",
+                "あ".repeat(LONG_VOWEL_MAX_READING_CHARACTERS)
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn pronunciation_search_keeps_unaffected_readings_on_the_exact_fast_path() {
+        let dictionary = Dictionary::bundled();
+        let overlong = format!("{}こー", "あ".repeat(LONG_VOWEL_MAX_READING_CHARACTERS));
+        for reading in ["わたしはにほん", overlong.as_str()] {
+            assert_eq!(
+                dictionary.convert_n_best(reading, 20),
+                dictionary.convert_n_best_exact(reading, 20)
+            );
+        }
     }
 
     #[test]

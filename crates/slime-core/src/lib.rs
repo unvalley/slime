@@ -656,12 +656,14 @@ impl SlimeEngine {
     /// Records agreement with an existing candidate, or adds one generated
     /// surface after proving it is a bounded path through the base lattice.
     ///
-    /// The generated text is never accepted directly. It must preserve ASCII
-    /// alphanumerics, change two to four bounded regions, and stay inside the
-    /// same cost window as ordinary model candidates. Regions are at most two
-    /// characters for equal-length surfaces. A surface compression may remove
-    /// at most two characters overall and align at most four characters per
-    /// side in each region. A bounded equal-length multi-region path may use a
+    /// The generated text is never accepted directly: its complete surface
+    /// must be a path through the base lattice. An otherwise unrestricted path
+    /// must stay inside the strict base-confidence cost gap. Structurally
+    /// bounded paths may use the ordinary model-candidate window: they preserve
+    /// ASCII alphanumerics and change two to four regions, with at most two
+    /// characters per equal-length region. A surface compression may remove at
+    /// most two characters overall and align at most four characters per side
+    /// in each region. A bounded equal-length multi-region path may use a
     /// separately evaluated cost window and records direct generation
     /// consensus. Other new candidates are marked as model supplemental, so
     /// the usual additional score margin still applies. An existing candidate
@@ -713,9 +715,6 @@ impl SlimeEngine {
         let is_multi_region = bounded_multi_region_substitution(base_surface, generated_surface);
         let is_surface_compression =
             bounded_multi_region_surface_compression(base_surface, generated_surface);
-        if !is_multi_region && !is_surface_compression {
-            return None;
-        }
         let conversion = self
             .dictionary
             .convert_n_best_with_surface_prefix(
@@ -725,7 +724,10 @@ impl SlimeEngine {
             )
             .into_iter()
             .find(|conversion| conversion.surface == generated_surface)?;
-        let maximum_cost_gap = if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
+        let structurally_bounded = is_multi_region || is_surface_compression;
+        let maximum_cost_gap = if !structurally_bounded {
+            RESCORE_MAX_BASE_COST_GAP
+        } else if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
             LONG_RESCORE_MAX_CANDIDATE_COST_GAP
         } else {
             RESCORE_MAX_CANDIDATE_COST_GAP
@@ -5959,18 +5961,33 @@ mod tests {
     }
 
     #[test]
-    fn generated_surface_rejects_local_arbitrary_and_ascii_changes() {
+    fn generated_surface_requires_full_lattice_and_bounds_unstructured_cost() {
         let dictionary = Dictionary::new(vec![
             DictionaryEntry::new("しょうがく", "奨学", 10),
             DictionaryEntry::new("しょうがく", "少額", 20),
             DictionaryEntry::new("もんだい", "問題", 10),
             DictionaryEntry::new("もんだい", "課題", 20),
+            DictionaryEntry::new("しょうがくのもんだい", "全く別解", 20_000),
             DictionaryEntry::new("abc", "abd", 20),
         ]);
+        let base_conversion = dictionary
+            .convert_n_best_with_surface_prefix("しょうがくのもんだい", "奨学の問題", 1)
+            .into_iter()
+            .next()
+            .expect("base lattice path");
+        let remote_conversion = dictionary
+            .convert_n_best_with_surface_prefix("しょうがくのもんだい", "全く別解", 1)
+            .into_iter()
+            .next()
+            .expect("remote lattice path");
+        assert!(
+            remote_conversion.cost.saturating_sub(base_conversion.cost)
+                > super::RESCORE_MAX_BASE_COST_GAP
+        );
         let state = || {
             let base = Candidate {
                 surface: "奨学の問題".to_owned(),
-                cost: 100,
+                cost: base_conversion.cost,
             };
             CandidateRescoreState {
                 request: CandidateRescoreRequest {
@@ -5989,7 +6006,19 @@ mod tests {
         engine.candidate_kind = Some(CandidateKind::Conversion);
         engine.candidates = vec!["奨学の問題".to_owned()];
 
-        for rejected in ["少額の問題", "少額の架空"] {
+        engine.candidate_rescore = Some(state());
+        let request = engine
+            .prepare_generative_rescore_candidate("少額の問題")
+            .expect("a confident complete lattice path should join rescoring");
+        assert_eq!(request.candidates, ["奨学の問題", "少額の問題"]);
+        let accepted = engine
+            .candidate_rescore
+            .as_ref()
+            .expect("pending rescore state");
+        assert_eq!(accepted.model_supplemental, [false, true]);
+        assert_eq!(accepted.generative_consensus, None);
+
+        for rejected in ["少額の架空", "全く別解"] {
             engine.candidate_rescore = Some(state());
             assert_eq!(
                 engine.prepare_generative_rescore_candidate(rejected),

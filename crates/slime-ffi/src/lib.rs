@@ -2112,6 +2112,45 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_confident_full_lattice_generation(handle: *mut super::SlimeHandle) {
+        // Greedy generation recovers a complete dictionary path outside the
+        // bounded edit shapes. The tight dictionary-confidence gate and the
+        // normal supplemental model margin must both agree before promotion.
+        let left_context = "一方、";
+        let right_context =
+            "は、スペイン語話者の歴史、その歴史的変遷、言語の社会的使用などが含まれる。 ";
+        // SAFETY: The live handle and UTF-8 context slices remain valid for the
+        // duration of this synchronous call.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    handle,
+                    left_context.as_ptr(),
+                    left_context.len(),
+                    right_context.as_ptr(),
+                    right_context.len(),
+                )
+            },
+            STATUS_OK
+        );
+        let mut capture = TypedCapture::default();
+        for character in "がいざいしに".chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("外在史に")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+        // SAFETY: Empty live slices clear the external context synchronously.
+        assert_eq!(
+            unsafe { slime_set_external_context(handle, b"".as_ptr(), 0, b"".as_ptr(), 0) },
+            STATUS_OK
+        );
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_context_contrast(handle: *mut super::SlimeHandle) {
         // The unconditioned model and dictionary narrowly prefer 乗せ. The
         // surrounding sentence specifically supports the written-form 載せ.
@@ -2360,6 +2399,7 @@ mod tests {
         verify_iterative_prefix_correction(handle);
         verify_generative_recall(handle);
         verify_extended_multi_region_generation(handle);
+        verify_confident_full_lattice_generation(handle);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

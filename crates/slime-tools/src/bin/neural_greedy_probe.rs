@@ -61,12 +61,25 @@ fn run() -> Result<(), String> {
     let mut arguments = env::args_os().skip(1);
     let input_path = arguments
         .next()
-        .ok_or("usage: neural_greedy_probe INPUT.json MODEL.gguf")?;
+        .ok_or("usage: neural_greedy_probe INPUT.json MODEL.gguf [--failures N]")?;
     let model_path = arguments
         .next()
-        .ok_or("usage: neural_greedy_probe INPUT.json MODEL.gguf")?;
+        .ok_or("usage: neural_greedy_probe INPUT.json MODEL.gguf [--failures N]")?;
+    let failure_limit = match (arguments.next(), arguments.next()) {
+        (None, None) => 0,
+        (Some(flag), Some(value)) if flag == "--failures" => value
+            .to_str()
+            .ok_or("--failures must be UTF-8")?
+            .parse::<usize>()
+            .map_err(|error| format!("invalid --failures value: {error}"))?,
+        _ => {
+            return Err(
+                "usage: neural_greedy_probe INPUT.json MODEL.gguf [--failures N]".to_owned(),
+            );
+        }
+    };
     if arguments.next().is_some() {
-        return Err("usage: neural_greedy_probe INPUT.json MODEL.gguf".to_owned());
+        return Err("usage: neural_greedy_probe INPUT.json MODEL.gguf [--failures N]".to_owned());
     }
     let items: Vec<Item> = serde_json::from_str(
         &fs::read_to_string(Path::new(&input_path))
@@ -117,22 +130,22 @@ fn run() -> Result<(), String> {
             && !augmented
                 .iter()
                 .any(|candidate| candidate.surface == conversion.surface)
-            && item.input.chars().count() <= MAXIMUM_GENERATIVE_READING_CHARACTERS
-            && (bounded_multi_region_substitution(&ordinary[0].surface, &conversion.surface)
-                || bounded_multi_region_surface_compression(
-                    &ordinary[0].surface,
-                    &conversion.surface,
-                ))
+            && (MINIMUM_GENERATIVE_READING_CHARACTERS..=MAXIMUM_GENERATIVE_READING_CHARACTERS)
+                .contains(&item.input.chars().count())
         {
             let is_long = item.input.chars().count() >= LONG_INPUT_CHARACTERS;
-            let maximum_gap = if is_long
-                && bounded_multi_region_substitution(&ordinary[0].surface, &conversion.surface)
-            {
+            let is_multi_region =
+                bounded_multi_region_substitution(&ordinary[0].surface, &conversion.surface);
+            let is_surface_compression =
+                bounded_multi_region_surface_compression(&ordinary[0].surface, &conversion.surface);
+            let maximum_gap = if is_long && is_multi_region {
                 EXTENDED_GENERATIVE_COST_GAP
-            } else if is_long {
+            } else if is_long && is_surface_compression {
                 LONG_MAX_CANDIDATE_COST_GAP
-            } else {
+            } else if is_multi_region || is_surface_compression {
                 SHORT_MAX_CANDIDATE_COST_GAP
+            } else {
+                MAX_BASE_COST_GAP
             };
             if conversion.cost.saturating_sub(ordinary[0].cost) <= maximum_gap {
                 augmented.push(Candidate {
@@ -204,6 +217,7 @@ fn run() -> Result<(), String> {
     let mut multi_consensus_correct = 0usize;
     let mut multi_consensus_improvements = 0usize;
     let mut multi_consensus_regressions = 0usize;
+    let mut reported_failures = 0usize;
     let mut latencies = Vec::with_capacity(generated.len());
     let mut eligible_latencies = Vec::new();
     let mut context_ablated_latencies = Vec::new();
@@ -579,6 +593,28 @@ fn run() -> Result<(), String> {
                 generated.surface,
                 item.expected_output.join(" | "),
             );
+        }
+        if !multi_matches && reported_failures < failure_limit {
+            let wide_candidates = dictionary.candidates_with_surrounding_context_limit(
+                &reading,
+                &item.context_text,
+                &item.right_context_text,
+                64,
+            );
+            let expected_rank = wide_candidates
+                .iter()
+                .position(|candidate| matches_expected(&candidate.surface, &item.expected_output))
+                .map_or_else(|| "missing".to_owned(), |rank| (rank + 1).to_string());
+            println!(
+                "final_failure\t{}\trank64={}\tbase={}\tfinal={}\tgenerated={}\texpected={}",
+                item.index,
+                expected_rank,
+                ordinary[0].surface,
+                multi_consensus_surface,
+                generated.surface,
+                item.expected_output.join(" | "),
+            );
+            reported_failures += 1;
         }
     }
     debug_assert!(scored_items.next().is_none());

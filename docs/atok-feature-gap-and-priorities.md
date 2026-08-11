@@ -294,6 +294,8 @@ modelの強い不一致prefixを辞書へ戻す局所修正では、従来は制
 
 通常cost窓の外でも、9〜32文字のgreedy生成と完全一致する辞書経路があり、同じ文字数・2〜4領域・各2文字以内・ASCII不変を満たす場合だけ、複数局所生成一致の上限を2,500から3,100へ広げた。表層圧縮と通常候補には適用しない。`編目・書く → 篇目・欠く`を回収してJWTDは234→235、他4 datasetは不変、exact悪化0だった。
 
+形状制限に収まらないgreedy全文も、EOS完了、辞書格子との完全一致、6〜32文字、cost差1,000以内を同時に満たす場合だけ通常のmodel supplemental候補へ加える。直接昇格せず追加margin 1.5を維持する。通常cost窓まで広げるとPUDでcost差1,481の誤変換が出たため採用せず、1,000で`外在42 → 外在史に`を回収した。PUDは349→350、JWTD、GSD dev/test、AJIMEEは不変、exact悪化0だった。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

@@ -53,6 +53,9 @@ const MAX_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 32;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
+const MODEL_KATAKANA_RECALL_ADDITIONAL_CANDIDATES: usize = 3;
+const MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS: usize = 5;
+const SHORT_KATAKANA_RECALL_MIN_BASE_COST: i32 = 20_000;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
 const PREFIX_CONSTRAINED_INITIAL_CANDIDATE_LIMIT: usize = 8;
@@ -524,7 +527,9 @@ impl SlimeEngine {
 
     /// Prepares the pending pool after an optional scorer becomes ready.
     ///
-    /// Long readings receive a wider bounded search. Short readings are
+    /// Long readings receive a wider bounded search. Short readings in the
+    /// generative-recall window are revisited for unknown katakana runs only
+    /// when the base result has low lattice confidence; shorter readings are
     /// revisited only when a model-rescore-only dictionary pack is installed.
     /// The visible result remains untouched unless scoring succeeds. A missing
     /// or not-yet-ready optional model cannot add latency, and a scoring
@@ -560,10 +565,15 @@ impl SlimeEngine {
         confidence_bypass_candidates: usize,
         bypass_long_input_confidence: bool,
     ) {
-        let is_long_input = self.reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS;
+        let reading_characters = self.reading.chars().count();
+        let is_long_input = reading_characters >= LONG_RESCORE_READING_CHARACTERS;
+        let supports_katakana_model_recall =
+            reading_characters >= GENERATIVE_MIN_READING_CHARACTERS;
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.selected != 0
-            || (!is_long_input && self.model_rescore_dictionary.is_none())
+            || (!is_long_input
+                && !supports_katakana_model_recall
+                && self.model_rescore_dictionary.is_none())
             || !self.candidate_corrections.is_empty()
         {
             return;
@@ -622,6 +632,12 @@ impl SlimeEngine {
     ) -> Option<CandidateRescoreState> {
         let current = self.candidate_rescore.as_ref()?;
         let base_winner = current.candidates.first()?.clone();
+        if self.model_rescore_dictionary.is_none()
+            && reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            && base_winner.cost < SHORT_KATAKANA_RECALL_MIN_BASE_COST
+        {
+            return Some(current.clone());
+        }
         let context = &current.request.context;
         let right_context = &current.request.right_context;
         let previous_surface = (!context.is_empty()).then_some(context.as_str());
@@ -636,6 +652,7 @@ impl SlimeEngine {
             .model_rescore_dictionary
             .as_ref()
             .unwrap_or(&self.dictionary);
+        let model_recall_dictionary = model_dictionary.with_model_recall_katakana_cost();
         let model_candidates = Self::dictionary_candidates_for_context_from(
             model_dictionary,
             reading,
@@ -643,6 +660,24 @@ impl SlimeEngine {
             previous_surface,
             right_context,
         );
+        let recall_candidates = Self::dictionary_candidates_for_context_from(
+            &model_recall_dictionary,
+            reading,
+            Some(candidate_limit),
+            previous_surface,
+            right_context,
+        );
+        if self.model_rescore_dictionary.is_none()
+            && reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            && !recall_candidates.iter().any(|candidate| {
+                is_mixed_katakana_recall_surface(&candidate.surface)
+                    && !base_candidates
+                        .iter()
+                        .any(|base| base.surface == candidate.surface)
+            })
+        {
+            return Some(current.clone());
+        }
         let state = candidate_rescore_state_with_limit(
             reading,
             context,
@@ -652,7 +687,15 @@ impl SlimeEngine {
             candidate_limit,
             bypass_long_input_confidence,
         )?;
-        anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)
+        let mut state =
+            anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)?;
+        append_model_katakana_recall_candidates(
+            &mut state,
+            &recall_candidates,
+            &base_candidates,
+            candidate_limit,
+        );
+        Some(state)
     }
 
     fn prepared_rescore_without_current(
@@ -674,6 +717,7 @@ impl SlimeEngine {
             .model_rescore_dictionary
             .as_ref()
             .unwrap_or(&self.dictionary);
+        let model_recall_dictionary = model_dictionary.with_model_recall_katakana_cost();
         let state = self
             .conversion_candidate_set_for_reading_with_limit_and_context_policy_from(
                 model_dictionary,
@@ -684,7 +728,22 @@ impl SlimeEngine {
                 Some(candidate_limit),
             )
             .rescore?;
-        anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)
+        let mut state =
+            anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)?;
+        let recall_candidates = Self::dictionary_candidates_for_context_from(
+            &model_recall_dictionary,
+            reading,
+            Some(candidate_limit),
+            previous_surface,
+            right_context,
+        );
+        append_model_katakana_recall_candidates(
+            &mut state,
+            &recall_candidates,
+            &base_candidates,
+            candidate_limit,
+        );
+        Some(state)
     }
 
     /// Applies model log-likelihoods to the pending dictionary-only request.
@@ -3069,6 +3128,52 @@ fn anchor_model_rescore_state(
         .map(|candidate| candidate.surface.clone())
         .collect();
     Some(state)
+}
+
+fn append_model_katakana_recall_candidates(
+    state: &mut CandidateRescoreState,
+    recall_candidates: &[Candidate],
+    base_candidates: &[Candidate],
+    base_limit: usize,
+) {
+    let maximum = base_limit
+        .saturating_add(MODEL_KATAKANA_RECALL_ADDITIONAL_CANDIDATES)
+        .min(MAX_EXTENDED_LONG_RESCORE_CANDIDATES);
+    for candidate in recall_candidates {
+        if state.candidates.len() >= maximum {
+            break;
+        }
+        if !is_mixed_katakana_recall_surface(&candidate.surface)
+            || base_candidates
+                .iter()
+                .any(|base| base.surface == candidate.surface)
+            || state
+                .candidates
+                .iter()
+                .any(|existing| existing.surface == candidate.surface)
+        {
+            continue;
+        }
+        state.candidates.push(candidate.clone());
+        state.model_supplemental.push(true);
+        state.request.candidates.push(candidate.surface.clone());
+    }
+}
+
+fn is_mixed_katakana_recall_surface(surface: &str) -> bool {
+    let mut maximum_katakana_run = 0_usize;
+    let mut current_katakana_run = 0_usize;
+    let mut has_japanese_non_katakana = false;
+    for character in surface.chars() {
+        if matches!(character, '\u{30A1}'..='\u{30FA}' | '\u{30FD}'..='\u{30FF}' | 'ー') {
+            current_katakana_run += 1;
+            maximum_katakana_run = maximum_katakana_run.max(current_katakana_run);
+        } else {
+            current_katakana_run = 0;
+            has_japanese_non_katakana |= is_hiragana(character) || is_kanji(character);
+        }
+    }
+    maximum_katakana_run >= MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS && has_japanese_non_katakana
 }
 
 fn candidate_rescore_order(
@@ -6064,6 +6169,50 @@ mod tests {
                 .candidates[0],
             "明日ゆっくり飲め"
         );
+    }
+
+    #[test]
+    fn ready_external_scorer_adds_unknown_katakana_recall_without_moving_base() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "akemeneidogun");
+        engine.handle(InputEvent::Space);
+        let base = engine.snapshot().preedit;
+
+        assert_ne!(base, "アケメネイド軍");
+        engine.prepare_extended_candidate_rescore_with_limit(32);
+        let request = engine
+            .candidate_rescore_request()
+            .expect("long reading should expose a model recall pool");
+        assert_eq!(request.candidates[0], base);
+        assert!(
+            request.candidates.contains(&"アケメネイド軍".to_owned()),
+            "model recall request: {request:?}"
+        );
+    }
+
+    #[test]
+    fn short_japanese_phrase_does_not_rebuild_model_pool_for_katakana_recall() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context(
+            "組織のパフォーマンスはどれだけ安全か、または規則に従うかという",
+            "れることは滅多にない。",
+        );
+        type_text(&mut engine, "menkarahakara");
+        engine.handle(InputEvent::Space);
+        let before = engine
+            .candidate_rescore_request()
+            .expect("ambiguous phrase should expose the ordinary model pool");
+
+        engine.prepare_extended_candidate_rescore_with_limit(32);
+        assert_eq!(engine.candidate_rescore_request(), Some(before));
+    }
+
+    #[test]
+    fn katakana_model_recall_requires_a_long_mixed_script_candidate() {
+        assert!(super::is_mixed_katakana_recall_surface("アケメネイド軍"));
+        assert!(!super::is_mixed_katakana_recall_surface("メンカラ測ら"));
+        assert!(!super::is_mixed_katakana_recall_surface("サンシャの過"));
+        assert!(!super::is_mixed_katakana_recall_surface("アケメネイド"));
     }
 
     #[test]

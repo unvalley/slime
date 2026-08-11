@@ -137,6 +137,7 @@ pub struct Dictionary {
     bundled: Option<&'static CompactDictionary>,
     layers: Arc<[DictionaryLayer]>,
     uses_connection_costs: bool,
+    katakana_run_character_cost: i32,
 }
 
 /// Adds dictionary-backed phrase and word-boundary evidence to the narrower
@@ -1287,6 +1288,7 @@ impl Dictionary {
             bundled: None,
             layers: vec![layer].into(),
             uses_connection_costs: false,
+            katakana_run_character_cost: katakana_run_character_cost(),
         }
     }
 
@@ -1296,6 +1298,7 @@ impl Dictionary {
             bundled: Some(CompactDictionary::bundled()),
             layers: Vec::new().into(),
             uses_connection_costs: true,
+            katakana_run_character_cost: katakana_run_character_cost(),
         }
     }
 
@@ -1305,7 +1308,21 @@ impl Dictionary {
             bundled: Some(CompactDictionary::bundled()),
             layers: additional_layers.into(),
             uses_connection_costs: true,
+            katakana_run_character_cost: katakana_run_character_cost(),
         }
+    }
+
+    /// Returns a cheap clone whose wider N-best search recalls unknown
+    /// katakana runs for optional model scoring. The ordinary dictionary keeps
+    /// the conservative production cost, so enabling no model cannot change
+    /// the visible deterministic winner.
+    #[must_use]
+    pub fn with_model_recall_katakana_cost(&self) -> Self {
+        let mut dictionary = self.clone();
+        dictionary.katakana_run_character_cost = dictionary
+            .katakana_run_character_cost
+            .min(MODEL_RECALL_KATAKANA_RUN_CHARACTER_COST);
+        dictionary
     }
 
     #[must_use]
@@ -3547,7 +3564,8 @@ impl Dictionary {
 
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
-        let synthetic_by_start = synthetic_entries_by_start(reading, &synthetic_arena);
+        let synthetic_by_start =
+            synthetic_entries_by_start(reading, &synthetic_arena, self.katakana_run_character_cost);
         let mut numeric_start_states = numeric_start_states(reading, synthetic_by_start.as_slice());
         let mut lattice: Vec<Vec<LatticeNode<'_>>> =
             (0..=reading.len()).map(|_| Vec::new()).collect();
@@ -3645,7 +3663,8 @@ impl Dictionary {
     ) -> Vec<Conversion> {
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
-        let synthetic_by_start = synthetic_entries_by_start(reading, &synthetic_arena);
+        let synthetic_by_start =
+            synthetic_entries_by_start(reading, &synthetic_arena, self.katakana_run_character_cost);
         let mut numeric_start_states = numeric_start_states(reading, synthetic_by_start.as_slice());
         let mut arena = Vec::<NBestNode<'_>>::with_capacity(n_best_arena_capacity(reading, limit));
         let mut lattice: Vec<NBestBucket> = (0..=reading.len())
@@ -4564,6 +4583,7 @@ const ARABIC_NUMBER_POS_ID: u16 = 2044;
 const KANJI_NUMBER_POS_ID: u16 = 2051;
 const NUMBER_VARIANT_STEP: i32 = 50;
 const KATAKANA_RUN_MAX_CHARACTERS: usize = 12;
+const MODEL_RECALL_KATAKANA_RUN_CHARACTER_COST: i32 = 3_000;
 
 fn n_best_arena_capacity(reading: &str, limit: usize) -> usize {
     reading
@@ -4938,13 +4958,20 @@ fn is_strong_sokuon_number(reading: &str) -> bool {
 fn synthetic_entries_by_start<'a>(
     reading: &'a str,
     arena: &'a Bump,
+    katakana_character_cost: i32,
 ) -> Vec<Vec<SyntheticEntry<'a>>> {
     let mut by_start: Vec<Vec<SyntheticEntry>> = (0..=reading.len()).map(|_| Vec::new()).collect();
     for (start, _) in reading.char_indices() {
         push_digit_run_entry(reading, start, &mut by_start[start]);
         push_number_entries(reading, start, arena, &mut by_start[start]);
         push_spoken_digit_entries(reading, start, arena, &mut by_start[start]);
-        push_katakana_entries(reading, start, arena, &mut by_start[start]);
+        push_katakana_entries(
+            reading,
+            start,
+            arena,
+            katakana_character_cost,
+            &mut by_start[start],
+        );
     }
     by_start
 }
@@ -5341,6 +5368,7 @@ fn push_katakana_entries<'a>(
     reading: &str,
     start: usize,
     arena: &'a Bump,
+    character_cost: i32,
     out: &mut Vec<SyntheticEntry<'a>>,
 ) {
     let mut surface = BumpString::with_capacity_in(reading.len() - start, arena);
@@ -5363,8 +5391,7 @@ fn push_katakana_entries<'a>(
                 left_id: UNKNOWN_POS_ID,
                 right_id: UNKNOWN_POS_ID,
                 cost: katakana_run_base_cost()
-                    + katakana_run_character_cost()
-                        * i32::try_from(characters).expect("run length fits i32"),
+                    + character_cost * i32::try_from(characters).expect("run length fits i32"),
                 numeric: false,
             });
         }
@@ -7532,6 +7559,29 @@ mod tests {
     }
 
     #[test]
+    fn model_recall_clone_adds_unknown_katakana_prefix_without_changing_base() {
+        let dictionary = Dictionary::bundled();
+        let reading = "あけめねいどぐん";
+        let base = dictionary.candidates_with_limit(reading, 32);
+        let recalled = dictionary
+            .with_model_recall_katakana_cost()
+            .candidates_with_limit(reading, 32);
+
+        assert_ne!(base[0].surface, "アケメネイド軍");
+        assert_eq!(
+            recalled[0].surface, "アケメネイド軍",
+            "model recall candidates: {recalled:?}"
+        );
+        assert!(
+            recalled
+                .iter()
+                .any(|candidate| candidate.surface == "アケメネイド軍"),
+            "model recall candidates: {recalled:?}"
+        );
+        assert_eq!(dictionary.candidates_with_limit(reading, 32), base);
+    }
+
+    #[test]
     fn input_longer_than_every_dictionary_entry_still_converts_completely() {
         let dictionary = Dictionary::bundled();
         let reading = "ゑ".repeat(100);
@@ -7695,7 +7745,8 @@ mod tests {
         let dictionary = Dictionary::bundled();
         let states_after_dictionary_scan = |reading: &str| {
             let arena = bumpalo::Bump::new();
-            let entries = synthetic_entries_by_start(reading, &arena);
+            let entries =
+                synthetic_entries_by_start(reading, &arena, super::katakana_run_character_cost());
             let mut states = numeric_start_states(reading, entries.as_slice());
             for (start, _) in reading.char_indices() {
                 dictionary.for_each_prefix_guarding_numeric_starts(

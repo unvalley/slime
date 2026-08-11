@@ -72,7 +72,7 @@ const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP: i32 = 3_100;
-const GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP: i32 = 2_000;
+const GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP: i32 = 3_100;
 const GENERATIVE_MODEL_VERIFIED_WHOLE_MARGIN: f64 = 1.8;
 
 fn accepts_whole_result_cost(reading_characters: usize, cost_gap: i32) -> bool {
@@ -7020,8 +7020,8 @@ mod tests {
         let reading = "しょうがくせい";
         let dictionary = Dictionary::new(vec![
             DictionaryEntry::new(reading, "第一候補", 100),
-            DictionaryEntry::new(reading, "完全正解", 2_101),
-            DictionaryEntry::new(reading, "完全な正解", 2_100),
+            DictionaryEntry::new(reading, "完全正解", 3_201),
+            DictionaryEntry::new(reading, "完全な正解", 3_200),
         ]);
         let base = exact_candidate(&dictionary, reading, "第一候補");
 

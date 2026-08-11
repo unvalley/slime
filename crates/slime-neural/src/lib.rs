@@ -26,6 +26,9 @@ use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 /// Maximum characters of left context fed to the model. Zenzai truncates the
 /// context similarly; unbounded context would dominate prefill latency.
 const MAX_CONTEXT_CHARACTERS: usize = 40;
+// A shorter suffix discarded useful topic anchors in held-out PUD. Keep the
+// full window unless the post-punctuation clause is long enough to stand alone.
+const MIN_LOCAL_CLAUSE_CHARACTERS: usize = 28;
 
 /// Candidates scored in parallel as independent sequences in one decode call.
 const DEFAULT_MAX_PARALLEL_CANDIDATES: usize = 16;
@@ -696,7 +699,14 @@ fn build_prompt(context: &str, right_context: &str, input_katakana: &str) -> Str
         prompt.push(CONTEXT_MARK);
         let characters: Vec<char> = context.chars().collect();
         let start = characters.len().saturating_sub(MAX_CONTEXT_CHARACTERS);
-        prompt.extend(&characters[start..]);
+        let bounded = &characters[start..];
+        let local_start = bounded
+            .iter()
+            .rposition(|character| matches!(character, '、' | '。' | '！' | '？' | '!' | '?'))
+            .map(|index| index + 1)
+            .filter(|index| bounded.len().saturating_sub(*index) >= MIN_LOCAL_CLAUSE_CHARACTERS)
+            .unwrap_or(0);
+        prompt.extend(&bounded[local_start..]);
     }
     if !right_context.is_empty() {
         prompt.push(RIGHT_CONTEXT_MARK);
@@ -941,6 +951,23 @@ mod tests {
             .take_while(|&character| character != '\u{EE00}')
             .collect();
         assert_eq!(context_part.chars().count(), 40);
+    }
+
+    #[test]
+    fn uses_a_sufficiently_long_local_clause_after_punctuation() {
+        assert_eq!(
+            build_prompt(
+                "前の話題はここまで、GoogleアシスタントやAppleのSiriのような人工知能の",
+                "ている。",
+                "インターフェイスガカケ"
+            ),
+            "\u{EE02}GoogleアシスタントやAppleのSiriのような人工知能の\u{EE07}ている。\u{EE00}インターフェイスガカケ\u{EE01}"
+        );
+        assert_eq!(
+            build_prompt("証人は、攻撃した、と", "た。", "ケイサツニイッ"),
+            "\u{EE02}証人は、攻撃した、と\u{EE07}た。\u{EE00}ケイサツニイッ\u{EE01}",
+            "a short tail after punctuation must retain the wider clause"
+        );
     }
 
     #[test]

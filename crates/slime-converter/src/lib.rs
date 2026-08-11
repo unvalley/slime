@@ -4943,6 +4943,7 @@ fn synthetic_entries_by_start<'a>(
     for (start, _) in reading.char_indices() {
         push_digit_run_entry(reading, start, &mut by_start[start]);
         push_number_entries(reading, start, arena, &mut by_start[start]);
+        push_spoken_digit_entries(reading, start, arena, &mut by_start[start]);
         push_katakana_entries(reading, start, arena, &mut by_start[start]);
     }
     by_start
@@ -5223,6 +5224,113 @@ fn push_number_entries<'a>(
             numeric: true,
         });
     }
+}
+
+/// Adds readings where the speaker names each digit instead of saying a
+/// quantity. The ordinary numeral parser deliberately collapses leading zeroes
+/// (`ぜろぜろぜろ` -> `0`) and treats `せん` as the positional unit 1,000.
+/// Codes, years, and decimal subunits need the spoken sequence to survive:
+/// `ぜろぜろぜろにん` -> `000人`, `にぜろいちよねん` -> `2014年`, and
+/// `ななはっせん` -> `78銭`.
+///
+/// Only forms that cannot be represented by the quantity parser are emitted.
+/// In particular, counter-specific `よ` requires at least two preceding digits,
+/// and assimilated `はっ` is accepted only immediately before `せん`. This
+/// keeps ordinary `よねん` and `はっせん` on their existing dictionary and
+/// quantity paths.
+fn push_spoken_digit_entries<'a>(
+    reading: &str,
+    start: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    const MAX_SPOKEN_DIGITS: usize = 16;
+
+    let suffix = &reading[start..];
+    let mut digits = [0_u8; MAX_SPOKEN_DIGITS];
+    let mut digit_count = 0_usize;
+    let mut consumed = 0_usize;
+    let mut special_ending = false;
+
+    while consumed < suffix.len() && digit_count < MAX_SPOKEN_DIGITS {
+        let rest = &suffix[consumed..];
+        let digit = NUMBER_TOKENS.iter().find_map(|(text, token)| {
+            if rest.starts_with(text)
+                && let NumberToken::Digit(value) = token
+            {
+                Some((*text, *value))
+            } else {
+                None
+            }
+        });
+        if let Some((text, value)) = digit {
+            digits[digit_count] = u8::try_from(value).expect("number token is one digit");
+            digit_count += 1;
+            consumed += text.len();
+            if digit_count >= 2 && digits[0] == 0 {
+                push_spoken_digit_surface(&digits[..digit_count], start + consumed, arena, out);
+            }
+            continue;
+        }
+
+        // Four is commonly pronounced よ before 年. Restrict this abbreviated
+        // counter form to an already established multi-digit sequence.
+        if digit_count >= 2
+            && let Some(remainder) = rest.strip_prefix("よ")
+            && remainder.starts_with("ねん")
+        {
+            digits[digit_count] = 4;
+            digit_count += 1;
+            consumed += "よ".len();
+            special_ending = true;
+        // In digit-by-digit financial readings, 八 before 銭 can assimilate to
+        // はっ. It must follow another spoken digit; standalone はっせん keeps
+        // its established 8,000 interpretation.
+        } else if digit_count >= 1
+            && let Some(remainder) = rest.strip_prefix("はっ")
+            && remainder.starts_with("せん")
+        {
+            digits[digit_count] = 8;
+            digit_count += 1;
+            consumed += "はっ".len();
+            special_ending = true;
+        }
+        break;
+    }
+
+    if special_ending {
+        push_spoken_digit_surface(&digits[..digit_count], start + consumed, arena, out);
+    }
+}
+
+fn push_spoken_digit_surface<'a>(
+    digits: &[u8],
+    end: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    let mut ascii = [0_u8; 16];
+    for (output, digit) in ascii.iter_mut().zip(digits) {
+        *output = b'0' + digit;
+    }
+    let ascii = std::str::from_utf8(&ascii[..digits.len()]).expect("ASCII digits are valid UTF-8");
+    out.push(SyntheticEntry {
+        end,
+        surface: arena.alloc_str(ascii),
+        left_id: ARABIC_NUMBER_POS_ID,
+        right_id: ARABIC_NUMBER_POS_ID,
+        cost: number_cost() - NUMBER_VARIANT_STEP,
+        numeric: true,
+    });
+    let fullwidth = to_fullwidth_digits(ascii);
+    out.push(SyntheticEntry {
+        end,
+        surface: arena.alloc_str(&fullwidth),
+        left_id: ARABIC_NUMBER_POS_ID,
+        right_id: ARABIC_NUMBER_POS_ID,
+        cost: number_cost(),
+        numeric: true,
+    });
 }
 
 fn is_katakana_run_character(character: char) -> bool {
@@ -7460,6 +7568,42 @@ mod tests {
             Some("1億2345万")
         );
         assert_eq!(super::mixed_numeral(1_991), None);
+    }
+
+    #[test]
+    fn spoken_digit_sequences_preserve_the_explicit_digits() {
+        let dictionary = Dictionary::bundled();
+        for (reading, expected) in [
+            ("ぜろぜろぜろにん", "000人"),
+            ("にぜろいちよねん", "2014年"),
+            ("ななはっせん", "78銭"),
+        ] {
+            let candidates = dictionary.candidates(reading);
+            assert!(
+                candidates
+                    .iter()
+                    .take(10)
+                    .any(|candidate| candidate.surface == expected),
+                "missing {expected} for {reading}: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spoken_digit_counter_forms_do_not_reinterpret_standalone_words() {
+        let dictionary = Dictionary::bundled();
+        for reading in ["よねん", "はっせん"] {
+            let conversions = dictionary.convert_n_best(reading, 32);
+            assert!(
+                conversions.iter().all(|conversion| {
+                    !conversion.surface.starts_with('4')
+                        && !conversion.surface.starts_with("４")
+                        && !conversion.surface.starts_with("8銭")
+                        && !conversion.surface.starts_with("８銭")
+                }),
+                "standalone counter form changed for {reading}: {conversions:?}"
+            );
+        }
     }
 
     #[test]

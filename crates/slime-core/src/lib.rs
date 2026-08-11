@@ -1085,9 +1085,7 @@ impl SlimeEngine {
 
         let (mut order, mut margin_protects_base, selected) =
             candidate_rescore_order_for_state(&state, log_likelihoods, lambda, minimum_margin)?;
-        if self.rescore_changes_exact_region_segment(&state, selected)
-            || self.rescore_fragments_exact_katakana_segment(&state, selected)
-        {
+        if self.rescore_requires_base(&state, selected) {
             return Some(self.candidate_actions());
         }
 
@@ -1174,6 +1172,15 @@ impl SlimeEngine {
         }
         self.candidates = pending_candidates;
         Some(self.candidate_actions())
+    }
+
+    fn rescore_requires_base(&self, state: &CandidateRescoreState, selected: usize) -> bool {
+        self.rescore_changes_exact_region_segment(state, selected)
+            || self.rescore_fragments_exact_katakana_segment(state, selected)
+            || rescore_only_expands_ascii_digit_width(
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
     }
 
     fn rescore_changes_exact_region_segment(
@@ -3005,6 +3012,31 @@ fn confirmed_parallel_percentage(left_context: &str, right_context: &str, surfac
     has_trailing_percentage(left_context)
         && starts_with_fractional_percentage(right_context)
         && surface.chars().next_back().is_some_and(is_decimal_digit)
+}
+
+/// Full-width digits remain an explicit transform/candidate choice. Neural
+/// rescoring may resolve the surrounding words, but it must not replace the
+/// converter's default ASCII number with an otherwise identical full-width
+/// spelling. Such a rewrite has no semantic evidence and makes codes and years
+/// inconsistent with the deterministic candidate order.
+fn rescore_only_expands_ascii_digit_width(base: &str, selected: &str) -> bool {
+    if base.chars().count() != selected.chars().count() {
+        return false;
+    }
+    let mut expanded = false;
+    for (base, selected) in base.chars().zip(selected.chars()) {
+        if base == selected {
+            continue;
+        }
+        if base.is_ascii_digit()
+            && char::from_u32(u32::from(base) - u32::from('0') + u32::from('０')) == Some(selected)
+        {
+            expanded = true;
+            continue;
+        }
+        return false;
+    }
+    expanded
 }
 
 fn anchor_model_rescore_state(
@@ -5661,6 +5693,63 @@ mod tests {
         contextual.handle(InputEvent::Space);
         assert_eq!(contextual.snapshot().preedit, "仙台39");
         assert!(contextual.candidate_rescore_request().is_none());
+    }
+
+    #[test]
+    fn neural_rescoring_does_not_only_expand_ascii_digit_width() {
+        assert!(super::rescore_only_expands_ascii_digit_width(
+            "2014年",
+            "２０１４年"
+        ));
+        assert!(super::rescore_only_expands_ascii_digit_width(
+            "第1期",
+            "第１期"
+        ));
+        assert!(!super::rescore_only_expands_ascii_digit_width(
+            "2014年",
+            "二〇一四年"
+        ));
+        assert!(!super::rescore_only_expands_ascii_digit_width(
+            "2014年",
+            "２０１５年"
+        ));
+        assert!(!super::rescore_only_expands_ascii_digit_width(
+            "２０１４年",
+            "2014年"
+        ));
+
+        let candidates = vec![
+            Candidate {
+                surface: "2014年".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "２０１４年".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "にぜろいちよねん".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("digit-width-only rescore should preserve the base candidate");
+        assert_eq!(engine.candidates[0], "2014年");
     }
 
     #[test]

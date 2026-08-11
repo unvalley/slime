@@ -2264,8 +2264,10 @@ impl SlimeEngine {
         } else {
             // Live conversion is an implicit presentation decision, not an
             // explicit candidate choice. Learning it would let an unnoticed
-            // mistake immediately override the confidence gate next time.
-            self.session_history.reset_context();
+            // mistake immediately override the confidence gate next time. It
+            // is still confirmed document text and therefore useful to the
+            // transient prediction context.
+            self.session_history.record_transient_surface(&committed);
         }
         let had_candidates = self.candidate_kind.is_some();
         self.clear_composition();
@@ -2598,7 +2600,7 @@ impl SlimeEngine {
             return;
         }
         if !user_data::is_useful_context_anchor(reading, surface) {
-            self.session_history.reset_context();
+            self.session_history.record_commit(reading, surface);
             return;
         }
 
@@ -2716,8 +2718,12 @@ impl SlimeEngine {
     }
 
     fn record_completion_history(&mut self, prefix: &str, surface: &str) {
-        if !self.preferences.history_learning || self.preferences.private_mode {
+        if self.preferences.private_mode {
             self.session_history.reset_context();
+            return;
+        }
+        if !self.preferences.history_learning {
+            self.session_history.record_commit(prefix, surface);
             return;
         }
         let Some(reading) = self.user_data.promote_completion(prefix, surface) else {
@@ -2729,7 +2735,7 @@ impl SlimeEngine {
                 self.user_data.record(prefix, surface);
                 self.session_history.record_commit(prefix, surface);
             } else {
-                self.session_history.reset_context();
+                self.session_history.record_commit(prefix, surface);
             }
             return;
         };
@@ -5341,6 +5347,58 @@ mod tests {
         assert_eq!(engine.snapshot().candidates.first(), Some(&promoted));
         assert!(actions.contains(&SlimeAction::UpdatePreedit(promoted)));
         assert!(engine.candidate_rescore_request().is_none());
+    }
+
+    #[test]
+    fn external_scores_receive_accumulated_confirmed_text() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.set_external_context("文書冒頭。", "直後");
+        engine.record_history("きょうは", "今日は");
+        engine.record_history("はれ", "晴れ");
+        engine.record_history("。", "。");
+        engine.record_history("つぎ", "次は");
+
+        type_text(&mut engine, "nihon");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("ambiguous dictionary candidates should include context");
+        assert_eq!(request.context, "文書冒頭。今日は晴れ。次は");
+        assert_eq!(request.right_context, "直後");
+        assert_eq!(
+            engine.session_history.previous_commit(),
+            Some(("つぎ", "次は")),
+            "punctuation stays in model context without becoming a learning edge",
+        );
+    }
+
+    #[test]
+    fn unconverted_commit_remains_in_prediction_context_without_learning() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("にほん", "日本", 1_000),
+            DictionaryEntry::new("にほん", "二本", 1_100),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.set_external_context("文書冒頭。", "直後");
+
+        type_text(&mut engine, "kakuteizumi");
+        let actions = engine.handle(InputEvent::Enter);
+        assert!(actions.contains(&SlimeAction::Commit("かくていずみ".to_owned())));
+
+        type_text(&mut engine, "nihon");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("raw confirmed text should remain available to prediction");
+        assert_eq!(request.context, "文書冒頭。かくていずみ");
+        assert_eq!(request.right_context, "直後");
+        assert!(engine.session_history.previous_commit().is_none());
     }
 
     #[test]

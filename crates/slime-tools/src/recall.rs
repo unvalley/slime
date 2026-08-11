@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use serde::Serialize;
-use slime_converter::{Dictionary, DictionaryEntry, DictionaryLayer};
+use slime_converter::{Candidate, Dictionary, DictionaryEntry, DictionaryLayer};
 
 const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
 const COMPOUND_CANDIDATE_LIMIT: usize = 32;
@@ -18,6 +18,9 @@ const PERSONAL_NAME_CANDIDATE_LIMIT: usize = 64;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
+const SHORT_EXPANDED_N_BEST: usize = 32;
+const LONG_EXPANDED_N_BEST: usize = 16;
+const LONG_DEEPENED_N_BEST: usize = 32;
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -397,6 +400,7 @@ enum RecallStage {
     Compound,
     PersonalName,
     FixedSegment,
+    Deepened,
     KnownComponents,
     Missing,
 }
@@ -426,6 +430,7 @@ struct RecallReport {
     compound: usize,
     personal_name: usize,
     fixed_segment: usize,
+    deepened: usize,
     known_components: usize,
     unknown_components: usize,
     missing: usize,
@@ -451,6 +456,7 @@ struct RecallReportOutput<'a> {
     compound: usize,
     personal_name: usize,
     fixed_segment: usize,
+    deepened: usize,
     known_components: usize,
     unknown_components: usize,
     missing: usize,
@@ -478,6 +484,7 @@ impl RecallReport {
             compound: self.compound,
             personal_name: self.personal_name,
             fixed_segment: self.fixed_segment,
+            deepened: self.deepened,
             known_components: self.known_components,
             unknown_components: self.unknown_components,
             missing: self.missing,
@@ -535,11 +542,13 @@ fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
             let top1_surface = initial.first().map(|candidate| candidate.surface.clone());
             let top1_correct = top1_surface.as_deref() == Some(item.surface.as_str());
             let reading_characters = item.reading.chars().count();
-            let expanded = if reading_characters <= MAX_EXPANDED_READING_CHARACTERS {
-                dictionary.candidates_with_limit(&item.reading, 32)
+            let expanded_limit = if reading_characters <= MAX_EXPANDED_READING_CHARACTERS {
+                SHORT_EXPANDED_N_BEST
             } else {
-                Vec::new()
+                LONG_EXPANDED_N_BEST
             };
+            let expanded = dictionary.candidates_with_limit(&item.reading, expanded_limit);
+            let deepened = deepened_candidates(dictionary, &item.reading);
             let compound = dictionary.compound_candidates(
                 &item.reading,
                 COMPOUND_ENTRIES_PER_SEGMENT,
@@ -568,6 +577,7 @@ fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
                     .iter()
                     .map(|candidate| candidate.surface.as_str()),
                 fixed_segment.iter().map(String::as_str),
+                deepened.iter().map(|candidate| candidate.surface.as_str()),
             );
             let stage = if stage == RecallStage::Missing
                 && dictionary.is_exact_compound_surface(&item.reading, &item.surface)
@@ -603,6 +613,7 @@ fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
         compound: count_stage(&results, RecallStage::Compound),
         personal_name: count_stage(&results, RecallStage::PersonalName),
         fixed_segment: count_stage(&results, RecallStage::FixedSegment),
+        deepened: count_stage(&results, RecallStage::Deepened),
         known_components,
         unknown_components,
         missing,
@@ -618,6 +629,14 @@ fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
         baseline_initial_latency_ms: initial_latency_ms,
         dictionary_bytes: 0,
         results,
+    }
+}
+
+fn deepened_candidates(dictionary: &Dictionary, reading: &str) -> Vec<Candidate> {
+    if reading.chars().count() > MAX_EXPANDED_READING_CHARACTERS {
+        dictionary.candidates_with_limit(reading, LONG_DEEPENED_N_BEST)
+    } else {
+        Vec::new()
     }
 }
 
@@ -645,6 +664,7 @@ fn classify<'a>(
     compound: impl Iterator<Item = &'a str>,
     personal_name: impl Iterator<Item = &'a str>,
     fixed_segment: impl Iterator<Item = &'a str>,
+    deepened: impl Iterator<Item = &'a str>,
 ) -> RecallStage {
     if initial.into_iter().any(|surface| surface == expected) {
         RecallStage::Initial
@@ -656,6 +676,8 @@ fn classify<'a>(
         RecallStage::PersonalName
     } else if fixed_segment.into_iter().any(|surface| surface == expected) {
         RecallStage::FixedSegment
+    } else if deepened.into_iter().any(|surface| surface == expected) {
+        RecallStage::Deepened
     } else {
         RecallStage::Missing
     }
@@ -680,6 +702,7 @@ fn print_report(report: &RecallReport, details: usize) {
     println!("  compound: {}", report.compound);
     println!("  personal name: {}", report.personal_name);
     println!("  fixed segment: {}", report.fixed_segment);
+    println!("  deepened: {}", report.deepened);
     println!("  known components: {}", report.known_components);
     println!("  unknown components: {}", report.unknown_components);
     println!("  missing: {}", report.missing);
@@ -787,6 +810,7 @@ mod tests {
                 [].into_iter(),
                 [].into_iter(),
                 [].into_iter(),
+                [].into_iter(),
                 [].into_iter()
             ),
             RecallStage::Initial
@@ -796,6 +820,7 @@ mod tests {
                 "正解",
                 ["別候補"].into_iter(),
                 ["正解"].into_iter(),
+                [].into_iter(),
                 [].into_iter(),
                 [].into_iter(),
                 [].into_iter()
@@ -809,6 +834,7 @@ mod tests {
                 ["別候補"].into_iter(),
                 ["正解"].into_iter(),
                 [].into_iter(),
+                [].into_iter(),
                 [].into_iter()
             ),
             RecallStage::Compound
@@ -820,6 +846,7 @@ mod tests {
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["正解"].into_iter(),
+                [].into_iter(),
                 [].into_iter()
             ),
             RecallStage::PersonalName
@@ -831,7 +858,8 @@ mod tests {
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
-                ["正解"].into_iter()
+                ["正解"].into_iter(),
+                [].into_iter()
             ),
             RecallStage::FixedSegment
         );
@@ -842,10 +870,78 @@ mod tests {
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["正解"].into_iter()
+            ),
+            RecallStage::Deepened
+        );
+        assert_eq!(
+            classify(
+                "正解",
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
                 ["別候補"].into_iter()
             ),
             RecallStage::Missing
         );
+    }
+
+    #[test]
+    fn evaluator_reports_second_stage_long_recall_separately() {
+        let dictionary = Dictionary::bundled();
+        let reading = "わたしはにほんじん";
+        let initial = dictionary.candidates(reading);
+        let expanded = dictionary.candidates_with_limit(reading, LONG_EXPANDED_N_BEST);
+        let compound = dictionary.compound_candidates(
+            reading,
+            COMPOUND_ENTRIES_PER_SEGMENT,
+            COMPOUND_CANDIDATE_LIMIT,
+        );
+        let personal_name = dictionary.personal_name_candidates(
+            reading,
+            PERSONAL_NAME_ENTRIES_PER_PART,
+            PERSONAL_NAME_CANDIDATE_LIMIT,
+        );
+        let fixed_segment = dictionary.fixed_segment_variants(
+            reading,
+            FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
+            FIXED_SEGMENT_CANDIDATE_LIMIT,
+        );
+        let target = dictionary
+            .candidates_with_limit(reading, LONG_DEEPENED_N_BEST)
+            .into_iter()
+            .map(|candidate| candidate.surface)
+            .find(|surface| {
+                !initial
+                    .iter()
+                    .any(|candidate| candidate.surface == *surface)
+                    && !expanded
+                        .iter()
+                        .any(|candidate| candidate.surface == *surface)
+                    && !compound
+                        .iter()
+                        .any(|candidate| candidate.surface == *surface)
+                    && !personal_name
+                        .iter()
+                        .any(|candidate| candidate.surface == *surface)
+                    && !fixed_segment.iter().any(|candidate| candidate == surface)
+            })
+            .expect("fixture should include a second-stage long candidate");
+
+        let report = evaluate(
+            &dictionary,
+            &[RecallItem {
+                reading: reading.to_owned(),
+                surface: target,
+            }],
+        );
+
+        assert_eq!(report.deepened, 1);
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.results[0].stage, RecallStage::Deepened);
     }
 
     #[test]

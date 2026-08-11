@@ -930,6 +930,26 @@ greedy生成と完全一致する辞書lattice pathでも、通常winnerとのco
 
 実製品FFIでも左右文脈を含む文字入力から`外在史に`が先頭候補になることを確認した。候補は辞書格子で全文を再検証し、モデル生成だけでは追加しない。通常候補の幅、表示候補探索、model推論回数は増やさない。
 
+### 2026-08-11 長文候補の二段階深掘り
+
+[ATOKの高度な変換処理](https://atok.com/other/support/howtouse/android_pro/02set.html)は精度向上と端末性能による速度低下を明示的に分け、[azooKeyの通常変換](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Core/FullInputProcessing.swift)も辞書・接続costに基づく候補探索を後段評価の土台にする。Slimeでは初回表示の探索幅を増やさず、ユーザーが候補末尾まで明示的に進んだ場合だけ候補recallを段階的に広げる。
+
+9文字以上の読みは、初回候補の末尾で従来どおりN-best 16とbounded compound・人名・固定文節候補を追加する。さらにその拡張候補の末尾まで進んだ場合だけ、二段目としてN-best 32を追加する。8文字以下は従来の一段N-best 32のまま、N-best 64は長文p95が大きいため追加しない。自動順位、ライブ変換、ニューラル再採点候補、最初の候補表示は変更しない。
+
+`slime-recall`にも`deepened`段階を追加し、製品と同じく第一拡張の`expanded / compound / personal name / fixed segment`を先に評価してから、第二拡張で初めて到達する候補だけを`deepened`へ分類した。重複を除いた各評価セットの回収数は次のとおり。
+
+| dataset | initial | expanded | compound | fixed segment | deepened | missing |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| JWTD dev 400件 | 269 | 21 | 0 | 4 | **21** | 85 |
+| AJIMEE 200件 | 144 | 6 | 0 | 2 | **9** | 39 |
+| PUD 446件 | 390 | 5 | 3 | 1 | **2** | 45 |
+| GSD dev 331件 | 331 | 0 | 0 | 0 | 0 | 0 |
+| GSD test 323件 | 323 | 0 | 0 | 0 | 0 | 0 |
+
+第二段階はJWTD 21件、AJIMEE 9件、PUD 2件を新たに選択可能にした。GSD dev/testは全件が初回候補内にあり変化しない。C ABI回帰では長文の初回候補、第一拡張、第二拡張を順に通り、第二拡張で初めて追加された候補をindex選択して確定できることまで確認した。
+
+Apple M3、Release、同じ50文字の長文を各1,000回測定すると、N-best 10は7.468 ms/op、16は14.823 ms/op、32は51.764 ms/opだった。32探索は初回入力や第一拡張では実行せず、第一拡張の末尾へさらに進んだ操作にだけ約52 msのcostを限定する。
+
 ### 2026-07-25 コスト上書きハックの除去とスコア尺度の一貫化
 
 `いいかんじ`が`いい漢字`へ変換される不具合の調査で、must-passを通すための語別ハックが変換全体を歪めていたことが判明した。次の方針へ改めた。

@@ -121,6 +121,9 @@ fn run_n_best_benchmarks(dictionary: &Dictionary, iterations: u64) {
     run("converter/n_best_long_10", iterations, || {
         black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(10)));
     });
+    run("converter/n_best_long_16", iterations, || {
+        black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(16)));
+    });
     run("converter/n_best_long_32", iterations, || {
         black_box(dictionary.convert_n_best(black_box(LONG_CANDIDATE_READING), black_box(32)));
     });

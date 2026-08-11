@@ -3030,7 +3030,7 @@ mod tests {
     }
 
     #[test]
-    fn long_expanded_recall_crosses_typed_actions_and_commits_by_index() {
+    fn long_deepened_recall_crosses_typed_actions_and_commits_by_index() {
         let handle = slime_create();
         let mut capture = TypedCapture::default();
         for character in "watashihanihonjin".chars() {
@@ -3079,7 +3079,25 @@ mod tests {
             );
         }
         assert!(capture.candidate_count > initial_count);
-        let expanded = capture.candidates[initial_count].clone();
+        let expanded_count = capture.candidate_count;
+
+        for _ in initial_count..expanded_count {
+            // SAFETY: Pointers remain live for the synchronous callback.
+            assert_eq!(
+                unsafe {
+                    slime_process_actions(
+                        handle,
+                        EVENT_NEXT_CANDIDATE,
+                        0,
+                        (&raw mut capture).cast(),
+                        Some(collect_typed_action),
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        assert!(capture.candidate_count > expanded_count);
+        let deepened = capture.candidates[expanded_count].clone();
 
         // SAFETY: Pointers remain live for the synchronous callback.
         assert_eq!(
@@ -3087,14 +3105,14 @@ mod tests {
                 slime_process_actions(
                     handle,
                     EVENT_SELECT_CANDIDATE,
-                    u32::try_from(initial_count).unwrap(),
+                    u32::try_from(expanded_count).unwrap(),
                     (&raw mut capture).cast(),
                     Some(collect_typed_action),
                 )
             },
             STATUS_OK
         );
-        assert_eq!(capture.last_preedit, expanded);
+        assert_eq!(capture.last_preedit, deepened);
         // SAFETY: Pointers remain live for the synchronous callback.
         assert_eq!(
             unsafe {
@@ -3108,7 +3126,7 @@ mod tests {
             },
             STATUS_OK
         );
-        assert_eq!(capture.last_commit, expanded);
+        assert_eq!(capture.last_commit, deepened);
         // SAFETY: The handle is live and released once.
         unsafe { slime_destroy(handle) };
     }

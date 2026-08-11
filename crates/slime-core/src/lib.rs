@@ -34,6 +34,7 @@ pub const ALL_DATE_FORMATS: u32 = date_time_candidates::ALL_FORMATS;
 
 const SHORT_EXPANDED_N_BEST: usize = 32;
 const LONG_EXPANDED_N_BEST: usize = 16;
+const LONG_DEEPENED_N_BEST: usize = 32;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
 const MAX_COMPOUND_READING_CHARACTERS: usize = 16;
 const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
@@ -197,6 +198,7 @@ enum CandidateKind {
 enum ConversionSearch {
     Initial,
     Expanded,
+    Deepened,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1634,51 +1636,65 @@ impl SlimeEngine {
     }
 
     fn expand_conversion_candidates_if_needed(&mut self) {
-        if self.candidate_kind != Some(CandidateKind::Conversion)
-            || self.conversion_search == ConversionSearch::Expanded
-        {
+        if self.candidate_kind != Some(CandidateKind::Conversion) {
             return;
         }
-        self.conversion_search = ConversionSearch::Expanded;
 
         let mut merged = self.candidates.clone();
         let reading_length = self.reading.chars().count();
-        // Keep long-input expansion bounded: this runs only after the user
-        // reaches the end of the initial candidate list, never on first show.
-        let expanded_n_best = if reading_length <= MAX_EXPANDED_READING_CHARACTERS {
-            SHORT_EXPANDED_N_BEST
-        } else {
-            LONG_EXPANDED_N_BEST
-        };
-        for candidate in
-            self.conversion_candidates_for_reading_with_limit(&self.reading, Some(expanded_n_best))
-        {
-            push_unique(&mut merged, candidate);
-        }
-        if reading_length <= MAX_COMPOUND_READING_CHARACTERS {
-            for candidate in self.dictionary.compound_candidates(
-                &self.reading,
-                COMPOUND_ENTRIES_PER_SEGMENT,
-                COMPOUND_CANDIDATE_LIMIT,
-            ) {
-                push_unique(&mut merged, candidate.surface);
+        match self.conversion_search {
+            ConversionSearch::Initial => {
+                self.conversion_search = ConversionSearch::Expanded;
+                // Keep long-input expansion bounded: this runs only after the
+                // user reaches the end of the initial candidate list, never
+                // on first show.
+                let expanded_n_best = if reading_length <= MAX_EXPANDED_READING_CHARACTERS {
+                    SHORT_EXPANDED_N_BEST
+                } else {
+                    LONG_EXPANDED_N_BEST
+                };
+                for candidate in self.conversion_candidates_for_reading_with_limit(
+                    &self.reading,
+                    Some(expanded_n_best),
+                ) {
+                    push_unique(&mut merged, candidate);
+                }
+                if reading_length <= MAX_COMPOUND_READING_CHARACTERS {
+                    for candidate in self.dictionary.compound_candidates(
+                        &self.reading,
+                        COMPOUND_ENTRIES_PER_SEGMENT,
+                        COMPOUND_CANDIDATE_LIMIT,
+                    ) {
+                        push_unique(&mut merged, candidate.surface);
+                    }
+                    for candidate in self.dictionary.personal_name_candidates(
+                        &self.reading,
+                        PERSONAL_NAME_ENTRIES_PER_PART,
+                        PERSONAL_NAME_CANDIDATE_LIMIT,
+                    ) {
+                        push_unique(&mut merged, candidate.surface);
+                    }
+                }
+                if reading_length > MAX_EXPANDED_READING_CHARACTERS {
+                    for surface in self.dictionary.fixed_segment_variants(
+                        &self.reading,
+                        FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
+                        FIXED_SEGMENT_CANDIDATE_LIMIT,
+                    ) {
+                        push_unique(&mut merged, surface);
+                    }
+                }
             }
-            for candidate in self.dictionary.personal_name_candidates(
-                &self.reading,
-                PERSONAL_NAME_ENTRIES_PER_PART,
-                PERSONAL_NAME_CANDIDATE_LIMIT,
-            ) {
-                push_unique(&mut merged, candidate.surface);
+            ConversionSearch::Expanded if reading_length > MAX_EXPANDED_READING_CHARACTERS => {
+                self.conversion_search = ConversionSearch::Deepened;
+                for candidate in self.conversion_candidates_for_reading_with_limit(
+                    &self.reading,
+                    Some(LONG_DEEPENED_N_BEST),
+                ) {
+                    push_unique(&mut merged, candidate);
+                }
             }
-        }
-        if reading_length > MAX_EXPANDED_READING_CHARACTERS {
-            for surface in self.dictionary.fixed_segment_variants(
-                &self.reading,
-                FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
-                FIXED_SEGMENT_CANDIDATE_LIMIT,
-            ) {
-                push_unique(&mut merged, surface);
-            }
+            ConversionSearch::Expanded | ConversionSearch::Deepened => return,
         }
         self.candidates = merged;
     }
@@ -6357,6 +6373,40 @@ mod tests {
 
         assert!(engine.snapshot().candidates.contains(&target));
         assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
+    fn cycling_past_expanded_long_candidates_runs_second_bounded_search() {
+        let reading = "わたしはにほんじん";
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "watashihanihonjin");
+        engine.handle(InputEvent::Space);
+
+        let initial_count = engine.snapshot().candidates.len();
+        for _ in 0..initial_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+        let expanded = engine.snapshot();
+        let expanded_count = expanded.candidates.len();
+        let target = engine
+            .conversion_candidates_for_reading_with_limit(
+                reading,
+                Some(super::LONG_DEEPENED_N_BEST),
+            )
+            .into_iter()
+            .find(|surface| !expanded.candidates.contains(surface))
+            .expect("bounded N-best 32 should add a candidate beyond N-best 16");
+        let current = expanded.selected.expect("conversion has a selection");
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+
+        for _ in current..expanded_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        let deepened = engine.snapshot();
+        assert!(deepened.candidates.contains(&target));
+        assert_eq!(deepened.selected, Some(expanded_count));
+        assert_eq!(engine.conversion_search, ConversionSearch::Deepened);
     }
 
     #[test]

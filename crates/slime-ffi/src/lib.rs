@@ -2150,6 +2150,32 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_multi_region_generative_consensus(model: &str) {
+        // Greedy generation agrees with the eighth dictionary candidate and
+        // corrects two disjoint regions. Keep the result lattice-backed while
+        // allowing the evaluated multi-region near-tie window to select it.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let mut capture = TypedCapture::default();
+        for character in "たんざわこでのとうけいかいしいらいのきょくちをこうしんした".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("丹沢湖での統計開始以来の極値を更新した")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     fn measure_prefix_diagnostics() {
         let service = super::NEURAL_SERVICE
             .get()
@@ -2259,6 +2285,7 @@ mod tests {
         verify_confident_long_neural_conversion(&model);
         verify_neural_learning_strength(&model);
         verify_generative_consensus(&model);
+        verify_multi_region_generative_consensus(&model);
         verify_context_contrast(handle);
         verify_prefix_correction_preserves_kanji(handle);
         verify_prefix_correction(handle);

@@ -29,6 +29,7 @@ const CONSTRAINED_CANDIDATES: usize = 8;
 const MAX_CHANGED_CHARACTERS: usize = 2;
 const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
+const MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const CONTEXT_CONTRAST_WEIGHT: f64 = 0.1;
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +190,9 @@ fn run() -> Result<(), String> {
     let mut context_contrast_correct = 0usize;
     let mut context_contrast_improvements = 0usize;
     let mut context_contrast_regressions = 0usize;
+    let mut multi_consensus_correct = 0usize;
+    let mut multi_consensus_improvements = 0usize;
+    let mut multi_consensus_regressions = 0usize;
     let mut latencies = Vec::with_capacity(generated.len());
     let mut eligible_latencies = Vec::new();
     let mut context_ablated_latencies = Vec::new();
@@ -425,6 +429,19 @@ fn run() -> Result<(), String> {
                 .map(|candidate| candidate.surface.as_str())
         })
         .flatten();
+        let multi_region_generated_existing = (generated.stopped_at_eos
+            && (MINIMUM_GENERATIVE_READING_CHARACTERS..=MAXIMUM_GENERATIVE_READING_CHARACTERS)
+                .contains(&item.input.chars().count())
+            && augmented.first().is_some_and(|base| {
+                bounded_multi_region_substitution(&base.surface, &generated.surface)
+            }))
+        .then(|| {
+            augmented[..original_count]
+                .iter()
+                .find(|candidate| candidate.surface == generated.surface)
+                .map(|candidate| candidate.surface.as_str())
+        })
+        .flatten();
         let mut consensus_matches = augmented_iterative_matches;
         let mut contrast_consensus_surface = contrast_iterative.clone();
         if let Some(generated_existing) = generated_existing {
@@ -489,6 +506,20 @@ fn run() -> Result<(), String> {
             usize::from(!consensus_matches && contrast_consensus_matches);
         context_contrast_regressions +=
             usize::from(consensus_matches && !contrast_consensus_matches);
+        let mut multi_consensus_surface = contrast_consensus_surface.as_str();
+        if let Some(generated_existing) = multi_region_generated_existing
+            && contrast_generation_stats.is_some_and(|(_, model_delta)| {
+                (GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE
+                    ..=MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE)
+                    .contains(&model_delta)
+            })
+        {
+            multi_consensus_surface = generated_existing;
+        }
+        let multi_matches = matches_expected(multi_consensus_surface, &item.expected_output);
+        multi_consensus_correct += usize::from(multi_matches);
+        multi_consensus_improvements += usize::from(!contrast_consensus_matches && multi_matches);
+        multi_consensus_regressions += usize::from(contrast_consensus_matches && !multi_matches);
         if consensus_matches != contrast_consensus_matches {
             println!(
                 "context_contrast_change\t{}\t{}\tcurrent={}\tcontrast={}\texpected={}",
@@ -559,6 +590,9 @@ fn run() -> Result<(), String> {
     println!("context_contrast_consensus_top1={context_contrast_correct}");
     println!("context_contrast_improvements={context_contrast_improvements}");
     println!("context_contrast_regressions={context_contrast_regressions}");
+    println!("multi_region_consensus_top1={multi_consensus_correct}");
+    println!("multi_region_consensus_improvements={multi_consensus_improvements}");
+    println!("multi_region_consensus_regressions={multi_consensus_regressions}");
     println!(
         "context_ablated_p50_ms={:.3}",
         percentile_ms(&context_ablated_latencies, 50)

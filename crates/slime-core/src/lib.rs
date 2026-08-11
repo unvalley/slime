@@ -62,7 +62,8 @@ const GENERATIVE_MIN_CHANGED_REGIONS: usize = 2;
 const GENERATIVE_MAX_CHANGED_REGIONS: usize = 4;
 const GENERATIVE_MAX_CHANGED_CHARACTERS_PER_REGION: usize = 2;
 const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
-const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
+const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
+const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -214,12 +215,24 @@ struct CandidateCorrection {
     reading: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerativeConsensusKind {
+    Local,
+    MultiRegion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenerativeConsensus {
+    candidate: usize,
+    kind: GenerativeConsensusKind,
+}
+
 #[derive(Clone, Debug)]
 struct CandidateRescoreState {
     request: CandidateRescoreRequest,
     candidates: Vec<Candidate>,
     model_supplemental: Vec<bool>,
-    generative_consensus: Option<usize>,
+    generative_consensus: Option<GenerativeConsensus>,
 }
 
 #[derive(Debug)]
@@ -643,9 +656,9 @@ impl SlimeEngine {
     /// regions of at most two characters each, and stay inside the same cost
     /// window as ordinary model candidates. A new candidate is marked as model
     /// supplemental, so the usual additional score margin still applies. An
-    /// existing candidate is only recorded as generation consensus; it may
-    /// override the ordinary winner later when their model scores are a narrow
-    /// near-tie.
+    /// existing candidate is only recorded as local or multi-region generation
+    /// consensus; it may override the ordinary winner later when their model
+    /// scores are a narrow near-tie.
     pub fn prepare_generative_rescore_candidate(
         &mut self,
         generated_surface: &str,
@@ -666,15 +679,25 @@ impl SlimeEngine {
             .iter()
             .position(|candidate| candidate.surface == generated_surface)
         {
-            if !bounded_local_substitution(
+            let kind = if bounded_local_substitution(
                 &state.candidates.first()?.surface,
                 generated_surface,
                 PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
             ) {
+                GenerativeConsensusKind::Local
+            } else if bounded_multi_region_substitution(
+                &state.candidates.first()?.surface,
+                generated_surface,
+            ) {
+                GenerativeConsensusKind::MultiRegion
+            } else {
                 return None;
-            }
+            };
             let state = self.candidate_rescore.as_mut()?;
-            state.generative_consensus = Some(index);
+            state.generative_consensus = Some(GenerativeConsensus {
+                candidate: index,
+                kind,
+            });
             return Some(state.request.clone());
         }
         if !bounded_multi_region_substitution(&state.candidates.first()?.surface, generated_surface)
@@ -2686,17 +2709,24 @@ fn candidate_rescore_order_for_state(
     let Some(consensus) = state.generative_consensus else {
         return Some((order, margin_protects_base, selected));
     };
-    if consensus >= log_likelihoods.len() || state.model_supplemental[consensus] {
+    if consensus.candidate >= log_likelihoods.len() || state.model_supplemental[consensus.candidate]
+    {
         return None;
     }
-    let model_advantage = log_likelihoods[consensus] - log_likelihoods[selected];
-    if consensus != selected
-        && (GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE..=GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE)
+    let maximum_model_advantage = match consensus.kind {
+        GenerativeConsensusKind::Local => GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE,
+        GenerativeConsensusKind::MultiRegion => {
+            GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE
+        }
+    };
+    let model_advantage = log_likelihoods[consensus.candidate] - log_likelihoods[selected];
+    if consensus.candidate != selected
+        && (GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE..=maximum_model_advantage)
             .contains(&model_advantage)
     {
-        order.retain(|&index| index != consensus);
-        order.insert(0, consensus);
-        selected = consensus;
+        order.retain(|&index| index != consensus.candidate);
+        order.insert(0, consensus.candidate);
+        selected = consensus.candidate;
         margin_protects_base = false;
     }
     Some((order, margin_protects_base, selected))
@@ -2936,11 +2966,11 @@ mod tests {
         ALL_DATE_FORMATS, ALL_DOMAIN_DICTIONARIES, CandidateAnnotation, CandidateDetail,
         CandidateKind, CandidateRescoreRequest, CandidateRescoreState, ConversionSearch,
         DictionaryPackTrust, DictionaryPackVerificationKey, DictionaryPackVersionFloor,
-        DictionaryPackWord, EnginePreferences, InputEvent, LiveConversionDecision,
-        MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction, SlimeEngine, TECHNOLOGY_DICTIONARY,
-        UserData, bounded_local_substitution, bundled_dictionary, candidate_rescore_order,
-        candidate_rescore_order_for_state, date_time_candidates, katakana_candidate,
-        preserves_kanji_from_hiragana_deconversion,
+        DictionaryPackWord, EnginePreferences, GenerativeConsensus, GenerativeConsensusKind,
+        InputEvent, LiveConversionDecision, MAX_EXPANDED_READING_CHARACTERS, Phase, SlimeAction,
+        SlimeEngine, TECHNOLOGY_DICTIONARY, UserData, bounded_local_substitution,
+        bundled_dictionary, candidate_rescore_order, candidate_rescore_order_for_state,
+        date_time_candidates, katakana_candidate, preserves_kanji_from_hiragana_deconversion,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
@@ -5480,7 +5510,62 @@ mod tests {
             .candidate_rescore
             .as_ref()
             .expect("pending rescore state");
-        assert_eq!(state.generative_consensus, Some(1));
+        assert_eq!(
+            state.generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::Local,
+            })
+        );
+        assert_eq!(state.model_supplemental, [false, false]);
+    }
+
+    #[test]
+    fn existing_multi_region_surface_records_distinct_generation_consensus() {
+        let candidates = vec![
+            Candidate {
+                surface: "奨学の問題".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "少額の課題".to_owned(),
+                cost: 1_100,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::default());
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        let request = engine
+            .prepare_generative_rescore_candidate("少額の課題")
+            .expect("an existing bounded multi-region surface should be recorded");
+        assert_eq!(request.candidates, ["奨学の問題", "少額の課題"]);
+        let state = engine
+            .candidate_rescore
+            .as_ref()
+            .expect("pending rescore state");
+        assert_eq!(
+            state.generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::MultiRegion,
+            })
+        );
         assert_eq!(state.model_supplemental, [false, false]);
     }
 
@@ -5504,10 +5589,49 @@ mod tests {
                 },
             ],
             model_supplemental: vec![false, false],
-            generative_consensus: Some(1),
+            generative_consensus: Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::Local,
+            }),
         };
 
         for (advantage, expected) in [(0.09, 0), (0.1, 1), (0.2, 1), (0.21, 0)] {
+            let (order, protected, selected) =
+                candidate_rescore_order_for_state(&state, &[0.0, advantage], 0.8, 0.0)
+                    .expect("aligned finite scores");
+            assert_eq!(selected, expected, "advantage={advantage}");
+            assert_eq!(order[0], expected, "advantage={advantage}");
+            assert!(!protected, "combined cost already keeps the base winner");
+        }
+    }
+
+    #[test]
+    fn multi_region_generation_consensus_uses_its_evaluated_near_tie_window() {
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: "しょうがくのもんだい".to_owned(),
+                candidates: vec!["奨学の問題".to_owned(), "少額の課題".to_owned()],
+            },
+            candidates: vec![
+                Candidate {
+                    surface: "奨学の問題".to_owned(),
+                    cost: 100,
+                },
+                Candidate {
+                    surface: "少額の課題".to_owned(),
+                    cost: 1_100,
+                },
+            ],
+            model_supplemental: vec![false, false],
+            generative_consensus: Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::MultiRegion,
+            }),
+        };
+
+        for (advantage, expected) in [(0.09, 0), (0.1, 1), (0.25, 1), (0.26, 0)] {
             let (order, protected, selected) =
                 candidate_rescore_order_for_state(&state, &[0.0, advantage], 0.8, 0.0)
                     .expect("aligned finite scores");

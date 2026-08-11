@@ -72,14 +72,60 @@ const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP: i32 = 3_100;
-const GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP: i32 = 1_400;
-const GENERATIVE_MODEL_VERIFIED_WHOLE_MARGIN: f64 = 1.5;
+const GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP: i32 = 2_000;
+const GENERATIVE_MODEL_VERIFIED_WHOLE_MARGIN: f64 = 1.8;
 
 fn accepts_whole_result_cost(reading_characters: usize, cost_gap: i32) -> bool {
     cost_gap <= RESCORE_MAX_BASE_COST_GAP
         && (reading_characters <= GENERATIVE_MAX_READING_CHARACTERS
             || (reading_characters <= WHOLE_RESULT_MAX_READING_CHARACTERS
                 && cost_gap >= LONG_WHOLE_RESULT_MIN_COST_GAP))
+}
+
+fn is_quoted_span(left_context: &str, right_context: &str) -> bool {
+    const QUOTE_PAIRS: [(char, char); 6] = [
+        ('「', '」'),
+        ('『', '』'),
+        ('“', '”'),
+        ('‘', '’'),
+        ('《', '》'),
+        ('〈', '〉'),
+    ];
+    let quote_characters = |character: &char| {
+        QUOTE_PAIRS
+            .iter()
+            .any(|&(open, close)| *character == open || *character == close)
+    };
+    let Some(left_boundary) = left_context.chars().rev().find(quote_characters) else {
+        return false;
+    };
+    let Some(right_boundary) = right_context.chars().find(quote_characters) else {
+        return false;
+    };
+    QUOTE_PAIRS.contains(&(left_boundary, right_boundary))
+}
+
+fn is_model_verified_whole_candidate(
+    dictionary: &Dictionary,
+    reading: &str,
+    base_surface: &str,
+    generated_surface: &str,
+    cost_gap: i32,
+    structurally_bounded: bool,
+    quoted_span: bool,
+) -> bool {
+    !structurally_bounded
+        && base_surface.chars().count() == generated_surface.chars().count()
+        && cost_gap > RESCORE_MAX_BASE_COST_GAP
+        && cost_gap <= GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
+        && !quoted_span
+        && preserves_ascii_alphanumerics(base_surface, generated_surface)
+        && preserves_kanji_from_hiragana_deconversion(base_surface, generated_surface)
+        && !dictionary.changes_exact_personal_name_or_region_segment(
+            reading,
+            base_surface,
+            generated_surface,
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -786,19 +832,16 @@ impl SlimeEngine {
         let is_surface_compression =
             bounded_multi_region_surface_compression(base_surface, generated_surface);
         let structurally_bounded = is_multi_region || is_surface_compression;
-        let is_model_verified_whole = !structurally_bounded
-            && base_surface.chars().count() == generated_surface.chars().count()
-            && cost_gap > RESCORE_MAX_BASE_COST_GAP
-            && cost_gap <= GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
-            && preserves_ascii_alphanumerics(base_surface, generated_surface)
-            && preserves_kanji_from_hiragana_deconversion(base_surface, generated_surface)
-            && !self
-                .dictionary
-                .changes_exact_personal_name_or_region_segment(
-                    reading,
-                    base_surface,
-                    generated_surface,
-                );
+        let quoted_span = is_quoted_span(&state.request.context, &state.request.right_context);
+        let is_model_verified_whole = is_model_verified_whole_candidate(
+            &self.dictionary,
+            reading,
+            base_surface,
+            generated_surface,
+            cost_gap,
+            structurally_bounded,
+            quoted_span,
+        );
         let maximum_cost_gap = if !structurally_bounded {
             RESCORE_MAX_BASE_COST_GAP
         } else if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
@@ -3009,7 +3052,40 @@ fn candidate_rescore_order_for_state(
             order.insert(0, consensus.candidate);
             return Some((order, false, consensus.candidate));
         }
-        return Some((order, margin_protects_base, selected));
+        // This candidate was admitted beyond the ordinary lattice-confidence
+        // window specifically on the promise of dominant raw-model evidence.
+        // If that evidence is absent, do not let interpolation or prefix
+        // diagnostics select the same supplemental path through a weaker
+        // route. Recompute the ordinary order without it and leave the
+        // supplemental surface at the end as a selectable alternative.
+        let retained = (0..state.candidates.len())
+            .filter(|&index| index != consensus.candidate)
+            .collect::<Vec<_>>();
+        let filtered_candidates = retained
+            .iter()
+            .map(|&index| state.candidates[index].clone())
+            .collect::<Vec<_>>();
+        let filtered_supplemental = retained
+            .iter()
+            .map(|&index| state.model_supplemental[index])
+            .collect::<Vec<_>>();
+        let filtered_scores = retained
+            .iter()
+            .map(|&index| log_likelihoods[index])
+            .collect::<Vec<_>>();
+        let (filtered_order, filtered_margin, filtered_selected) = candidate_rescore_order(
+            &filtered_candidates,
+            &filtered_supplemental,
+            &filtered_scores,
+            lambda,
+            minimum_margin,
+        )?;
+        order = filtered_order
+            .into_iter()
+            .map(|index| retained[index])
+            .collect();
+        order.push(consensus.candidate);
+        return Some((order, filtered_margin, retained[filtered_selected]));
     }
     if consensus.kind == GenerativeConsensusKind::Whole {
         return consensus
@@ -6843,7 +6919,7 @@ mod tests {
             })
         );
 
-        for (advantage, expected, protected) in [(1.49, 0, true), (1.5, 1, false), (2.0, 1, false)]
+        for (advantage, expected, protected) in [(1.79, 0, false), (1.8, 1, false), (2.0, 1, false)]
         {
             let (order, was_protected, selected) =
                 candidate_rescore_order_for_state(state, &[0.0, advantage], 0.8, 0.0)
@@ -6854,6 +6930,89 @@ mod tests {
                 assert_eq!(order[0], expected, "advantage={advantage}");
             }
         }
+
+        let competing_state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: vec![
+                    "第一候補".to_owned(),
+                    "通常候補".to_owned(),
+                    "完全正解".to_owned(),
+                ],
+            },
+            candidates: vec![
+                Candidate {
+                    surface: "第一候補".to_owned(),
+                    cost: 100,
+                },
+                Candidate {
+                    surface: "通常候補".to_owned(),
+                    cost: 5_000,
+                },
+                Candidate {
+                    surface: "完全正解".to_owned(),
+                    cost: 1_500,
+                },
+            ],
+            model_supplemental: vec![false, false, true],
+            generative_consensus: Some(GenerativeConsensus {
+                candidate: 2,
+                kind: GenerativeConsensusKind::ModelVerifiedWhole,
+                accepts_whole_result: false,
+            }),
+        };
+        let (order, _, selected) =
+            candidate_rescore_order_for_state(&competing_state, &[0.0, 10.0, 11.79], 0.8, 0.0)
+                .expect("aligned finite scores");
+        assert_eq!(selected, 1);
+        assert_eq!(order, [1, 0, 2]);
+    }
+
+    #[test]
+    fn model_verified_whole_result_preserves_a_quoted_name() {
+        let reading = "しょうがくせい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "第一候補", 100),
+            DictionaryEntry::new(reading, "完全正解", 2_100),
+        ]);
+        let base = exact_candidate(&dictionary, reading, "第一候補");
+
+        let mut ordinary =
+            engine_with_rescore_candidates(dictionary.clone(), reading, vec![base.clone()]);
+        assert!(
+            ordinary
+                .prepare_generative_rescore_candidate("完全正解")
+                .is_some(),
+            "the wider cost window should remain available outside quoted names"
+        );
+
+        let mut quoted = engine_with_rescore_candidates(dictionary, reading, vec![base]);
+        let state = quoted
+            .candidate_rescore
+            .as_mut()
+            .expect("pending rescore state");
+        state.request.context = "いったい、「".to_owned();
+        state.request.right_context = "研究所」とは何か".to_owned();
+        assert_eq!(
+            quoted.prepare_generative_rescore_candidate("完全正解"),
+            None,
+            "a model-only whole rewrite must not replace a decisive quoted name"
+        );
+    }
+
+    #[test]
+    fn quoted_span_detection_uses_the_nearest_paired_boundaries() {
+        assert!(super::is_quoted_span(
+            "『閉じた引用』の後に“",
+            "研究所”とは何か",
+        ));
+        assert!(!super::is_quoted_span(
+            "“閉じた引用”の後",
+            "研究所”とは何か",
+        ));
+        assert!(!super::is_quoted_span("「入れ子の『", "語句」だけ",));
     }
 
     #[test]
@@ -6861,8 +7020,8 @@ mod tests {
         let reading = "しょうがくせい";
         let dictionary = Dictionary::new(vec![
             DictionaryEntry::new(reading, "第一候補", 100),
-            DictionaryEntry::new(reading, "完全正解", 1_501),
-            DictionaryEntry::new(reading, "完全な正解", 1_500),
+            DictionaryEntry::new(reading, "完全正解", 2_101),
+            DictionaryEntry::new(reading, "完全な正解", 2_100),
         ]);
         let base = exact_candidate(&dictionary, reading, "第一候補");
 

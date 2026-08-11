@@ -258,7 +258,10 @@ fn run() -> Result<(), String> {
         .score_all_with_prefix_diagnostics(&score_requests)?
         .into_iter();
     let mut broad_supplemental_scored_items = rescorer
-        .score_all(&broad_supplemental_score_requests)?
+        .score_all_with_prefix_diagnostics_and_context_contrast(
+            &broad_supplemental_score_requests,
+            CONTEXT_CONTRAST_WEIGHT,
+        )?
         .into_iter();
     let context_ablated_requests = score_requests
         .iter()

@@ -60,6 +60,8 @@ const PREFIX_CONSTRAINED_MAX_CANDIDATE_LIMIT: usize = 32;
 const PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS: usize = 2;
 const GENERATIVE_MIN_READING_CHARACTERS: usize = 6;
 const GENERATIVE_MAX_READING_CHARACTERS: usize = 32;
+const WHOLE_RESULT_MAX_READING_CHARACTERS: usize = 40;
+const LONG_WHOLE_RESULT_MIN_COST_GAP: i32 = 500;
 const GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
 const GENERATIVE_MIN_CHANGED_REGIONS: usize = 2;
 const GENERATIVE_MAX_CHANGED_REGIONS: usize = 4;
@@ -70,6 +72,13 @@ const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP: i32 = 3_100;
+
+fn accepts_whole_result_cost(reading_characters: usize, cost_gap: i32) -> bool {
+    cost_gap <= RESCORE_MAX_BASE_COST_GAP
+        && (reading_characters <= GENERATIVE_MAX_READING_CHARACTERS
+            || (reading_characters <= WHOLE_RESULT_MAX_READING_CHARACTERS
+                && cost_gap >= LONG_WHOLE_RESULT_MIN_COST_GAP))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -658,6 +667,52 @@ impl SlimeEngine {
             })
     }
 
+    /// Whether an already-scored long N-best winner justifies one delayed
+    /// greedy verification. This is only a generation pre-gate; the generated
+    /// surface must still pass [`Self::prepare_generative_rescore_candidate`].
+    #[must_use]
+    pub fn candidate_rescore_supports_delayed_long_generation(
+        &self,
+        log_likelihoods: &[f64],
+    ) -> bool {
+        if self.candidate_kind != Some(CandidateKind::Conversion) || self.selected != 0 {
+            return false;
+        }
+        let Some(state) = self.candidate_rescore.as_ref() else {
+            return false;
+        };
+        if state.candidates.len() != log_likelihoods.len()
+            || log_likelihoods.iter().any(|score| !score.is_finite())
+        {
+            return false;
+        }
+        let reading_characters = state.request.reading.chars().count();
+        if !((GENERATIVE_MAX_READING_CHARACTERS + 1)..=WHOLE_RESULT_MAX_READING_CHARACTERS)
+            .contains(&reading_characters)
+        {
+            return false;
+        }
+        let Some((winner, _)) = log_likelihoods
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        else {
+            return false;
+        };
+        if winner == 0 || state.model_supplemental[winner] {
+            return false;
+        }
+        let Some(base) = state.candidates.first() else {
+            return false;
+        };
+        (LONG_WHOLE_RESULT_MIN_COST_GAP..=RESCORE_MAX_BASE_COST_GAP).contains(
+            &state.candidates[winner]
+                .cost
+                .saturating_sub(base.cost)
+                .max(0),
+        )
+    }
+
     /// Records agreement with an existing candidate, or adds one generated
     /// surface after proving it is a bounded path through the base lattice.
     ///
@@ -688,7 +743,8 @@ impl SlimeEngine {
         let state = self.candidate_rescore.as_ref()?;
         let reading = &state.request.reading;
         let reading_characters = reading.chars().count();
-        if !(GENERATIVE_MIN_READING_CHARACTERS..=GENERATIVE_MAX_READING_CHARACTERS)
+        let whole_result_only = reading_characters > GENERATIVE_MAX_READING_CHARACTERS;
+        if !(GENERATIVE_MIN_READING_CHARACTERS..=WHOLE_RESULT_MAX_READING_CHARACTERS)
             .contains(&reading_characters)
         {
             return None;
@@ -704,6 +760,9 @@ impl SlimeEngine {
             state.generative_consensus = Some(consensus);
             return Some(state.request.clone());
         }
+        if whole_result_only {
+            return None;
+        }
         let conversion = self
             .dictionary
             .convert_n_best_with_surface_prefix(
@@ -714,7 +773,7 @@ impl SlimeEngine {
             .into_iter()
             .find(|conversion| conversion.surface == generated_surface)?;
         let cost_gap = conversion.cost.saturating_sub(base.cost).max(0);
-        let accepts_whole_result = cost_gap <= RESCORE_MAX_BASE_COST_GAP;
+        let accepts_whole_result = accepts_whole_result_cost(reading_characters, cost_gap);
         let base_surface = &base.surface;
         let is_multi_region = bounded_multi_region_substitution(base_surface, generated_surface);
         let is_surface_compression =
@@ -783,9 +842,17 @@ impl SlimeEngine {
         } else {
             existing.cost
         };
-        let accepts_whole_result =
-            existing_cost.saturating_sub(base.cost).max(0) <= RESCORE_MAX_BASE_COST_GAP;
-        let kind = if bounded_local_substitution(
+        let reading_characters = state.request.reading.chars().count();
+        let accepts_whole_result = accepts_whole_result_cost(
+            reading_characters,
+            existing_cost.saturating_sub(base.cost).max(0),
+        );
+        let kind = if reading_characters > GENERATIVE_MAX_READING_CHARACTERS {
+            if !accepts_whole_result {
+                return None;
+            }
+            GenerativeConsensusKind::Whole
+        } else if bounded_local_substitution(
             &base.surface,
             generated_surface,
             PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
@@ -6188,6 +6255,85 @@ mod tests {
             .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
             .expect("whole-result consensus should apply");
         assert_eq!(engine.candidates[0], "完全正解");
+    }
+
+    #[test]
+    fn whole_result_consensus_accepts_long_reading_at_the_evidence_floor() {
+        let reading = "あ".repeat(33);
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(&reading, "第一候補", 100),
+            DictionaryEntry::new(&reading, "完全正解", 600),
+        ]);
+        let candidates = vec![
+            exact_candidate(&dictionary, &reading, "第一候補"),
+            exact_candidate(&dictionary, &reading, "完全正解"),
+        ];
+        let mut engine = engine_with_rescore_candidates(dictionary, &reading, candidates);
+
+        assert!(!engine.candidate_rescore_supports_generative_recall());
+        assert!(!engine.candidate_rescore_supports_delayed_long_generation(&[1.0, 0.0]));
+        assert!(engine.candidate_rescore_supports_delayed_long_generation(&[0.0, 1.0]));
+        engine
+            .prepare_generative_rescore_candidate("完全正解")
+            .expect("a long complete path at the evidence floor should be recorded");
+        assert_eq!(
+            engine
+                .candidate_rescore
+                .as_ref()
+                .expect("pending rescore state")
+                .generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::Whole,
+                accepts_whole_result: true,
+            })
+        );
+
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("safe long whole-result consensus should apply");
+        assert_eq!(engine.candidates[0], "完全正解");
+    }
+
+    #[test]
+    fn whole_result_consensus_rejects_weak_or_overlong_long_readings() {
+        for (length, alternative_cost) in [(33, 599), (33, 1_101), (41, 600)] {
+            let reading = "あ".repeat(length);
+            let dictionary = Dictionary::new(vec![
+                DictionaryEntry::new(&reading, "第一候補", 100),
+                DictionaryEntry::new(&reading, "完全正解", alternative_cost),
+            ]);
+            let candidates = vec![
+                exact_candidate(&dictionary, &reading, "第一候補"),
+                exact_candidate(&dictionary, &reading, "完全正解"),
+            ];
+            let mut engine = engine_with_rescore_candidates(dictionary, &reading, candidates);
+
+            assert!(!engine.candidate_rescore_supports_generative_recall());
+            assert!(!engine.candidate_rescore_supports_delayed_long_generation(&[0.0, 1.0]));
+            assert_eq!(
+                engine.prepare_generative_rescore_candidate("完全正解"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn long_whole_result_pre_gate_requires_existing_cost_evidence() {
+        let reading = "あ".repeat(33);
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(&reading, "第一候補", 100),
+            DictionaryEntry::new(&reading, "完全正解", 600),
+        ]);
+        let candidates = vec![exact_candidate(&dictionary, &reading, "第一候補")];
+        let mut engine = engine_with_rescore_candidates(dictionary, &reading, candidates);
+
+        assert!(!engine.candidate_rescore_supports_generative_recall());
+        assert!(!engine.candidate_rescore_supports_delayed_long_generation(&[1.0]));
+        assert_eq!(
+            engine.prepare_generative_rescore_candidate("完全正解"),
+            None
+        );
     }
 
     #[test]

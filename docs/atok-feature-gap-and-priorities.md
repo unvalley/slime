@@ -327,6 +327,21 @@ baseline比約107 ms、最大RSS増分は約24.2 MBである。語彙本体は�
 
 旧Release FFIとの同条件比較では、信頼性gate後JWTD 232→234、PUD 346→349、GSD phrase dev 220→222へ改善し、AJIMEE 167、条件固定後に一度だけ評価したGSD phrase test 245を維持した。合計7改善・0悪化で、model推論回数と候補上限は増えない。通常build、`balanced`、履歴、ユーザー辞書、入力ミス訂正、規則候補の保護境界も変更しない。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 長文だけ遅延するwhole-result一致
+
+ATOKが長い入力でも前後のつながりを変換へ使い、azooKeyがEOS完了した全文を通常候補の
+再検討へ返す設計を参考に、`high-accuracy`の全文一致を33〜40文字へ限定的に広げる。
+単純な上限拡張はGSDとPUDで既存正解を壊したため採用しない。通常N-bestを先に採点し、
+model全体の首位がbase以外の既存候補、辞書cost差500〜1,000の場合だけgreedy生成を
+遅延実行する。EOS完了、既存候補との完全一致、ASCII・漢字・姓名の保護をすべて満たす
+場合だけ順位信号として使い、生成表層を直接追加しない。
+
+長文専用コーパスではGSD train 2件、PUD 1件を修正し、GSD dev/testの悪化は0件だった。
+製品Release FFIではJWTD 234→235、AJIMEE 167を維持し、重点21件は15→18、悪化0だった。
+対象となる33〜40文字のhigh-accuracy入力では平均約40.1 ms/件を追加するが、6〜32文字、
+`balanced`、モデルなしの経路は変更しない。41文字以上と、回帰が出た48文字拡張は対象外とする。
+詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

@@ -671,11 +671,13 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             service
                 .rescorer
                 .score_all_with_prefix_diagnostics_and_context_contrast(
-                    &[score_request],
+                    std::slice::from_ref(&score_request),
                     handle.neural_profile.context_contrast_weight,
                 )
         } else {
-            service.rescorer.score_all(&[score_request])
+            service
+                .rescorer
+                .score_all(std::slice::from_ref(&score_request))
         };
         let Ok(scored) = scored else {
             return actions;
@@ -683,6 +685,7 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let Some(scored) = scored.first() else {
             return actions;
         };
+        prepare_delayed_long_generative_consensus(handle, service, &score_request, scored);
         let rescored_actions = if handle.neural_profile.prefix_correction {
             let constraints = scored
                 .first_mismatch_prefixes
@@ -743,6 +746,30 @@ fn prepare_generative_score_request(
         score_request = neural_score_request(extended);
     }
     score_request
+}
+
+#[cfg(feature = "neural")]
+fn prepare_delayed_long_generative_consensus(
+    handle: &mut SlimeHandle,
+    service: &NeuralService,
+    score_request: &slime_neural::ScoreRequest,
+    scored: &slime_neural::ScoredItem,
+) {
+    if handle.neural_profile.generative_recall
+        && handle
+            .engine
+            .candidate_rescore_supports_delayed_long_generation(&scored.candidate_logliks)
+        && let Ok(generated) = service.rescorer.generate_greedy_outputs(
+            std::slice::from_ref(score_request),
+            GENERATIVE_RECALL_MAX_OUTPUT_TOKENS,
+        )
+        && let Some(generated) = generated.first()
+        && generated.stopped_at_eos
+    {
+        handle
+            .engine
+            .prepare_generative_rescore_candidate(&generated.surface);
+    }
 }
 
 #[cfg(feature = "neural")]
@@ -2249,6 +2276,47 @@ mod tests {
         assert_eq!(
             capture.candidates.first().map(String::as_str),
             Some("魔導具は主に土星の輪を使う")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+
+        // The longer path is outside the local/multi-region generation window.
+        // It may be selected only because the complete dictionary path is
+        // 500..=1,000 cost points behind the base candidate, the independently
+        // evaluated evidence band for 33..=40 reading characters.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let left_context = "カエサルは、";
+        let right_context = "に知らされていた。";
+        // SAFETY: The handle and both UTF-8 context strings remain live for
+        // this synchronous call.
+        assert_eq!(
+            unsafe {
+                slime_set_external_context(
+                    handle,
+                    left_context.as_ptr(),
+                    left_context.len(),
+                    right_context.as_ptr(),
+                    right_context.len(),
+                )
+            },
+            STATUS_OK
+        );
+        let mut capture = TypedCapture::default();
+        for character in
+            "とうじのにんきをおえたくりおからぽんぺいうすのこうどうをこじんてき".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("当時の任期を終えたクリオからポンペイウスの行動を個人的")
         );
         // SAFETY: The isolated handle is released exactly once.
         unsafe { slime_destroy(handle) };

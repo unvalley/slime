@@ -1328,3 +1328,52 @@ cargo run --release --quiet -p slime-tools --bin slime-balanced-devset -- \
 | AJIMEE 200件 | 167 | 167 | 0 / 0 |
 
 JWTDでは`性的衝動にかられて → 性的衝動に駆られて`と`魔道具 → 魔導具`、PUDでは`賛成だと話 → 賛成だと話し`、`シベリアの第 → シベリアの大`、`評判はよく → 評判は良く`を回収した。5 dataset合計で7件改善、既存正解の悪化は0件だった。通常のmodel補間では選ばれない場合も全文一致を優先するが、EOS完了、6〜32文字、完全な辞書経路、base cost差1,000以内、ASCII不変、漢字保持、姓名保持を一つでも満たさなければ従来結果を維持する。履歴、ユーザー辞書、入力ミス訂正、規則候補は外部再採点要求を作らない既存境界のままである。
+
+## 2026-08-11 遅延生成による33〜40文字のwhole-result一致
+
+32文字を超える入力でも全文の意味選択が必要になるため、GSD train/dev/testとPUDから、
+句読点をまたがず、実際に出力した辞書補正後の読みが33〜40文字になる評価窓を生成した。
+`--phrase-min-reading`と`--phrase-max-reading`を省略した既存の
+`--phrase-windows`は従来どおり6〜20文字であり、長文評価だけ明示的に範囲を変える。
+UniDicの生発音ではなく最終的に出力する読みで境界を検証するため、指定範囲外のfixtureを
+混ぜない。
+
+```sh
+cargo run --release --quiet -p slime-tools --bin slime-balanced-devset -- \
+  target/evaluation/ud-japanese-gsd/r2.18/ja_gsd-ud-train.conllu \
+  crates/slime-converter/data/mozc-basic.tsv /tmp/slime-gsd-long-train.json \
+  --source-split ud-japanese-gsd-r2.18-long-train --phrase-windows \
+  --phrase-min-reading 33 --phrase-max-reading 40
+```
+
+生成件数はGSD train 462、dev 93、test 84、PUD 129件だった。最初に6〜32文字と
+同じ条件で生成上限だけ40文字へ広げると、GSD trainは2件改善・3件悪化、PUDは
+1件改善・1件悪化した。`よい → 良い`、`鶏ガラ → 鶏がら`、`事故 → 自己`、
+`がっかり → ガッカリ`のように、辞書第1候補とcostが近すぎる表記を全文生成だけで
+覆すため、この全面拡張は採用しない。48文字までの拡張もAJIMEEで悪化したため棄却した。
+
+GSD trainだけでcost差の下限0 / 250 / 500 / 750 / 1,000を比較し、既存正解の悪化を
+初めて0件にした500を固定した。その後、dev/test/PUDを同じ条件で確認した。
+
+| dataset | 変更前 | cost差500〜1,000 | 改善 / 悪化 |
+| --- | ---: | ---: | ---: |
+| GSD long train 462件 | 142 | **144** | 2 / 0 |
+| GSD long dev 93件 | 33 | 33 | 0 / 0 |
+| GSD long test 84件 | 36 | 36 | 0 / 0 |
+| PUD long 129件 | 57 | **58** | 1 / 0 |
+
+回収した`おめー`、`問い質し`、`任期を終えた`はいずれも既存N-best内にあり、順位は
+それぞれ4位、2位、2位だった。したがって33〜40文字ではモデルが生成した新しい表層を
+候補へ追加せず、通常N-bestを先に一度採点する。モデル全体の首位がbase以外の既存候補で、
+そのcost差が500〜1,000の場合だけgreedy生成を遅延実行し、EOSまでの全文がその候補と
+完全一致した場合に限ってwhole-result一致を記録する。候補内最上位、baseより高score、
+model全体の首位という3種類の採点だけによる昇格も比較したが、別datasetで悪化したため、
+生成一致を最終確認から外さない。
+
+Release FFIで現行mainと比較すると、信頼性gate後JWTDは234→235、AJIMEEは167のままで、
+AJIMEE 200件の出力は全件同一だった。既知の改善・悪化候補とAJIMEEの長文を合わせた
+重点21件では15→18、改善3件・悪化0だった。21件を旧・新Releaseで5回ずつ交互測定した
+総時間中央値は3.6331秒→4.4744秒で、長文のhigh-accuracy入力では平均約40.1 ms/件の
+追加となる。生成を採点前に行う試作の約103 ms/件、33〜40文字で常に行う試作の
+約156 ms/件より小さい。6〜32文字の推論回数、`balanced`、モデルなし、履歴、
+ユーザー辞書、入力ミス訂正、規則候補は変更しない。

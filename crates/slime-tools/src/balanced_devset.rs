@@ -35,7 +35,22 @@ struct Options {
     source_split: String,
     count: Option<usize>,
     annotated_output: Option<PathBuf>,
-    phrase_windows: bool,
+    phrase_window: Option<PhraseWindowLength>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhraseWindowLength {
+    minimum: usize,
+    maximum: usize,
+}
+
+impl Default for PhraseWindowLength {
+    fn default() -> Self {
+        Self {
+            minimum: 6,
+            maximum: 20,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -80,7 +95,7 @@ fn run() -> Result<(), String> {
         &sentences,
         &dictionary,
         &options.source_split,
-        options.phrase_windows,
+        options.phrase_window,
         &surface_readings,
     );
     let accepted = items.len();
@@ -102,7 +117,8 @@ fn run() -> Result<(), String> {
 
 fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options, String> {
     let usage = "usage: slime-balanced-devset <input.conllu> <mozc-basic.tsv> <output.json> \
-                 --source-split NAME [--count N] [--annotated-output PATH] [--phrase-windows]";
+                 --source-split NAME [--count N] [--annotated-output PATH] \
+                 [--phrase-windows [--phrase-min-reading N] [--phrase-max-reading N]]";
     let conllu_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let dictionary_path = PathBuf::from(arguments.next().ok_or(usage)?);
     let output_path = PathBuf::from(arguments.next().ok_or(usage)?);
@@ -110,6 +126,8 @@ fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options,
     let mut count = None;
     let mut annotated_output = None;
     let mut phrase_windows = false;
+    let mut phrase_minimum = None;
+    let mut phrase_maximum = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--source-split" => {
@@ -134,9 +152,37 @@ fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options,
                 ));
             }
             "--phrase-windows" => phrase_windows = true,
+            "--phrase-min-reading" => {
+                phrase_minimum = Some(parse_positive_usize(
+                    arguments.next(),
+                    "--phrase-min-reading",
+                )?);
+            }
+            "--phrase-max-reading" => {
+                phrase_maximum = Some(parse_positive_usize(
+                    arguments.next(),
+                    "--phrase-max-reading",
+                )?);
+            }
             _ => return Err(format!("unknown argument {argument:?}\n{usage}")),
         }
     }
+    if !phrase_windows && (phrase_minimum.is_some() || phrase_maximum.is_some()) {
+        return Err("phrase reading bounds require --phrase-windows".to_owned());
+    }
+    let phrase_window = if phrase_windows {
+        let defaults = PhraseWindowLength::default();
+        let length = PhraseWindowLength {
+            minimum: phrase_minimum.unwrap_or(defaults.minimum),
+            maximum: phrase_maximum.unwrap_or(defaults.maximum),
+        };
+        if length.minimum > length.maximum {
+            return Err("--phrase-min-reading cannot exceed --phrase-max-reading".to_owned());
+        }
+        Some(length)
+    } else {
+        None
+    };
     Ok(Options {
         conllu_path,
         dictionary_path,
@@ -144,8 +190,19 @@ fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options,
         source_split: source_split.ok_or("--source-split is required")?,
         count,
         annotated_output,
-        phrase_windows,
+        phrase_window,
     })
+}
+
+fn parse_positive_usize(value: Option<String>, option: &str) -> Result<usize, String> {
+    let parsed = value
+        .ok_or_else(|| format!("{option} requires a value"))?
+        .parse()
+        .map_err(|_| format!("{option} requires a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{option} requires a positive integer"));
+    }
+    Ok(parsed)
 }
 
 fn write_annotated_corpus(path: &PathBuf, sentences: &[Sentence]) -> Result<(), String> {
@@ -243,7 +300,7 @@ fn build_items(
     sentences: &[Sentence],
     dictionary: &HashMap<String, HashSet<String>>,
     source_split: &str,
-    phrase_windows: bool,
+    phrase_window: Option<PhraseWindowLength>,
     surface_readings: &SurfaceReadingIndex,
 ) -> Vec<EvaluationItem> {
     let mut items = Vec::new();
@@ -283,8 +340,20 @@ fn build_items(
         if !seen.insert(identity) {
             continue;
         }
-        let (window_start, window_end) = if phrase_windows {
-            let Some(bounds) = phrase_window_bounds(&sentence.tokens, token_index) else {
+        let phrase_readings = phrase_window.map(|_| {
+            sentence
+                .tokens
+                .iter()
+                .map(|token| phrase_token_reading(token, surface_readings))
+                .collect::<Vec<_>>()
+        });
+        let (window_start, window_end) = if let Some(length) = phrase_window {
+            let Some(bounds) = phrase_window_bounds(
+                &sentence.tokens,
+                phrase_readings.as_deref().expect("phrase readings exist"),
+                token_index,
+                length,
+            ) else {
                 continue;
             };
             bounds
@@ -294,8 +363,8 @@ fn build_items(
         let window = &sentence.tokens[window_start..window_end];
         let context_text = render_surface(&sentence.tokens[..window_start]);
         let right_context_text = render_surface(&sentence.tokens[window_end..]);
-        let input = if phrase_windows {
-            phrase_window_reading(window, surface_readings)
+        let input = if let Some(readings) = &phrase_readings {
+            phrase_window_reading(&readings[window_start..window_end])
         } else {
             token.pronunciation.clone()
         };
@@ -321,35 +390,35 @@ fn build_items(
     items
 }
 
-const PHRASE_MINIMUM_READING_CHARACTERS: usize = 6;
-const PHRASE_MAXIMUM_READING_CHARACTERS: usize = 20;
-
-fn phrase_window_bounds(tokens: &[Token], target: usize) -> Option<(usize, usize)> {
+fn phrase_window_bounds(
+    tokens: &[Token],
+    readings: &[String],
+    target: usize,
+    length: PhraseWindowLength,
+) -> Option<(usize, usize)> {
     let mut start = target;
     let mut end = target + 1;
-    let mut reading_characters = tokens[target].pronunciation.chars().count();
-    while reading_characters < PHRASE_MINIMUM_READING_CHARACTERS {
+    let mut reading_characters = readings[target].chars().count();
+    while reading_characters < length.minimum {
         let left = start.checked_sub(1).filter(|index| {
             !is_phrase_boundary(&tokens[*index])
-                && reading_characters + tokens[*index].pronunciation.chars().count()
-                    <= PHRASE_MAXIMUM_READING_CHARACTERS
+                && reading_characters + readings[*index].chars().count() <= length.maximum
         });
         let right = (end < tokens.len()).then_some(end).filter(|index| {
             !is_phrase_boundary(&tokens[*index])
-                && reading_characters + tokens[*index].pronunciation.chars().count()
-                    <= PHRASE_MAXIMUM_READING_CHARACTERS
+                && reading_characters + readings[*index].chars().count() <= length.maximum
         });
         let Some(index) = left.or(right) else {
             break;
         };
-        reading_characters += tokens[index].pronunciation.chars().count();
+        reading_characters += readings[index].chars().count();
         if index < start {
             start = index;
         } else {
             end = index + 1;
         }
     }
-    (PHRASE_MINIMUM_READING_CHARACTERS..=PHRASE_MAXIMUM_READING_CHARACTERS)
+    (length.minimum..=length.maximum)
         .contains(&reading_characters)
         .then_some((start, end))
 }
@@ -369,16 +438,15 @@ fn render_surface(tokens: &[Token]) -> String {
     surface
 }
 
-fn phrase_window_reading(tokens: &[Token], surface_readings: &SurfaceReadingIndex) -> String {
-    tokens
-        .iter()
-        .map(|token| {
-            surface_readings.reading(&token.surface).map_or_else(
-                || token.pronunciation.clone(),
-                |reading| hiragana_to_katakana(&reading),
-            )
-        })
-        .collect()
+fn phrase_token_reading(token: &Token, surface_readings: &SurfaceReadingIndex) -> String {
+    surface_readings.reading(&token.surface).map_or_else(
+        || token.pronunciation.clone(),
+        |reading| hiragana_to_katakana(&reading),
+    )
+}
+
+fn phrase_window_reading(readings: &[String]) -> String {
+    readings.concat()
 }
 
 fn is_content_word(upos: &str) -> bool {
@@ -434,7 +502,7 @@ mod tests {
             HashSet::from(["魚".to_owned(), "肴".to_owned()]),
         )]);
         let surface_readings = SurfaceReadingIndex::from_pairs([]);
-        let items = build_items(&sentences, &dictionary, "test", false, &surface_readings);
+        let items = build_items(&sentences, &dictionary, "test", None, &surface_readings);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].target_upos, "NOUN");
         assert_eq!(items[0].context_text, "私は");
@@ -455,12 +523,95 @@ mod tests {
             ("私".to_owned(), "わたし".to_owned()),
             ("魚".to_owned(), "さかな".to_owned()),
         ]);
-        let items = build_items(&sentences, &dictionary, "test", true, &surface_readings);
+        let items = build_items(
+            &sentences,
+            &dictionary,
+            "test",
+            Some(PhraseWindowLength::default()),
+            &surface_readings,
+        );
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].context_text, "");
         assert_eq!(items[0].right_context_text, "を食べる。");
         assert_eq!(items[0].input, "ワタシハサカナ");
         assert_eq!(items[0].expected_output, ["私は魚"]);
+    }
+
+    #[test]
+    fn supports_a_custom_long_phrase_window() {
+        let tokens = (0..5)
+            .map(|index| Token {
+                id: (index + 1).to_string(),
+                surface: format!("語{index}"),
+                upos: "NOUN".to_owned(),
+                pronunciation: "アアアアアアアア".to_owned(),
+                space_after: false,
+            })
+            .collect::<Vec<_>>();
+        let readings = tokens
+            .iter()
+            .map(|token| token.pronunciation.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            phrase_window_bounds(
+                &tokens,
+                &readings,
+                2,
+                PhraseWindowLength {
+                    minimum: 33,
+                    maximum: 40,
+                },
+            ),
+            Some((0, 5))
+        );
+    }
+
+    #[test]
+    fn measures_phrase_bounds_from_the_emitted_readings() {
+        let tokens = (0..5)
+            .map(|index| Token {
+                id: (index + 1).to_string(),
+                surface: format!("語{index}"),
+                upos: "NOUN".to_owned(),
+                pronunciation: "アアアアアアアア".to_owned(),
+                space_after: false,
+            })
+            .collect::<Vec<_>>();
+        let readings = vec!["アアアアアア".to_owned(); 5];
+
+        assert_eq!(
+            phrase_window_bounds(
+                &tokens,
+                &readings,
+                2,
+                PhraseWindowLength {
+                    minimum: 33,
+                    maximum: 40,
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_phrase_bounds_without_phrase_windows() {
+        let arguments = [
+            "input.conllu",
+            "dictionary.tsv",
+            "output.json",
+            "--source-split",
+            "test",
+            "--phrase-min-reading",
+            "33",
+        ]
+        .into_iter()
+        .map(str::to_owned);
+
+        assert_eq!(
+            parse_options(arguments).unwrap_err(),
+            "phrase reading bounds require --phrase-windows"
+        );
     }
 }

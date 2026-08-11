@@ -872,6 +872,16 @@ prefix局所修正は強いmodel不一致をN-best外へ戻すため、通常候
 
 JWTDでは`そしてエンジェル帯に復讐渡渉していろいろなちょっかい → そしてエンジェル隊に復讐と称して色々なちょっかい`を回収した。通常pool外だった生成候補1件だけが追加され、既存の再採点と追加marginを通ってtop-1になった。他4 datasetの候補追加数とtop-1は最終条件で不変だった。実製品FFIでは文字入力から同じ表層を確認し、coreでは短縮方向、長さ差、領域数、各側文字数、ASCII変更、辞書裏付けを個別に固定した。
 
+### 2026-08-11 azooKey rich候補の評価と不採用
+
+[azooKeyKanaKanjiConverterの`requestRichCandidates`](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift)は、候補がmodelの最尤token列に従っている位置でも上位の代替tokenを集める。全位置から確率比の高いprefixを最大5件保持し、[確率比0.25超を追加候補、0.5超を追加探索](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/93766c46e31fa6a18b7ced49dab31337780f6f45/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/zenzai.swift#L2141-L2174)へ使う。Slimeで既に棄却した「最初の不一致位置の2・3位token」とは探索位置が異なるため、v3.2-smallで別に評価した。
+
+JWTD 400件では、通常winnerが最尤token列に従う場合だけ各位置の上位3tokenを走査し、確率比0.25超のprefixを辞書latticeへ戻した。95件から418表層を得て、最終169誤りのうち24件で正解表層を含んだ。ただし厳格な「確率比0.65以上、同じ文字数、連続2文字以内、変更文字は漢字同士」まで固定すると、通常poolにない新規候補は2件だけだった。正解の`施設秘書 → 私設秘書`と誤候補の`鼻にかける → 花にかける`が1件ずつで、候補追加としても汚染を避けられなかった。
+
+候補を直接選ぶ閾値はJWTDだけで比較した。漢字同士の条件では確率比0.25 / 0.35 / 0.50 / 0.65 / 0.75 / 0.85のtop-1が221 / 227 / 230 / **234** / 233 / 232となり、0.65は現行231件から3件改善、exact悪化0だった。条件を0.65へ固定してAJIMEEへ適用すると168→165、改善0・悪化3となったため不採用とした。AJIMEEを見た後の語別・表記別guardは追加していない。
+
+直接選ばず、0.65以上の候補だけを同じv3.2-smallで全文再採点する二段方式も、追加margin 0 / 0.1 / 0.25 / 0.5 / 1.0 / 1.5の全条件でJWTD 231件から変化しなかった。全語彙top-3走査と追加lattice探索を製品へ残す精度根拠がないため、診断実装は削除した。
+
 ### 2026-07-25 コスト上書きハックの除去とスコア尺度の一貫化
 
 `いいかんじ`が`いい漢字`へ変換される不具合の調査で、must-passを通すための語別ハックが変換全体を歪めていたことが判明した。次の方針へ改めた。

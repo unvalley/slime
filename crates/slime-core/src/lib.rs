@@ -1,6 +1,6 @@
 //! Platform-independent IME state machine.
 
-use slime_converter::{Candidate, Dictionary, Segment};
+use slime_converter::{Candidate, Conversion, Dictionary, Segment};
 use slime_romaji::RomajiComposer;
 
 mod date_time_candidates;
@@ -77,6 +77,9 @@ const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP: i32 = 3_100;
 const GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP: i32 = 3_100;
 const GENERATIVE_MODEL_VERIFIED_WHOLE_MARGIN: f64 = 1.8;
+const GENERATIVE_FOREIGN_PREFIX_MIN_CHARACTERS: usize = 4;
+const GENERATIVE_FOREIGN_PREFIX_MAX_CHARACTERS: usize = 12;
+const GENERATIVE_FOREIGN_PREFIX_MAX_BASE_KATAKANA: usize = 3;
 
 fn accepts_whole_result_cost(reading_characters: usize, cost_gap: i32) -> bool {
     cost_gap <= RESCORE_MAX_BASE_COST_GAP
@@ -108,27 +111,178 @@ fn is_quoted_span(left_context: &str, right_context: &str) -> bool {
     QUOTE_PAIRS.contains(&(left_boundary, right_boundary))
 }
 
-fn is_model_verified_whole_candidate(
-    dictionary: &Dictionary,
-    reading: &str,
-    base_surface: &str,
-    generated_surface: &str,
+/// A complete generated lattice path awaiting the stricter model-only gates.
+/// Ordinary dictionary candidates never pass through this verifier.
+struct ModelVerifiedCandidate<'a> {
+    dictionary: &'a Dictionary,
+    reading: &'a str,
+    base_surface: &'a str,
+    generated_surface: &'a str,
+    conversion: &'a Conversion,
     cost_gap: i32,
     structurally_bounded: bool,
     quoted_span: bool,
-) -> bool {
-    !structurally_bounded
-        && base_surface.chars().count() == generated_surface.chars().count()
-        && cost_gap > RESCORE_MAX_BASE_COST_GAP
-        && cost_gap <= GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
-        && !quoted_span
-        && preserves_ascii_alphanumerics(base_surface, generated_surface)
-        && preserves_kanji_from_hiragana_deconversion(base_surface, generated_surface)
-        && !dictionary.changes_exact_personal_name_or_region_segment(
-            reading,
-            base_surface,
-            generated_surface,
+}
+
+/// One model-proposed foreign-looking prefix followed by a Japanese suffix.
+struct ForeignPrefix {
+    characters: usize,
+    reading_bytes: usize,
+    suffix: String,
+    suffix_reading: String,
+}
+
+fn foreign_prefix(conversion: &Conversion) -> Option<ForeignPrefix> {
+    let mut prefix_characters = 0_usize;
+    let mut prefix_segments = 0_usize;
+    let mut prefix_reading_bytes = 0_usize;
+    for segment in &conversion.segments {
+        if segment.surface.is_empty()
+            || segment.surface != text_transform::full_katakana(&segment.reading)
+            || !segment.surface.chars().all(is_full_katakana_or_mark)
+        {
+            break;
+        }
+        prefix_characters += segment.surface.chars().count();
+        prefix_segments += 1;
+        prefix_reading_bytes += segment.reading.len();
+    }
+    if prefix_segments < 2
+        || !(GENERATIVE_FOREIGN_PREFIX_MIN_CHARACTERS..=GENERATIVE_FOREIGN_PREFIX_MAX_CHARACTERS)
+            .contains(&prefix_characters)
+    {
+        return None;
+    }
+    let suffix = conversion.segments[prefix_segments..]
+        .iter()
+        .map(|segment| segment.surface.as_str())
+        .collect::<String>();
+    let suffix_reading = conversion.segments[prefix_segments..]
+        .iter()
+        .map(|segment| segment.reading.as_str())
+        .collect::<String>();
+    suffix
+        .chars()
+        .next()
+        .is_some_and(|character| is_hiragana(character) || is_kanji(character))
+        .then_some(ForeignPrefix {
+            characters: prefix_characters,
+            reading_bytes: prefix_reading_bytes,
+            suffix,
+            suffix_reading,
+        })
+}
+
+fn conversion_surface_split(
+    conversion: &Conversion,
+    prefix_reading_bytes: usize,
+) -> Option<(String, String)> {
+    let mut consumed_reading_bytes = 0_usize;
+    let suffix_start = conversion
+        .segments
+        .iter()
+        .enumerate()
+        .find_map(|(index, segment)| {
+            consumed_reading_bytes += segment.reading.len();
+            (consumed_reading_bytes == prefix_reading_bytes).then_some(index + 1)
+        })?;
+    (consumed_reading_bytes == prefix_reading_bytes).then(|| {
+        let join_surface = |segments: &[Segment]| {
+            segments
+                .iter()
+                .map(|segment| segment.surface.as_str())
+                .collect::<String>()
+        };
+        (
+            join_surface(&conversion.segments[..suffix_start]),
+            join_surface(&conversion.segments[suffix_start..]),
         )
+    })
+}
+
+impl ModelVerifiedCandidate<'_> {
+    fn accepts(self) -> bool {
+        self.accepts_whole_surface() || self.accepts_foreign_prefix()
+    }
+
+    fn accepts_whole_surface(&self) -> bool {
+        !self.structurally_bounded
+            && self.base_surface.chars().count() == self.generated_surface.chars().count()
+            && self.cost_gap > RESCORE_MAX_BASE_COST_GAP
+            && self.cost_gap <= GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
+            && !self.quoted_span
+            && preserves_ascii_alphanumerics(self.base_surface, self.generated_surface)
+            && preserves_kanji_from_hiragana_deconversion(self.base_surface, self.generated_surface)
+            && !self
+                .dictionary
+                .changes_exact_personal_name_or_region_segment(
+                    self.reading,
+                    self.base_surface,
+                    self.generated_surface,
+                )
+    }
+
+    fn accepts_foreign_prefix(&self) -> bool {
+        if self.structurally_bounded
+            || self.quoted_span
+            || self.cost_gap <= RESCORE_MAX_BASE_COST_GAP
+            || self.cost_gap > GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
+            || !preserves_ascii_alphanumerics(self.base_surface, self.generated_surface)
+        {
+            return false;
+        }
+        let Some(prefix) = foreign_prefix(self.conversion) else {
+            return false;
+        };
+        let base_prefix_characters = self
+            .base_surface
+            .chars()
+            .take_while(|character| is_full_katakana_or_mark(*character))
+            .count();
+        if base_prefix_characters >= prefix.characters
+            || base_prefix_characters > GENERATIVE_FOREIGN_PREFIX_MAX_BASE_KATAKANA
+        {
+            return false;
+        }
+        let Some(base_conversion) = self
+            .dictionary
+            .convert_n_best_with_surface_prefix(
+                self.reading,
+                self.base_surface,
+                GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT,
+            )
+            .into_iter()
+            .find(|candidate| candidate.surface == self.base_surface)
+        else {
+            return false;
+        };
+        let Some((base_prefix, base_suffix)) =
+            conversion_surface_split(&base_conversion, prefix.reading_bytes)
+        else {
+            return false;
+        };
+        if base_prefix.chars().count() >= 2 && base_prefix.chars().all(is_kanji) {
+            return false;
+        }
+        if prefix.suffix == base_suffix {
+            return true;
+        }
+        bounded_local_substitution(
+            &base_suffix,
+            &prefix.suffix,
+            PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+        ) && preserves_kanji_from_hiragana_deconversion(&base_suffix, &prefix.suffix)
+            && (!self
+                .dictionary
+                .changes_exact_personal_name_or_region_segment(
+                    &prefix.suffix_reading,
+                    &base_suffix,
+                    &prefix.suffix,
+                )
+                || self
+                    .dictionary
+                    .has_exact_region_surface(&prefix.suffix_reading, &prefix.suffix))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -838,8 +992,12 @@ impl SlimeEngine {
     /// ASCII alphanumerics, existing kanji, and dictionary-confirmed personal
     /// names. It must later beat every scored candidate by a separately
     /// evaluated raw-model margin. Other new candidates are marked as model
-    /// supplemental, so the usual additional score margin still applies. An
-    /// existing candidate is recorded as local or multi-region generation
+    /// supplemental, so the usual additional score margin still applies. A
+    /// four- to twelve-character foreign-looking prefix may also join when
+    /// it consists of multiple katakana lattice segments followed by an
+    /// unchanged or tightly bounded Japanese suffix. Existing all-kanji words
+    /// and established long katakana prefixes remain protected. An existing
+    /// candidate is recorded as local or multi-region generation
     /// consensus; it may override the ordinary winner later when their model
     /// scores are a narrow near-tie. Independently, a complete lattice path
     /// inside the strict base cost window records whole-result agreement. It
@@ -892,15 +1050,17 @@ impl SlimeEngine {
             bounded_multi_region_surface_compression(base_surface, generated_surface);
         let structurally_bounded = is_multi_region || is_surface_compression;
         let quoted_span = is_quoted_span(&state.request.context, &state.request.right_context);
-        let is_model_verified_whole = is_model_verified_whole_candidate(
-            &self.dictionary,
+        let is_model_verified_whole = ModelVerifiedCandidate {
+            dictionary: &self.dictionary,
             reading,
             base_surface,
             generated_surface,
+            conversion: &conversion,
             cost_gap,
             structurally_bounded,
             quoted_span,
-        );
+        }
+        .accepts();
         let maximum_cost_gap = if !structurally_bounded {
             RESCORE_MAX_BASE_COST_GAP
         } else if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
@@ -3377,6 +3537,13 @@ fn is_kanji(character: char) -> bool {
 
 fn is_hiragana(character: char) -> bool {
     matches!(character, '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309F}')
+}
+
+fn is_full_katakana_or_mark(character: char) -> bool {
+    matches!(
+        character,
+        '\u{30A1}'..='\u{30FA}' | '\u{30FD}'..='\u{30FF}' | 'ー' | '・'
+    )
 }
 
 fn bounded_multi_region_substitution(current: &str, alternative: &str) -> bool {
@@ -6213,6 +6380,113 @@ mod tests {
         assert!(!super::is_mixed_katakana_recall_surface("メンカラ測ら"));
         assert!(!super::is_mixed_katakana_recall_surface("サンシャの過"));
         assert!(!super::is_mixed_katakana_recall_surface("アケメネイド"));
+    }
+
+    fn accepts_foreign_prefix(
+        dictionary: &Dictionary,
+        reading: &str,
+        base_surface: &str,
+        generated_surface: &str,
+        conversion: &slime_converter::Conversion,
+        cost_gap: i32,
+    ) -> bool {
+        super::ModelVerifiedCandidate {
+            dictionary,
+            reading,
+            base_surface,
+            generated_surface,
+            conversion,
+            cost_gap,
+            structurally_bounded: false,
+            quoted_span: false,
+        }
+        .accepts_foreign_prefix()
+    }
+
+    #[test]
+    fn generative_recall_accepts_only_bounded_foreign_prefix_paths() {
+        let dictionary = Dictionary::bundled();
+        let accepted = [
+            ("みりかんがしん", "ミリ感が死ん", "ミリカンが死ん"),
+            ("とぅるちゃけん", "トゥル茶権", "トゥルチャ県"),
+            (
+                "めるでぃんげんにうつり",
+                "目ルディン源に移り",
+                "メルディンゲンに移り",
+            ),
+        ];
+        for (reading, base, generated) in accepted {
+            let base = dictionary
+                .convert_n_best_with_surface_prefix(reading, base, 32)
+                .into_iter()
+                .find(|conversion| conversion.surface == base)
+                .expect("base surface must be a complete lattice path");
+            let generated = dictionary
+                .convert_n_best_with_surface_prefix(reading, generated, 32)
+                .into_iter()
+                .find(|conversion| conversion.surface == generated)
+                .expect("generated surface must be a complete lattice path");
+            let cost_gap = generated.cost.saturating_sub(base.cost).max(0);
+            assert!(
+                accepts_foreign_prefix(
+                    &dictionary,
+                    reading,
+                    &base.surface,
+                    &generated.surface,
+                    &generated,
+                    cost_gap,
+                ),
+                "generated={generated:?}, base={base:?}, gap={cost_gap}"
+            );
+        }
+
+        let reading = "りれさんをこえ";
+        let base = dictionary
+            .convert_n_best_with_surface_prefix(reading, "リレさんを越え", 32)
+            .into_iter()
+            .find(|conversion| conversion.surface == "リレさんを越え")
+            .unwrap();
+        let short_prefix = dictionary
+            .convert_n_best_with_surface_prefix(reading, "リレ山を越え", 32)
+            .into_iter()
+            .find(|conversion| conversion.surface == "リレ山を越え")
+            .unwrap();
+        assert!(!accepts_foreign_prefix(
+            &dictionary,
+            reading,
+            &base.surface,
+            &short_prefix.surface,
+            &short_prefix,
+            short_prefix.cost.saturating_sub(base.cost).max(0),
+        ));
+
+        for (reading, base_surface, generated_surface) in [
+            (
+                "ぷろてくとよーのみ",
+                "プロテクト用のみ",
+                "プロテクトヨーのみ",
+            ),
+            ("りゅーゆーのいぼ", "劉裕の異母", "リューユーの異母"),
+        ] {
+            let base = dictionary
+                .convert_n_best_with_surface_prefix(reading, base_surface, 32)
+                .into_iter()
+                .find(|conversion| conversion.surface == base_surface)
+                .unwrap();
+            let generated = dictionary
+                .convert_n_best_with_surface_prefix(reading, generated_surface, 32)
+                .into_iter()
+                .find(|conversion| conversion.surface == generated_surface)
+                .unwrap();
+            assert!(!accepts_foreign_prefix(
+                &dictionary,
+                reading,
+                &base.surface,
+                &generated.surface,
+                &generated,
+                generated.cost.saturating_sub(base.cost).max(0),
+            ));
+        }
     }
 
     #[test]

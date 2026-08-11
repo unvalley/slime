@@ -453,6 +453,25 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             0
         }
     }
+
+    fn quotation_reporting_promotion(&self, left_context: &str, conversion: &Conversion) -> i32 {
+        if !document_context_ends_with_quotation_case(left_context)
+            || document_right_grammar_pos_id(self.right_context).is_none()
+        {
+            return 0;
+        }
+        let [.., _recipient, particle, reporting_verb] = conversion.segments.as_slice() else {
+            return 0;
+        };
+        if particle.reading != "に" || particle.surface != "に" {
+            return 0;
+        }
+        if is_reporting_verb_surface(&reporting_verb.surface) {
+            DOCUMENT_QUOTATION_REPORTING_PROMOTION
+        } else {
+            0
+        }
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -534,6 +553,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         } else {
             self.numeric_particle_suru_promotion(conversion)
         };
+        let quotation_reporting_promotion =
+            self.quotation_reporting_promotion(left_context, conversion);
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
@@ -551,6 +572,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(right_auxiliary_promotion)
             .saturating_sub(right_grammar_promotion.max(unique_right_grammar_promotion))
             .saturating_sub(unique_right_suru_promotion)
+            .saturating_sub(quotation_reporting_promotion)
     }
 }
 
@@ -747,6 +769,7 @@ const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
 const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
 const DOCUMENT_NUMERIC_PARTICLE_SURU_PROMOTION: i32 = 6_500;
+const DOCUMENT_QUOTATION_REPORTING_PROMOTION: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN: i32 = 1_500;
 const DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN: i32 = 1_000;
 const MOZC_PAST_AUXILIARY_POS_ID: u16 = 142;
@@ -807,6 +830,20 @@ fn document_context_ends_with_honorific_prefix(left_context: &str) -> bool {
         }),
         _ => false,
     }
+}
+
+fn document_context_ends_with_quotation_case(left_context: &str) -> bool {
+    left_context
+        .strip_suffix('と')
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_some_and(|character| matches!(character, '、' | '，' | ',' | '」' | '』' | '”' | '"'))
+}
+
+fn is_reporting_verb_surface(surface: &str) -> bool {
+    matches!(
+        surface,
+        "言っ" | "言い" | "言わ" | "伝え" | "話し" | "述べ" | "答え"
+    )
 }
 
 fn document_region_suffix_promotion(reading: &str, surface: &str) -> i32 {
@@ -6584,6 +6621,30 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.surface == "視"),
             "a broad passive-form rule must not evict an otherwise visible candidate"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_uses_a_bounded_quotation_reporting_frame() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "けいさつにいっ",
+                "証人は、被疑者を攻撃した、と",
+                "た。"
+            )[0]
+            .surface,
+            "警察に言っ"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "けいさつにいっ",
+                "証人は昨日、",
+                "た。"
+            )[0]
+            .surface,
+            "警察に行っ",
+            "a destination without a quotation case must keep the motion verb"
         );
     }
 

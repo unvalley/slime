@@ -403,6 +403,16 @@ PUDで`グレード421 → グレード4に位置`を1件修正した。初期�
 敬称・複数呼称にもなる単独読み`さん`を除外して解消した。GSD dev/test、JWTD、AJIMEEは
 全出力不変、5 dataset合計1改善・悪化0だった。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 引用格＋受け手＋発話動詞
+
+ATOKが前後のつながりを変換に使い、azooKey/Zenzaiが左右文脈を別tagで扱う設計を参考に、
+読点・閉じ括弧直後の引用格`と`、受け手を示す`に`、発話動詞、右側の活用接続がすべて揃う
+場合だけ、既存の発話候補を補強する。一般の`に行った/に言った`には適用しない。
+
+公式v3.2-smallの製品比較でPUDの`警察に行っ → 警察に言っ`を1件修正し、悪化0だった。
+GSD devは全出力不変、GSD test・JWTD・AJIMEEには発火する左境界がなかった。通常の移動表現を
+保護する反例と性能測定を含む詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

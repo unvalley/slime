@@ -420,6 +420,39 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             .unwrap_or(0)
             .saturating_neg()
     }
+
+    fn numeric_particle_suru_promotion(&self, conversion: &Conversion) -> i32 {
+        if !starts_with_suru_inflection(self.right_context) {
+            return 0;
+        }
+        let [.., numeric, particle, verbal_noun] = conversion.segments.as_slice() else {
+            return 0;
+        };
+        if particle.reading != "に" || particle.surface != "に" {
+            return 0;
+        }
+        // さん before に is often the honorific/plural ending in 皆さんに,
+        // not the standalone digit 3. Structural evidence on the right must
+        // not reinterpret that left boundary as a numeral.
+        if numeric.reading == "さん" {
+            return 0;
+        }
+        let whole_numeric_surface = split_trailing_decimal(&numeric.surface)
+            .is_some_and(|(prefix, _)| prefix.is_empty())
+            || numeric.surface.chars().all(is_japanese_numeric_character);
+        if !whole_numeric_surface {
+            return 0;
+        }
+        if self
+            .dictionary
+            .document_unique_right_suru_surface(&verbal_noun.reading, self.right_context)
+            == Some(verbal_noun.surface.as_str())
+        {
+            DOCUMENT_NUMERIC_PARTICLE_SURU_PROMOTION
+        } else {
+            0
+        }
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -499,7 +532,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         {
             DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION
         } else {
-            0
+            self.numeric_particle_suru_promotion(conversion)
         };
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
@@ -713,6 +746,7 @@ const DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
 const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
+const DOCUMENT_NUMERIC_PARTICLE_SURU_PROMOTION: i32 = 6_500;
 const DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN: i32 = 1_500;
 const DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN: i32 = 1_000;
 const MOZC_PAST_AUXILIARY_POS_ID: u16 = 142;
@@ -6497,6 +6531,38 @@ mod tests {
             dictionary.candidates_with_surrounding_context("ながい", "そのまま", "道路")[0].surface,
             "長い",
             "unrelated right context must not promote a verbal noun"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context_limit(
+                "ぐれーどよんにいち",
+                "彼らは、全国平均",
+                "し、全国平均グレード8よりも優れている。",
+                32,
+            )[0]
+            .surface,
+            "グレード4に位置",
+            "a numeric run must not swallow a particle before a unique verbal noun"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ぐれーどよんにいち",
+                "彼らは、全国平均",
+                "、全国平均グレード8よりも優れている。"
+            )[0]
+            .surface,
+            "グレード421",
+            "the segmented form needs an explicit suru continuation"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context_limit(
+                "さんにおつたえ",
+                "尋常ではないこの現実をみな",
+                "したいのです。",
+                32,
+            )[0]
+            .surface,
+            "さんにお伝え",
+            "the honorific ending さん must not be reinterpreted as the digit 3"
         );
         assert_eq!(
             dictionary.candidates_with_surrounding_context(

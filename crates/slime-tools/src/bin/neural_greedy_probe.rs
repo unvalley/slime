@@ -33,6 +33,8 @@ const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const CONTEXT_CONTRAST_WEIGHT: f64 = 0.1;
+const WHOLE_RESULT_COST_GAP: i32 = 1_000;
+const WHOLE_GENERATION_COST_GAPS: [i32; 7] = [500, 1_000, 1_500, 2_500, 3_100, 5_000, i32::MAX];
 
 #[derive(Debug, Deserialize)]
 struct Item {
@@ -217,6 +219,15 @@ fn run() -> Result<(), String> {
     let mut multi_consensus_correct = 0usize;
     let mut multi_consensus_improvements = 0usize;
     let mut multi_consensus_regressions = 0usize;
+    let mut whole_generation_correct = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut whole_generation_improvements = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut whole_generation_regressions = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut same_length_whole_correct = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut same_length_whole_improvements = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut same_length_whole_regressions = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut preserving_whole_correct = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut preserving_whole_improvements = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut preserving_whole_regressions = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
     let mut reported_failures = 0usize;
     let mut latencies = Vec::with_capacity(generated.len());
     let mut eligible_latencies = Vec::new();
@@ -241,11 +252,10 @@ fn run() -> Result<(), String> {
                 CONSTRAINED_CANDIDATES,
             )
             .into_iter()
-            .find(|conversion| conversion.surface == generated.surface)
-            .map(|conversion| conversion.surface);
+            .find(|conversion| conversion.surface == generated.surface);
         let backed_matches = backed
-            .as_deref()
-            .is_some_and(|surface| matches_expected(surface, &item.expected_output));
+            .as_ref()
+            .is_some_and(|conversion| matches_expected(&conversion.surface, &item.expected_output));
         base_correct += usize::from(base_matches);
         raw_correct += usize::from(raw_matches);
         dictionary_backed += usize::from(backed.is_some());
@@ -561,6 +571,62 @@ fn run() -> Result<(), String> {
         multi_consensus_correct += usize::from(multi_matches);
         multi_consensus_improvements += usize::from(!contrast_consensus_matches && multi_matches);
         multi_consensus_regressions += usize::from(contrast_consensus_matches && !multi_matches);
+        let generated_cost_gap = backed
+            .as_ref()
+            .map(|conversion| conversion.cost.saturating_sub(ordinary[0].cost).max(0));
+        let in_whole_window = generated.stopped_at_eos
+            && (MINIMUM_GENERATIVE_READING_CHARACTERS..=MAXIMUM_GENERATIVE_READING_CHARACTERS)
+                .contains(&item.input.chars().count())
+            && !dictionary.changes_exact_personal_name_segment(
+                &reading,
+                multi_consensus_surface,
+                &generated.surface,
+            )
+            && preserves_ascii_alphanumerics(multi_consensus_surface, &generated.surface);
+        let same_length =
+            multi_consensus_surface.chars().count() == generated.surface.chars().count();
+        let preserves_kanji =
+            preserves_kanji_from_hiragana_deconversion(multi_consensus_surface, &generated.surface);
+        for (index, maximum_cost_gap) in WHOLE_GENERATION_COST_GAPS.iter().enumerate() {
+            let accepts = in_whole_window
+                && generated_cost_gap.is_some_and(|cost_gap| cost_gap <= *maximum_cost_gap);
+            let whole_matches = if accepts { raw_matches } else { multi_matches };
+            whole_generation_correct[index] += usize::from(whole_matches);
+            whole_generation_improvements[index] += usize::from(!multi_matches && whole_matches);
+            whole_generation_regressions[index] += usize::from(multi_matches && !whole_matches);
+
+            let same_length_matches = if accepts && same_length {
+                raw_matches
+            } else {
+                multi_matches
+            };
+            same_length_whole_correct[index] += usize::from(same_length_matches);
+            same_length_whole_improvements[index] +=
+                usize::from(!multi_matches && same_length_matches);
+            same_length_whole_regressions[index] +=
+                usize::from(multi_matches && !same_length_matches);
+
+            let preserving_matches = if accepts && preserves_kanji {
+                raw_matches
+            } else {
+                multi_matches
+            };
+            preserving_whole_correct[index] += usize::from(preserving_matches);
+            preserving_whole_improvements[index] +=
+                usize::from(!multi_matches && preserving_matches);
+            preserving_whole_regressions[index] +=
+                usize::from(multi_matches && !preserving_matches);
+        }
+        if raw_matches != multi_matches {
+            println!(
+                "whole_generation_change\t{}\t{}\tcurrent={}\tgenerated={}\texpected={}",
+                item.index,
+                if raw_matches { "improve" } else { "regress" },
+                multi_consensus_surface,
+                generated.surface,
+                item.expected_output.join(" | "),
+            );
+        }
         if consensus_matches != contrast_consensus_matches {
             println!(
                 "context_contrast_change\t{}\t{}\tcurrent={}\tcontrast={}\texpected={}",
@@ -656,6 +722,42 @@ fn run() -> Result<(), String> {
     println!("multi_region_consensus_top1={multi_consensus_correct}");
     println!("multi_region_consensus_improvements={multi_consensus_improvements}");
     println!("multi_region_consensus_regressions={multi_consensus_regressions}");
+    for (index, maximum_cost_gap) in WHOLE_GENERATION_COST_GAPS.iter().enumerate() {
+        println!(
+            "whole_generation_cost_gap={maximum_cost_gap}\ttop1={}\timprovements={}\tregressions={}",
+            whole_generation_correct[index],
+            whole_generation_improvements[index],
+            whole_generation_regressions[index],
+        );
+        println!(
+            "same_length_whole_cost_gap={maximum_cost_gap}\ttop1={}\timprovements={}\tregressions={}",
+            same_length_whole_correct[index],
+            same_length_whole_improvements[index],
+            same_length_whole_regressions[index],
+        );
+        println!(
+            "preserving_whole_cost_gap={maximum_cost_gap}\ttop1={}\timprovements={}\tregressions={}",
+            preserving_whole_correct[index],
+            preserving_whole_improvements[index],
+            preserving_whole_regressions[index],
+        );
+    }
+    let whole_result_index = WHOLE_GENERATION_COST_GAPS
+        .iter()
+        .position(|&cost_gap| cost_gap == WHOLE_RESULT_COST_GAP)
+        .expect("selected whole-result cost gap must be part of the diagnostic sweep");
+    println!(
+        "whole_result_consensus_top1={}",
+        preserving_whole_correct[whole_result_index]
+    );
+    println!(
+        "whole_result_consensus_improvements={}",
+        preserving_whole_improvements[whole_result_index]
+    );
+    println!(
+        "whole_result_consensus_regressions={}",
+        preserving_whole_regressions[whole_result_index]
+    );
     println!(
         "context_ablated_p50_ms={:.3}",
         percentile_ms(&context_ablated_latencies, 50)
@@ -726,6 +828,13 @@ fn preserves_kanji_from_hiragana_deconversion(current: &str, alternative: &str) 
         .all(|(current, alternative)| {
             current == alternative || !is_kanji(current) || !is_hiragana(alternative)
         })
+}
+
+fn preserves_ascii_alphanumerics(current: &str, alternative: &str) -> bool {
+    current
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .eq(alternative.chars().filter(char::is_ascii_alphanumeric))
 }
 
 fn is_kanji(character: char) -> bool {

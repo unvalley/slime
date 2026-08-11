@@ -1416,18 +1416,21 @@ impl Dictionary {
     ) -> bool {
         let current_characters = current_surface.chars().collect::<Vec<_>>();
         let alternative_characters = alternative_surface.chars().collect::<Vec<_>>();
-        if current_characters.len() != alternative_characters.len() {
+        if current_characters == alternative_characters {
             return false;
         }
-        let changed = current_characters
+        let common_prefix = current_characters
             .iter()
             .zip(&alternative_characters)
-            .enumerate()
-            .filter_map(|(index, (current, alternative))| (current != alternative).then_some(index))
-            .collect::<Vec<_>>();
-        if changed.is_empty() {
-            return false;
-        }
+            .take_while(|(current, alternative)| current == alternative)
+            .count();
+        let common_suffix = current_characters[common_prefix..]
+            .iter()
+            .rev()
+            .zip(alternative_characters[common_prefix..].iter().rev())
+            .take_while(|(current, alternative)| current == alternative)
+            .count();
+        let changed_current_end = current_characters.len().saturating_sub(common_suffix);
         let Some(conversion) = self
             .convert_n_best_with_surface_prefix(reading, current_surface, 1)
             .into_iter()
@@ -1454,11 +1457,22 @@ impl Dictionary {
                         .get(index + 1)
                         .is_some_and(|(_, _, next)| next.given_name))
                 || (roles.given_name && index > 0 && segments[index - 1].2.surname);
-            if changed
-                .iter()
-                .any(|&index| (surface_start..surface_end).contains(&index))
-                && protected_name
-            {
+            let changes_segment = if current_characters.len() == alternative_characters.len() {
+                current_characters
+                    .iter()
+                    .zip(&alternative_characters)
+                    .enumerate()
+                    .any(|(changed, (current, alternative))| {
+                        current != alternative && (surface_start..surface_end).contains(&changed)
+                    })
+            } else if common_prefix == changed_current_end {
+                // A pure insertion only changes a name when it splits the
+                // existing segment, not when it is placed before or after it.
+                surface_start < common_prefix && common_prefix < surface_end
+            } else {
+                common_prefix < surface_end && surface_start < changed_current_end
+            };
+            if changes_segment && protected_name {
                 return true;
             }
         }
@@ -4876,10 +4890,25 @@ mod tests {
             "片瀬志麻課程",
             "片瀬志摩課程",
         ));
+        assert!(dictionary.changes_exact_personal_name_segment(
+            "かたせしまかてい",
+            "片瀬志麻課程",
+            "片瀬志課程",
+        ));
+        assert!(dictionary.changes_exact_personal_name_segment(
+            "かたせしまかてい",
+            "片瀬志麻課程",
+            "片瀬志の麻課程",
+        ));
         assert!(!dictionary.changes_exact_personal_name_segment(
             "かたせしまかてい",
             "片瀬志麻課程",
             "片瀬志麻過程",
+        ));
+        assert!(!dictionary.changes_exact_personal_name_segment(
+            "かたせしまかてい",
+            "片瀬志麻課程",
+            "片瀬志麻の課程",
         ));
         assert!(!dictionary.changes_exact_personal_name_segment(
             "ふちゅうしゃ",

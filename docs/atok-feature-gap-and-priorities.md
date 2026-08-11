@@ -319,6 +319,14 @@ baseline比約107 ms、最大RSS増分は約24.2 MBである。語彙本体は�
 
 信頼性gate後のJWTD 400件では、1回prefix修正が226→227、2回までの修正が230→231となり、`片瀬志麻→片瀬志摩`のexact悪化1件を0件にした。AJIMEEの最終精度は不変、PUD 446件、GSD dev 331件、GSD test 323件は計測時間以外の出力が保護前とバイト一致した。Release相当の2,000回単独測定は、人名保護成立が0.0346 ms/op、一般語の非成立が0.0188 ms/opだった。通常変換や表示候補には追加探索を行わない。
 
+## 今回の実装: 安全なwhole-result一致
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)は、直前の確定だけを常に優先せず、文脈上自然な候補を優先する学習強度を説明している。[azooKeyの現行候補評価](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift)は、生成が完了した全文を`wholeResult`として通常候補の再検討へ返す。Slimeはこの責務分離を参考にしつつ、model文字列を直接表示候補へ入れない境界を維持する。
+
+`high-accuracy`のgreedy全文がEOSまで完了し、読みが6〜32文字、完全な辞書lattice path、辞書第1候補とのcost差1,000以内をすべて満たす場合だけ、局所prefix修正後の最終候補との一致を評価する。ASCII英数字列の変更、漢字からひらがなへの表記崩れ、辞書で確定できる姓名の変更は拒否する。広い3,100 cost窓はPUDで悪化したため棄却し、PUD参照後の再調整は行わず既存base confidence値1,000を使った。
+
+旧Release FFIとの同条件比較では、信頼性gate後JWTD 232→234、PUD 346→349、GSD phrase dev 220→222へ改善し、AJIMEE 167、条件固定後に一度だけ評価したGSD phrase test 245を維持した。合計7改善・0悪化で、model推論回数と候補上限は増えない。通常build、`balanced`、履歴、ユーザー辞書、入力ミス訂正、規則候補の保護境界も変更しない。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

@@ -2229,6 +2229,32 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_whole_result_generative_consensus(model: &str) {
+        // The final local-correction path keeps 魔道具 first, while greedy
+        // generation agrees with the complete dictionary path 魔導具. The
+        // strict whole-result gate can select it without exposing generated
+        // text or widening the ordinary candidate-cost window.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let mut capture = TypedCapture::default();
+        for character in "まどうぐはおもにどせいのわをつかう".chars() {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("魔導具は主に土星の輪を使う")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_multi_region_generative_consensus(model: &str) {
         // Greedy generation agrees with the eighth dictionary candidate and
         // corrects two disjoint regions. Keep the result lattice-backed while
@@ -2390,6 +2416,7 @@ mod tests {
         verify_confident_long_neural_conversion(&model);
         verify_neural_learning_strength(&model);
         verify_generative_consensus(&model);
+        verify_whole_result_generative_consensus(&model);
         verify_multi_region_generative_consensus(&model);
         verify_generative_surface_compression(&model);
         verify_context_contrast(handle);

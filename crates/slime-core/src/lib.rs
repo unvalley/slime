@@ -227,12 +227,14 @@ enum GenerativeConsensusKind {
     Local,
     MultiRegion,
     ExtendedMultiRegion,
+    Whole,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GenerativeConsensus {
     candidate: usize,
     kind: GenerativeConsensusKind,
+    accepts_whole_result: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -670,9 +672,12 @@ impl SlimeEngine {
     /// separately evaluated cost window and records direct generation
     /// consensus. Other new candidates are marked as model supplemental, so
     /// the usual additional score margin still applies. An existing candidate
-    /// is only recorded as local or multi-region generation consensus; it may
+    /// is recorded as local or multi-region generation consensus; it may
     /// override the ordinary winner later when their model scores are a narrow
-    /// near-tie.
+    /// near-tie. Independently, a complete lattice path inside the strict base
+    /// cost window records whole-result agreement. It may replace the final
+    /// local-correction result only after preserving ASCII alphanumerics,
+    /// existing kanji, and dictionary-confirmed personal names.
     pub fn prepare_generative_rescore_candidate(
         &mut self,
         generated_surface: &str,
@@ -688,36 +693,17 @@ impl SlimeEngine {
         {
             return None;
         }
+        let base = state.candidates.first()?;
         if let Some(index) = state
             .candidates
             .iter()
             .position(|candidate| candidate.surface == generated_surface)
         {
-            let kind = if bounded_local_substitution(
-                &state.candidates.first()?.surface,
-                generated_surface,
-                PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
-            ) {
-                GenerativeConsensusKind::Local
-            } else if bounded_multi_region_substitution(
-                &state.candidates.first()?.surface,
-                generated_surface,
-            ) {
-                GenerativeConsensusKind::MultiRegion
-            } else {
-                return None;
-            };
+            let consensus = self.existing_generative_consensus(state, index, generated_surface)?;
             let state = self.candidate_rescore.as_mut()?;
-            state.generative_consensus = Some(GenerativeConsensus {
-                candidate: index,
-                kind,
-            });
+            state.generative_consensus = Some(consensus);
             return Some(state.request.clone());
         }
-        let base_surface = &state.candidates.first()?.surface;
-        let is_multi_region = bounded_multi_region_substitution(base_surface, generated_surface);
-        let is_surface_compression =
-            bounded_multi_region_surface_compression(base_surface, generated_surface);
         let conversion = self
             .dictionary
             .convert_n_best_with_surface_prefix(
@@ -727,6 +713,12 @@ impl SlimeEngine {
             )
             .into_iter()
             .find(|conversion| conversion.surface == generated_surface)?;
+        let cost_gap = conversion.cost.saturating_sub(base.cost).max(0);
+        let accepts_whole_result = cost_gap <= RESCORE_MAX_BASE_COST_GAP;
+        let base_surface = &base.surface;
+        let is_multi_region = bounded_multi_region_substitution(base_surface, generated_surface);
+        let is_surface_compression =
+            bounded_multi_region_surface_compression(base_surface, generated_surface);
         let structurally_bounded = is_multi_region || is_surface_compression;
         let maximum_cost_gap = if !structurally_bounded {
             RESCORE_MAX_BASE_COST_GAP
@@ -735,10 +727,6 @@ impl SlimeEngine {
         } else {
             RESCORE_MAX_CANDIDATE_COST_GAP
         };
-        let cost_gap = conversion
-            .cost
-            .saturating_sub(state.candidates.first()?.cost)
-            .max(0);
         let uses_extended_multi_region_consensus = reading_characters
             >= LONG_RESCORE_READING_CHARACTERS
             && is_multi_region
@@ -760,13 +748,61 @@ impl SlimeEngine {
         });
         state.model_supplemental.push(true);
         state.request.candidates.push(conversion.surface);
-        if uses_extended_multi_region_consensus {
+        if uses_extended_multi_region_consensus || accepts_whole_result {
             state.generative_consensus = Some(GenerativeConsensus {
                 candidate: state.candidates.len() - 1,
-                kind: GenerativeConsensusKind::ExtendedMultiRegion,
+                kind: if uses_extended_multi_region_consensus {
+                    GenerativeConsensusKind::ExtendedMultiRegion
+                } else {
+                    GenerativeConsensusKind::Whole
+                },
+                accepts_whole_result,
             });
         }
         Some(state.request.clone())
+    }
+
+    fn existing_generative_consensus(
+        &self,
+        state: &CandidateRescoreState,
+        candidate: usize,
+        generated_surface: &str,
+    ) -> Option<GenerativeConsensus> {
+        let base = state.candidates.first()?;
+        let existing = state.candidates.get(candidate)?;
+        let existing_cost = if state.model_supplemental.get(candidate).copied()? {
+            self.dictionary
+                .convert_n_best_with_surface_prefix(
+                    &state.request.reading,
+                    generated_surface,
+                    GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT,
+                )
+                .into_iter()
+                .find(|conversion| conversion.surface == generated_surface)?
+                .cost
+        } else {
+            existing.cost
+        };
+        let accepts_whole_result =
+            existing_cost.saturating_sub(base.cost).max(0) <= RESCORE_MAX_BASE_COST_GAP;
+        let kind = if bounded_local_substitution(
+            &base.surface,
+            generated_surface,
+            PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+        ) {
+            GenerativeConsensusKind::Local
+        } else if bounded_multi_region_substitution(&base.surface, generated_surface) {
+            GenerativeConsensusKind::MultiRegion
+        } else if accepts_whole_result {
+            GenerativeConsensusKind::Whole
+        } else {
+            return None;
+        };
+        Some(GenerativeConsensus {
+            candidate,
+            kind,
+            accepts_whole_result,
+        })
     }
 
     /// Applies model scores and optional model-directed surface prefixes.
@@ -912,7 +948,7 @@ impl SlimeEngine {
             return None;
         }
 
-        let (order, margin_protects_base, selected) =
+        let (mut order, mut margin_protects_base, selected) =
             candidate_rescore_order_for_state(&state, log_likelihoods, lambda, minimum_margin)?;
 
         let mut pending_candidates = self.candidates.clone();
@@ -950,7 +986,7 @@ impl SlimeEngine {
         }
         positions.sort_unstable();
 
-        let prefix_correction = prefix_constraints
+        let mut prefix_correction = prefix_constraints
             .and_then(|constraints| constraints[selected].as_deref())
             .and_then(|prefix| {
                 self.constrained_local_correction(
@@ -960,6 +996,27 @@ impl SlimeEngine {
                     &pending_candidates,
                 )
             });
+        let mut followup_correction = prefix_correction.as_deref().and_then(|correction| {
+            followup_prefix_constraint.and_then(|prefix| {
+                self.constrained_local_correction(
+                    &state.request.reading,
+                    correction,
+                    prefix,
+                    &pending_candidates,
+                )
+            })
+        });
+        let current = followup_correction
+            .as_deref()
+            .or(prefix_correction.as_deref())
+            .unwrap_or(&state.candidates[selected].surface);
+        if let Some(whole_result) = self.safe_whole_result_candidate(&state, current) {
+            order.retain(|&index| index != whole_result);
+            order.insert(0, whole_result);
+            margin_protects_base = false;
+            prefix_correction = None;
+            followup_correction = None;
+        }
         if margin_protects_base && prefix_correction.is_none() {
             return Some(self.candidate_actions());
         }
@@ -970,14 +1027,6 @@ impl SlimeEngine {
             }
         }
         if let Some(correction) = prefix_correction {
-            let followup_correction = followup_prefix_constraint.and_then(|prefix| {
-                self.constrained_local_correction(
-                    &state.request.reading,
-                    &correction,
-                    prefix,
-                    &pending_candidates,
-                )
-            });
             pending_candidates.insert(correction_position, correction);
             if let Some(followup) = followup_correction {
                 pending_candidates.insert(correction_position, followup);
@@ -985,6 +1034,25 @@ impl SlimeEngine {
         }
         self.candidates = pending_candidates;
         Some(self.candidate_actions())
+    }
+
+    fn safe_whole_result_candidate(
+        &self,
+        state: &CandidateRescoreState,
+        current: &str,
+    ) -> Option<usize> {
+        let consensus = state
+            .generative_consensus
+            .filter(|consensus| consensus.accepts_whole_result)?;
+        let generated = &state.candidates.get(consensus.candidate)?.surface;
+        (preserves_ascii_alphanumerics(current, generated)
+            && preserves_kanji_from_hiragana_deconversion(current, generated)
+            && !self.dictionary.changes_exact_personal_name_segment(
+                &state.request.reading,
+                current,
+                generated,
+            ))
+        .then_some(consensus.candidate)
     }
 
     /// Returns conversion candidates for an explicit transient left context.
@@ -2789,15 +2857,24 @@ fn candidate_rescore_order_for_state(
         order.insert(0, consensus.candidate);
         return Some((order, false, consensus.candidate));
     }
+    if consensus.kind == GenerativeConsensusKind::Whole {
+        return consensus
+            .accepts_whole_result
+            .then_some((order, margin_protects_base, selected));
+    }
     if state.model_supplemental[consensus.candidate] {
-        return None;
+        return consensus
+            .accepts_whole_result
+            .then_some((order, margin_protects_base, selected));
     }
     let maximum_model_advantage = match consensus.kind {
         GenerativeConsensusKind::Local => GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE,
         GenerativeConsensusKind::MultiRegion => {
             GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE
         }
-        GenerativeConsensusKind::ExtendedMultiRegion => unreachable!(),
+        GenerativeConsensusKind::ExtendedMultiRegion | GenerativeConsensusKind::Whole => {
+            unreachable!()
+        }
     };
     let model_advantage = log_likelihoods[consensus.candidate] - log_likelihoods[selected];
     if consensus.candidate != selected
@@ -2843,6 +2920,13 @@ fn preserves_kanji_from_hiragana_deconversion(current: &str, alternative: &str) 
         .all(|(current, alternative)| {
             current == alternative || !is_kanji(current) || !is_hiragana(alternative)
         })
+}
+
+fn preserves_ascii_alphanumerics(current: &str, alternative: &str) -> bool {
+    current
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .eq(alternative.chars().filter(char::is_ascii_alphanumeric))
 }
 
 fn is_kanji(character: char) -> bool {
@@ -3158,6 +3242,44 @@ mod tests {
                 _ => None,
             })
             .expect("show candidates action")
+    }
+
+    fn exact_candidate(dictionary: &Dictionary, reading: &str, surface: &str) -> Candidate {
+        dictionary
+            .convert_n_best_with_surface_prefix(reading, surface, 1)
+            .into_iter()
+            .find(|candidate| candidate.surface == surface)
+            .map(|candidate| Candidate {
+                surface: candidate.surface,
+                cost: candidate.cost,
+            })
+            .expect("exact lattice candidate")
+    }
+
+    fn engine_with_rescore_candidates(
+        dictionary: Dictionary,
+        reading: &str,
+        candidates: Vec<Candidate>,
+    ) -> SlimeEngine {
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
     }
 
     fn lower_hex(bytes: &[u8]) -> String {
@@ -5799,6 +5921,10 @@ mod tests {
                 .model_supplemental,
             [false, true]
         );
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("safe whole-result agreement should override ordinary scoring");
+        assert_eq!(engine.candidates[0], "少額の課題");
     }
 
     #[test]
@@ -5843,7 +5969,14 @@ mod tests {
             .as_ref()
             .expect("pending rescore state");
         assert_eq!(state.model_supplemental, [false, true]);
-        assert_eq!(state.generative_consensus, None);
+        assert_eq!(
+            state.generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::Whole,
+                accepts_whole_result: true,
+            })
+        );
     }
 
     #[test]
@@ -5919,6 +6052,7 @@ mod tests {
             Some(GenerativeConsensus {
                 candidate: 1,
                 kind: GenerativeConsensusKind::ExtendedMultiRegion,
+                accepts_whole_result: false,
             })
         );
 
@@ -5931,34 +6065,16 @@ mod tests {
 
     #[test]
     fn existing_generated_surface_records_generation_consensus_without_duplication() {
+        let reading = "しょうがくせい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "奨学生", 100),
+            DictionaryEntry::new(reading, "小学生", 1_100),
+        ]);
         let candidates = vec![
-            Candidate {
-                surface: "奨学生".to_owned(),
-                cost: 100,
-            },
-            Candidate {
-                surface: "小学生".to_owned(),
-                cost: 1_100,
-            },
+            exact_candidate(&dictionary, reading, "奨学生"),
+            exact_candidate(&dictionary, reading, "小学生"),
         ];
-        let mut engine = SlimeEngine::new(Dictionary::default());
-        engine.reading = "しょうがくせい".to_owned();
-        engine.candidate_kind = Some(CandidateKind::Conversion);
-        engine.candidates = candidates
-            .iter()
-            .map(|candidate| candidate.surface.clone())
-            .collect();
-        engine.candidate_rescore = Some(CandidateRescoreState {
-            request: CandidateRescoreRequest {
-                context: String::new(),
-                right_context: String::new(),
-                reading: engine.reading.clone(),
-                candidates: engine.candidates.clone(),
-            },
-            model_supplemental: vec![false; candidates.len()],
-            generative_consensus: None,
-            candidates,
-        });
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
 
         let request = engine
             .prepare_generative_rescore_candidate("小学生")
@@ -5973,41 +6089,51 @@ mod tests {
             Some(GenerativeConsensus {
                 candidate: 1,
                 kind: GenerativeConsensusKind::Local,
+                accepts_whole_result: true,
             })
         );
         assert_eq!(state.model_supplemental, [false, false]);
     }
 
     #[test]
-    fn existing_multi_region_surface_records_distinct_generation_consensus() {
+    fn whole_result_consensus_revalidates_an_existing_supplemental_path() {
+        let reading = "しょうがくせい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "奨学生", 100),
+            DictionaryEntry::new(reading, "小学生", 200),
+        ]);
         let candidates = vec![
-            Candidate {
-                surface: "奨学の問題".to_owned(),
-                cost: 100,
-            },
-            Candidate {
-                surface: "少額の課題".to_owned(),
-                cost: 1_100,
-            },
+            exact_candidate(&dictionary, reading, "奨学生"),
+            exact_candidate(&dictionary, reading, "小学生"),
         ];
-        let mut engine = SlimeEngine::new(Dictionary::default());
-        engine.reading = "しょうがくのもんだい".to_owned();
-        engine.candidate_kind = Some(CandidateKind::Conversion);
-        engine.candidates = candidates
-            .iter()
-            .map(|candidate| candidate.surface.clone())
-            .collect();
-        engine.candidate_rescore = Some(CandidateRescoreState {
-            request: CandidateRescoreRequest {
-                context: String::new(),
-                right_context: String::new(),
-                reading: engine.reading.clone(),
-                candidates: engine.candidates.clone(),
-            },
-            model_supplemental: vec![false; candidates.len()],
-            generative_consensus: None,
-            candidates,
-        });
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
+        engine
+            .candidate_rescore
+            .as_mut()
+            .expect("pending rescore state")
+            .model_supplemental[1] = true;
+
+        engine
+            .prepare_generative_rescore_candidate("小学生")
+            .expect("a supplemental candidate must pass exact lattice validation");
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("safe whole-result agreement should apply");
+        assert_eq!(engine.candidates[0], "小学生");
+    }
+
+    #[test]
+    fn existing_multi_region_surface_records_distinct_generation_consensus() {
+        let reading = "しょうがくのもんだい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "奨学の問題", 100),
+            DictionaryEntry::new(reading, "少額の課題", 1_100),
+        ]);
+        let candidates = vec![
+            exact_candidate(&dictionary, reading, "奨学の問題"),
+            exact_candidate(&dictionary, reading, "少額の課題"),
+        ];
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
 
         let request = engine
             .prepare_generative_rescore_candidate("少額の課題")
@@ -6022,9 +6148,142 @@ mod tests {
             Some(GenerativeConsensus {
                 candidate: 1,
                 kind: GenerativeConsensusKind::MultiRegion,
+                accepts_whole_result: true,
             })
         );
         assert_eq!(state.model_supplemental, [false, false]);
+    }
+
+    #[test]
+    fn whole_result_consensus_accepts_the_strict_base_cost_boundary() {
+        let reading = "かんぜんなかいとう";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "第一候補", 100),
+            DictionaryEntry::new(reading, "完全正解", 1_100),
+        ]);
+        let candidates = vec![
+            exact_candidate(&dictionary, reading, "第一候補"),
+            exact_candidate(&dictionary, reading, "完全正解"),
+        ];
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
+
+        let request = engine
+            .prepare_generative_rescore_candidate("完全正解")
+            .expect("a complete path at the strict cost boundary should be recorded");
+        assert_eq!(request.candidates, ["第一候補", "完全正解"]);
+        assert_eq!(
+            engine
+                .candidate_rescore
+                .as_ref()
+                .expect("pending rescore state")
+                .generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::Whole,
+                accepts_whole_result: true,
+            })
+        );
+
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("whole-result consensus should apply");
+        assert_eq!(engine.candidates[0], "完全正解");
+    }
+
+    #[test]
+    fn whole_result_consensus_rejects_costs_beyond_the_strict_boundary() {
+        let reading = "かんぜんなかいとう";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "第一候補", 100),
+            DictionaryEntry::new(reading, "完全正解", 1_101),
+        ]);
+        let candidates = vec![
+            exact_candidate(&dictionary, reading, "第一候補"),
+            exact_candidate(&dictionary, reading, "完全正解"),
+        ];
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
+
+        assert_eq!(
+            engine.prepare_generative_rescore_candidate("完全正解"),
+            None
+        );
+    }
+
+    #[test]
+    fn whole_result_consensus_preserves_ascii_kanji_and_personal_names() {
+        let cases = [
+            (
+                "きげんぜんごひゃくじゅういち",
+                vec![
+                    DictionaryEntry::new("きげんぜんごひゃくじゅういち", "紀元前511年", 10),
+                    DictionaryEntry::new("きげんぜんごひゃくじゅういち", "紀元前後11年", 20),
+                ],
+                "紀元前511年",
+                "紀元前後11年",
+            ),
+            (
+                "ほうほうがとら",
+                vec![
+                    DictionaryEntry::new("ほうほうがとら", "方法が取ら", 10),
+                    DictionaryEntry::new("ほうほうがとら", "方法がとら", 20),
+                ],
+                "方法が取ら",
+                "方法がとら",
+            ),
+        ];
+        for (reading, entries, current, generated) in cases {
+            let dictionary = Dictionary::new(entries);
+            let candidates = vec![
+                exact_candidate(&dictionary, reading, current),
+                exact_candidate(&dictionary, reading, generated),
+            ];
+            let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
+            engine
+                .prepare_generative_rescore_candidate(generated)
+                .expect("the complete path should reach final safety validation");
+            engine
+                .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+                .expect("aligned scores should preserve the current candidate");
+            assert_eq!(engine.candidates[0], current);
+        }
+
+        let reading = "かたせしまかてい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("かたせしま", "片瀬志麻", 1_923, 1_922, 10),
+            DictionaryEntry::with_pos("かたせ", "片瀬", 1_923, 1_923, 20),
+            DictionaryEntry::with_pos("しま", "志摩", 1_922, 1_922, 20),
+            DictionaryEntry::new("かてい", "課程", 10),
+        ]);
+        let candidates = vec![
+            exact_candidate(&dictionary, reading, "片瀬志麻課程"),
+            exact_candidate(&dictionary, reading, "片瀬志摩課程"),
+        ];
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
+        engine
+            .prepare_generative_rescore_candidate("片瀬志摩課程")
+            .expect("the complete path should reach final name validation");
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("aligned scores should preserve the exact personal name");
+        assert_eq!(engine.candidates[0], "片瀬志麻課程");
+
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("かたせしま", "片瀬志麻", 1_923, 1_922, 10),
+            DictionaryEntry::new("かてい", "課程", 10),
+            DictionaryEntry::new(reading, "片瀬志課程", 30),
+        ]);
+        let candidates = vec![
+            exact_candidate(&dictionary, reading, "片瀬志麻課程"),
+            exact_candidate(&dictionary, reading, "片瀬志課程"),
+        ];
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, candidates);
+        engine
+            .prepare_generative_rescore_candidate("片瀬志課程")
+            .expect("the complete path should reach unequal-length name validation");
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("aligned scores should preserve the complete personal name");
+        assert_eq!(engine.candidates[0], "片瀬志麻課程");
     }
 
     #[test]
@@ -6050,6 +6309,7 @@ mod tests {
             generative_consensus: Some(GenerativeConsensus {
                 candidate: 1,
                 kind: GenerativeConsensusKind::Local,
+                accepts_whole_result: false,
             }),
         };
 
@@ -6086,6 +6346,7 @@ mod tests {
             generative_consensus: Some(GenerativeConsensus {
                 candidate: 1,
                 kind: GenerativeConsensusKind::MultiRegion,
+                accepts_whole_result: false,
             }),
         };
 
@@ -6155,7 +6416,14 @@ mod tests {
             .as_ref()
             .expect("pending rescore state");
         assert_eq!(accepted.model_supplemental, [false, true]);
-        assert_eq!(accepted.generative_consensus, None);
+        assert_eq!(
+            accepted.generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::Whole,
+                accepts_whole_result: true,
+            })
+        );
 
         for rejected in ["少額の架空", "全く別解"] {
             engine.candidate_rescore = Some(state());

@@ -1299,3 +1299,32 @@ baseline比でmedian +107.161 ms、p95 +106.748 ms、最大RSS +24,150,016 bytes
 これは任意の20万件パックを読み込む追加コストであり、通常buildには発生しない。
 初回順位を維持しつつ固有名詞を回収する基盤として採用するが、実配布語彙は
 ライセンス、由来、頻度、メモリを別途gateする。
+
+## 2026-08-11 辞書制約付きwhole-result一致
+
+[azooKeyの現行`ZenzCandidateEvaluator`](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzCandidateEvaluator.swift)は、生成がEOSへ到達した場合に`wholeResult`を返し、候補tokenとの不一致ではprefix制約を返す。Slimeでは生成表層を直接採用せず、既存の局所prefix修正と複数領域一致を適用した後の候補に対し、完全な辞書lattice pathとして検証済みのgreedy全文だけを最後の一致信号として評価した。
+
+JWTDの信頼性gate後400件でcost差500 / 1,000 / 1,500 / 2,500 / 3,100 / 5,000を比較した。3,100は開発側で改善幅が大きかったが、PUDで既存正解を悪化させたため棄却した。PUD参照後に閾値を再調整せず、既存のbase confidence境界と同じ1,000へ戻した。さらに、漢字からひらがなへの表記崩れを禁止し、ASCII英数字列を不変とし、辞書で確定できる姓名を保護する条件を固定した。姓名保護は文字数が変わる全文候補にも拡張し、名前segment内部の削除・挿入を拒否する。
+
+同じ条件でUD Japanese GSD r2.18のdev/test文から句読点をまたがない句を新規生成した。devは323件、testは320件で、testは条件固定後に一度だけ使用した。最終判定は診断器の近似値ではなく、旧`1d74db6`と変更後のRelease FFIを同じmodel・入力・文脈で直接比較した。
+
+```sh
+cargo run --release --quiet -p slime-tools --bin slime-balanced-devset -- \
+  target/evaluation/ud-japanese-gsd/r2.18/ja_gsd-ud-dev.conllu \
+  crates/slime-converter/data/mozc-basic.tsv /tmp/slime-gsd-phrase-dev.json \
+  --source-split ud-japanese-gsd-r2.18-phrase-dev --phrase-windows
+cargo run --release --quiet -p slime-tools --bin slime-balanced-devset -- \
+  target/evaluation/ud-japanese-gsd/r2.18/ja_gsd-ud-test.conllu \
+  crates/slime-converter/data/mozc-basic.tsv /tmp/slime-gsd-phrase-test.json \
+  --source-split ud-japanese-gsd-r2.18-phrase-test --phrase-windows
+```
+
+| dataset | 変更前 | whole-result一致後 | 改善 / 悪化 |
+| --- | ---: | ---: | ---: |
+| 信頼性gate後JWTD 400件 | 232 | **234** | 2 / 0 |
+| PUD phrase 446件 | 346 | **349** | 3 / 0 |
+| GSD phrase dev 323件 | 220 | **222** | 2 / 0 |
+| GSD phrase test 320件 | 245 | 245 | 0 / 0 |
+| AJIMEE 200件 | 167 | 167 | 0 / 0 |
+
+JWTDでは`性的衝動にかられて → 性的衝動に駆られて`と`魔道具 → 魔導具`、PUDでは`賛成だと話 → 賛成だと話し`、`シベリアの第 → シベリアの大`、`評判はよく → 評判は良く`を回収した。5 dataset合計で7件改善、既存正解の悪化は0件だった。通常のmodel補間では選ばれない場合も全文一致を優先するが、EOS完了、6〜32文字、完全な辞書経路、base cost差1,000以内、ASCII不変、漢字保持、姓名保持を一つでも満たさなければ従来結果を維持する。履歴、ユーザー辞書、入力ミス訂正、規則候補は外部再採点要求を作らない既存境界のままである。

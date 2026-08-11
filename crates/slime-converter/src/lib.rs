@@ -1414,6 +1414,47 @@ impl Dictionary {
         current_surface: &str,
         alternative_surface: &str,
     ) -> bool {
+        self.changes_exact_named_segment(reading, current_surface, alternative_surface, true, false)
+    }
+
+    /// Returns whether a surface substitution changes a dictionary-confirmed
+    /// personal-name or sufficiently specific region segment in the exact path
+    /// for `current_surface`.
+    ///
+    /// Region protection deliberately requires one unambiguous all-kanji
+    /// surface of at least three characters. Short or competing geographic
+    /// spellings remain available to contextual ranking, while an established
+    /// specific place spelling is not decomposed by an external model.
+    #[must_use]
+    pub fn changes_exact_personal_name_or_region_segment(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        self.changes_exact_named_segment(reading, current_surface, alternative_surface, true, true)
+    }
+
+    /// Returns whether a substitution changes one unambiguous specific region
+    /// segment in the exact path for `current_surface`.
+    #[must_use]
+    pub fn changes_exact_region_segment(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        self.changes_exact_named_segment(reading, current_surface, alternative_surface, false, true)
+    }
+
+    fn changes_exact_named_segment(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+        protect_personal_names: bool,
+        protect_regions: bool,
+    ) -> bool {
         let current_characters = current_surface.chars().collect::<Vec<_>>();
         let alternative_characters = alternative_surface.chars().collect::<Vec<_>>();
         if current_characters == alternative_characters {
@@ -1445,18 +1486,32 @@ impl Dictionary {
             .map(|segment| {
                 let surface_end = surface_start + segment.surface.chars().count();
                 let roles = self.exact_personal_name_roles(&segment.reading, &segment.surface);
-                let indexed = (surface_start, surface_end, roles);
+                let region = protect_regions
+                    && segment.surface.chars().count() >= 3
+                    && segment.surface.chars().all(|character| {
+                        matches!(
+                            character,
+                            '\u{3400}'..='\u{4DBF}'
+                                | '\u{4E00}'..='\u{9FFF}'
+                                | '\u{F900}'..='\u{FAFF}'
+                        )
+                    })
+                    && self.is_unique_exact_region_surface(&segment.reading, &segment.surface);
+                let indexed = (surface_start, surface_end, roles, region);
                 surface_start = surface_end;
                 indexed
             })
             .collect::<Vec<_>>();
-        for (index, &(surface_start, surface_end, roles)) in segments.iter().enumerate() {
-            let protected_name = roles.full_name
-                || (roles.surname
-                    && segments
-                        .get(index + 1)
-                        .is_some_and(|(_, _, next)| next.given_name))
-                || (roles.given_name && index > 0 && segments[index - 1].2.surname);
+        for (index, &(surface_start, surface_end, roles, protected_region)) in
+            segments.iter().enumerate()
+        {
+            let protected_name = protect_personal_names
+                && (roles.full_name
+                    || (roles.surname
+                        && segments
+                            .get(index + 1)
+                            .is_some_and(|(_, _, next, _)| next.given_name))
+                    || (roles.given_name && index > 0 && segments[index - 1].2.surname));
             let changes_segment = if current_characters.len() == alternative_characters.len() {
                 current_characters
                     .iter()
@@ -1472,11 +1527,28 @@ impl Dictionary {
             } else {
                 common_prefix < surface_end && surface_start < changed_current_end
             };
-            if changes_segment && protected_name {
+            if changes_segment && (protected_name || protected_region) {
                 return true;
             }
         }
         false
+    }
+
+    fn is_unique_exact_region_surface(&self, reading: &str, surface: &str) -> bool {
+        let mut matched = false;
+        let mut competing = false;
+        self.for_each_exact(reading, |entry| {
+            if MOZC_REGION_POS_IDS.contains(&entry.left_id)
+                || MOZC_REGION_POS_IDS.contains(&entry.right_id)
+            {
+                if entry.surface == surface {
+                    matched = true;
+                } else {
+                    competing = true;
+                }
+            }
+        });
+        matched && !competing
     }
 
     fn exact_personal_name_roles(&self, reading: &str, surface: &str) -> PersonalNameRoles {
@@ -4914,6 +4986,40 @@ mod tests {
             "ふちゅうしゃ",
             "不忠社",
             "不忠者",
+        ));
+    }
+
+    #[test]
+    fn exact_region_change_detection_is_specific_and_segment_local() {
+        let region_pos_id = MOZC_REGION_POS_IDS[0];
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("くるみだて", "胡桃舘", region_pos_id, region_pos_id, 10),
+            DictionaryEntry::new("にちかい", "に近い", 10),
+            DictionaryEntry::with_pos("かんさい", "関西", region_pos_id, region_pos_id, 10),
+            DictionaryEntry::new("ちいき", "地域", 10),
+            DictionaryEntry::with_pos("たちあらい", "大刀洗", region_pos_id, region_pos_id, 10),
+            DictionaryEntry::with_pos("たちあらい", "太刀洗", region_pos_id, region_pos_id, 20),
+        ]);
+
+        assert!(dictionary.changes_exact_personal_name_or_region_segment(
+            "くるみだてにちかい",
+            "胡桃舘に近い",
+            "くるみだてに近い",
+        ));
+        assert!(!dictionary.changes_exact_personal_name_or_region_segment(
+            "くるみだてにちかい",
+            "胡桃舘に近い",
+            "胡桃舘にちかい",
+        ));
+        assert!(!dictionary.changes_exact_personal_name_or_region_segment(
+            "かんさいちいき",
+            "関西地域",
+            "かんさい地域",
+        ));
+        assert!(!dictionary.changes_exact_personal_name_or_region_segment(
+            "たちあらい",
+            "大刀洗",
+            "太刀洗",
         ));
     }
 

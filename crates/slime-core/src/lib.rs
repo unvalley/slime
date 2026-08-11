@@ -792,11 +792,13 @@ impl SlimeEngine {
             && cost_gap <= GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
             && preserves_ascii_alphanumerics(base_surface, generated_surface)
             && preserves_kanji_from_hiragana_deconversion(base_surface, generated_surface)
-            && !self.dictionary.changes_exact_personal_name_segment(
-                reading,
-                base_surface,
-                generated_surface,
-            );
+            && !self
+                .dictionary
+                .changes_exact_personal_name_or_region_segment(
+                    reading,
+                    base_surface,
+                    generated_surface,
+                );
         let maximum_cost_gap = if !structurally_bounded {
             RESCORE_MAX_BASE_COST_GAP
         } else if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
@@ -994,7 +996,7 @@ impl SlimeEngine {
             ) && preserves_kanji_from_hiragana_deconversion(current, correction)
                 && !self
                     .dictionary
-                    .changes_exact_personal_name_segment(reading, current, correction)
+                    .changes_exact_personal_name_or_region_segment(reading, current, correction)
                 && !existing_candidates.contains(correction)
         };
         let initial = self.dictionary.convert_n_best_with_surface_prefix(
@@ -1040,6 +1042,9 @@ impl SlimeEngine {
 
         let (mut order, mut margin_protects_base, selected) =
             candidate_rescore_order_for_state(&state, log_likelihoods, lambda, minimum_margin)?;
+        if self.rescore_changes_exact_region_segment(&state, selected) {
+            return Some(self.candidate_actions());
+        }
 
         let mut pending_candidates = self.candidates.clone();
         let existing_positions: Vec<_> = state
@@ -1126,6 +1131,24 @@ impl SlimeEngine {
         Some(self.candidate_actions())
     }
 
+    fn rescore_changes_exact_region_segment(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        let base = &state.candidates[0].surface;
+        selected != 0
+            && !preserves_kanji_from_hiragana_deconversion(
+                base,
+                &state.candidates[selected].surface,
+            )
+            && self.dictionary.changes_exact_region_segment(
+                &state.request.reading,
+                base,
+                &state.candidates[selected].surface,
+            )
+    }
+
     fn safe_whole_result_candidate(
         &self,
         state: &CandidateRescoreState,
@@ -1137,11 +1160,13 @@ impl SlimeEngine {
         let generated = &state.candidates.get(consensus.candidate)?.surface;
         (preserves_ascii_alphanumerics(current, generated)
             && preserves_kanji_from_hiragana_deconversion(current, generated)
-            && !self.dictionary.changes_exact_personal_name_segment(
-                &state.request.reading,
-                current,
-                generated,
-            ))
+            && !self
+                .dictionary
+                .changes_exact_personal_name_or_region_segment(
+                    &state.request.reading,
+                    current,
+                    generated,
+                ))
         .then_some(consensus.candidate)
     }
 
@@ -5838,6 +5863,51 @@ mod tests {
 
         assert_eq!(engine.candidates[0], "片瀬志麻たち");
         assert!(!engine.candidates.contains(&"片瀬志摩たち".to_owned()));
+    }
+
+    #[test]
+    fn model_rescore_preserves_a_specific_exact_region_segment() {
+        const REGION_POS_ID: u16 = 1924;
+        let reading = "くるみだてちゅうざいしょ";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("くるみだて", "胡桃舘", REGION_POS_ID, REGION_POS_ID, 10),
+            DictionaryEntry::new("ちゅうざいしょ", "駐在所", 10),
+            DictionaryEntry::new(reading, "くるみだて駐在所", 100),
+        ]);
+        let candidates = vec![
+            Candidate {
+                surface: "胡桃舘駐在所".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "くるみだて駐在所".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("aligned scores should preserve the exact region");
+
+        assert_eq!(engine.candidates[0], "胡桃舘駐在所");
     }
 
     #[test]

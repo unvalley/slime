@@ -2237,6 +2237,33 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_exact_region_spelling(model: &str) {
+        // The model prefers a phonetic spelling, but the dictionary has one
+        // unambiguous three-kanji region entry for the same segment. Preserve
+        // the established place spelling without enabling broad region bias.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let mut capture = TypedCapture::default();
+        for character in
+            "かつてはごしょがわらけいさつしょくるみだてちゅうざいしょがちかくにあったが".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("かつては五所川原警察署胡桃舘駐在所が近くにあったが")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_context_contrast(handle: *mut super::SlimeHandle) {
         // The unconditioned model and dictionary narrowly prefer 乗せ. The
         // surrounding sentence specifically supports the written-form 載せ.
@@ -2555,6 +2582,7 @@ mod tests {
         verify_extended_multi_region_generation(handle);
         verify_confident_full_lattice_generation(handle);
         verify_model_verified_whole_generation(&model);
+        verify_exact_region_spelling(&model);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

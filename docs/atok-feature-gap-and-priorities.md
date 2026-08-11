@@ -356,6 +356,18 @@ JWTD 235、AJIMEE 167を維持した。合計3改善・0悪化で、既存の6�
 推論回数は増えない。azooKeyの生成と通常候補評価の責務分離を参考にした一般設計であり、
 ATOKやazooKeyの内部実装を複製していない。詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 一意な全漢字地名の表記保護
+
+[ATOKの固有名詞優先](https://atok.com/other/support/howtouse/mac/tr/pgs/tr_conv_name.htm)は
+人名と地名を独立または同時に優先できる。Slimeは通常順位を地名優先へ切り替えず、現在の
+辞書第1候補に3文字以上の全漢字地名segmentがあり、同じ読みの地名表層が辞書内で一意で、
+model候補がそれをひらがなへ戻す場合だけ、その変換回のmodel結果を採用しない。
+
+これにより`五所川原警察署くるみだて駐在所`を`胡桃舘駐在所`へ1件修正した。
+複数地名表記を持つ`大刀洗 / 太刀洗`は保護対象外とし、広い地名優先で発生した回帰を除いた。
+JWTD 235→236、GSD dev/test、PUD、AJIMEEは全出力不変だった。詳細は
+[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

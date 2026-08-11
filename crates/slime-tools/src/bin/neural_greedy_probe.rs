@@ -37,7 +37,11 @@ const MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const CONTEXT_CONTRAST_WEIGHT: f64 = 0.1;
 const WHOLE_RESULT_COST_GAP: i32 = 1_000;
 const WHOLE_GENERATION_COST_GAPS: [i32; 7] = [500, 1_000, 1_500, 2_500, 3_100, 5_000, i32::MAX];
+const SUPPLEMENTAL_WHOLE_COST_GAPS: [i32; 5] = [1_400, 1_500, 2_000, 2_500, 3_100];
+const SUPPLEMENTAL_MODEL_MARGINS: [f64; 5] = [0.0, 0.5, 1.0, 1.5, 2.0];
+const MODEL_TOP_MARGIN_THRESHOLDS: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
 const WHOLE_RESULT_READING_MAXIMUMS: [usize; 5] = [32, 40, 48, 64, usize::MAX];
+const DELAYED_LONG_READING_MAXIMUMS: [usize; 4] = [40, 48, 64, usize::MAX];
 const LONG_WHOLE_RESULT_COST_FLOORS: [i32; 5] = [0, 250, 500, 750, 1_000];
 const SCORED_LONG_VARIANTS: [&str; 3] = ["eligible_top", "beats_base", "global_model_top"];
 const WHOLE_RESULT_BLOCKS: [&str; 9] = [
@@ -119,8 +123,11 @@ fn run() -> Result<(), String> {
 
     let mut ordinary_sets = Vec::with_capacity(items.len());
     let mut augmented_sets = Vec::with_capacity(items.len());
+    let mut broad_supplemental_sets = Vec::with_capacity(items.len());
+    let mut broad_supplemental_added = Vec::with_capacity(items.len());
     let mut original_counts = Vec::with_capacity(items.len());
     let mut score_requests = Vec::new();
+    let mut broad_supplemental_score_requests = Vec::new();
     for (item, generated) in items.iter().zip(&generated) {
         let reading = katakana_to_hiragana(&item.input);
         let ordinary = dictionary.candidates_with_surrounding_context_limit(
@@ -183,12 +190,75 @@ fn run() -> Result<(), String> {
                     .collect(),
             });
         }
+        let reading = katakana_to_hiragana(&item.input);
+        let mut broad_supplemental = augmented.clone();
+        let broad_conversion = (original_count >= 2
+            && generated.stopped_at_eos
+            && (MINIMUM_GENERATIVE_READING_CHARACTERS..=MAXIMUM_GENERATIVE_READING_CHARACTERS)
+                .contains(&item.input.chars().count())
+            && ordinary[0].surface.chars().count() == generated.surface.chars().count()
+            && preserves_ascii_alphanumerics(&ordinary[0].surface, &generated.surface)
+            && preserves_kanji_from_hiragana_deconversion(
+                &ordinary[0].surface,
+                &generated.surface,
+            )
+            && !dictionary.changes_exact_personal_name_segment(
+                &reading,
+                &ordinary[0].surface,
+                &generated.surface,
+            )
+            && !broad_supplemental
+                .iter()
+                .any(|candidate| candidate.surface == generated.surface))
+        .then(|| {
+            dictionary
+                .convert_n_best_with_surface_prefix(
+                    &reading,
+                    &generated.surface,
+                    CONSTRAINED_CANDIDATES,
+                )
+                .into_iter()
+                .find(|conversion| {
+                    conversion.surface == generated.surface
+                        && conversion.cost.saturating_sub(ordinary[0].cost).max(0)
+                            <= *SUPPLEMENTAL_WHOLE_COST_GAPS
+                                .last()
+                                .expect("supplemental cost sweep")
+                })
+        })
+        .flatten();
+        let added_broad_supplemental = broad_conversion.is_some();
+        if let Some(conversion) = broad_conversion {
+            if broad_supplemental.len() >= SEARCH_LIMIT {
+                broad_supplemental.pop();
+            }
+            broad_supplemental.push(Candidate {
+                surface: conversion.surface,
+                cost: conversion.cost,
+            });
+        }
+        if added_broad_supplemental {
+            broad_supplemental_score_requests.push(ScoreRequest {
+                context: item.context_text.clone(),
+                right_context: item.right_context_text.clone(),
+                input_katakana: item.input.clone(),
+                candidates: broad_supplemental
+                    .iter()
+                    .map(|candidate| candidate.surface.clone())
+                    .collect(),
+            });
+        }
         ordinary_sets.push(ordinary);
         augmented_sets.push(augmented);
+        broad_supplemental_sets.push(broad_supplemental);
+        broad_supplemental_added.push(added_broad_supplemental);
         original_counts.push(original_count);
     }
     let mut scored_items = rescorer
         .score_all_with_prefix_diagnostics(&score_requests)?
+        .into_iter();
+    let mut broad_supplemental_scored_items = rescorer
+        .score_all(&broad_supplemental_score_requests)?
         .into_iter();
     let context_ablated_requests = score_requests
         .iter()
@@ -244,6 +314,18 @@ fn run() -> Result<(), String> {
     let mut preserving_whole_correct = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
     let mut preserving_whole_improvements = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
     let mut preserving_whole_regressions = [0usize; WHOLE_GENERATION_COST_GAPS.len()];
+    let mut supplemental_whole_correct = [0usize; SUPPLEMENTAL_WHOLE_COST_GAPS.len()];
+    let mut supplemental_whole_improvements = [0usize; SUPPLEMENTAL_WHOLE_COST_GAPS.len()];
+    let mut supplemental_whole_regressions = [0usize; SUPPLEMENTAL_WHOLE_COST_GAPS.len()];
+    let mut supplemental_model_correct =
+        [[0usize; SUPPLEMENTAL_MODEL_MARGINS.len()]; SUPPLEMENTAL_WHOLE_COST_GAPS.len()];
+    let mut supplemental_model_improvements =
+        [[0usize; SUPPLEMENTAL_MODEL_MARGINS.len()]; SUPPLEMENTAL_WHOLE_COST_GAPS.len()];
+    let mut supplemental_model_regressions =
+        [[0usize; SUPPLEMENTAL_MODEL_MARGINS.len()]; SUPPLEMENTAL_WHOLE_COST_GAPS.len()];
+    let mut model_top_margin_correct = [0usize; MODEL_TOP_MARGIN_THRESHOLDS.len()];
+    let mut model_top_margin_improvements = [0usize; MODEL_TOP_MARGIN_THRESHOLDS.len()];
+    let mut model_top_margin_regressions = [0usize; MODEL_TOP_MARGIN_THRESHOLDS.len()];
     let mut final_present_in_64 = 0usize;
     let mut final_missing_from_64 = 0usize;
     let mut final_whole_block_counts = [0usize; WHOLE_RESULT_BLOCKS.len()];
@@ -251,6 +333,9 @@ fn run() -> Result<(), String> {
     let mut whole_reading_correct = [0usize; WHOLE_RESULT_READING_MAXIMUMS.len()];
     let mut whole_reading_improvements = [0usize; WHOLE_RESULT_READING_MAXIMUMS.len()];
     let mut whole_reading_regressions = [0usize; WHOLE_RESULT_READING_MAXIMUMS.len()];
+    let mut delayed_long_reading_correct = [0usize; DELAYED_LONG_READING_MAXIMUMS.len()];
+    let mut delayed_long_reading_improvements = [0usize; DELAYED_LONG_READING_MAXIMUMS.len()];
+    let mut delayed_long_reading_regressions = [0usize; DELAYED_LONG_READING_MAXIMUMS.len()];
     let mut long_whole_correct = [0usize; LONG_WHOLE_RESULT_COST_FLOORS.len()];
     let mut long_whole_improvements = [0usize; LONG_WHOLE_RESULT_COST_FLOORS.len()];
     let mut long_whole_regressions = [0usize; LONG_WHOLE_RESULT_COST_FLOORS.len()];
@@ -261,12 +346,13 @@ fn run() -> Result<(), String> {
     let mut latencies = Vec::with_capacity(generated.len());
     let mut eligible_latencies = Vec::new();
     let mut context_ablated_latencies = Vec::new();
-    for ((((item, generated), ordinary), augmented), &original_count) in items
+    for (item_index, ((((item, generated), ordinary), augmented), &original_count)) in items
         .iter()
         .zip(&generated)
         .zip(&ordinary_sets)
         .zip(&augmented_sets)
         .zip(&original_counts)
+        .enumerate()
     {
         let reading = katakana_to_hiragana(&item.input);
         let base = ordinary
@@ -302,6 +388,8 @@ fn run() -> Result<(), String> {
         let mut existing_generation_stats = None;
         let mut contrast_generation_stats = None;
         let mut scored_candidate_logliks = Vec::new();
+        let mut broad_supplemental_selected = None;
+        let mut broad_supplemental_model_margin = None;
         let ordinary_generated_cost_gap = if item.input.chars().count() >= LONG_INPUT_CHARACTERS {
             LONG_MAX_CANDIDATE_COST_GAP
         } else {
@@ -322,6 +410,26 @@ fn run() -> Result<(), String> {
             let scored = scored_items
                 .next()
                 .expect("one score for each eligible candidate set");
+            if broad_supplemental_added[item_index] {
+                let broad_scored = broad_supplemental_scored_items
+                    .next()
+                    .expect("one broad score for each added supplemental candidate");
+                let generated_index = broad_supplemental_sets[item_index].len() - 1;
+                broad_supplemental_selected = Some(rescored_index(
+                    item,
+                    &broad_supplemental_sets[item_index],
+                    &broad_scored.candidate_logliks,
+                    true,
+                ));
+                broad_supplemental_model_margin = broad_scored
+                    .candidate_logliks
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, _)| index != generated_index)
+                    .map(|(_, score)| *score)
+                    .max_by(f64::total_cmp)
+                    .map(|runner_up| broad_scored.candidate_logliks[generated_index] - runner_up);
+            }
             scored_candidate_logliks.clone_from(&scored.candidate_logliks);
             let context_ablated =
                 (!item.context_text.is_empty() || !item.right_context_text.is_empty()).then(|| {
@@ -692,6 +800,138 @@ fn run() -> Result<(), String> {
             multi_consensus_surface
         };
         let whole_result_matches = matches_expected(whole_result_surface, &item.expected_output);
+        let model_top_with_margin = if scored_candidate_logliks.len() >= 2 {
+            let mut model_order = (0..original_count).collect::<Vec<_>>();
+            model_order.sort_by(|&left, &right| {
+                scored_candidate_logliks[right].total_cmp(&scored_candidate_logliks[left])
+            });
+            Some((
+                model_order[0],
+                scored_candidate_logliks[model_order[0]] - scored_candidate_logliks[model_order[1]],
+            ))
+        } else {
+            None
+        };
+        for (index, minimum_margin) in MODEL_TOP_MARGIN_THRESHOLDS.iter().enumerate() {
+            let alternative = model_top_with_margin
+                .filter(|&(candidate, margin)| candidate != 0 && margin >= *minimum_margin)
+                .map(|(candidate, _)| ordinary[candidate].surface.as_str())
+                .filter(|candidate| {
+                    preserves_ascii_alphanumerics(whole_result_surface, candidate)
+                        && preserves_kanji_from_hiragana_deconversion(
+                            whole_result_surface,
+                            candidate,
+                        )
+                        && !dictionary.changes_exact_personal_name_segment(
+                            &reading,
+                            whole_result_surface,
+                            candidate,
+                        )
+                });
+            let matches = alternative.map_or(whole_result_matches, |candidate| {
+                matches_expected(candidate, &item.expected_output)
+            });
+            model_top_margin_correct[index] += usize::from(matches);
+            model_top_margin_improvements[index] += usize::from(!whole_result_matches && matches);
+            model_top_margin_regressions[index] += usize::from(whole_result_matches && !matches);
+        }
+        for (index, maximum_cost_gap) in SUPPLEMENTAL_WHOLE_COST_GAPS.iter().enumerate() {
+            let broad_candidates = &broad_supplemental_sets[item_index];
+            let generated_index = broad_supplemental_added[item_index]
+                .then(|| broad_candidates.len().checked_sub(1))
+                .flatten();
+            let accepts = generated_index.is_some_and(|generated_index| {
+                Some(generated_index) == broad_supplemental_selected
+                    && broad_candidates[generated_index]
+                        .cost
+                        .saturating_sub(ordinary[0].cost)
+                        .max(0)
+                        <= *maximum_cost_gap
+            });
+            let matches = if accepts {
+                raw_matches
+            } else {
+                whole_result_matches
+            };
+            supplemental_whole_correct[index] += usize::from(matches);
+            supplemental_whole_improvements[index] += usize::from(!whole_result_matches && matches);
+            supplemental_whole_regressions[index] += usize::from(whole_result_matches && !matches);
+            for (margin_index, minimum_margin) in SUPPLEMENTAL_MODEL_MARGINS.iter().enumerate() {
+                let accepts_model_consensus = generated_index.is_some_and(|generated_index| {
+                    broad_candidates[generated_index]
+                        .cost
+                        .saturating_sub(ordinary[0].cost)
+                        .max(0)
+                        <= *maximum_cost_gap
+                        && broad_supplemental_model_margin
+                            .is_some_and(|margin| margin >= *minimum_margin)
+                });
+                let model_matches = if accepts_model_consensus {
+                    raw_matches
+                } else {
+                    whole_result_matches
+                };
+                supplemental_model_correct[index][margin_index] += usize::from(model_matches);
+                supplemental_model_improvements[index][margin_index] +=
+                    usize::from(!whole_result_matches && model_matches);
+                supplemental_model_regressions[index][margin_index] +=
+                    usize::from(whole_result_matches && !model_matches);
+                if *maximum_cost_gap == 3_100
+                    && (*minimum_margin - 1.5).abs() < f64::EPSILON
+                    && accepts_model_consensus
+                    && model_matches != whole_result_matches
+                {
+                    println!(
+                        "supplemental_model_change\t{}\t{}\tcost_gap={}\tmodel_margin={:.4}\tcurrent={}\tgenerated={}\texpected={}",
+                        item.index,
+                        if model_matches { "improve" } else { "regress" },
+                        generated_index
+                            .map(|generated_index| broad_candidates[generated_index]
+                                .cost
+                                .saturating_sub(ordinary[0].cost)
+                                .max(0))
+                            .unwrap_or_default(),
+                        broad_supplemental_model_margin.unwrap_or_default(),
+                        whole_result_surface,
+                        generated.surface,
+                        item.expected_output.join(" | "),
+                    );
+                }
+            }
+        }
+        let generated_existing_index = ordinary
+            .iter()
+            .take(original_count)
+            .position(|candidate| candidate.surface == generated.surface);
+        let strict_delayed_long_support = generated_existing_index.is_some_and(|candidate| {
+            candidate != 0
+                && Some(candidate) == global_model_top
+                && (LONG_WHOLE_RESULT_MINIMUM_COST_GAP..=WHOLE_RESULT_COST_GAP).contains(
+                    &ordinary[candidate]
+                        .cost
+                        .saturating_sub(ordinary[0].cost)
+                        .max(0),
+                )
+        });
+        for (index, maximum_reading) in DELAYED_LONG_READING_MAXIMUMS.iter().enumerate() {
+            let accepts_extension = reading_characters > WHOLE_RESULT_MAXIMUM_READING_CHARACTERS
+                && reading_characters <= *maximum_reading
+                && generated.stopped_at_eos
+                && strict_delayed_long_support
+                && preserves_personal_name
+                && preserves_ascii
+                && preserves_kanji;
+            let matches = if accepts_extension {
+                raw_matches
+            } else {
+                whole_result_matches
+            };
+            delayed_long_reading_correct[index] += usize::from(matches);
+            delayed_long_reading_improvements[index] +=
+                usize::from(!whole_result_matches && matches);
+            delayed_long_reading_regressions[index] +=
+                usize::from(whole_result_matches && !matches);
+        }
         for (index, maximum_reading) in WHOLE_RESULT_READING_MAXIMUMS.iter().enumerate() {
             let accepts = generated.stopped_at_eos
                 && item.input.chars().count() >= MINIMUM_GENERATIVE_READING_CHARACTERS
@@ -768,10 +1008,23 @@ fn run() -> Result<(), String> {
                 usize::from(multi_matches && !preserving_matches);
         }
         if raw_matches != multi_matches {
+            let generation_diagnostics = existing_generation_stats.map_or_else(
+                || "rank=missing\tselected=-\tmodel_delta=-\tcombined_delta=-".to_owned(),
+                |(rank, selected, model_delta, combined_delta, _)| {
+                    format!(
+                        "rank={rank}\tselected={selected}\tmodel_delta={model_delta:.4}\tcombined_delta={combined_delta:.4}"
+                    )
+                },
+            );
             println!(
-                "whole_generation_change\t{}\t{}\tcurrent={}\tgenerated={}\texpected={}",
+                "whole_generation_change\t{}\t{}\treading_chars={}\tcost_gap={}\tsame_length={}\tpreserves_kanji={}\t{}\tcurrent={}\tgenerated={}\texpected={}",
                 item.index,
                 if raw_matches { "improve" } else { "regress" },
+                reading_characters,
+                generated_cost_gap.map_or_else(|| "missing".to_owned(), |gap| gap.to_string()),
+                same_length,
+                preserves_kanji,
+                generation_diagnostics,
                 multi_consensus_surface,
                 generated.surface,
                 item.expected_output.join(" | "),
@@ -926,6 +1179,30 @@ fn run() -> Result<(), String> {
             preserving_whole_regressions[index],
         );
     }
+    for (index, maximum_cost_gap) in SUPPLEMENTAL_WHOLE_COST_GAPS.iter().enumerate() {
+        println!(
+            "supplemental_whole_cost_gap={maximum_cost_gap}\ttop1={}\timprovements={}\tregressions={}",
+            supplemental_whole_correct[index],
+            supplemental_whole_improvements[index],
+            supplemental_whole_regressions[index],
+        );
+        for (margin_index, minimum_margin) in SUPPLEMENTAL_MODEL_MARGINS.iter().enumerate() {
+            println!(
+                "supplemental_model_cost_gap={maximum_cost_gap}\tmodel_margin={minimum_margin:.2}\ttop1={}\timprovements={}\tregressions={}",
+                supplemental_model_correct[index][margin_index],
+                supplemental_model_improvements[index][margin_index],
+                supplemental_model_regressions[index][margin_index],
+            );
+        }
+    }
+    for (index, minimum_margin) in MODEL_TOP_MARGIN_THRESHOLDS.iter().enumerate() {
+        println!(
+            "model_top_margin={minimum_margin:.2}\ttop1={}\timprovements={}\tregressions={}",
+            model_top_margin_correct[index],
+            model_top_margin_improvements[index],
+            model_top_margin_regressions[index],
+        );
+    }
     let whole_result_index = WHOLE_GENERATION_COST_GAPS
         .iter()
         .position(|&cost_gap| cost_gap == WHOLE_RESULT_COST_GAP)
@@ -954,6 +1231,14 @@ fn run() -> Result<(), String> {
             whole_reading_correct[index],
             whole_reading_improvements[index],
             whole_reading_regressions[index],
+        );
+    }
+    for (index, maximum_reading) in DELAYED_LONG_READING_MAXIMUMS.iter().enumerate() {
+        println!(
+            "delayed_long_reading_max={maximum_reading}\ttop1={}\timprovements={}\tregressions={}",
+            delayed_long_reading_correct[index],
+            delayed_long_reading_improvements[index],
+            delayed_long_reading_regressions[index],
         );
     }
     for (index, cost_floor) in LONG_WHOLE_RESULT_COST_FLOORS.iter().enumerate() {

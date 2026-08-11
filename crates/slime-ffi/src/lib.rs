@@ -2178,6 +2178,65 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_model_verified_whole_generation(model: &str) {
+        let fixtures = [
+            (
+                "リミテッド・シリーズの『マーベル1602』で、「スティーブン・ストレンジ卿」は",
+                "魔術師としてエリザベス1世に仕えた。 ",
+                "せんぞくいしけん",
+                "専属医師兼",
+            ),
+            (
+                "1986年より開発はフェイズ2に",
+                "の改修作業が行われた。 ",
+                "いこうしきたい",
+                "移行し機体",
+            ),
+            (
+                "たとえばフィヨルドでは、",
+                "も深い場合がある。 ",
+                "たんすいこで",
+                "淡水湖で",
+            ),
+        ];
+        for (left_context, right_context, input, expected) in fixtures {
+            let handle = slime_create();
+            // SAFETY: The handle and model path are live for this synchronous call.
+            assert_eq!(
+                unsafe { enable_high_accuracy_neural(handle, model) },
+                STATUS_OK
+            );
+            wait_for_neural_model();
+            // SAFETY: The live handle and UTF-8 context slices remain valid for
+            // this synchronous call.
+            assert_eq!(
+                unsafe {
+                    slime_set_external_context(
+                        handle,
+                        left_context.as_ptr(),
+                        left_context.len(),
+                        right_context.as_ptr(),
+                        right_context.len(),
+                    )
+                },
+                STATUS_OK
+            );
+            let mut capture = TypedCapture::default();
+            for character in input.chars() {
+                process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+            }
+            process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+            assert_eq!(
+                capture.candidates.first().map(String::as_str),
+                Some(expected),
+                "input={input:?}"
+            );
+            // SAFETY: The isolated handle is released exactly once.
+            unsafe { slime_destroy(handle) };
+        }
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_context_contrast(handle: *mut super::SlimeHandle) {
         // The unconditioned model and dictionary narrowly prefer 乗せ. The
         // surrounding sentence specifically supports the written-form 載せ.
@@ -2495,6 +2554,7 @@ mod tests {
         verify_generative_recall(handle);
         verify_extended_multi_region_generation(handle);
         verify_confident_full_lattice_generation(handle);
+        verify_model_verified_whole_generation(&model);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

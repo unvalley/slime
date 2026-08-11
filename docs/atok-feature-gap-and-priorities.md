@@ -342,6 +342,20 @@ model全体の首位がbase以外の既存候補、辞書cost差500〜1,000の�
 `balanced`、モデルなしの経路は変更しない。41文字以上と、回帰が出た48文字拡張は対象外とする。
 詳細は[evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: modelが圧倒的な同文字数whole候補
+
+6〜32文字でgreedy全文が完全な辞書経路に一致しても、通常のcost境界から少し外れる
+候補を直接採用すると回帰が多い。そこで既存の局所・複数領域補正に入らない同文字数の
+候補だけを追加採点し、辞書第1候補とのcost差1,001〜1,400、ASCII不変、漢字保持、
+姓名保持に加え、生のmodel scoreが他の全候補を1.5以上上回る場合だけ昇格する。
+生成文字列は直接採用せず、辞書latticeの表層とsegmentsを使う。
+
+上限1,500はPUDで`面から測ら → 面から計ら`を起こしたため棄却した。1,400へ固定後の
+Release FFI比較はGSD dev 222→224、PUD validation 349→350で、GSD test 245、
+JWTD 235、AJIMEE 167を維持した。合計3改善・0悪化で、既存の6〜32文字生成を使うため
+推論回数は増えない。azooKeyの生成と通常候補評価の責務分離を参考にした一般設計であり、
+ATOKやazooKeyの内部実装を複製していない。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

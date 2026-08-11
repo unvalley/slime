@@ -72,6 +72,8 @@ const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
 const GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP: i32 = 3_100;
+const GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP: i32 = 1_400;
+const GENERATIVE_MODEL_VERIFIED_WHOLE_MARGIN: f64 = 1.5;
 
 fn accepts_whole_result_cost(reading_characters: usize, cost_gap: i32) -> bool {
     cost_gap <= RESCORE_MAX_BASE_COST_GAP
@@ -236,6 +238,7 @@ enum GenerativeConsensusKind {
     Local,
     MultiRegion,
     ExtendedMultiRegion,
+    ModelVerifiedWhole,
     Whole,
 }
 
@@ -725,14 +728,18 @@ impl SlimeEngine {
     /// most two characters overall and align at most four characters per side
     /// in each region. A bounded equal-length multi-region path may use a
     /// separately evaluated cost window and records direct generation
-    /// consensus. Other new candidates are marked as model supplemental, so
-    /// the usual additional score margin still applies. An existing candidate
-    /// is recorded as local or multi-region generation consensus; it may
-    /// override the ordinary winner later when their model scores are a narrow
-    /// near-tie. Independently, a complete lattice path inside the strict base
-    /// cost window records whole-result agreement. It may replace the final
-    /// local-correction result only after preserving ASCII alphanumerics,
-    /// existing kanji, and dictionary-confirmed personal names.
+    /// consensus. A same-length path just outside the strict base window may
+    /// join as model-verified whole-result evidence only after preserving
+    /// ASCII alphanumerics, existing kanji, and dictionary-confirmed personal
+    /// names. It must later beat every scored candidate by a separately
+    /// evaluated raw-model margin. Other new candidates are marked as model
+    /// supplemental, so the usual additional score margin still applies. An
+    /// existing candidate is recorded as local or multi-region generation
+    /// consensus; it may override the ordinary winner later when their model
+    /// scores are a narrow near-tie. Independently, a complete lattice path
+    /// inside the strict base cost window records whole-result agreement. It
+    /// may replace the final local-correction result only after preserving the
+    /// same surface invariants.
     pub fn prepare_generative_rescore_candidate(
         &mut self,
         generated_surface: &str,
@@ -779,6 +786,17 @@ impl SlimeEngine {
         let is_surface_compression =
             bounded_multi_region_surface_compression(base_surface, generated_surface);
         let structurally_bounded = is_multi_region || is_surface_compression;
+        let is_model_verified_whole = !structurally_bounded
+            && base_surface.chars().count() == generated_surface.chars().count()
+            && cost_gap > RESCORE_MAX_BASE_COST_GAP
+            && cost_gap <= GENERATIVE_MODEL_VERIFIED_WHOLE_COST_GAP
+            && preserves_ascii_alphanumerics(base_surface, generated_surface)
+            && preserves_kanji_from_hiragana_deconversion(base_surface, generated_surface)
+            && !self.dictionary.changes_exact_personal_name_segment(
+                reading,
+                base_surface,
+                generated_surface,
+            );
         let maximum_cost_gap = if !structurally_bounded {
             RESCORE_MAX_BASE_COST_GAP
         } else if reading_characters >= LONG_RESCORE_READING_CHARACTERS {
@@ -791,7 +809,10 @@ impl SlimeEngine {
             && is_multi_region
             && cost_gap > maximum_cost_gap
             && cost_gap <= GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP;
-        if cost_gap > maximum_cost_gap && !uses_extended_multi_region_consensus {
+        if cost_gap > maximum_cost_gap
+            && !uses_extended_multi_region_consensus
+            && !is_model_verified_whole
+        {
             return None;
         }
 
@@ -807,11 +828,13 @@ impl SlimeEngine {
         });
         state.model_supplemental.push(true);
         state.request.candidates.push(conversion.surface);
-        if uses_extended_multi_region_consensus || accepts_whole_result {
+        if uses_extended_multi_region_consensus || is_model_verified_whole || accepts_whole_result {
             state.generative_consensus = Some(GenerativeConsensus {
                 candidate: state.candidates.len() - 1,
                 kind: if uses_extended_multi_region_consensus {
                     GenerativeConsensusKind::ExtendedMultiRegion
+                } else if is_model_verified_whole {
+                    GenerativeConsensusKind::ModelVerifiedWhole
                 } else {
                     GenerativeConsensusKind::Whole
                 },
@@ -2924,6 +2947,24 @@ fn candidate_rescore_order_for_state(
         order.insert(0, consensus.candidate);
         return Some((order, false, consensus.candidate));
     }
+    if consensus.kind == GenerativeConsensusKind::ModelVerifiedWhole {
+        if !state.model_supplemental[consensus.candidate] {
+            return None;
+        }
+        let candidate_score = log_likelihoods[consensus.candidate];
+        let runner_up = log_likelihoods
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != consensus.candidate)
+            .map(|(_, score)| *score)
+            .max_by(f64::total_cmp)?;
+        if candidate_score - runner_up >= GENERATIVE_MODEL_VERIFIED_WHOLE_MARGIN {
+            order.retain(|&index| index != consensus.candidate);
+            order.insert(0, consensus.candidate);
+            return Some((order, false, consensus.candidate));
+        }
+        return Some((order, margin_protects_base, selected));
+    }
     if consensus.kind == GenerativeConsensusKind::Whole {
         return consensus
             .accepts_whole_result
@@ -2939,7 +2980,9 @@ fn candidate_rescore_order_for_state(
         GenerativeConsensusKind::MultiRegion => {
             GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE
         }
-        GenerativeConsensusKind::ExtendedMultiRegion | GenerativeConsensusKind::Whole => {
+        GenerativeConsensusKind::ExtendedMultiRegion
+        | GenerativeConsensusKind::ModelVerifiedWhole
+        | GenerativeConsensusKind::Whole => {
             unreachable!()
         }
     };
@@ -6583,6 +6626,124 @@ mod tests {
             "abcの問題",
             "abdの課題"
         ));
+    }
+
+    #[test]
+    fn model_verified_whole_result_requires_a_dominant_supplemental_score() {
+        let reading = "しょうがくせい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "第一候補", 100),
+            DictionaryEntry::new(reading, "完全正解", 1_500),
+        ]);
+        let base = exact_candidate(&dictionary, reading, "第一候補");
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, vec![base]);
+
+        let request = engine
+            .prepare_generative_rescore_candidate("完全正解")
+            .expect("same-length whole-result evidence should join the scored pool");
+        assert_eq!(request.candidates, ["第一候補", "完全正解"]);
+        let state = engine
+            .candidate_rescore
+            .as_ref()
+            .expect("pending rescore state");
+        assert_eq!(state.model_supplemental, [false, true]);
+        assert_eq!(
+            state.generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::ModelVerifiedWhole,
+                accepts_whole_result: false,
+            })
+        );
+
+        for (advantage, expected, protected) in [(1.49, 0, true), (1.5, 1, false), (2.0, 1, false)]
+        {
+            let (order, was_protected, selected) =
+                candidate_rescore_order_for_state(state, &[0.0, advantage], 0.8, 0.0)
+                    .expect("aligned finite scores");
+            assert_eq!(selected, expected, "advantage={advantage}");
+            assert_eq!(was_protected, protected, "advantage={advantage}");
+            if !protected {
+                assert_eq!(order[0], expected, "advantage={advantage}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_verified_whole_result_rejects_wide_cost_or_length_changes() {
+        let reading = "しょうがくせい";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new(reading, "第一候補", 100),
+            DictionaryEntry::new(reading, "完全正解", 1_501),
+            DictionaryEntry::new(reading, "完全な正解", 1_500),
+        ]);
+        let base = exact_candidate(&dictionary, reading, "第一候補");
+
+        for generated in ["完全正解", "完全な正解"] {
+            let mut engine =
+                engine_with_rescore_candidates(dictionary.clone(), reading, vec![base.clone()]);
+            assert_eq!(
+                engine.prepare_generative_rescore_candidate(generated),
+                None,
+                "{generated} must remain outside the scored pool"
+            );
+        }
+    }
+
+    #[test]
+    fn model_verified_whole_result_preserves_ascii_kanji_and_personal_names() {
+        let cases = [
+            (
+                "えーびーしーこうほ",
+                vec![
+                    DictionaryEntry::new("えーびーしーこうほ", "ABC候補", 100),
+                    DictionaryEntry::new("えーびーしーこうほ", "ABD正解", 1_500),
+                ],
+                "ABC候補",
+                "ABD正解",
+            ),
+            (
+                "かんじこうほ",
+                vec![
+                    DictionaryEntry::new("かんじこうほ", "漢字候補", 100),
+                    DictionaryEntry::new("かんじこうほ", "かな正解", 1_500),
+                ],
+                "漢字候補",
+                "かな正解",
+            ),
+        ];
+        for (reading, entries, current, generated) in cases {
+            let dictionary = Dictionary::new(entries);
+            let base = exact_candidate(&dictionary, reading, current);
+            let mut engine = engine_with_rescore_candidates(dictionary, reading, vec![base]);
+            assert_eq!(
+                engine.prepare_generative_rescore_candidate(generated),
+                None,
+                "{generated} must not cross a surface-preservation boundary"
+            );
+        }
+
+        let reading = "かたせしまかていでした";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos("かたせしま", "片瀬志麻", 1_923, 1_922, 10),
+            DictionaryEntry::with_pos("かたせ", "片瀬", 1_923, 1_923, 20),
+            DictionaryEntry::with_pos("しま", "志摩", 1_922, 1_922, 20),
+            DictionaryEntry::new("かてい", "課程", 10),
+            DictionaryEntry::new("でした", "でした", 10),
+            DictionaryEntry::new(reading, "片瀬志摩過程デシタ", 32_420),
+        ]);
+        let base = exact_candidate(&dictionary, reading, "片瀬志麻課程でした");
+        assert!(dictionary.changes_exact_personal_name_segment(
+            reading,
+            "片瀬志麻課程でした",
+            "片瀬志摩過程デシタ",
+        ));
+        let mut engine = engine_with_rescore_candidates(dictionary, reading, vec![base]);
+        assert_eq!(
+            engine.prepare_generative_rescore_candidate("片瀬志摩過程デシタ"),
+            None,
+            "an exact dictionary-backed personal name must remain unchanged"
+        );
     }
 
     #[test]

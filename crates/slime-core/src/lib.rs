@@ -53,7 +53,8 @@ const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
-const PREFIX_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
+const PREFIX_CONSTRAINED_INITIAL_CANDIDATE_LIMIT: usize = 8;
+const PREFIX_CONSTRAINED_MAX_CANDIDATE_LIMIT: usize = 32;
 const PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS: usize = 2;
 const GENERATIVE_MIN_READING_CHARACTERS: usize = 6;
 const GENERATIVE_MAX_READING_CHARACTERS: usize = 32;
@@ -841,19 +842,35 @@ impl SlimeEngine {
         prefix: &str,
         existing_candidates: &[String],
     ) -> Option<String> {
-        let correction = self
-            .dictionary
-            .convert_n_best_with_surface_prefix(reading, prefix, PREFIX_CONSTRAINED_CANDIDATE_LIMIT)
+        let is_safe = |correction: &String| {
+            bounded_local_substitution(
+                current,
+                correction,
+                PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+            ) && preserves_kanji_from_hiragana_deconversion(current, correction)
+                && !existing_candidates.contains(correction)
+        };
+        let initial = self.dictionary.convert_n_best_with_surface_prefix(
+            reading,
+            prefix,
+            PREFIX_CONSTRAINED_INITIAL_CANDIDATE_LIMIT,
+        );
+        if let Some(correction) = initial
             .into_iter()
-            .next()?
-            .surface;
-        (bounded_local_substitution(
-            current,
-            &correction,
-            PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
-        ) && preserves_kanji_from_hiragana_deconversion(current, &correction)
-            && !existing_candidates.contains(&correction))
-        .then_some(correction)
+            .map(|conversion| conversion.surface)
+            .find(is_safe)
+        {
+            return Some(correction);
+        }
+        self.dictionary
+            .convert_n_best_with_surface_prefix(
+                reading,
+                prefix,
+                PREFIX_CONSTRAINED_MAX_CANDIDATE_LIMIT,
+            )
+            .into_iter()
+            .map(|conversion| conversion.surface)
+            .find(is_safe)
     }
 
     fn apply_candidate_rescore_internal(
@@ -5512,6 +5529,63 @@ mod tests {
             .expect("valid scores should still apply");
 
         assert_eq!(engine.candidates[0], "奨学の問題");
+        assert!(!engine.candidates.contains(&"少額の課題".to_owned()));
+    }
+
+    #[test]
+    fn model_prefix_skips_unsafe_paths_before_a_safe_local_correction() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "少額", 20),
+            DictionaryEntry::new("もんだい", "課題", 1),
+            DictionaryEntry::new("もんだい", "命題", 2),
+            DictionaryEntry::new("もんだい", "設問", 3),
+            DictionaryEntry::new("もんだい", "題目", 4),
+            DictionaryEntry::new("もんだい", "疑問", 5),
+            DictionaryEntry::new("もんだい", "論題", 6),
+            DictionaryEntry::new("もんだい", "難題", 7),
+            DictionaryEntry::new("もんだい", "問答", 8),
+            DictionaryEntry::new("もんだい", "問題", 20),
+        ]);
+        let first_eight =
+            dictionary.convert_n_best_with_surface_prefix("しょうがくのもんだい", "少", 8);
+        assert_eq!(first_eight.len(), 8);
+        assert!(
+            first_eight
+                .iter()
+                .all(|conversion| conversion.surface != "少額の問題")
+        );
+
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "しょうがくのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["奨学の問題".to_owned()];
+        let candidate = Candidate {
+            surface: "奨学の問題".to_owned(),
+            cost: 100,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![candidate.surface.clone()],
+            },
+            model_supplemental: vec![false],
+            generative_consensus: None,
+            candidates: vec![candidate],
+        });
+
+        engine
+            .apply_candidate_rescore_with_prefix_constraints(
+                &[0.0],
+                &[Some("少".to_owned())],
+                0.8,
+                0.0,
+            )
+            .expect("a safe deeper prefix correction should apply");
+
+        assert_eq!(engine.candidates[0], "少額の問題");
+        assert!(engine.candidates.contains(&"奨学の問題".to_owned()));
         assert!(!engine.candidates.contains(&"少額の課題".to_owned()));
     }
 

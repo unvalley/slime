@@ -26,6 +26,7 @@ const SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
 const MIN_PREFIX_CHARACTERS: usize = 4;
 const MIN_LOGIT_MARGIN: f32 = 1.5;
 const CONSTRAINED_CANDIDATES: usize = 8;
+const PREFIX_CONSTRAINED_CANDIDATES: usize = 32;
 const MAX_CHANGED_CHARACTERS: usize = 2;
 const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
@@ -632,14 +633,31 @@ fn apply_prefix_correction(
     {
         return None;
     }
-    let alternative = dictionary
-        .convert_n_best_with_surface_prefix(reading, &diagnostic.prefix, CONSTRAINED_CANDIDATES)
+    let is_safe = |alternative: &String| {
+        bounded_local_substitution(current, alternative, MAX_CHANGED_CHARACTERS)
+            && preserves_kanji_from_hiragana_deconversion(current, alternative)
+    };
+    let initial = dictionary.convert_n_best_with_surface_prefix(
+        reading,
+        &diagnostic.prefix,
+        CONSTRAINED_CANDIDATES,
+    );
+    if let Some(alternative) = initial
         .into_iter()
-        .next()?
-        .surface;
-    (bounded_local_substitution(current, &alternative, MAX_CHANGED_CHARACTERS)
-        && preserves_kanji_from_hiragana_deconversion(current, &alternative))
-    .then_some(alternative)
+        .map(|conversion| conversion.surface)
+        .find(is_safe)
+    {
+        return Some(alternative);
+    }
+    dictionary
+        .convert_n_best_with_surface_prefix(
+            reading,
+            &diagnostic.prefix,
+            PREFIX_CONSTRAINED_CANDIDATES,
+        )
+        .into_iter()
+        .map(|conversion| conversion.surface)
+        .find(is_safe)
 }
 
 fn preserves_kanji_from_hiragana_deconversion(current: &str, alternative: &str) -> bool {

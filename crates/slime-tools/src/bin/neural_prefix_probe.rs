@@ -13,7 +13,8 @@ use slime_neural::{Rescorer, ScoreRequest};
 const SEARCH_LIMIT: usize = 32;
 const SHORT_CANDIDATES: usize = 5;
 const CONFIDENCE_BYPASS_CANDIDATES: usize = 8;
-const CONSTRAINED_CANDIDATES: usize = 8;
+const INITIAL_CONSTRAINED_CANDIDATES: usize = 8;
+const MAX_CONSTRAINED_CANDIDATES: usize = 32;
 const LONG_INPUT_CHARACTERS: usize = 9;
 const VERY_LONG_INPUT_CHARACTERS: usize = 20;
 const MAX_BASE_COST_GAP: i32 = 1_000;
@@ -152,19 +153,15 @@ fn run() -> Result<(), String> {
                 eligible_constraints += 1;
                 selected_prefix = Some(diagnostic.prefix.clone());
                 let constrained_started = Instant::now();
-                let alternative = dictionary
-                    .convert_n_best_with_surface_prefix(
-                        &reading,
-                        &diagnostic.prefix,
-                        CONSTRAINED_CANDIDATES,
-                    )
-                    .into_iter()
-                    .next()
-                    .map(|conversion| conversion.surface);
+                let alternative = constrained_local_correction(
+                    &dictionary,
+                    &reading,
+                    &baseline,
+                    &diagnostic.prefix,
+                    &[],
+                );
                 constrained_latencies.push(constrained_started.elapsed());
-                if let Some(alternative) = alternative
-                    && bounded_local_substitution(&baseline, &alternative, MAX_CHANGED_CHARACTERS)
-                {
+                if let Some(alternative) = alternative {
                     corrected = alternative;
                     applied_corrections += 1;
                 }
@@ -197,23 +194,15 @@ fn run() -> Result<(), String> {
                     {
                         break;
                     }
-                    let Some(alternative) = dictionary
-                        .convert_n_best_with_surface_prefix(
-                            &reading,
-                            &diagnostic.prefix,
-                            CONSTRAINED_CANDIDATES,
-                        )
-                        .into_iter()
-                        .next()
-                        .map(|conversion| conversion.surface)
-                    else {
+                    let Some(alternative) = constrained_local_correction(
+                        &dictionary,
+                        &reading,
+                        &iterative,
+                        &diagnostic.prefix,
+                        &seen,
+                    ) else {
                         break;
                     };
-                    if !bounded_local_substitution(&iterative, &alternative, MAX_CHANGED_CHARACTERS)
-                        || seen.contains(&alternative)
-                    {
-                        break;
-                    }
                     iterative = alternative;
                     seen.push(iterative.clone());
                     iterative_surfaces[round..].fill(iterative.clone());
@@ -433,6 +422,52 @@ fn bounded_local_substitution(current: &str, alternative: &str, maximum_changes:
         && changed.iter().all(|&(_, current, alternative)| {
             !current.is_ascii_alphanumeric() && !alternative.is_ascii_alphanumeric()
         })
+}
+
+fn constrained_local_correction(
+    dictionary: &Dictionary,
+    reading: &str,
+    current: &str,
+    prefix: &str,
+    excluded: &[String],
+) -> Option<String> {
+    let is_safe = |alternative: &String| {
+        bounded_local_substitution(current, alternative, MAX_CHANGED_CHARACTERS)
+            && preserves_kanji_from_hiragana_deconversion(current, alternative)
+            && !excluded.contains(alternative)
+    };
+    let initial = dictionary.convert_n_best_with_surface_prefix(
+        reading,
+        prefix,
+        INITIAL_CONSTRAINED_CANDIDATES,
+    );
+    if let Some(alternative) = initial
+        .into_iter()
+        .map(|conversion| conversion.surface)
+        .find(is_safe)
+    {
+        return Some(alternative);
+    }
+    dictionary
+        .convert_n_best_with_surface_prefix(reading, prefix, MAX_CONSTRAINED_CANDIDATES)
+        .into_iter()
+        .map(|conversion| conversion.surface)
+        .find(is_safe)
+}
+
+fn preserves_kanji_from_hiragana_deconversion(current: &str, alternative: &str) -> bool {
+    current
+        .chars()
+        .zip(alternative.chars())
+        .all(|(current, alternative)| !(is_kanji(current) && is_hiragana(alternative)))
+}
+
+fn is_kanji(character: char) -> bool {
+    matches!(character as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+fn is_hiragana(character: char) -> bool {
+    matches!(character as u32, 0x3040..=0x309F)
 }
 
 fn matches_expected(surface: &str, expected: &[String]) -> bool {

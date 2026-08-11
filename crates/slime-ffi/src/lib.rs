@@ -2035,6 +2035,26 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_deeper_prefix_correction(handle: *mut super::SlimeHandle) {
+        // The first eight constrained paths also rewrite a distant region.
+        // The adaptive fallback must skip them and recover the later safe
+        // local correction without exposing the unsafe paths as candidates.
+        // SAFETY: The live handle is reset before this independent fixture.
+        assert_eq!(unsafe { slime_reset_context(handle) }, STATUS_OK);
+        let mut capture = TypedCapture::default();
+        for character in "らいんはるとがしょうさときにかんちょうをつとめた".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("ラインハルトが少佐時に艦長を務めた")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_iterative_prefix_correction(handle: *mut super::SlimeHandle) {
         // The first review changes 偏光 to another local candidate. Reviewing
         // that corrected surface once more recovers the contextually natural
@@ -2316,6 +2336,7 @@ mod tests {
         verify_context_contrast(handle);
         verify_prefix_correction_preserves_kanji(handle);
         verify_prefix_correction(handle);
+        verify_deeper_prefix_correction(handle);
         verify_iterative_prefix_correction(handle);
         verify_generative_recall(handle);
         measure_prefix_diagnostics();

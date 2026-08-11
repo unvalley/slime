@@ -3061,6 +3061,25 @@ impl Dictionary {
         }
     }
 
+    fn for_each_prefix_guarding_numeric_starts<'s>(
+        &'s self,
+        reading: &str,
+        start: usize,
+        protected: &mut [u8],
+        mut callback: impl FnMut(usize, EntryView<'s>),
+    ) {
+        self.for_each_prefix(&reading[start..], |relative_end, entry| {
+            protect_numeric_starts_inside_dictionary_entry(
+                reading,
+                start,
+                relative_end,
+                entry,
+                protected,
+            );
+            callback(relative_end, entry);
+        });
+    }
+
     #[must_use]
     pub fn candidates(&self, reading: &str) -> Vec<Candidate> {
         self.candidates_with_ranker(reading, DEFAULT_N_BEST, &CostOnlyRanker)
@@ -3529,6 +3548,7 @@ impl Dictionary {
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
         let synthetic_by_start = synthetic_entries_by_start(reading, &synthetic_arena);
+        let mut numeric_start_states = numeric_start_states(reading, synthetic_by_start.as_slice());
         let mut lattice: Vec<Vec<LatticeNode<'_>>> =
             (0..=reading.len()).map(|_| Vec::new()).collect();
         let mut predecessor_cache = Vec::new();
@@ -3544,55 +3564,45 @@ impl Dictionary {
             predecessor_cache.clear();
 
             let suffix = &reading[start..];
-            self.for_each_prefix(suffix, |relative_end, entry| {
-                let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
-                    &lattice,
-                    start,
-                    entry.left_id,
-                    connection,
-                    &mut predecessor_cache,
-                ) else {
-                    return;
-                };
-                let total_cost = predecessor_cost.saturating_add(entry.word_cost);
-                insert_lattice_node(
-                    &mut lattice[start + relative_end],
-                    LatticeNode {
+            self.for_each_prefix_guarding_numeric_starts(
+                reading,
+                start,
+                &mut numeric_start_states,
+                |relative_end, entry| {
+                    let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
+                        &lattice,
                         start,
-                        predecessor,
-                        reading: &suffix[..relative_end],
-                        surface: entry.surface,
-                        segment_cost: entry.word_cost,
-                        right_id: entry.right_id,
-                        total_cost,
-                    },
-                );
-            });
+                        entry.left_id,
+                        connection,
+                        &mut predecessor_cache,
+                    ) else {
+                        return;
+                    };
+                    let total_cost = predecessor_cost.saturating_add(entry.word_cost);
+                    insert_lattice_node(
+                        &mut lattice[start + relative_end],
+                        LatticeNode {
+                            start,
+                            predecessor,
+                            reading: &suffix[..relative_end],
+                            surface: entry.surface,
+                            segment_cost: entry.word_cost,
+                            right_id: entry.right_id,
+                            total_cost,
+                        },
+                    );
+                },
+            );
 
-            for synthetic in &synthetic_by_start[start] {
-                let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
-                    &lattice,
-                    start,
-                    synthetic.left_id,
-                    connection,
-                    &mut predecessor_cache,
-                ) else {
-                    continue;
-                };
-                let total_cost = predecessor_cost.saturating_add(synthetic.cost);
-                insert_lattice_node(
-                    &mut lattice[synthetic.end],
-                    LatticeNode {
-                        start,
-                        predecessor,
-                        reading: &reading[start..synthetic.end],
-                        surface: synthetic.surface,
-                        segment_cost: synthetic.cost,
-                        right_id: synthetic.right_id,
-                        total_cost,
-                    },
-                );
-            }
+            insert_best_synthetic_nodes(
+                reading,
+                start,
+                &synthetic_by_start[start],
+                numeric_start_states[start] == NUMERIC_START_PROTECTED,
+                &mut lattice,
+                connection,
+                &mut predecessor_cache,
+            );
 
             let character = suffix.chars().next()?;
             let end = start + character.len_utf8();
@@ -3636,6 +3646,7 @@ impl Dictionary {
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
         let synthetic_by_start = synthetic_entries_by_start(reading, &synthetic_arena);
+        let mut numeric_start_states = numeric_start_states(reading, synthetic_by_start.as_slice());
         let mut arena = Vec::<NBestNode<'_>>::with_capacity(n_best_arena_capacity(reading, limit));
         let mut lattice: Vec<NBestBucket> = (0..=reading.len())
             .map(|_| NBestBucket::default())
@@ -3652,23 +3663,32 @@ impl Dictionary {
             let predecessors = lattice[start].states.clone();
             let suffix = &reading[start..];
 
-            self.for_each_prefix(suffix, |relative_end, entry| {
-                insert_connected_word(
-                    &mut arena,
-                    &mut lattice[start + relative_end],
-                    &predecessors,
-                    connection,
-                    start,
-                    &suffix[..relative_end],
-                    entry.surface,
-                    (entry.left_id, entry.right_id),
-                    entry.word_cost,
-                    surface_prefix,
-                    limit,
-                );
-            });
+            self.for_each_prefix_guarding_numeric_starts(
+                reading,
+                start,
+                &mut numeric_start_states,
+                |relative_end, entry| {
+                    insert_connected_word(
+                        &mut arena,
+                        &mut lattice[start + relative_end],
+                        &predecessors,
+                        connection,
+                        start,
+                        &suffix[..relative_end],
+                        entry.surface,
+                        (entry.left_id, entry.right_id),
+                        entry.word_cost,
+                        surface_prefix,
+                        limit,
+                    );
+                },
+            );
 
             for synthetic in &synthetic_by_start[start] {
+                let synthetic_cost = guarded_cost(
+                    synthetic,
+                    numeric_start_states[start] == NUMERIC_START_PROTECTED,
+                );
                 insert_connected_word(
                     &mut arena,
                     &mut lattice[synthetic.end],
@@ -3678,7 +3698,7 @@ impl Dictionary {
                     &reading[start..synthetic.end],
                     synthetic.surface,
                     (synthetic.left_id, synthetic.right_id),
-                    synthetic.cost,
+                    synthetic_cost,
                     surface_prefix,
                     limit,
                 );
@@ -4358,6 +4378,43 @@ fn cached_connected_predecessor(
     Some((cost, predecessor))
 }
 
+fn insert_best_synthetic_nodes<'a>(
+    reading: &'a str,
+    start: usize,
+    entries: &[SyntheticEntry<'a>],
+    protected_start: bool,
+    lattice: &mut [Vec<LatticeNode<'a>>],
+    connection: ConnectionMatrix,
+    predecessor_cache: &mut Vec<(u16, i32, Option<NodeIndex>)>,
+) {
+    for entry in entries {
+        let entry_reading = &reading[start..entry.end];
+        let entry_cost = guarded_cost(entry, protected_start);
+        let Some((predecessor_cost, predecessor)) = cached_connected_predecessor(
+            lattice,
+            start,
+            entry.left_id,
+            connection,
+            predecessor_cache,
+        ) else {
+            continue;
+        };
+        let total_cost = predecessor_cost.saturating_add(entry_cost);
+        insert_lattice_node(
+            &mut lattice[entry.end],
+            LatticeNode {
+                start,
+                predecessor,
+                reading: entry_reading,
+                surface: entry.surface,
+                segment_cost: entry_cost,
+                right_id: entry.right_id,
+                total_cost,
+            },
+        );
+    }
+}
+
 fn insert_lattice_node<'a>(nodes: &mut Vec<LatticeNode<'a>>, candidate: LatticeNode<'a>) {
     if let Some(existing) = nodes
         .iter_mut()
@@ -4771,6 +4828,111 @@ struct SyntheticEntry<'a> {
     left_id: u16,
     right_id: u16,
     cost: i32,
+    numeric: bool,
+}
+
+const NUMERIC_INTERIOR_DICTIONARY_COST_CEILING: i32 = 6_000;
+const NUMERIC_START_UNPROTECTED: u8 = 1;
+const NUMERIC_START_PROTECTED: u8 = 2;
+
+fn numeric_start_states(reading: &str, entries_by_start: &[Vec<SyntheticEntry<'_>>]) -> Vec<u8> {
+    let mut states = vec![0; reading.len() + 1];
+    for (start, entries) in entries_by_start.iter().enumerate() {
+        if entries.iter().any(|entry| {
+            entry.numeric
+                && is_risky_numeric_start(&reading[start..entry.end])
+                && !is_strong_sokuon_number(&reading[start..entry.end])
+        }) {
+            states[start] = NUMERIC_START_UNPROTECTED;
+        }
+    }
+    states
+}
+
+fn protect_numeric_starts_inside_dictionary_entry(
+    reading: &str,
+    start: usize,
+    relative_end: usize,
+    entry: EntryView<'_>,
+    states: &mut [u8],
+) {
+    if entry.word_cost > NUMERIC_INTERIOR_DICTIONARY_COST_CEILING {
+        return;
+    }
+    let entry_reading = &reading[start..start + relative_end];
+    let protect_entry_start = states[start] == NUMERIC_START_UNPROTECTED
+        && ["し", "く"]
+            .iter()
+            .any(|prefix| entry_reading.starts_with(prefix))
+        && entry_reading.chars().take(2).count() == 2;
+    let has_protectable_interior =
+        entry_reading
+            .char_indices()
+            .skip(1)
+            .any(|(interior, character)| {
+                let is_final_ku =
+                    interior + character.len_utf8() == entry_reading.len() && character == 'く';
+                !is_final_ku && states[start + interior] == NUMERIC_START_UNPROTECTED
+            });
+    if (!protect_entry_start && !has_protectable_interior)
+        || !entry.surface.chars().any(|character| {
+            matches!(
+                character,
+                '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+            )
+        })
+    {
+        return;
+    }
+    if protect_entry_start {
+        states[start] = NUMERIC_START_PROTECTED;
+    }
+    for (interior, character) in entry_reading.char_indices().skip(1) {
+        if interior + character.len_utf8() == entry_reading.len() && character == 'く' {
+            continue;
+        }
+        if states[start + interior] == NUMERIC_START_UNPROTECTED {
+            states[start + interior] = NUMERIC_START_PROTECTED;
+        }
+    }
+}
+
+fn numeric_interior_dictionary_penalty() -> i32 {
+    static VALUE: OnceLock<i32> = OnceLock::new();
+    *VALUE.get_or_init(|| tuning_parameter("SLIME_NUMERIC_INTERIOR_DICTIONARY_PENALTY", 750))
+}
+
+fn guarded_cost(entry: &SyntheticEntry<'_>, protected_start: bool) -> i32 {
+    let penalty = if entry.numeric && protected_start {
+        numeric_interior_dictionary_penalty()
+    } else {
+        0
+    };
+    entry.cost.saturating_add(penalty)
+}
+
+fn is_risky_numeric_start(reading: &str) -> bool {
+    ["に", "し", "ご", "く", "せん", "ぜん"]
+        .iter()
+        .any(|prefix| reading.starts_with(prefix))
+}
+
+fn is_strong_sokuon_number(reading: &str) -> bool {
+    ["いっ", "はっ", "ろっ"].iter().any(|prefix| {
+        reading.strip_prefix(prefix).is_some_and(|remainder| {
+            [
+                "じゅう",
+                "じゅっ",
+                "ひゃく",
+                "びゃく",
+                "ぴゃく",
+                "せん",
+                "ぜん",
+            ]
+            .iter()
+            .any(|unit| remainder.starts_with(unit))
+        })
+    })
 }
 
 fn synthetic_entries_by_start<'a>(
@@ -4803,6 +4965,7 @@ fn push_digit_run_entry<'a>(reading: &'a str, start: usize, out: &mut Vec<Synthe
         left_id: ARABIC_NUMBER_POS_ID,
         right_id: ARABIC_NUMBER_POS_ID,
         cost: number_cost(),
+        numeric: true,
     });
 }
 
@@ -5032,6 +5195,7 @@ fn push_number_entries<'a>(
                 left_id: ARABIC_NUMBER_POS_ID,
                 right_id: ARABIC_NUMBER_POS_ID,
                 cost: number_cost() - NUMBER_VARIANT_STEP,
+                numeric: true,
             });
         }
         out.push(SyntheticEntry {
@@ -5040,6 +5204,7 @@ fn push_number_entries<'a>(
             left_id: ARABIC_NUMBER_POS_ID,
             right_id: ARABIC_NUMBER_POS_ID,
             cost: number_cost() + NUMBER_VARIANT_STEP,
+            numeric: true,
         });
         out.push(SyntheticEntry {
             end: start + length,
@@ -5047,6 +5212,7 @@ fn push_number_entries<'a>(
             left_id: KANJI_NUMBER_POS_ID,
             right_id: KANJI_NUMBER_POS_ID,
             cost: number_cost() + 2 * NUMBER_VARIANT_STEP,
+            numeric: true,
         });
         out.push(SyntheticEntry {
             end: start + length,
@@ -5054,6 +5220,7 @@ fn push_number_entries<'a>(
             left_id: ARABIC_NUMBER_POS_ID,
             right_id: ARABIC_NUMBER_POS_ID,
             cost: number_cost(),
+            numeric: true,
         });
     }
 }
@@ -5090,6 +5257,7 @@ fn push_katakana_entries<'a>(
                 cost: katakana_run_base_cost()
                     + katakana_run_character_cost()
                         * i32::try_from(characters).expect("run length fits i32"),
+                numeric: false,
             });
         }
     }
@@ -5098,11 +5266,13 @@ fn push_katakana_entries<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix, Conversion, Dictionary,
-        DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+        ARABIC_NUMBER_POS_ID, Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix,
+        Conversion, Dictionary, DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
         MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, MOZC_VERBAL_NOUN_POS_ID, NBestBucket,
-        NBestNode, UNKNOWN_POS_ID, document_context_ends_with_honorific_prefix,
-        document_region_suffix_promotion, insert_n_best_node, orthographic_long_vowel_variants,
+        NBestNode, NUMERIC_START_PROTECTED, SyntheticEntry, UNKNOWN_POS_ID,
+        document_context_ends_with_honorific_prefix, document_region_suffix_promotion,
+        guarded_cost, insert_n_best_node, numeric_interior_dictionary_penalty,
+        numeric_start_states, orthographic_long_vowel_variants, synthetic_entries_by_start,
         trailing_numeric_surface,
     };
     use crate::pronunciation::{
@@ -7374,6 +7544,88 @@ mod tests {
                 "standalone じっ must not become 10 in {reading}: {conversions:?}"
             );
         }
+    }
+
+    #[test]
+    fn numeric_guard_preserves_overlapping_dictionary_words() {
+        let dictionary = Dictionary::bundled();
+        let states_after_dictionary_scan = |reading: &str| {
+            let arena = bumpalo::Bump::new();
+            let entries = synthetic_entries_by_start(reading, &arena);
+            let mut states = numeric_start_states(reading, entries.as_slice());
+            for (start, _) in reading.char_indices() {
+                dictionary.for_each_prefix_guarding_numeric_starts(
+                    reading,
+                    start,
+                    &mut states,
+                    |_, _| {},
+                );
+            }
+            states
+        };
+
+        assert_eq!(
+            states_after_dictionary_scan("よせんなない")["よ".len()],
+            NUMERIC_START_PROTECTED
+        );
+        assert_eq!(
+            states_after_dictionary_scan("とくにろくだい")["と".len()],
+            NUMERIC_START_PROTECTED
+        );
+        assert_eq!(
+            states_after_dictionary_scan("にはしぜんこ")["には".len()],
+            NUMERIC_START_PROTECTED
+        );
+        let preliminary = dictionary.candidates_with_limit("よせんなない", 32);
+        assert!(
+            preliminary
+                .iter()
+                .take(3)
+                .any(|candidate| candidate.surface == "予選7位")
+        );
+        let preliminary = dictionary.candidates_with_limit("とくにろくだい", 32);
+        assert!(
+            preliminary
+                .iter()
+                .take(3)
+                .any(|candidate| candidate.surface == "特に6代")
+        );
+        let natural_lake = dictionary.candidates_with_limit("にはしぜんこ", 32);
+        assert!(
+            natural_lake
+                .iter()
+                .any(|candidate| candidate.surface == "には自然湖")
+        );
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "なくいちにん",
+                "でも、まずはハーフドリアでは",
+                "前のドリアをお試し下さい。"
+            )[0]
+            .surface,
+            "なく1人"
+        );
+        assert!(
+            dictionary
+                .candidates("はっせん")
+                .iter()
+                .any(|candidate| candidate.surface == "8000")
+        );
+
+        let numeric = SyntheticEntry {
+            end: 0,
+            surface: "4000",
+            left_id: ARABIC_NUMBER_POS_ID,
+            right_id: ARABIC_NUMBER_POS_ID,
+            cost: 100,
+            numeric: true,
+        };
+        assert_eq!(guarded_cost(&numeric, false), 100);
+        assert_eq!(
+            guarded_cost(&numeric, true),
+            100 + numeric_interior_dictionary_penalty()
+        );
     }
 
     #[test]

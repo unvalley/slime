@@ -10,6 +10,7 @@ pub use ranking::{CandidateRanker, CostOnlyRanker, DocumentContextRanker};
 use bumpalo::{Bump, collections::String as BumpString};
 use compact::CompactDictionary;
 use compact_str::CompactString;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
@@ -137,6 +138,7 @@ pub struct Dictionary {
 /// text.
 struct DictionaryDocumentContextRanker<'a> {
     dictionary: &'a Dictionary,
+    right_context: &'a str,
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     strong_left_phrase_evidence: StrongLeftPhraseEvidence,
@@ -152,6 +154,7 @@ struct DictionaryDocumentContextRanker<'a> {
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
     allows_single_character_phrase_prefix: bool,
+    multi_segment_right_phrase_cache: RefCell<Vec<MultiSegmentRightPhraseCacheEntry<'a>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +168,13 @@ struct DocumentBoundaryPromotion<'a> {
 struct DocumentContextualCost<'a> {
     surface: &'a str,
     relative_cost: i32,
+}
+
+#[derive(Debug)]
+struct MultiSegmentRightPhraseCacheEntry<'a> {
+    reading: CompactString,
+    prefix_surface: CompactString,
+    promotions: Vec<(&'a str, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,7 +192,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         dictionary: &'a Dictionary,
         reading: &str,
         left_context: &str,
-        right_context: &str,
+        right_context: &'a str,
     ) -> Self {
         // Mozc gives 最 its own productive superlative-prefix POS, while full
         // dictionary entries capture honorific forms such as お菓子. Checking the
@@ -205,6 +215,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         );
         Self {
             dictionary,
+            right_context,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
             right_phrase_promotions,
             strong_left_phrase_evidence,
@@ -236,6 +247,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             numeric_counter_promotions: dictionary
                 .document_numeric_counter_promotions(reading, left_context),
             allows_single_character_phrase_prefix,
+            multi_segment_right_phrase_cache: RefCell::new(Vec::new()),
         }
     }
 
@@ -330,6 +342,84 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION
         }
     }
+
+    fn multi_segment_right_phrase_promotion(&self, conversion: &Conversion) -> i32 {
+        if self.right_context.is_empty() || conversion.segments.len() < 2 {
+            return 0;
+        }
+        let Some(last) = conversion.segments.last() else {
+            return 0;
+        };
+        let Some(prefix_surface) = conversion.surface.strip_suffix(&last.surface) else {
+            return 0;
+        };
+        let allows_single_character_phrase_prefix = prefix_surface.ends_with('最')
+            || (document_context_ends_with_honorific_prefix(prefix_surface)
+                && !starts_with_copula(self.right_context));
+        if let Some(promotion) = self
+            .multi_segment_right_phrase_cache
+            .borrow()
+            .iter()
+            .find(|cached| {
+                cached.reading == last.reading && cached.prefix_surface == prefix_surface
+            })
+            .map(|cached| {
+                cached
+                    .promotions
+                    .iter()
+                    .filter(|(surface, _)| *surface == last.surface)
+                    .map(|(_, promotion)| *promotion)
+                    .max()
+                    .unwrap_or(0)
+            })
+        {
+            return promotion;
+        }
+        let promotions = self
+            .dictionary
+            .document_multi_segment_right_phrase_promotions(
+                &last.reading,
+                prefix_surface,
+                self.right_context,
+                allows_single_character_phrase_prefix,
+            );
+        let promotion = promotions
+            .iter()
+            .filter(|(surface, _)| *surface == last.surface)
+            .map(|(_, promotion)| *promotion)
+            .max()
+            .unwrap_or(0);
+        self.multi_segment_right_phrase_cache.borrow_mut().push(
+            MultiSegmentRightPhraseCacheEntry {
+                reading: last.reading.as_str().into(),
+                prefix_surface: prefix_surface.into(),
+                promotions,
+            },
+        );
+        promotion
+    }
+
+    fn boundary_adjustment(&self, conversion: &Conversion, specialized_promotion: i32) -> i32 {
+        if specialized_promotion > 0
+            || self.strong_left_phrase_evidence == StrongLeftPhraseEvidence::Present
+        {
+            return 0;
+        }
+        // A post-hoc boundary score is exact only when the complete candidate
+        // is one dictionary word. Multi-segment paths would need the context
+        // transition inside the lattice search.
+        self.boundary_promotions
+            .iter()
+            .filter(|promotion| {
+                conversion.segments.len() == 1
+                    && promotion.surface == conversion.surface
+                    && promotion.isolated_cost == conversion.cost
+            })
+            .map(|promotion| promotion.promotion)
+            .max()
+            .unwrap_or(0)
+            .saturating_neg()
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -356,7 +446,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             })
             .map(|promotion| promotion.promotion)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.multi_segment_right_phrase_promotion(conversion));
         let right_function_word_promotion = self.right_function_word_promotion(conversion);
         let right_particle_promotion = self.right_particle_promotion(conversion);
         let right_grammar_promotion = self.right_grammar_promotion(conversion);
@@ -414,26 +505,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(notation_promotion)
             .max(numeric_counter_promotion)
             .max(region_suffix_promotion);
-        let boundary_adjustment = if specialized_promotion > 0
-            || self.strong_left_phrase_evidence == StrongLeftPhraseEvidence::Present
-        {
-            0
-        } else {
-            // A post-hoc boundary score is exact only when the complete
-            // candidate is one dictionary word. Multi-segment paths would
-            // need the context transition inside the lattice search.
-            self.boundary_promotions
-                .iter()
-                .filter(|promotion| {
-                    conversion.segments.len() == 1
-                        && promotion.surface == conversion.surface
-                        && promotion.isolated_cost == conversion.cost
-                })
-                .map(|promotion| promotion.promotion)
-                .max()
-                .unwrap_or(0)
-                .saturating_neg()
-        };
+        let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
             .saturating_add(boundary_adjustment)
             .saturating_sub(specialized_promotion)
@@ -2128,15 +2200,87 @@ impl Dictionary {
         right_context: &str,
         allows_single_character_phrase_prefix: bool,
     ) -> Vec<DocumentBoundaryPromotion<'s>> {
-        if !self.uses_connection_costs {
+        let Some((numeric_left_context, has_left_phrase_evidence)) = self
+            .document_right_phrase_requirements(
+                reading,
+                left_context,
+                allows_single_character_phrase_prefix,
+            )
+        else {
             return Vec::new();
+        };
+        let connection = ConnectionMatrix::bundled();
+        let mut promotions = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            let promotion = self
+                .document_right_phrase_promotion(
+                    reading,
+                    entry.surface,
+                    right_context,
+                    numeric_left_context,
+                    has_left_phrase_evidence,
+                )
+                .0;
+            if entry.surface != reading && promotion > 0 {
+                promotions.push(DocumentBoundaryPromotion {
+                    surface: entry.surface,
+                    isolated_cost: whole_reading_entry_cost(Some(connection), &entry),
+                    promotion,
+                });
+            }
+        });
+        promotions
+    }
+
+    fn document_multi_segment_right_phrase_promotions<'s>(
+        &'s self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+        allows_single_character_phrase_prefix: bool,
+    ) -> Vec<(&'s str, i32)> {
+        let Some((requires_general_noun, requires_noun_prefix)) = self
+            .document_right_phrase_requirements(
+                reading,
+                left_context,
+                allows_single_character_phrase_prefix,
+            )
+        else {
+            return Vec::new();
+        };
+        let mut promotions = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            let promotion = self
+                .document_right_phrase_promotion(
+                    reading,
+                    entry.surface,
+                    right_context,
+                    requires_general_noun,
+                    requires_noun_prefix,
+                )
+                .1;
+            if entry.surface != reading && promotion > 0 {
+                promotions.push((entry.surface, promotion));
+            }
+        });
+        promotions
+    }
+
+    fn document_right_phrase_requirements(
+        &self,
+        reading: &str,
+        left_context: &str,
+        allows_single_character_phrase_prefix: bool,
+    ) -> Option<(bool, bool)> {
+        if !self.uses_connection_costs {
+            return None;
         }
         let numeric_left_context = trailing_numeric_surface(left_context).is_some();
         // Japanese numerals retain the dedicated counter boundary. Decimal
         // suffixes also appear inside route IDs and section numbers, so they
         // may use only the stricter general-noun phrase evidence below.
         if numeric_left_context && split_trailing_decimal(left_context).is_none() {
-            return Vec::new();
+            return None;
         }
         let mut has_left_phrase_evidence = false;
         let mut has_noun_prefix_candidate = false;
@@ -2155,28 +2299,8 @@ impl Dictionary {
                 allows_single_character_phrase_prefix,
             ) > 0;
         });
-        if has_left_phrase_evidence && !has_noun_prefix_candidate {
-            return Vec::new();
-        }
-        let connection = ConnectionMatrix::bundled();
-        let mut promotions = Vec::new();
-        self.for_each_exact(reading, |entry| {
-            let promotion = self.document_right_phrase_promotion(
-                reading,
-                entry.surface,
-                right_context,
-                numeric_left_context,
-                has_left_phrase_evidence,
-            );
-            if entry.surface != reading && promotion > 0 {
-                promotions.push(DocumentBoundaryPromotion {
-                    surface: entry.surface,
-                    isolated_cost: whole_reading_entry_cost(Some(connection), &entry),
-                    promotion,
-                });
-            }
-        });
-        promotions
+        (!has_left_phrase_evidence || has_noun_prefix_candidate)
+            .then_some((numeric_left_context, has_left_phrase_evidence))
     }
 
     fn document_right_phrase_promotion(
@@ -2186,12 +2310,12 @@ impl Dictionary {
         right_context: &str,
         requires_general_noun: bool,
         requires_noun_prefix: bool,
-    ) -> i32 {
+    ) -> (i32, i32) {
         let Some(compact) = self.bundled else {
-            return 0;
+            return (0, 0);
         };
         let Some(first) = right_context.chars().next() else {
-            return 0;
+            return (0, 0);
         };
         if !candidate_surface
             .chars()
@@ -2201,7 +2325,7 @@ impl Dictionary {
                 '\u{3040}'..='\u{309f}' | '\u{30a0}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'
             )
         {
-            return 0;
+            return (0, 0);
         }
         let context_end = right_context
             .char_indices()
@@ -2210,6 +2334,7 @@ impl Dictionary {
         let context_head = &right_context[..context_end];
         let starts_with_hiragana = matches!(first, '\u{3040}'..='\u{309f}');
         let mut best_promotion = 0;
+        let mut best_multi_segment_promotion = 0;
         compact.for_each_joined_surface_reading_prefix(
             candidate_surface,
             context_head,
@@ -2252,17 +2377,23 @@ impl Dictionary {
                 } else {
                     DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING
                 };
-                best_promotion =
-                    best_promotion.max(cost_ceiling.saturating_sub(entry.word_cost).min(
-                        if noun_prefix_entry {
+                let promotion =
+                    cost_ceiling
+                        .saturating_sub(entry.word_cost)
+                        .min(if noun_prefix_entry {
                             DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION
                         } else {
                             DOCUMENT_PHRASE_PROMOTION
-                        },
-                    ));
+                        });
+                if promotion > best_promotion {
+                    best_promotion = promotion;
+                }
+                if suffix.chars().count() <= 2 || bounded_nominal_suffix {
+                    best_multi_segment_promotion = best_multi_segment_promotion.max(promotion);
+                }
             },
         );
-        best_promotion
+        (best_promotion, best_multi_segment_promotion)
     }
 
     fn document_context_has_pos_suffix(
@@ -6515,6 +6646,39 @@ mod tests {
                 .surface,
             dictionary.candidates_with_context("いぼ", "皮膚の")[0].surface,
             "a sibling character inside a longer noun is not a word boundary"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_promotes_a_right_compound_after_converted_segments() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "とうしょばってりふ",
+                "韓国の会社は、",
+                "具合が問題だと考え、自社製の"
+            )[0]
+            .surface,
+            "当初バッテリ不"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "かたまったかた",
+                "デスクワークで",
+                "や背中を、アロママッサージで"
+            )[0]
+            .surface,
+            "固まった肩"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "じけんのさい",
+                "最新作の監督は、その",
+                "セットにはいなかった"
+            )[0]
+            .surface,
+            "事件の際",
+            "a three-character following word must not override a confident phrase"
         );
     }
 

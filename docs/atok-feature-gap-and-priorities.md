@@ -379,6 +379,19 @@ JWTDは236→237となり、他のGSD dev/test、PUD、AJIMEEは全出力不変�
 Slimeでは辞書候補と外部modelの境界で表記整合性を独立に検証する。詳細は
 [evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: 複数segment後の右文脈複合語
+
+[ATOKの変換エンジン説明](https://atok.com/info/features/engine.html)と
+[azooKey/Zenzaiの左右文脈tag](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/zenzai.md)
+を参考に、Slimeの既存辞書文脈規則を複数segment候補の末尾まで適用する。文章全体を1語として
+扱わず、末尾候補と右側を結ぶ完全なMozc辞書語があり、右suffixが2文字以下、または境界付きの
+`AやB`・`AのB`である場合だけ既存候補を昇格する。無制限の長いsuffixは`際セット → 再セット`
+の回帰を起こしたため採用しない。
+
+GSD dev/testとPUDで合計8改善・悪化0、JWTDとAJIMEEは全出力不変だった。モデルなしの
+1,089件×6回では0.8835→0.9350 ms/件（+0.0516 ms）で、計算は変換回内だけにcacheし、
+文章を保存しない。詳細は[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

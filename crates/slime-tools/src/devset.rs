@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde::{Deserialize, Serialize};
-use slime_tools::surface_annotation::{SurfaceReadingIndex, contains_kanji, hiragana_to_katakana};
+use slime_tools::surface_annotation::{SurfaceViterbiIndex, contains_kanji, hiragana_to_katakana};
 
 fn main() -> ExitCode {
     match run() {
@@ -72,7 +72,10 @@ struct Options {
 
 fn run() -> Result<(), String> {
     let options = parse_options(env::args().skip(1))?;
-    let readings = SurfaceReadingIndex::load(&options.dictionary_path)?;
+    let connection_path = options
+        .dictionary_path
+        .with_file_name("mozc-connection.bin");
+    let readings = SurfaceViterbiIndex::load(&options.dictionary_path, &connection_path)?;
     eprintln!("loaded {} unambiguous surface readings", readings.len());
 
     let file = fs::File::open(&options.train_path)
@@ -249,7 +252,7 @@ fn build_item(
     pair: &TrainPair,
     line_number: usize,
     accepted_count: usize,
-    readings: &SurfaceReadingIndex,
+    readings: &SurfaceViterbiIndex,
 ) -> Option<DevItem> {
     let [diff] = pair.diffs.as_slice() else {
         return None;
@@ -276,18 +279,17 @@ fn build_item(
         return None;
     }
 
-    let annotated_tokens = readings.annotate(&span)?;
+    let annotated_tokens = readings.consensus_annotation(&span)?;
     let reading = annotated_tokens
         .iter()
         .map(|(_, reading)| reading.as_str())
         .collect::<String>();
-
     // A kana-kanji misconversion types the same reading for both surfaces;
     // if the readings of the two variants are derivable and differ, the
     // reading estimate for this span is not trustworthy.
     if let (Some(pre_reading), Some(post_reading)) = (
-        readings.reading(&diff.pre_str),
-        readings.reading(&diff.post_str),
+        readings.longest_reading(&diff.pre_str),
+        readings.longest_reading(&diff.post_str),
     ) && pre_reading != post_reading
     {
         return None;
@@ -395,7 +397,7 @@ fn sample_evenly(items: Vec<DevItem>, count: usize) -> Vec<DevItem> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DevItem, SurfaceReadingIndex, diff_span, hiragana_to_katakana, partition_items};
+    use super::{DevItem, diff_span, hiragana_to_katakana, partition_items};
 
     #[test]
     fn diff_span_finds_the_changed_region() {
@@ -456,7 +458,7 @@ mod tests {
 
     #[test]
     fn annotated_tokens_preserve_the_derived_reading() {
-        let readings = SurfaceReadingIndex::from_pairs([
+        let readings = slime_tools::surface_annotation::SurfaceReadingIndex::from_pairs([
             ("漢字".to_owned(), "かんじ".to_owned()),
             ("変換".to_owned(), "へんかん".to_owned()),
         ]);

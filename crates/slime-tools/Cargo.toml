@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+compact_str = "0.10.0"
 slime-converter = { path = "../slime-converter" }
 slime-core = { path = "../slime-core" }
 serde = { version = "1", features = ["derive"] }

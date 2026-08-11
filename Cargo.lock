@@ -611,6 +611,7 @@ version = "0.1.0"
 name = "slime-tools"
 version = "0.1.0"
 dependencies = [
+ "compact_str",
  "ed25519-dalek",
  "serde",
  "serde_json",

@@ -653,6 +653,9 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let Some(request) = handle.engine.candidate_rescore_request() else {
             return actions;
         };
+        let dictionary_only_ranking = handle
+            .engine
+            .candidate_rescore_requires_dictionary_only_ranking();
         let Ok(service) = service.lock() else {
             return actions;
         };
@@ -686,37 +689,38 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             return actions;
         };
         prepare_delayed_long_generative_consensus(handle, service, &score_request, scored);
-        let rescored_actions = if handle.neural_profile.prefix_correction {
-            let constraints = scored
-                .first_mismatch_prefixes
-                .iter()
-                .map(|diagnostic| diagnostic.as_ref().and_then(prefix_constraint))
-                .collect::<Vec<_>>();
-            let followup_prefix = handle
-                .engine
-                .candidate_rescore_prefix_followup_request(
+        let rescored_actions =
+            if handle.neural_profile.prefix_correction && !dictionary_only_ranking {
+                let constraints = scored
+                    .first_mismatch_prefixes
+                    .iter()
+                    .map(|diagnostic| diagnostic.as_ref().and_then(prefix_constraint))
+                    .collect::<Vec<_>>();
+                let followup_prefix = handle
+                    .engine
+                    .candidate_rescore_prefix_followup_request(
+                        &scored.candidate_logliks,
+                        &constraints,
+                        candidate_weight,
+                        minimum_margin,
+                    )
+                    .and_then(|request| score_followup_prefix(service, request));
+                handle
+                    .engine
+                    .apply_candidate_rescore_with_prefix_constraints_and_followup(
+                        &scored.candidate_logliks,
+                        &constraints,
+                        followup_prefix.as_deref(),
+                        candidate_weight,
+                        minimum_margin,
+                    )
+            } else {
+                handle.engine.apply_candidate_rescore(
                     &scored.candidate_logliks,
-                    &constraints,
                     candidate_weight,
                     minimum_margin,
                 )
-                .and_then(|request| score_followup_prefix(service, request));
-            handle
-                .engine
-                .apply_candidate_rescore_with_prefix_constraints_and_followup(
-                    &scored.candidate_logliks,
-                    &constraints,
-                    followup_prefix.as_deref(),
-                    candidate_weight,
-                    minimum_margin,
-                )
-        } else {
-            handle.engine.apply_candidate_rescore(
-                &scored.candidate_logliks,
-                candidate_weight,
-                minimum_margin,
-            )
-        };
+            };
         if let Some(rescored_actions) = rescored_actions {
             return rescored_actions;
         }

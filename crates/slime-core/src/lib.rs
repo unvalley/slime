@@ -52,6 +52,8 @@ const DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 16;
 const MAX_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 32;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
+const SHORT_SURROUNDING_CONTEXT_RESCORE_MAX_READING_CHARACTERS: usize = 6;
+const SHORT_SURROUNDING_CONTEXT_RESCORE_COST_GAP: i32 = 2_000;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const MODEL_KATAKANA_RECALL_ADDITIONAL_CANDIDATES: usize = 3;
 const MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS: usize = 5;
@@ -924,9 +926,21 @@ impl SlimeEngine {
         self.candidate_kind == Some(CandidateKind::Conversion)
             && self.selected == 0
             && self.candidate_rescore.as_ref().is_some_and(|state| {
-                (GENERATIVE_MIN_READING_CHARACTERS..=GENERATIVE_MAX_READING_CHARACTERS)
-                    .contains(&state.request.reading.chars().count())
+                !requires_dictionary_only_context_ranking(state)
+                    && (GENERATIVE_MIN_READING_CHARACTERS..=GENERATIVE_MAX_READING_CHARACTERS)
+                        .contains(&state.request.reading.chars().count())
             })
+    }
+
+    /// Whether this request only exists because confirmed text on both sides
+    /// widened the ordinary confidence gate. Such requests may reorder the
+    /// bounded dictionary pool, but must not introduce generated or
+    /// prefix-followup surfaces.
+    #[must_use]
+    pub fn candidate_rescore_requires_dictionary_only_ranking(&self) -> bool {
+        self.candidate_rescore
+            .as_ref()
+            .is_some_and(requires_dictionary_only_context_ranking)
     }
 
     /// Whether an already-scored long N-best winner justifies one delayed
@@ -943,6 +957,9 @@ impl SlimeEngine {
         let Some(state) = self.candidate_rescore.as_ref() else {
             return false;
         };
+        if requires_dictionary_only_context_ranking(state) {
+            return false;
+        }
         if state.candidates.len() != log_likelihoods.len()
             || log_likelihoods.iter().any(|score| !score.is_finite())
         {
@@ -3122,11 +3139,16 @@ fn candidate_rescore_state_with_limit(
         return None;
     }
     let base_cost = dictionary_candidates.first()?.cost;
+    let uses_short_surrounding_context = !context.is_empty()
+        && !right_context.is_empty()
+        && reading.chars().count() <= SHORT_SURROUNDING_CONTEXT_RESCORE_MAX_READING_CHARACTERS;
     // Multi-segment paths accumulate a wider base-cost spread than short
     // homophones. Let the ready local model inspect that bounded tail without
     // weakening the conservative window used by short readings.
     let max_candidate_cost_gap = if reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS {
         LONG_RESCORE_MAX_CANDIDATE_COST_GAP
+    } else if uses_short_surrounding_context {
+        SHORT_SURROUNDING_CONTEXT_RESCORE_COST_GAP
     } else {
         RESCORE_MAX_CANDIDATE_COST_GAP
     };
@@ -3147,7 +3169,12 @@ fn candidate_rescore_state_with_limit(
     let bypasses_base_confidence = bypass_long_input_confidence
         && right_context.is_empty()
         && reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS;
-    if alternative.saturating_sub(first).max(0) > RESCORE_MAX_BASE_COST_GAP
+    let max_base_confidence_gap = if uses_short_surrounding_context {
+        SHORT_SURROUNDING_CONTEXT_RESCORE_COST_GAP
+    } else {
+        RESCORE_MAX_BASE_COST_GAP
+    };
+    if alternative.saturating_sub(first).max(0) > max_base_confidence_gap
         && !bypasses_base_confidence
     {
         return None;
@@ -3166,6 +3193,24 @@ fn candidate_rescore_state_with_limit(
         generative_consensus: None,
         candidates,
     })
+}
+
+fn requires_dictionary_only_context_ranking(state: &CandidateRescoreState) -> bool {
+    !state.request.context.is_empty()
+        && !state.request.right_context.is_empty()
+        && state.request.reading.chars().count()
+            <= SHORT_SURROUNDING_CONTEXT_RESCORE_MAX_READING_CHARACTERS
+        && state.candidates.first().is_some_and(|base| {
+            state
+                .candidates
+                .iter()
+                .skip(1)
+                .map(|candidate| candidate.cost)
+                .min()
+                .is_some_and(|alternative| {
+                    alternative.saturating_sub(base.cost).max(0) > RESCORE_MAX_BASE_COST_GAP
+                })
+        })
 }
 
 fn confirmed_parallel_percentage(left_context: &str, right_context: &str, surface: &str) -> bool {
@@ -5930,6 +5975,40 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!request.candidates.contains(&"コウホ".to_owned()));
+    }
+
+    #[test]
+    fn surrounding_context_exposes_a_bounded_short_semantic_alternative() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context(
+            "しかし、スキャンでは",
+            "の右肺の腫瘍が成長していることがわかり、裁判をやめた。",
+        );
+        for character in "ぴゅーじょし".chars() {
+            engine.handle(InputEvent::Character(character));
+        }
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("surrounding context should expose the bounded ambiguity");
+        assert_eq!(request.candidates[0], "ピュー女子");
+        assert!(request.candidates.contains(&"ピュー女史".to_owned()));
+        assert!(engine.candidate_rescore_requires_dictionary_only_ranking());
+        assert!(!engine.candidate_rescore_supports_generative_recall());
+    }
+
+    #[test]
+    fn surrounding_context_does_not_widen_seven_character_confidence() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context("電車に戻ると、", "をつづけた。");
+        for character in "なんぽーへたび".chars() {
+            engine.handle(InputEvent::Character(character));
+        }
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "南方へ旅");
+        assert!(engine.candidate_rescore_request().is_none());
     }
 
     #[test]

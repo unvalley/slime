@@ -298,11 +298,26 @@ modelの強い不一致prefixを辞書へ戻す局所修正では、従来は制
 
 形状制限に収まらないgreedy全文も、EOS完了、辞書格子との完全一致、6〜32文字、cost差1,000以内を同時に満たす場合だけ通常のmodel supplemental候補へ加える。直接昇格せず追加margin 1.5を維持する。通常cost窓まで広げるとPUDでcost差1,481の誤変換が出たため採用せず、1,000で`外在42 → 外在史に`を回収した。PUDは349→350、JWTD、GSD dev/test、AJIMEEは不変、exact悪化0だった。
 
+## 今回の実装: 初回順位を変えない固有名詞パック
+
+[SudachiDict](https://github.com/WorksApplications/SudachiDict)のFull辞書を評価専用に
+調べると、通常64候補にも正解がないJWTD 84件のうち51件は期待表記と読みを辞書語で
+構成できた。一方、固有名詞entryを通常ラティスへ大量投入すると、第一候補、ライブ
+変換、起動時間を同時に変える危険がある。
+
+そこでv5辞書パックへ`explicit-search-only`を追加した。この語彙は通常変換、ライブ
+変換、補完、英単語逆変換、モデル再採点から隔離し、ユーザーが候補末尾へ進んだ場合
+だけ入力読み全体の完全一致を最大64件追加する。20万3,590件の一時パックでは、32件の
+均等サンプルを通常末尾探索16/32から32/32へ回収した。初回回収は15/32のまま、末尾
+探索時間は交互測定で通常経路と同じ測定帯だった。20万件パックのprocess起動中央値は
+baseline比約107 ms、最大RSS増分は約24.2 MBである。語彙本体は同梱せず、ライセンスと頻度を
+確認した配布パックを別途評価する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。
 2. 辞書制約付き生成と再採点で別々に作るllama contextを共有し、high-accuracyの追加61〜106 msを削減する。精度5 dataset非悪化を維持する。
-3. 組織名・地名は、辞書にない語だけをライセンス・頻度付きoptional packとして評価し、初回top-1を変えない改善だけを採用する。
+3. 組織名・地名は、実装済みの`explicit-search-only`へライセンス・頻度付き語彙を載せ、held-out追加回収、起動時間、メモリを通るoptional packだけを配布候補にする。
 4. 入力ミス訂正と学習強度の実利用false positiveを固定データへ追加する。
 5. macOSを再インストールし、TextEditで逐次入力、候補操作、再変換、private/secure inputを確認する。
 6. Windowsは署名以外の実機動作をVMで先に閉じ、配布可能という表現は署名・install/update/uninstall完了まで使わない。

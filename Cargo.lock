@@ -578,6 +578,7 @@ dependencies = [
 name = "slime-core"
 version = "0.1.0"
 dependencies = [
+ "compact_str",
  "ed25519-dalek",
  "libc",
  "sha2",

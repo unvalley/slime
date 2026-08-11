@@ -98,6 +98,25 @@ cargo run -p slime-tools --bin slime-dictionary-pack -- build \
   --entries entries.tsv --model-rescore-only --output supplemental-general.slime-dict
 ```
 
+v5の`explicit-search-only`は、モデルを必須にせず大規模な固有名詞・新語を
+安全に探索する。entryは通常変換、ライブ変換、補完、英単語逆変換、モデル再採点へ
+参加しない。ユーザーが通常候補の末尾を越えて進んだときだけ、入力読み全体との
+完全一致を最大64候補追加する。部分語を文中へ自動挿入するモードではないため、
+長い文章の一部にだけ一致する固有名詞は別の候補生成処理が必要である。
+
+```console
+cargo run -p slime-tools --bin slime-dictionary-pack -- build \
+  --id proper-names --name 固有名詞 --version 2026.08.1 \
+  --license Apache-2.0 --minimum-slime-version 0.1.0 \
+  --published-at 2026-08-11 --provenance example/generated/proper-names \
+  --entries entries.tsv --explicit-search-only --output proper-names.slime-dict
+```
+
+`--model-rescore-only`と`--explicit-search-only`は同時に指定できず、どちらも
+文脈ruleを含められない。明示探索は初回top-1を変えないが、パックの読み込み時間、
+メモリ、候補末尾到達後のp95を増やし得る。配布候補ごとに実サイズとheld-outの
+追加回収数を測定し、巨大な一般辞書を選別なしで配布しない。
+
 ローダーは次を検証する。
 
 - 読みはひらがなと長音だけ

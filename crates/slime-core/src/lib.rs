@@ -41,6 +41,7 @@ const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
 const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const PERSONAL_NAME_ENTRIES_PER_PART: usize = 64;
 const PERSONAL_NAME_CANDIDATE_LIMIT: usize = 64;
+const EXPLICIT_PACK_CANDIDATE_LIMIT: usize = 64;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
@@ -1058,7 +1059,10 @@ impl SlimeEngine {
         let domain_words = domain_dictionaries::words(self.preferences.dictionary_packs)
             .into_iter()
             .map(|(_, surface)| surface);
-        let installed_words = self.installed_packs.words().map(|(_, surface)| surface);
+        let installed_words = self
+            .installed_packs
+            .standard_words()
+            .map(|(_, surface)| surface);
         for surface in user_entries.chain(domain_words).chain(installed_words) {
             if let Some(key) = english_reverse::surface_key(surface)
                 && !self
@@ -1683,6 +1687,12 @@ impl SlimeEngine {
                     ) {
                         push_unique(&mut merged, surface);
                     }
+                }
+                for surface in self
+                    .installed_packs
+                    .explicit_search_surfaces(&self.reading, EXPLICIT_PACK_CANDIDATE_LIMIT)
+                {
+                    push_unique(&mut merged, surface);
                 }
             }
             ConversionSearch::Expanded if reading_length > MAX_EXPANDED_READING_CHARACTERS => {
@@ -3203,6 +3213,33 @@ mod tests {
                  # published-at: 2026-08-11\n\
                  # provenance: fixture/generated/sample-model-rescore\n\
                  # candidate-mode: model-rescore-only\n\
+                 # payload-sha256: {digest}\n\
+                 # entries\n\
+                 {payload}"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_explicit_search_pack(directory: &std::path::Path) {
+        let pack_directory = directory.join("dictionary-packs");
+        fs::create_dir_all(&pack_directory).unwrap();
+        let payload = "てすとようご\t明示試験語甲\t500\n\
+てすとようご\t明示試験語乙\t550\n\
+ぎっとはぶ\tGitHub\t500\n";
+        let digest = lower_hex(&Sha256::digest(payload.as_bytes()));
+        fs::write(
+            pack_directory.join("sample-explicit-search.slime-dict"),
+            format!(
+                "# slime-dictionary-pack-v5\n\
+                 # id: sample-explicit-search\n\
+                 # name: 明示探索語彙サンプル\n\
+                 # version: 2026.08.1\n\
+                 # license: Example-Test-Only\n\
+                 # minimum-slime-version: 0.1.0\n\
+                 # published-at: 2026-08-11\n\
+                 # provenance: fixture/generated/sample-explicit-search\n\
+                 # candidate-mode: explicit-search-only\n\
                  # payload-sha256: {digest}\n\
                  # entries\n\
                  {payload}"
@@ -5179,6 +5216,40 @@ mod tests {
             .apply_candidate_rescore(&scores, 0.7, 0.1)
             .expect("successful scoring should publish supplemental pack candidate");
         assert_eq!(engine.snapshot().candidates[0], "補助試験語乙");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_explicit_search_pack_joins_only_after_candidate_tail() {
+        let directory = test_directory("explicit-search-pack");
+        write_explicit_search_pack(&directory);
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+
+        assert!(
+            !engine
+                .ascii_surfaces
+                .iter()
+                .any(|(_, surface)| surface == "GitHub")
+        );
+        assert!(
+            !engine
+                .conversion_candidates("てすとようご")
+                .contains(&"明示試験語甲".to_owned())
+        );
+        type_text(&mut engine, "tesutoyougo");
+        engine.handle(InputEvent::Space);
+        let initial = engine.snapshot();
+        assert!(!initial.candidates.contains(&"明示試験語甲".to_owned()));
+        assert!(!initial.candidates.contains(&"明示試験語乙".to_owned()));
+
+        for _ in 0..initial.candidates.len() {
+            engine.handle(InputEvent::NextCandidate);
+        }
+        let expanded = engine.snapshot();
+        assert!(expanded.candidates.contains(&"明示試験語甲".to_owned()));
+        assert!(expanded.candidates.contains(&"明示試験語乙".to_owned()));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
 
         fs::remove_dir_all(directory).unwrap();
     }

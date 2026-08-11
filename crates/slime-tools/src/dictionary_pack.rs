@@ -24,7 +24,8 @@ const USAGE: &str = concat!(
     "  slime-dictionary-pack validate <pack.slime-dict> [...]\n",
     "  slime-dictionary-pack build --id ID --name NAME --version VERSION --license LICENSE \\\n",
     "    --minimum-slime-version VERSION --published-at YYYY-MM-DD --provenance VALUE \\\n",
-    "    [--entries INPUT.tsv] [--context-rules INPUT.tsv] [--model-rescore-only] \\\n",
+    "    [--entries INPUT.tsv] [--context-rules INPUT.tsv] \\\n",
+    "    [--model-rescore-only | --explicit-search-only] \\\n",
     "    --output OUTPUT.slime-dict [--json]\n",
     "  slime-dictionary-pack verify-signed --data-dir PATH --verification-keys KEYS.tsv \\\n",
     "    --version-floors FLOORS.tsv --expected-packs N [--json]"
@@ -91,6 +92,7 @@ struct BuildOptions {
     entries: Option<PathBuf>,
     context_rules: Option<PathBuf>,
     model_rescore_only: bool,
+    explicit_search_only: bool,
     output: PathBuf,
     json: bool,
 }
@@ -246,6 +248,7 @@ fn parse_build_options(arguments: impl Iterator<Item = String>) -> Result<BuildO
     let mut context_rules = None;
     let mut output = None;
     let mut model_rescore_only = false;
+    let mut explicit_search_only = false;
     let mut json = false;
     let mut arguments = arguments;
 
@@ -282,6 +285,10 @@ fn parse_build_options(arguments: impl Iterator<Item = String>) -> Result<BuildO
             "--model-rescore-only" => {
                 return Err("build option --model-rescore-only is duplicated".to_owned());
             }
+            "--explicit-search-only" if !explicit_search_only => explicit_search_only = true,
+            "--explicit-search-only" => {
+                return Err("build option --explicit-search-only is duplicated".to_owned());
+            }
             "--output" => set_once(
                 &mut output,
                 PathBuf::from(next_value(&mut arguments)?),
@@ -304,6 +311,7 @@ fn parse_build_options(arguments: impl Iterator<Item = String>) -> Result<BuildO
         entries,
         context_rules,
         model_rescore_only,
+        explicit_search_only,
         output: required(output, "--output")?,
         json,
     })
@@ -375,7 +383,9 @@ fn verify_signed_packs(options: &VerifySignedOptions) -> Result<VerifySignedRepo
 fn build_pack(options: &BuildOptions) -> Result<BuildReport, String> {
     validate_output_path(&options.output)?;
     let (entries, context_rules) = read_build_inputs(options)?;
-    let format_version = if options.model_rescore_only {
+    let format_version = if options.explicit_search_only {
+        5
+    } else if options.model_rescore_only {
         4
     } else if options.context_rules.is_some() {
         3
@@ -409,7 +419,9 @@ fn build_pack(options: &BuildOptions) -> Result<BuildReport, String> {
     } else {
         "entries-sha256"
     };
-    let candidate_mode = if options.model_rescore_only {
+    let candidate_mode = if options.explicit_search_only {
+        "# candidate-mode: explicit-search-only\n"
+    } else if options.model_rescore_only {
         "# candidate-mode: model-rescore-only\n"
     } else {
         ""
@@ -462,6 +474,17 @@ fn read_build_inputs(options: &BuildOptions) -> Result<(Vec<Entry>, Vec<ContextR
     }
     if options.model_rescore_only && options.entries.is_none() {
         return Err("--model-rescore-only requires --entries".to_owned());
+    }
+    if options.explicit_search_only && options.context_rules.is_some() {
+        return Err("--explicit-search-only cannot be combined with --context-rules".to_owned());
+    }
+    if options.explicit_search_only && options.entries.is_none() {
+        return Err("--explicit-search-only requires --entries".to_owned());
+    }
+    if options.model_rescore_only && options.explicit_search_only {
+        return Err(
+            "--model-rescore-only and --explicit-search-only are mutually exclusive".to_owned(),
+        );
     }
     let mut entries = options
         .entries
@@ -718,6 +741,7 @@ mod tests {
             entries: Some(directory.path().join("entries.tsv")),
             context_rules: Some(directory.path().join("context.tsv")),
             model_rescore_only: false,
+            explicit_search_only: false,
             output: directory.path().join(output_name),
             json: false,
         }
@@ -881,6 +905,28 @@ mod tests {
                 .unwrap()
                 .candidate_mode,
             slime_core::DictionaryPackCandidateMode::ModelRescoreOnly
+        );
+    }
+
+    #[test]
+    fn builds_v5_explicit_search_only_pack() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("entries.tsv"), "あさぼらけ\t朝朗け\n").unwrap();
+        let mut build_options = options(&directory, "explicit.slime-dict");
+        build_options.context_rules = None;
+        build_options.explicit_search_only = true;
+
+        let report = build_pack(&build_options).unwrap();
+        let source = fs::read_to_string(&build_options.output).unwrap();
+        assert_eq!(report.format_version, 5);
+        assert!(source.starts_with("# slime-dictionary-pack-v5\n"));
+        assert!(source.contains("# candidate-mode: explicit-search-only\n"));
+        assert!(source.contains("# payload-sha256: "));
+        assert_eq!(
+            slime_core::validate_dictionary_pack(&source)
+                .unwrap()
+                .candidate_mode,
+            slime_core::DictionaryPackCandidateMode::ExplicitSearchOnly
         );
     }
 

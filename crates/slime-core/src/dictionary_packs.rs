@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use compact_str::CompactString;
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use slime_converter::{Dictionary, DictionaryLayer};
@@ -14,6 +15,7 @@ const PACK_HEADER_V1: &str = "# slime-dictionary-pack-v1";
 const PACK_HEADER_V2: &str = "# slime-dictionary-pack-v2";
 const PACK_HEADER_V3: &str = "# slime-dictionary-pack-v3";
 const PACK_HEADER_V4: &str = "# slime-dictionary-pack-v4";
+const PACK_HEADER_V5: &str = "# slime-dictionary-pack-v5";
 const PACK_ENTRIES_MARKER: &str = "# entries";
 const PACK_CONTEXT_RULES_MARKER: &str = "# context-rules";
 const PACK_SIGNATURE_HEADER_V1: &str = "# slime-dictionary-signature-v1";
@@ -232,13 +234,15 @@ pub struct DictionaryPackInfo {
 ///
 /// Model-rescore-only packs are invisible to ordinary conversion. Their
 /// entries join the candidate pool only after an optional local scorer is
-/// ready, so a large supplemental vocabulary cannot perturb the base winner
-/// when the model is unavailable or scoring fails.
+/// ready. Explicit-search-only packs remain invisible until the user reaches
+/// the end of the ordinary candidate list and asks for more alternatives.
+/// Both modes keep large supplemental vocabularies away from the base winner.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DictionaryPackCandidateMode {
     #[default]
     Standard,
     ModelRescoreOnly,
+    ExplicitSearchOnly,
 }
 
 impl DictionaryPackCandidateMode {
@@ -247,6 +251,7 @@ impl DictionaryPackCandidateMode {
         match self {
             Self::Standard => "standard",
             Self::ModelRescoreOnly => "model-rescore-only",
+            Self::ExplicitSearchOnly => "explicit-search-only",
         }
     }
 }
@@ -286,13 +291,14 @@ pub(crate) struct DictionaryPackStore {
 struct DictionaryPack {
     info: DictionaryPackInfo,
     entries: Vec<PackEntry>,
+    explicit_search_index: Vec<u32>,
     context_rules: Vec<PackContextRule>,
 }
 
 #[derive(Clone, Debug)]
 struct PackEntry {
-    reading: String,
-    surface: String,
+    reading: CompactString,
+    surface: CompactString,
     word_cost: i32,
 }
 
@@ -428,12 +434,57 @@ impl DictionaryPackStore {
             .collect()
     }
 
-    pub(crate) fn words(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.packs.iter().flat_map(|pack| {
-            pack.entries
+    pub(crate) fn explicit_search_surfaces(&self, reading: &str, limit: usize) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        for pack in self.packs.iter().filter(|pack| {
+            pack.info.candidate_mode == DictionaryPackCandidateMode::ExplicitSearchOnly
+        }) {
+            let entry_at = |index: &u32| &pack.entries[*index as usize];
+            let start = pack
+                .explicit_search_index
+                .partition_point(|index| entry_at(index).reading.as_str() < reading);
+            let end = pack
+                .explicit_search_index
+                .partition_point(|index| entry_at(index).reading.as_str() <= reading);
+            entries.extend(
+                pack.explicit_search_index[start..end]
+                    .iter()
+                    .take(limit)
+                    .map(entry_at),
+            );
+        }
+        entries.sort_unstable_by(|left, right| {
+            left.word_cost
+                .cmp(&right.word_cost)
+                .then(left.surface.cmp(&right.surface))
+        });
+        let mut surfaces = Vec::with_capacity(limit.min(entries.len()));
+        for entry in entries {
+            if !surfaces
                 .iter()
-                .map(|entry| (entry.reading.as_str(), entry.surface.as_str()))
-        })
+                .any(|surface: &String| surface == entry.surface.as_str())
+            {
+                surfaces.push(entry.surface.to_string());
+                if surfaces.len() == limit {
+                    break;
+                }
+            }
+        }
+        surfaces
+    }
+
+    pub(crate) fn standard_words(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.packs
+            .iter()
+            .filter(|pack| pack.info.candidate_mode == DictionaryPackCandidateMode::Standard)
+            .flat_map(|pack| {
+                pack.entries
+                    .iter()
+                    .map(|entry| (entry.reading.as_str(), entry.surface.as_str()))
+            })
     }
 
     pub(crate) fn visit_contextual_surfaces(
@@ -478,8 +529,8 @@ impl DictionaryPackStore {
             pack.entries
                 .iter()
                 .map(|entry| DictionaryPackWord {
-                    reading: entry.reading.clone(),
-                    surface: entry.surface.clone(),
+                    reading: entry.reading.to_string(),
+                    surface: entry.surface.to_string(),
                 })
                 .collect(),
         )
@@ -673,10 +724,11 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
         PACK_HEADER_V2 => 2,
         PACK_HEADER_V3 => 3,
         PACK_HEADER_V4 => 4,
+        PACK_HEADER_V5 => 5,
         _ => {
             return Err(format!(
                 "first line must be {PACK_HEADER_V1:?}, {PACK_HEADER_V2:?}, \
-                 {PACK_HEADER_V3:?}, or {PACK_HEADER_V4:?}"
+                 {PACK_HEADER_V3:?}, {PACK_HEADER_V4:?}, or {PACK_HEADER_V5:?}"
             ));
         }
     };
@@ -686,6 +738,7 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
     for (line_index, line) in lines {
         content.parse_line(format_version, line, line_index + 2)?;
     }
+    let explicit_search_index = validate_and_index_entries(&content.entries)?;
 
     let PackContent {
         metadata,
@@ -725,16 +778,7 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
     if entries.is_empty() && (format_version < 3 || context_rules.is_empty()) {
         return Err("dictionary pack has no entries".to_owned());
     }
-    if validated.candidate_mode == DictionaryPackCandidateMode::ModelRescoreOnly {
-        if entries.is_empty() {
-            return Err("model-rescore-only dictionary pack has no entries".to_owned());
-        }
-        if !context_rules.is_empty() {
-            return Err(
-                "model-rescore-only dictionary pack cannot contain context rules".to_owned(),
-            );
-        }
-    }
+    validate_candidate_content(validated.candidate_mode, &entries, &context_rules)?;
 
     Ok(DictionaryPack {
         info: DictionaryPackInfo {
@@ -754,8 +798,42 @@ fn parse_pack(source: &str) -> Result<DictionaryPack, String> {
             candidate_mode: validated.candidate_mode,
         },
         entries,
+        explicit_search_index: if validated.candidate_mode
+            == DictionaryPackCandidateMode::ExplicitSearchOnly
+        {
+            explicit_search_index
+        } else {
+            Vec::new()
+        },
         context_rules,
     })
+}
+
+fn validate_candidate_content(
+    candidate_mode: DictionaryPackCandidateMode,
+    entries: &[PackEntry],
+    context_rules: &[PackContextRule],
+) -> Result<(), String> {
+    if !matches!(
+        candidate_mode,
+        DictionaryPackCandidateMode::ModelRescoreOnly
+            | DictionaryPackCandidateMode::ExplicitSearchOnly
+    ) {
+        return Ok(());
+    }
+    if entries.is_empty() {
+        return Err(format!(
+            "{} dictionary pack has no entries",
+            candidate_mode.as_str()
+        ));
+    }
+    if !context_rules.is_empty() {
+        return Err(format!(
+            "{} dictionary pack cannot contain context rules",
+            candidate_mode.as_str()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -769,7 +847,6 @@ struct PackContent {
     metadata: PackMetadata,
     entries: Vec<PackEntry>,
     context_rules: Vec<PackContextRule>,
-    entry_keys: HashSet<(String, String)>,
     context_keys: HashSet<(String, String, String)>,
     section: PackSection,
 }
@@ -780,7 +857,6 @@ impl PackContent {
             metadata: PackMetadata::default(),
             entries: Vec::new(),
             context_rules: Vec::new(),
-            entry_keys: HashSet::new(),
             context_keys: HashSet::new(),
             section: if format_version == 1 {
                 PackSection::Entries
@@ -874,12 +950,6 @@ impl PackContent {
             ));
         }
         let entry = parse_entry(line, line_number)?;
-        if !self
-            .entry_keys
-            .insert((entry.reading.clone(), entry.surface.clone()))
-        {
-            return Err(format!("line {line_number} duplicates an earlier entry"));
-        }
         self.entries.push(entry);
         Ok(())
     }
@@ -904,6 +974,33 @@ impl PackContent {
         self.context_rules.push(rule);
         Ok(())
     }
+}
+
+fn validate_and_index_entries(entries: &[PackEntry]) -> Result<Vec<u32>, String> {
+    let mut indices =
+        (0..u32::try_from(entries.len()).expect("pack entry limit fits u32")).collect::<Vec<_>>();
+    indices.sort_unstable_by(|left, right| {
+        let left = &entries[*left as usize];
+        let right = &entries[*right as usize];
+        (&left.reading, left.word_cost, &left.surface).cmp(&(
+            &right.reading,
+            right.word_cost,
+            &right.surface,
+        ))
+    });
+    let mut reading = "";
+    let mut surfaces = HashSet::new();
+    for index in &indices {
+        let entry = &entries[*index as usize];
+        if entry.reading.as_str() != reading {
+            reading = entry.reading.as_str();
+            surfaces.clear();
+        }
+        if !surfaces.insert(entry.surface.as_str()) {
+            return Err("dictionary pack duplicates an entry".to_owned());
+        }
+    }
+    Ok(indices)
 }
 
 fn parse_entry(line: &str, line_number: usize) -> Result<PackEntry, String> {
@@ -939,8 +1036,8 @@ fn parse_entry(line: &str, line_number: usize) -> Result<PackEntry, String> {
         ));
     }
     Ok(PackEntry {
-        reading: reading.to_owned(),
-        surface: surface.to_owned(),
+        reading: reading.into(),
+        surface: surface.into(),
         word_cost,
     })
 }
@@ -1091,20 +1188,7 @@ fn validate_versioned_metadata(
         });
     }
 
-    let candidate_mode = if format_version == 4 {
-        match required(candidate_mode, "candidate-mode")?.as_str() {
-            "standard" => DictionaryPackCandidateMode::Standard,
-            "model-rescore-only" => DictionaryPackCandidateMode::ModelRescoreOnly,
-            _ => {
-                return Err("candidate-mode must be standard or model-rescore-only".to_owned());
-            }
-        }
-    } else {
-        if candidate_mode.is_some() {
-            return Err("candidate-mode requires the v4 pack header".to_owned());
-        }
-        DictionaryPackCandidateMode::Standard
-    };
+    let candidate_mode = validate_candidate_mode(format_version, candidate_mode)?;
 
     let minimum_slime_version = required(minimum_slime_version, "minimum-slime-version")?;
     let published_at = required(published_at, "published-at")?;
@@ -1142,7 +1226,7 @@ fn validate_versioned_metadata(
             validate_digest("entries-sha256", &expected, &actual_sha256)?;
             (Some(actual_sha256), None)
         }
-        3 | 4 => {
+        3..=5 => {
             if entries_sha256.is_some() {
                 return Err(
                     "entries-sha256 is replaced by payload-sha256 in v3 and newer".to_owned(),
@@ -1163,6 +1247,30 @@ fn validate_versioned_metadata(
         payload_sha256,
         candidate_mode,
     })
+}
+
+fn validate_candidate_mode(
+    format_version: u8,
+    candidate_mode: Option<String>,
+) -> Result<DictionaryPackCandidateMode, String> {
+    if format_version < 4 {
+        if candidate_mode.is_some() {
+            return Err("candidate-mode requires the v4 or newer pack header".to_owned());
+        }
+        return Ok(DictionaryPackCandidateMode::Standard);
+    }
+    match required(candidate_mode, "candidate-mode")?.as_str() {
+        "standard" => Ok(DictionaryPackCandidateMode::Standard),
+        "model-rescore-only" => Ok(DictionaryPackCandidateMode::ModelRescoreOnly),
+        "explicit-search-only" if format_version >= 5 => {
+            Ok(DictionaryPackCandidateMode::ExplicitSearchOnly)
+        }
+        _ if format_version >= 5 => Err(
+            "candidate-mode must be standard, model-rescore-only, or explicit-search-only"
+                .to_owned(),
+        ),
+        _ => Err("candidate-mode must be standard or model-rescore-only".to_owned()),
+    }
 }
 
 fn validate_digest(key: &str, expected: &str, actual: &str) -> Result<(), String> {
@@ -1298,6 +1406,7 @@ mod tests {
             errors: Vec::new(),
         };
         assert!(store.layers().is_empty());
+        assert_eq!(store.standard_words().count(), 0);
         assert_eq!(
             store
                 .model_rescore_layers(&Dictionary::new(Vec::new()))
@@ -1320,6 +1429,54 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_v5_explicit_search_only_pack_and_separates_its_dictionary() {
+        let payload = "あさぼらけ\t朝朗け\t500\nあさぼらけ\t麻幌家\t300\n";
+        let digest = sha256_hex(payload.as_bytes());
+        let source = format!(
+            "# slime-dictionary-pack-v5\n\
+             # id: explicit-general\n\
+             # name: 明示探索語彙\n\
+             # version: 2026.08.1\n\
+             # license: Apache-2.0\n\
+             # minimum-slime-version: 0.1.0\n\
+             # published-at: 2026-08-11\n\
+             # provenance: fixture/generated/explicit-general\n\
+             # candidate-mode: explicit-search-only\n\
+             # payload-sha256: {digest}\n\
+             # entries\n\
+             {payload}"
+        );
+        let pack = parse_pack(&source).unwrap();
+        assert_eq!(pack.info.format_version, 5);
+        assert_eq!(
+            pack.info.candidate_mode,
+            DictionaryPackCandidateMode::ExplicitSearchOnly
+        );
+        let store = DictionaryPackStore {
+            packs: vec![pack],
+            context_rules: Vec::new(),
+            errors: Vec::new(),
+        };
+        assert!(store.layers().is_empty());
+        assert!(
+            store
+                .model_rescore_layers(&Dictionary::new(Vec::new()))
+                .is_empty()
+        );
+        assert_eq!(
+            store.explicit_search_surfaces("あさぼらけ", 64),
+            vec!["麻幌家", "朝朗け"]
+        );
+
+        let v4 = source.replacen(
+            "# slime-dictionary-pack-v5",
+            "# slime-dictionary-pack-v4",
+            1,
+        );
+        assert!(validate_dictionary_pack(&v4).is_err());
     }
 
     #[test]
@@ -1475,7 +1632,7 @@ mod tests {
         let infos: Vec<_> = store.infos().collect();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, "sample-general");
-        assert_eq!(store.words().count(), 2);
+        assert_eq!(store.standard_words().count(), 2);
         assert_eq!(store.errors().len(), 1);
         assert_eq!(store.errors()[0].file, "broken.slime-dict");
 

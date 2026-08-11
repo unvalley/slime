@@ -116,7 +116,11 @@ fn run() -> Result<(), String> {
                 .iter()
                 .any(|candidate| candidate.surface == conversion.surface)
             && item.input.chars().count() <= MAXIMUM_GENERATIVE_READING_CHARACTERS
-            && bounded_multi_region_substitution(&ordinary[0].surface, &conversion.surface)
+            && (bounded_multi_region_substitution(&ordinary[0].surface, &conversion.surface)
+                || bounded_multi_region_surface_compression(
+                    &ordinary[0].surface,
+                    &conversion.surface,
+                ))
         {
             let maximum_gap = if item.input.chars().count() >= LONG_INPUT_CHARACTERS {
                 LONG_MAX_CANDIDATE_COST_GAP
@@ -742,6 +746,124 @@ fn bounded_multi_region_substitution(current: &str, alternative: &str) -> bool {
         }
     }
     regions >= MINIMUM_REGIONS
+}
+
+#[allow(clippy::too_many_lines)]
+fn bounded_multi_region_surface_compression(current: &str, alternative: &str) -> bool {
+    const MINIMUM_REGIONS: usize = 2;
+    const MAXIMUM_REGIONS: usize = 4;
+    const MAXIMUM_REGION_CHARACTERS_PER_SIDE: usize = 4;
+    const MAXIMUM_LENGTH_DIFFERENCE: usize = 2;
+
+    #[derive(Clone, Copy)]
+    enum Edit {
+        Match,
+        Substitute(char, char),
+        Delete(char),
+        Insert(char),
+    }
+
+    let current = current.chars().collect::<Vec<_>>();
+    let alternative = alternative.chars().collect::<Vec<_>>();
+    if current.len() <= alternative.len()
+        || current.len() - alternative.len() > MAXIMUM_LENGTH_DIFFERENCE
+    {
+        return false;
+    }
+
+    let width = alternative.len() + 1;
+    let mut costs = vec![0usize; (current.len() + 1) * width];
+    for row in 0..=current.len() {
+        costs[row * width] = row;
+    }
+    for (column, cost) in costs.iter_mut().take(width).enumerate() {
+        *cost = column;
+    }
+    for row in 1..=current.len() {
+        for column in 1..=alternative.len() {
+            let substitution = costs[(row - 1) * width + column - 1]
+                + usize::from(current[row - 1] != alternative[column - 1]);
+            let deletion = costs[(row - 1) * width + column] + 1;
+            let insertion = costs[row * width + column - 1] + 1;
+            costs[row * width + column] = substitution.min(deletion).min(insertion);
+        }
+    }
+
+    let mut edits = Vec::with_capacity(current.len().max(alternative.len()));
+    let (mut row, mut column) = (current.len(), alternative.len());
+    while row > 0 || column > 0 {
+        let cost = costs[row * width + column];
+        if row > 0
+            && column > 0
+            && current[row - 1] == alternative[column - 1]
+            && cost == costs[(row - 1) * width + column - 1]
+        {
+            edits.push(Edit::Match);
+            row -= 1;
+            column -= 1;
+        } else if row > 0 && column > 0 && cost == costs[(row - 1) * width + column - 1] + 1 {
+            edits.push(Edit::Substitute(current[row - 1], alternative[column - 1]));
+            row -= 1;
+            column -= 1;
+        } else if row > 0 && cost == costs[(row - 1) * width + column] + 1 {
+            edits.push(Edit::Delete(current[row - 1]));
+            row -= 1;
+        } else if column > 0 && cost == costs[row * width + column - 1] + 1 {
+            edits.push(Edit::Insert(alternative[column - 1]));
+            column -= 1;
+        } else {
+            return false;
+        }
+    }
+    edits.reverse();
+
+    let mut regions = 0usize;
+    let mut inside_region = false;
+    let mut current_characters = 0usize;
+    let mut alternative_characters = 0usize;
+    for edit in edits {
+        if matches!(edit, Edit::Match) {
+            inside_region = false;
+            current_characters = 0;
+            alternative_characters = 0;
+            continue;
+        }
+        if !inside_region {
+            regions += 1;
+            if regions > MAXIMUM_REGIONS {
+                return false;
+            }
+            inside_region = true;
+        }
+        match edit {
+            Edit::Match => unreachable!(),
+            Edit::Substitute(current, alternative) => {
+                if current.is_ascii_alphanumeric() || alternative.is_ascii_alphanumeric() {
+                    return false;
+                }
+                current_characters += 1;
+                alternative_characters += 1;
+            }
+            Edit::Delete(current) => {
+                if current.is_ascii_alphanumeric() {
+                    return false;
+                }
+                current_characters += 1;
+            }
+            Edit::Insert(alternative) => {
+                if alternative.is_ascii_alphanumeric() {
+                    return false;
+                }
+                alternative_characters += 1;
+            }
+        }
+        if current_characters > MAXIMUM_REGION_CHARACTERS_PER_SIDE
+            || alternative_characters > MAXIMUM_REGION_CHARACTERS_PER_SIDE
+        {
+            return false;
+        }
+    }
+    (MINIMUM_REGIONS..=MAXIMUM_REGIONS).contains(&regions)
 }
 
 fn high_accuracy_candidate_count(item: &Item, candidates: &[Candidate]) -> usize {

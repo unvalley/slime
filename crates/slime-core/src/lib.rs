@@ -61,6 +61,8 @@ const GENERATIVE_CONSTRAINED_CANDIDATE_LIMIT: usize = 8;
 const GENERATIVE_MIN_CHANGED_REGIONS: usize = 2;
 const GENERATIVE_MAX_CHANGED_REGIONS: usize = 4;
 const GENERATIVE_MAX_CHANGED_CHARACTERS_PER_REGION: usize = 2;
+const GENERATIVE_MAX_COMPRESSION_CHARACTERS_PER_REGION: usize = 4;
+const GENERATIVE_MAX_SURFACE_COMPRESSION_CHARACTERS: usize = 2;
 const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
@@ -651,12 +653,14 @@ impl SlimeEngine {
     /// Records agreement with an existing candidate, or adds one generated
     /// surface after proving it is a bounded path through the base lattice.
     ///
-    /// The generated text is never accepted directly. It must preserve the
-    /// surface length and ASCII alphanumerics, change two to four disjoint
-    /// regions of at most two characters each, and stay inside the same cost
-    /// window as ordinary model candidates. A new candidate is marked as model
-    /// supplemental, so the usual additional score margin still applies. An
-    /// existing candidate is only recorded as local or multi-region generation
+    /// The generated text is never accepted directly. It must preserve ASCII
+    /// alphanumerics, change two to four bounded regions, and stay inside the
+    /// same cost window as ordinary model candidates. Regions are at most two
+    /// characters for equal-length surfaces. A surface compression may remove
+    /// at most two characters overall and align at most four characters per
+    /// side in each region. A new candidate is marked as model supplemental,
+    /// so the usual additional score margin still applies. An existing
+    /// candidate is only recorded as local or multi-region generation
     /// consensus; it may override the ordinary winner later when their model
     /// scores are a narrow near-tie.
     pub fn prepare_generative_rescore_candidate(
@@ -701,6 +705,10 @@ impl SlimeEngine {
             return Some(state.request.clone());
         }
         if !bounded_multi_region_substitution(&state.candidates.first()?.surface, generated_surface)
+            && !bounded_multi_region_surface_compression(
+                &state.candidates.first()?.surface,
+                generated_surface,
+            )
         {
             return None;
         }
@@ -2800,6 +2808,89 @@ fn bounded_multi_region_substitution(current: &str, alternative: &str) -> bool {
         }
         region_characters += 1;
         if region_characters > GENERATIVE_MAX_CHANGED_CHARACTERS_PER_REGION {
+            return false;
+        }
+    }
+    regions >= GENERATIVE_MIN_CHANGED_REGIONS
+}
+
+fn bounded_multi_region_surface_compression(current: &str, alternative: &str) -> bool {
+    let current = current.chars().collect::<Vec<_>>();
+    let alternative = alternative.chars().collect::<Vec<_>>();
+    if current.len() <= alternative.len()
+        || current.len() - alternative.len() > GENERATIVE_MAX_SURFACE_COMPRESSION_CHARACTERS
+    {
+        return false;
+    }
+
+    let width = alternative.len() + 1;
+    let mut costs = vec![0usize; (current.len() + 1) * width];
+    for (row, costs) in costs.chunks_mut(width).enumerate() {
+        costs[0] = row;
+    }
+    for (column, cost) in costs.iter_mut().take(width).enumerate() {
+        *cost = column;
+    }
+    for row in 1..=current.len() {
+        for column in 1..=alternative.len() {
+            let substitution = costs[(row - 1) * width + column - 1]
+                + usize::from(current[row - 1] != alternative[column - 1]);
+            let deletion = costs[(row - 1) * width + column] + 1;
+            let insertion = costs[row * width + column - 1] + 1;
+            costs[row * width + column] = substitution.min(deletion).min(insertion);
+        }
+    }
+
+    let (mut row, mut column) = (current.len(), alternative.len());
+    let mut regions = 0usize;
+    let mut inside_region = false;
+    let mut current_region_characters = 0usize;
+    let mut alternative_region_characters = 0usize;
+    while row > 0 || column > 0 {
+        let cost = costs[row * width + column];
+        if row > 0
+            && column > 0
+            && current[row - 1] == alternative[column - 1]
+            && cost == costs[(row - 1) * width + column - 1]
+        {
+            inside_region = false;
+            current_region_characters = 0;
+            alternative_region_characters = 0;
+            row -= 1;
+            column -= 1;
+            continue;
+        }
+        let (current_character, alternative_character) =
+            if row > 0 && column > 0 && cost == costs[(row - 1) * width + column - 1] + 1 {
+                row -= 1;
+                column -= 1;
+                (Some(current[row]), Some(alternative[column]))
+            } else if row > 0 && cost == costs[(row - 1) * width + column] + 1 {
+                row -= 1;
+                (Some(current[row]), None)
+            } else if column > 0 && cost == costs[row * width + column - 1] + 1 {
+                column -= 1;
+                (None, Some(alternative[column]))
+            } else {
+                return false;
+            };
+        if current_character.is_some_and(|character| character.is_ascii_alphanumeric())
+            || alternative_character.is_some_and(|character| character.is_ascii_alphanumeric())
+        {
+            return false;
+        }
+        if !inside_region {
+            regions += 1;
+            if regions > GENERATIVE_MAX_CHANGED_REGIONS {
+                return false;
+            }
+            inside_region = true;
+        }
+        current_region_characters += usize::from(current_character.is_some());
+        alternative_region_characters += usize::from(alternative_character.is_some());
+        if current_region_characters > GENERATIVE_MAX_COMPRESSION_CHARACTERS_PER_REGION
+            || alternative_region_characters > GENERATIVE_MAX_COMPRESSION_CHARACTERS_PER_REGION
+        {
             return false;
         }
     }
@@ -5472,6 +5563,51 @@ mod tests {
     }
 
     #[test]
+    fn generated_surface_compression_can_join_after_bounded_lattice_validation() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あい", "あい", 10),
+            DictionaryEntry::new("あい", "愛", 20),
+            DictionaryEntry::new("もんだい", "問題", 10),
+            DictionaryEntry::new("もんだい", "課題", 20),
+        ]);
+        let base_conversion = dictionary
+            .convert_n_best_with_surface_prefix("あいのもんだい", "あいの問題", 1)
+            .into_iter()
+            .next()
+            .expect("base lattice path");
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "あいのもんだい".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["あいの問題".to_owned()];
+        let base = Candidate {
+            surface: "あいの問題".to_owned(),
+            cost: base_conversion.cost,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![base.surface.clone()],
+            },
+            model_supplemental: vec![false],
+            generative_consensus: None,
+            candidates: vec![base],
+        });
+
+        let request = engine
+            .prepare_generative_rescore_candidate("愛の課題")
+            .expect("a bounded dictionary-backed surface compression should join rescoring");
+        assert_eq!(request.candidates, ["あいの問題", "愛の課題"]);
+        let state = engine
+            .candidate_rescore
+            .as_ref()
+            .expect("pending rescore state");
+        assert_eq!(state.model_supplemental, [false, true]);
+        assert_eq!(state.generative_consensus, None);
+    }
+
+    #[test]
     fn existing_generated_surface_records_generation_consensus_without_duplication() {
         let candidates = vec![
             Candidate {
@@ -5691,6 +5827,30 @@ mod tests {
         assert!(bounded_local_substitution("奨学の問題", "少額の問題", 2));
         assert!(!bounded_local_substitution("紀元前511", "紀元前後11", 2));
         assert!(!bounded_local_substitution("abc版", "abd版", 2));
+    }
+
+    #[test]
+    fn multi_region_surface_compression_is_bounded_and_preserves_ascii() {
+        assert!(super::bounded_multi_region_surface_compression(
+            "あいの問題",
+            "愛の課題"
+        ));
+        assert!(super::bounded_multi_region_surface_compression(
+            "そしてエンジェル帯に復讐渡渉していろいろなちょっかい",
+            "そしてエンジェル隊に復讐と称して色々なちょっかい"
+        ));
+        assert!(!super::bounded_multi_region_surface_compression(
+            "浮きの先駆け",
+            "雨季のさきがけ"
+        ));
+        assert!(!super::bounded_multi_region_surface_compression(
+            "abcあいの問題",
+            "abd愛の課題"
+        ));
+        assert!(!super::bounded_multi_region_surface_compression(
+            "あいうえの問題",
+            "愛の課題"
+        ));
     }
 
     #[test]

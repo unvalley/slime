@@ -2176,6 +2176,32 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_generative_surface_compression(model: &str) {
+        // The dictionary-backed greedy result compresses いろいろ to 色々 and
+        // fixes two other regions. The bounded alignment can add it without
+        // accepting arbitrary generated text.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let mut capture = TypedCapture::default();
+        for character in "そしてえんじぇるたいにふくしゅうとしょうしていろいろなちょっかい".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("そしてエンジェル隊に復讐と称して色々なちょっかい")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     fn measure_prefix_diagnostics() {
         let service = super::NEURAL_SERVICE
             .get()
@@ -2286,6 +2312,7 @@ mod tests {
         verify_neural_learning_strength(&model);
         verify_generative_consensus(&model);
         verify_multi_region_generative_consensus(&model);
+        verify_generative_surface_compression(&model);
         verify_context_contrast(handle);
         verify_prefix_correction_preserves_kanji(handle);
         verify_prefix_correction(handle);

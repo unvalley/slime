@@ -67,6 +67,7 @@ const GENERATIVE_MAX_SURFACE_COMPRESSION_CHARACTERS: usize = 2;
 const GENERATIVE_CONSENSUS_MIN_MODEL_ADVANTAGE: f64 = 0.1;
 const GENERATIVE_LOCAL_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.2;
 const GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE: f64 = 0.25;
+const GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP: i32 = 3_100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
@@ -222,6 +223,7 @@ struct CandidateCorrection {
 enum GenerativeConsensusKind {
     Local,
     MultiRegion,
+    ExtendedMultiRegion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -659,11 +661,13 @@ impl SlimeEngine {
     /// same cost window as ordinary model candidates. Regions are at most two
     /// characters for equal-length surfaces. A surface compression may remove
     /// at most two characters overall and align at most four characters per
-    /// side in each region. A new candidate is marked as model supplemental,
-    /// so the usual additional score margin still applies. An existing
-    /// candidate is only recorded as local or multi-region generation
-    /// consensus; it may override the ordinary winner later when their model
-    /// scores are a narrow near-tie.
+    /// side in each region. A bounded equal-length multi-region path may use a
+    /// separately evaluated cost window and records direct generation
+    /// consensus. Other new candidates are marked as model supplemental, so
+    /// the usual additional score margin still applies. An existing candidate
+    /// is only recorded as local or multi-region generation consensus; it may
+    /// override the ordinary winner later when their model scores are a narrow
+    /// near-tie.
     pub fn prepare_generative_rescore_candidate(
         &mut self,
         generated_surface: &str,
@@ -705,12 +709,11 @@ impl SlimeEngine {
             });
             return Some(state.request.clone());
         }
-        if !bounded_multi_region_substitution(&state.candidates.first()?.surface, generated_surface)
-            && !bounded_multi_region_surface_compression(
-                &state.candidates.first()?.surface,
-                generated_surface,
-            )
-        {
+        let base_surface = &state.candidates.first()?.surface;
+        let is_multi_region = bounded_multi_region_substitution(base_surface, generated_surface);
+        let is_surface_compression =
+            bounded_multi_region_surface_compression(base_surface, generated_surface);
+        if !is_multi_region && !is_surface_compression {
             return None;
         }
         let conversion = self
@@ -727,12 +730,16 @@ impl SlimeEngine {
         } else {
             RESCORE_MAX_CANDIDATE_COST_GAP
         };
-        if conversion
+        let cost_gap = conversion
             .cost
             .saturating_sub(state.candidates.first()?.cost)
-            .max(0)
-            > maximum_cost_gap
-        {
+            .max(0);
+        let uses_extended_multi_region_consensus = reading_characters
+            >= LONG_RESCORE_READING_CHARACTERS
+            && is_multi_region
+            && cost_gap > maximum_cost_gap
+            && cost_gap <= GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP;
+        if cost_gap > maximum_cost_gap && !uses_extended_multi_region_consensus {
             return None;
         }
 
@@ -748,6 +755,12 @@ impl SlimeEngine {
         });
         state.model_supplemental.push(true);
         state.request.candidates.push(conversion.surface);
+        if uses_extended_multi_region_consensus {
+            state.generative_consensus = Some(GenerativeConsensus {
+                candidate: state.candidates.len() - 1,
+                kind: GenerativeConsensusKind::ExtendedMultiRegion,
+            });
+        }
         Some(state.request.clone())
     }
 
@@ -2734,8 +2747,18 @@ fn candidate_rescore_order_for_state(
     let Some(consensus) = state.generative_consensus else {
         return Some((order, margin_protects_base, selected));
     };
-    if consensus.candidate >= log_likelihoods.len() || state.model_supplemental[consensus.candidate]
-    {
+    if consensus.candidate >= log_likelihoods.len() {
+        return None;
+    }
+    if consensus.kind == GenerativeConsensusKind::ExtendedMultiRegion {
+        if !state.model_supplemental[consensus.candidate] {
+            return None;
+        }
+        order.retain(|&index| index != consensus.candidate);
+        order.insert(0, consensus.candidate);
+        return Some((order, false, consensus.candidate));
+    }
+    if state.model_supplemental[consensus.candidate] {
         return None;
     }
     let maximum_model_advantage = match consensus.kind {
@@ -2743,6 +2766,7 @@ fn candidate_rescore_order_for_state(
         GenerativeConsensusKind::MultiRegion => {
             GENERATIVE_MULTI_REGION_CONSENSUS_MAX_MODEL_ADVANTAGE
         }
+        GenerativeConsensusKind::ExtendedMultiRegion => unreachable!(),
     };
     let model_advantage = log_likelihoods[consensus.candidate] - log_likelihoods[selected];
     if consensus.candidate != selected
@@ -5679,6 +5703,89 @@ mod tests {
             .expect("pending rescore state");
         assert_eq!(state.model_supplemental, [false, true]);
         assert_eq!(state.generative_consensus, None);
+    }
+
+    #[test]
+    fn generated_multi_region_surface_can_use_extended_cost_consensus() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("しょうがく", "奨学", 10),
+            DictionaryEntry::new("しょうがく", "少額", 1_560),
+            DictionaryEntry::new("しょうがく", "商学", 1_561),
+            DictionaryEntry::new("もんだい", "問題", 10),
+            DictionaryEntry::new("もんだい", "課題", 1_560),
+            DictionaryEntry::new("もんだい", "門題", 1_561),
+        ]);
+        let reading = "しょうがくのもんだい";
+        let base = dictionary
+            .convert_n_best_with_surface_prefix(reading, "奨学の問題", 1)
+            .into_iter()
+            .next()
+            .expect("base lattice path");
+        let generated = dictionary
+            .convert_n_best_with_surface_prefix(reading, "少額の課題", 1)
+            .into_iter()
+            .next()
+            .expect("generated lattice path");
+        let beyond_limit = dictionary
+            .convert_n_best_with_surface_prefix(reading, "商学の門題", 1)
+            .into_iter()
+            .next()
+            .expect("beyond-limit lattice path");
+        let cost_gap = generated.cost.saturating_sub(base.cost);
+        assert!(cost_gap > super::LONG_RESCORE_MAX_CANDIDATE_COST_GAP);
+        assert!(cost_gap <= super::GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP);
+        assert!(
+            beyond_limit.cost.saturating_sub(base.cost)
+                > super::GENERATIVE_EXTENDED_MULTI_REGION_COST_GAP
+        );
+
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec![base.surface.clone()];
+        let base_candidate = Candidate {
+            surface: base.surface.clone(),
+            cost: base.cost,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: vec![base.surface.clone()],
+            },
+            model_supplemental: vec![false],
+            generative_consensus: None,
+            candidates: vec![base_candidate],
+        });
+
+        assert!(
+            engine
+                .prepare_generative_rescore_candidate(&beyond_limit.surface)
+                .is_none()
+        );
+        let request = engine
+            .prepare_generative_rescore_candidate(&generated.surface)
+            .expect("bounded multi-region generation should use the extended window");
+        assert_eq!(request.candidates, ["奨学の問題", "少額の課題"]);
+        let state = engine
+            .candidate_rescore
+            .as_ref()
+            .expect("pending rescore state");
+        assert_eq!(state.model_supplemental, [false, true]);
+        assert_eq!(
+            state.generative_consensus,
+            Some(GenerativeConsensus {
+                candidate: 1,
+                kind: GenerativeConsensusKind::ExtendedMultiRegion,
+            })
+        );
+
+        engine
+            .apply_candidate_rescore(&[0.0, -100.0], 0.8, 0.0)
+            .expect("aligned scores should apply direct generation consensus");
+        assert_eq!(engine.candidates[0], "少額の課題");
+        assert!(engine.candidates.contains(&"奨学の問題".to_owned()));
     }
 
     #[test]

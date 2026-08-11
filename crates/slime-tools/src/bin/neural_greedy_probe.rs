@@ -21,6 +21,7 @@ const VERY_LONG_INPUT_CHARACTERS: usize = 20;
 const MAX_BASE_COST_GAP: i32 = 1_000;
 const SHORT_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const LONG_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
+const EXTENDED_GENERATIVE_COST_GAP: i32 = 3_100;
 const COST_LOG_SCALE: f64 = 500.0;
 const SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
 const MIN_PREFIX_CHARACTERS: usize = 4;
@@ -123,7 +124,12 @@ fn run() -> Result<(), String> {
                     &conversion.surface,
                 ))
         {
-            let maximum_gap = if item.input.chars().count() >= LONG_INPUT_CHARACTERS {
+            let is_long = item.input.chars().count() >= LONG_INPUT_CHARACTERS;
+            let maximum_gap = if is_long
+                && bounded_multi_region_substitution(&ordinary[0].surface, &conversion.surface)
+            {
+                EXTENDED_GENERATIVE_COST_GAP
+            } else if is_long {
                 LONG_MAX_CANDIDATE_COST_GAP
             } else {
                 SHORT_MAX_CANDIDATE_COST_GAP
@@ -226,7 +232,6 @@ fn run() -> Result<(), String> {
         let backed_matches = backed
             .as_deref()
             .is_some_and(|surface| matches_expected(surface, &item.expected_output));
-
         base_correct += usize::from(base_matches);
         raw_correct += usize::from(raw_matches);
         dictionary_backed += usize::from(backed.is_some());
@@ -243,6 +248,15 @@ fn run() -> Result<(), String> {
 
         let mut existing_generation_stats = None;
         let mut contrast_generation_stats = None;
+        let ordinary_generated_cost_gap = if item.input.chars().count() >= LONG_INPUT_CHARACTERS {
+            LONG_MAX_CANDIDATE_COST_GAP
+        } else {
+            SHORT_MAX_CANDIDATE_COST_GAP
+        };
+        let extended_generated_candidate = augmented.get(original_count).is_some_and(|candidate| {
+            candidate.surface == generated.surface
+                && candidate.cost.saturating_sub(ordinary[0].cost) > ordinary_generated_cost_gap
+        });
         let (
             current_surface,
             augmented_surface,
@@ -315,12 +329,16 @@ fn run() -> Result<(), String> {
                 scored.first_mismatch_prefixes[current_index].as_ref(),
             )
             .unwrap_or_else(|| current_surface.clone());
-            let augmented_index = rescored_index(
-                item,
-                augmented,
-                &scored.candidate_logliks,
-                augmented.len() > original_count,
-            );
+            let augmented_index = if extended_generated_candidate {
+                original_count
+            } else {
+                rescored_index(
+                    item,
+                    augmented,
+                    &scored.candidate_logliks,
+                    augmented.len() > original_count,
+                )
+            };
             let augmented_surface = augmented[augmented_index].surface.clone();
             let augmented_prefix = apply_prefix_correction(
                 &dictionary,
@@ -329,12 +347,16 @@ fn run() -> Result<(), String> {
                 scored.first_mismatch_prefixes[augmented_index].as_ref(),
             )
             .unwrap_or_else(|| augmented_surface.clone());
-            let contrast_index = rescored_index(
-                item,
-                augmented,
-                &contrast_logliks,
-                augmented.len() > original_count,
-            );
+            let contrast_index = if extended_generated_candidate {
+                original_count
+            } else {
+                rescored_index(
+                    item,
+                    augmented,
+                    &contrast_logliks,
+                    augmented.len() > original_count,
+                )
+            };
             if let Some(generated_index) = augmented[..original_count]
                 .iter()
                 .position(|candidate| candidate.surface == generated.surface)

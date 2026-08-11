@@ -2092,6 +2092,26 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_extended_multi_region_generation(handle: *mut super::SlimeHandle) {
+        // The generated surface is a complete lattice path with two bounded
+        // local regions, but sits just outside the ordinary rescoring cost
+        // window. Direct generation consensus recovers the whole expression.
+        // SAFETY: The live handle is reset before this independent fixture.
+        assert_eq!(unsafe { slime_reset_context(handle) }, STATUS_OK);
+        let mut capture = TypedCapture::default();
+        for character in "ただし、へんもくのなかにはなかみをかくものがあり".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("ただし、篇目の中には中身を欠くものがあり")
+        );
+        process_typed_event(handle, EVENT_ENTER, 0, &mut capture);
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_context_contrast(handle: *mut super::SlimeHandle) {
         // The unconditioned model and dictionary narrowly prefer 乗せ. The
         // surrounding sentence specifically supports the written-form 載せ.
@@ -2339,6 +2359,7 @@ mod tests {
         verify_deeper_prefix_correction(handle);
         verify_iterative_prefix_correction(handle);
         verify_generative_recall(handle);
+        verify_extended_multi_region_generation(handle);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

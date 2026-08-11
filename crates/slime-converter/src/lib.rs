@@ -4834,6 +4834,7 @@ const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
     ("はっ", NumberToken::SokuonDigit(8)),
     ("ろっ", NumberToken::SokuonDigit(6)),
     ("じゅっ", NumberToken::Small(10)),
+    ("じっ", NumberToken::Small(10)),
     ("じゅう", NumberToken::Small(10)),
     ("ひゃく", NumberToken::Small(100)),
     ("びゃく", NumberToken::Small(100)),
@@ -4848,7 +4849,7 @@ const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
     ("く", NumberToken::Digit(9)),
 ];
 
-const RISKY_SINGLE_NUMBER_READINGS: &[&str] = &["に", "し", "ご", "く", "ぜん", "じゅっ"];
+const RISKY_SINGLE_NUMBER_READINGS: &[&str] = &["に", "し", "ご", "く", "ぜん", "じゅっ", "じっ"];
 
 /// Parses kana numeral prefixes of `suffix`. Returns every token boundary at
 /// which the consumed prefix forms a complete number, with its value.
@@ -4921,8 +4922,16 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
             first_token = text;
         }
 
-        let single_and_risky =
-            token_count == 1 && RISKY_SINGLE_NUMBER_READINGS.contains(&first_token);
+        // `じっ` is a common pronunciation of ten in compounds such as
+        // `さんじっかい` and before the assimilated minute counter
+        // (`じっぷん`). It is also the beginning of ordinary words such as
+        // `じっけん` and `じっこう`, so never expose a standalone numeric
+        // node except at that unambiguous counter boundary.
+        let single_sokuon_ten_before_minutes =
+            token_count == 1 && first_token == "じっ" && suffix[consumed..].starts_with("ぷん");
+        let single_and_risky = token_count == 1
+            && RISKY_SINGLE_NUMBER_READINGS.contains(&first_token)
+            && !single_sokuon_ten_before_minutes;
         if !single_and_risky && !awaiting_unit {
             results.push((consumed, total + section + pending));
         }
@@ -7336,6 +7345,35 @@ mod tests {
                 .iter()
                 .all(|candidate| !candidate.surface.contains('1'))
         );
+    }
+
+    #[test]
+    fn sokuon_ten_reading_composes_inside_numbers_and_before_minutes() {
+        let dictionary = Dictionary::bundled();
+        for (reading, expected) in [
+            ("さんじっかい", "30回"),
+            ("ごじっこ", "50個"),
+            ("じっぷんけん", "10分圏"),
+        ] {
+            let candidates = dictionary.candidates(reading);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.surface == expected),
+                "missing {expected} for {reading}: {candidates:?}"
+            );
+        }
+
+        for reading in ["じっけん", "じっこう", "じっかい"] {
+            let conversions = dictionary.convert_n_best(reading, 32);
+            assert!(
+                conversions
+                    .iter()
+                    .all(|conversion| !conversion.surface.starts_with("10")
+                        && !conversion.surface.starts_with("１０")),
+                "standalone じっ must not become 10 in {reading}: {conversions:?}"
+            );
+        }
     }
 
     #[test]

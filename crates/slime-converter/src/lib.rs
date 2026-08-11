@@ -480,6 +480,13 @@ enum PersonalNameRole {
     GivenName,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PersonalNameRoles {
+    full_name: bool,
+    surname: bool,
+    given_name: bool,
+}
+
 const COMPOUND_MAX_SEGMENTS: usize = 6;
 const COMPOUND_MAX_READING_CHARACTERS: usize = 16;
 const COMPOUND_MAX_ENTRIES_PER_SEGMENT: usize = 8;
@@ -1391,6 +1398,84 @@ impl Dictionary {
         }
 
         candidates
+    }
+
+    /// Returns whether a surface substitution changes a dictionary-confirmed
+    /// personal-name segment in the exact path for `current_surface`.
+    ///
+    /// Model-directed local corrections use this to preserve an already valid
+    /// name spelling while still allowing corrections elsewhere in the same
+    /// sentence. The check is deliberately limited to exact Mozc surname/name
+    /// POS entries; ordinary nouns and unknown strings are unaffected.
+    #[must_use]
+    pub fn changes_exact_personal_name_segment(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        let current_characters = current_surface.chars().collect::<Vec<_>>();
+        let alternative_characters = alternative_surface.chars().collect::<Vec<_>>();
+        if current_characters.len() != alternative_characters.len() {
+            return false;
+        }
+        let changed = current_characters
+            .iter()
+            .zip(&alternative_characters)
+            .enumerate()
+            .filter_map(|(index, (current, alternative))| (current != alternative).then_some(index))
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            return false;
+        }
+        let Some(conversion) = self
+            .convert_n_best_with_surface_prefix(reading, current_surface, 1)
+            .into_iter()
+            .find(|conversion| conversion.surface == current_surface)
+        else {
+            return false;
+        };
+        let mut surface_start = 0usize;
+        let segments = conversion
+            .segments
+            .into_iter()
+            .map(|segment| {
+                let surface_end = surface_start + segment.surface.chars().count();
+                let roles = self.exact_personal_name_roles(&segment.reading, &segment.surface);
+                let indexed = (surface_start, surface_end, roles);
+                surface_start = surface_end;
+                indexed
+            })
+            .collect::<Vec<_>>();
+        for (index, &(surface_start, surface_end, roles)) in segments.iter().enumerate() {
+            let protected_name = roles.full_name
+                || (roles.surname
+                    && segments
+                        .get(index + 1)
+                        .is_some_and(|(_, _, next)| next.given_name))
+                || (roles.given_name && index > 0 && segments[index - 1].2.surname);
+            if changed
+                .iter()
+                .any(|&index| (surface_start..surface_end).contains(&index))
+                && protected_name
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn exact_personal_name_roles(&self, reading: &str, surface: &str) -> PersonalNameRoles {
+        let mut roles = PersonalNameRoles::default();
+        self.for_each_exact(reading, |entry| {
+            if entry.surface == surface {
+                roles.full_name |= entry.left_id == MOZC_PERSONAL_SURNAME_POS_ID
+                    && entry.right_id == MOZC_PERSONAL_GIVEN_NAME_POS_ID;
+                roles.surname |= entry.right_id == MOZC_PERSONAL_SURNAME_POS_ID;
+                roles.given_name |= entry.left_id == MOZC_PERSONAL_GIVEN_NAME_POS_ID;
+            }
+        });
+        roles
     }
 
     /// Reports whether `surface` can be aligned to two to six exact dictionary
@@ -4739,6 +4824,68 @@ mod tests {
                 .any(|candidate| candidate.surface == "山田深名")
         );
         assert!(personal_names.len() <= 64);
+    }
+
+    #[test]
+    fn exact_personal_name_change_detection_is_segment_local() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos(
+                "かたせしま",
+                "片瀬志麻",
+                MOZC_PERSONAL_SURNAME_POS_ID,
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                10,
+            ),
+            DictionaryEntry::with_pos(
+                "かたせ",
+                "片瀬",
+                MOZC_PERSONAL_SURNAME_POS_ID,
+                MOZC_PERSONAL_SURNAME_POS_ID,
+                20,
+            ),
+            DictionaryEntry::with_pos(
+                "しま",
+                "志摩",
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                20,
+            ),
+            DictionaryEntry::new("かてい", "課程", 10),
+            DictionaryEntry::new("かてい", "過程", 20),
+            DictionaryEntry::new("ふ", "不", 10),
+            DictionaryEntry::with_pos(
+                "ちゅう",
+                "忠",
+                MOZC_PERSONAL_SURNAME_POS_ID,
+                MOZC_PERSONAL_SURNAME_POS_ID,
+                20,
+            ),
+            DictionaryEntry::with_pos(
+                "ちゅう",
+                "忠",
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                MOZC_PERSONAL_GIVEN_NAME_POS_ID,
+                20,
+            ),
+            DictionaryEntry::new("しゃ", "社", 10),
+            DictionaryEntry::new("しゃ", "者", 20),
+        ]);
+
+        assert!(dictionary.changes_exact_personal_name_segment(
+            "かたせしまかてい",
+            "片瀬志麻課程",
+            "片瀬志摩課程",
+        ));
+        assert!(!dictionary.changes_exact_personal_name_segment(
+            "かたせしまかてい",
+            "片瀬志麻課程",
+            "片瀬志麻過程",
+        ));
+        assert!(!dictionary.changes_exact_personal_name_segment(
+            "ふちゅうしゃ",
+            "不忠社",
+            "不忠者",
+        ));
     }
 
     #[test]

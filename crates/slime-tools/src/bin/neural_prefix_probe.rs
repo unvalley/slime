@@ -434,6 +434,7 @@ fn constrained_local_correction(
     let is_safe = |alternative: &String| {
         bounded_local_substitution(current, alternative, MAX_CHANGED_CHARACTERS)
             && preserves_kanji_from_hiragana_deconversion(current, alternative)
+            && !dictionary.changes_exact_personal_name_segment(reading, current, alternative)
             && !excluded.contains(alternative)
     };
     let initial = dictionary.convert_n_best_with_surface_prefix(

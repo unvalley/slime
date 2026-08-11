@@ -313,6 +313,12 @@ modelの強い不一致prefixを辞書へ戻す局所修正では、従来は制
 baseline比約107 ms、最大RSS増分は約24.2 MBである。語彙本体は同梱せず、ライセンスと頻度を
 確認した配布パックを別途評価する。
 
+## 今回の実装: 辞書で確定できる姓名の表記保護
+
+[ATOKの固有名詞優先](https://atok.com/other/support/howtouse/mac/tr/pgs/tr_conv_name.htm)が示すように、人名は一般語の順位付けと分けて扱う必要がある。Slimeは人名候補を無条件に初回優先せず、現在の候補にMozc辞書で完全一致する姓＋名の経路がある場合だけ、`high-accuracy`のmodel指示prefix修正からその表記を保護する。フルネームentry、または隣接する姓POS＋名POSが必要で、名前POSを別解に持つ一般語だけでは保護しない。
+
+信頼性gate後のJWTD 400件では、1回prefix修正が226→227、2回までの修正が230→231となり、`片瀬志麻→片瀬志摩`のexact悪化1件を0件にした。AJIMEEの最終精度は不変、PUD 446件、GSD dev 331件、GSD test 323件は計測時間以外の出力が保護前とバイト一致した。Release相当の2,000回単独測定は、人名保護成立が0.0346 ms/op、一般語の非成立が0.0188 ms/opだった。通常変換や表示候補には追加探索を行わない。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

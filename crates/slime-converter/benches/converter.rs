@@ -21,6 +21,7 @@ fn main() {
         black_box(dictionary.convert_best(black_box("わたしはにほん")));
     });
     run_n_best_benchmarks(&dictionary, iterations);
+    run_personal_name_guard_benchmarks(&dictionary, iterations);
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
     });
@@ -106,6 +107,31 @@ fn main() {
     run("converter/short_dictionary_layer", iterations, || {
         black_box(short_dictionary_layer());
     });
+}
+
+fn run_personal_name_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/personal_name_guard_exact_name",
+        iterations,
+        || {
+            black_box(dictionary.changes_exact_personal_name_segment(
+                black_box("かたせしまたち"),
+                black_box("片瀬志麻たち"),
+                black_box("片瀬志摩たち"),
+            ));
+        },
+    );
+    run(
+        "converter/personal_name_guard_ordinary_word",
+        iterations,
+        || {
+            black_box(dictionary.changes_exact_personal_name_segment(
+                black_box("ふちゅうしゃ"),
+                black_box("不忠社"),
+                black_box("不忠者"),
+            ));
+        },
+    );
 }
 
 fn run_n_best_benchmarks(dictionary: &Dictionary, iterations: u64) {

@@ -866,6 +866,9 @@ impl SlimeEngine {
                 correction,
                 PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
             ) && preserves_kanji_from_hiragana_deconversion(current, correction)
+                && !self
+                    .dictionary
+                    .changes_exact_personal_name_segment(reading, current, correction)
                 && !existing_candidates.contains(correction)
         };
         let initial = self.dictionary.convert_n_best_with_surface_prefix(
@@ -5554,6 +5557,55 @@ mod tests {
                 .handle(InputEvent::Enter)
                 .contains(&SlimeAction::Commit("少額の問題".to_owned()))
         );
+    }
+
+    #[test]
+    fn model_prefix_preserves_an_exact_personal_name_segment() {
+        const GIVEN_NAME_POS_ID: u16 = 1922;
+        const SURNAME_POS_ID: u16 = 1923;
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos(
+                "かたせしま",
+                "片瀬志麻",
+                SURNAME_POS_ID,
+                GIVEN_NAME_POS_ID,
+                10,
+            ),
+            DictionaryEntry::with_pos("かたせ", "片瀬", SURNAME_POS_ID, SURNAME_POS_ID, 20),
+            DictionaryEntry::with_pos("しま", "志摩", GIVEN_NAME_POS_ID, GIVEN_NAME_POS_ID, 20),
+            DictionaryEntry::new("たち", "たち", 10),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = "かたせしまたち".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = vec!["片瀬志麻たち".to_owned()];
+        let candidate = Candidate {
+            surface: "片瀬志麻たち".to_owned(),
+            cost: 100,
+        };
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: vec![candidate.surface.clone()],
+            },
+            model_supplemental: vec![false],
+            generative_consensus: None,
+            candidates: vec![candidate],
+        });
+
+        engine
+            .apply_candidate_rescore_with_prefix_constraints(
+                &[0.0],
+                &[Some("片瀬志摩".to_owned())],
+                0.8,
+                0.0,
+            )
+            .expect("valid scores should still apply");
+
+        assert_eq!(engine.candidates[0], "片瀬志麻たち");
+        assert!(!engine.candidates.contains(&"片瀬志摩たち".to_owned()));
     }
 
     #[test]

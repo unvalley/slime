@@ -52,8 +52,8 @@ const DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 16;
 const MAX_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 32;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
-const SHORT_SURROUNDING_CONTEXT_RESCORE_MAX_READING_CHARACTERS: usize = 6;
-const SHORT_SURROUNDING_CONTEXT_RESCORE_COST_GAP: i32 = 2_000;
+const SHORT_CONFIRMED_CONTEXT_RESCORE_MAX_READING_CHARACTERS: usize = 6;
+const SHORT_CONFIRMED_CONTEXT_RESCORE_COST_GAP: i32 = 2_000;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const MODEL_KATAKANA_RECALL_ADDITIONAL_CANDIDATES: usize = 3;
 const MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS: usize = 5;
@@ -932,10 +932,10 @@ impl SlimeEngine {
             })
     }
 
-    /// Whether this request only exists because confirmed text on both sides
-    /// widened the ordinary confidence gate. Such requests may reorder the
-    /// bounded dictionary pool, but must not introduce generated or
-    /// prefix-followup surfaces.
+    /// Whether this request only exists because confirmed left context widened
+    /// the ordinary confidence gate. Such requests may reorder the bounded
+    /// dictionary pool, but must not introduce generated or prefix-followup
+    /// surfaces.
     #[must_use]
     pub fn candidate_rescore_requires_dictionary_only_ranking(&self) -> bool {
         self.candidate_rescore
@@ -3139,16 +3139,15 @@ fn candidate_rescore_state_with_limit(
         return None;
     }
     let base_cost = dictionary_candidates.first()?.cost;
-    let uses_short_surrounding_context = !context.is_empty()
-        && !right_context.is_empty()
-        && reading.chars().count() <= SHORT_SURROUNDING_CONTEXT_RESCORE_MAX_READING_CHARACTERS;
+    let uses_short_confirmed_context = !context.is_empty()
+        && reading.chars().count() <= SHORT_CONFIRMED_CONTEXT_RESCORE_MAX_READING_CHARACTERS;
     // Multi-segment paths accumulate a wider base-cost spread than short
     // homophones. Let the ready local model inspect that bounded tail without
     // weakening the conservative window used by short readings.
     let max_candidate_cost_gap = if reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS {
         LONG_RESCORE_MAX_CANDIDATE_COST_GAP
-    } else if uses_short_surrounding_context {
-        SHORT_SURROUNDING_CONTEXT_RESCORE_COST_GAP
+    } else if uses_short_confirmed_context {
+        SHORT_CONFIRMED_CONTEXT_RESCORE_COST_GAP
     } else {
         RESCORE_MAX_CANDIDATE_COST_GAP
     };
@@ -3169,8 +3168,8 @@ fn candidate_rescore_state_with_limit(
     let bypasses_base_confidence = bypass_long_input_confidence
         && right_context.is_empty()
         && reading.chars().count() >= LONG_RESCORE_READING_CHARACTERS;
-    let max_base_confidence_gap = if uses_short_surrounding_context {
-        SHORT_SURROUNDING_CONTEXT_RESCORE_COST_GAP
+    let max_base_confidence_gap = if uses_short_confirmed_context {
+        SHORT_CONFIRMED_CONTEXT_RESCORE_COST_GAP
     } else {
         RESCORE_MAX_BASE_COST_GAP
     };
@@ -3197,9 +3196,8 @@ fn candidate_rescore_state_with_limit(
 
 fn requires_dictionary_only_context_ranking(state: &CandidateRescoreState) -> bool {
     !state.request.context.is_empty()
-        && !state.request.right_context.is_empty()
         && state.request.reading.chars().count()
-            <= SHORT_SURROUNDING_CONTEXT_RESCORE_MAX_READING_CHARACTERS
+            <= SHORT_CONFIRMED_CONTEXT_RESCORE_MAX_READING_CHARACTERS
         && state.candidates.first().is_some_and(|base| {
             state
                 .candidates
@@ -5999,9 +5997,26 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_left_context_exposes_a_bounded_short_semantic_alternative() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context("キリスト教世界でも、たとえばアメリカでは大統領は", "");
+        for character in "せんせいしき".chars() {
+            engine.handle(InputEvent::Character(character));
+        }
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("confirmed left context should expose the bounded ambiguity");
+        assert_eq!(request.candidates[0], "先生式");
+        assert!(request.candidates.contains(&"宣誓式".to_owned()));
+        assert!(engine.candidate_rescore_requires_dictionary_only_ranking());
+    }
+
+    #[test]
     fn surrounding_context_does_not_widen_seven_character_confidence() {
         let mut engine = SlimeEngine::bundled();
-        engine.set_external_context("電車に戻ると、", "をつづけた。");
+        engine.set_external_context("電車に戻ると、", "");
         for character in "なんぽーへたび".chars() {
             engine.handle(InputEvent::Character(character));
         }

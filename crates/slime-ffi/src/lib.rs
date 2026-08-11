@@ -205,6 +205,21 @@ impl NeuralProfileParameters {
     }
 }
 
+#[cfg(any(feature = "neural", test))]
+fn minimum_score_margin_for_request(
+    profile: NeuralProfileParameters,
+    is_long_input: bool,
+    has_right_context: bool,
+    dictionary_only_ranking: bool,
+) -> f64 {
+    let configured = profile.minimum_score_margin(is_long_input, has_right_context);
+    if dictionary_only_ranking && !has_right_context {
+        configured.max(DICTIONARY_ONLY_LEFT_CONTEXT_MINIMUM_SCORE_MARGIN)
+    } else {
+        configured
+    }
+}
+
 pub struct SlimeHandle {
     engine: SlimeEngine,
     neural_enabled: bool,
@@ -226,6 +241,8 @@ static NEURAL_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "neural")]
 const NEURAL_MAX_PARALLEL_CANDIDATES: usize = 32;
+#[cfg(any(feature = "neural", test))]
+const DICTIONARY_ONLY_LEFT_CONTEXT_MINIMUM_SCORE_MARGIN: f64 = 0.75;
 #[cfg(feature = "neural")]
 static NEURAL_EXIT_HANDLER: OnceLock<()> = OnceLock::new();
 
@@ -663,9 +680,12 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             return actions;
         };
         let has_right_context = !request.right_context.is_empty();
-        let minimum_margin = handle
-            .neural_profile
-            .minimum_score_margin(request.is_long_input(), has_right_context);
+        let minimum_margin = minimum_score_margin_for_request(
+            handle.neural_profile,
+            request.is_long_input(),
+            has_right_context,
+            dictionary_only_ranking,
+        );
         let candidate_weight = handle
             .neural_profile
             .candidate_weight_for(request.reading.chars().count(), has_right_context);
@@ -1830,6 +1850,18 @@ mod tests {
         assert_close(high_accuracy.minimum_score_margin(true, false), 0.0);
         assert_close(high_accuracy.minimum_score_margin(false, true), 0.5);
         assert_close(high_accuracy.minimum_score_margin(true, true), 0.5);
+        assert_close(
+            super::minimum_score_margin_for_request(high_accuracy, false, false, true),
+            0.75,
+        );
+        assert_close(
+            super::minimum_score_margin_for_request(high_accuracy, false, true, true),
+            0.5,
+        );
+        assert_close(
+            super::minimum_score_margin_for_request(balanced, false, false, true),
+            0.75,
+        );
         assert_eq!(super::neural_profile_parameters(u32::MAX), None);
     }
 

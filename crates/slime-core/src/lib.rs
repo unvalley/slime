@@ -1042,7 +1042,9 @@ impl SlimeEngine {
 
         let (mut order, mut margin_protects_base, selected) =
             candidate_rescore_order_for_state(&state, log_likelihoods, lambda, minimum_margin)?;
-        if self.rescore_changes_exact_region_segment(&state, selected) {
+        if self.rescore_changes_exact_region_segment(&state, selected)
+            || self.rescore_fragments_exact_katakana_segment(&state, selected)
+        {
             return Some(self.candidate_actions());
         }
 
@@ -1145,6 +1147,19 @@ impl SlimeEngine {
             && self.dictionary.changes_exact_region_segment(
                 &state.request.reading,
                 base,
+                &state.candidates[selected].surface,
+            )
+    }
+
+    fn rescore_fragments_exact_katakana_segment(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self.dictionary.fragments_exact_katakana_segment(
+                &state.request.reading,
+                &state.candidates[0].surface,
                 &state.candidates[selected].surface,
             )
     }
@@ -5908,6 +5923,50 @@ mod tests {
             .expect("aligned scores should preserve the exact region");
 
         assert_eq!(engine.candidates[0], "胡桃舘駐在所");
+    }
+
+    #[test]
+    fn model_rescore_rejects_fragmented_exact_katakana() {
+        let reading = "あるごるたいようけい";
+        let candidates = vec![
+            Candidate {
+                surface: "アルゴル太陽系".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "あるゴル太陽系".to_owned(),
+                cost: 200,
+            },
+        ];
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あるごる", "アルゴル", 10),
+            DictionaryEntry::new("たいようけい", "太陽系", 10),
+            DictionaryEntry::new(reading, "あるゴル太陽系", 100),
+        ]);
+        let mut engine = SlimeEngine::new(dictionary);
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("mixed-script fragment should not replace exact katakana");
+
+        assert_eq!(engine.candidates[0], "アルゴル太陽系");
     }
 
     #[test]

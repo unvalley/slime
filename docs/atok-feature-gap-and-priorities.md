@@ -368,6 +368,17 @@ model候補がそれをひらがなへ戻す場合だけ、その変換回のmod
 JWTD 235→236、GSD dev/test、PUD、AJIMEEは全出力不変だった。詳細は
 [evaluation.md](evaluation.md)に記録する。
 
+## 今回の実装: カタカナ語の混在表記分断を防止
+
+high-accuracy modelが辞書完全一致の`アルゴル`を`あるゴル`へ分断するケースに対し、4文字
+以上の全カタカナsegmentがひらがな・カタカナ混在表記へ壊れ、変更がそのsegment内だけに
+収まる場合を拒否する。全ひらがな化は許可し、一般的な表記選択や学習を固定しない。
+
+JWTDは236→237となり、他のGSD dev/test、PUD、AJIMEEは全出力不変だった。azooKey Desktopも
+[Zenzaiによるニューラルかな漢字変換](https://github.com/azooKey/azooKey-Desktop)を採用するが、
+Slimeでは辞書候補と外部modelの境界で表記整合性を独立に検証する。詳細は
+[evaluation.md](evaluation.md)に記録する。
+
 ## 次の実装順
 
 1. v3.2-smallの学習元を作者へ確認し、Apache-2.0のNOTICE、署名、notarizationを含むhigh-accuracy artifactの配布gateを閉じる。通常buildはモデルなしを維持する。

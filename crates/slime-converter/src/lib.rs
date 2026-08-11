@@ -1447,6 +1447,100 @@ impl Dictionary {
         self.changes_exact_named_segment(reading, current_surface, alternative_surface, false, true)
     }
 
+    /// Returns whether a model substitution fragments one exact all-katakana
+    /// dictionary segment into a same-length hiragana/katakana mixture.
+    ///
+    /// A complete hiragana spelling remains available for intentional script
+    /// changes. This only rejects artifacts such as `アルゴル -> あるゴル`,
+    /// where the model splits an established katakana word between scripts.
+    #[must_use]
+    pub fn fragments_exact_katakana_segment(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        let current_characters = current_surface.chars().collect::<Vec<_>>();
+        let alternative_characters = alternative_surface.chars().collect::<Vec<_>>();
+        if current_characters.len() != alternative_characters.len()
+            || current_characters == alternative_characters
+        {
+            return false;
+        }
+        let Some(first_change) = current_characters
+            .iter()
+            .zip(&alternative_characters)
+            .position(|(current, alternative)| current != alternative)
+        else {
+            return false;
+        };
+        let last_change = current_characters
+            .iter()
+            .zip(&alternative_characters)
+            .rposition(|(current, alternative)| current != alternative)
+            .unwrap_or(first_change);
+        let plausible_fragment = current_characters
+            .split_inclusive(|character| !matches!(character, 'ァ'..='ヿ'))
+            .scan(0usize, |surface_start, run| {
+                let start = *surface_start;
+                *surface_start += run.len();
+                Some((start, run))
+            })
+            .any(|(start, run)| {
+                let katakana_characters = run
+                    .iter()
+                    .take_while(|character| matches!(character, 'ァ'..='ヿ'))
+                    .count();
+                let end = start + katakana_characters;
+                katakana_characters >= 4
+                    && start <= first_change
+                    && last_change < end
+                    && alternative_characters[start..end]
+                        .iter()
+                        .any(|character| matches!(character, 'ぁ'..='ゖ'))
+                    && alternative_characters[start..end]
+                        .iter()
+                        .any(|character| matches!(character, 'ァ'..='ヿ'))
+            });
+        if !plausible_fragment {
+            return false;
+        }
+        let Some(conversion) = self
+            .convert_n_best_with_surface_prefix(reading, current_surface, 1)
+            .into_iter()
+            .find(|conversion| conversion.surface == current_surface)
+        else {
+            return false;
+        };
+        let mut surface_start = 0usize;
+        conversion.segments.into_iter().any(|segment| {
+            let segment_characters = segment.surface.chars().count();
+            let surface_end = surface_start + segment_characters;
+            let exact_katakana = segment_characters >= 4
+                && segment
+                    .surface
+                    .chars()
+                    .all(|character| matches!(character, 'ァ'..='ヿ'))
+                && self.has_exact_entry(&segment.reading, &segment.surface);
+            let alternative_segment = &alternative_characters[surface_start..surface_end];
+            let fragmented = exact_katakana
+                && alternative_segment
+                    .iter()
+                    .any(|character| matches!(character, 'ぁ'..='ゖ'))
+                && alternative_segment
+                    .iter()
+                    .any(|character| matches!(character, 'ァ'..='ヿ'));
+            let changes_only_this_segment = current_characters
+                .iter()
+                .zip(&alternative_characters)
+                .enumerate()
+                .filter(|(_, (current, alternative))| current != alternative)
+                .all(|(index, _)| (surface_start..surface_end).contains(&index));
+            surface_start = surface_end;
+            fragmented && changes_only_this_segment
+        })
+    }
+
     fn changes_exact_named_segment(
         &self,
         reading: &str,
@@ -5021,6 +5115,35 @@ mod tests {
             "大刀洗",
             "太刀洗",
         ));
+    }
+
+    #[test]
+    fn exact_katakana_segment_rejects_only_mixed_script_fragmentation() {
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::new("あるごる", "アルゴル", 10),
+            DictionaryEntry::new("たいようけい", "太陽系", 10),
+            DictionaryEntry::new("そふと", "ソフト", 10),
+            DictionaryEntry::new("はむ", "ハム", 10),
+        ]);
+
+        assert!(dictionary.fragments_exact_katakana_segment(
+            "あるごるたいようけい",
+            "アルゴル太陽系",
+            "あるゴル太陽系",
+        ));
+        assert!(!dictionary.fragments_exact_katakana_segment(
+            "あるごるたいようけい",
+            "アルゴル太陽系",
+            "アルゴル太陽けい",
+        ));
+        assert!(!dictionary.fragments_exact_katakana_segment(
+            "あるごるたいようけい",
+            "アルゴル太陽系",
+            "あるゴル太陽けい",
+        ));
+        assert!(!dictionary.fragments_exact_katakana_segment("あるごる", "アルゴル", "あるごる",));
+        assert!(!dictionary.fragments_exact_katakana_segment("そふと", "ソフト", "そふと",));
+        assert!(!dictionary.fragments_exact_katakana_segment("はむ", "ハム", "はム"));
     }
 
     #[test]

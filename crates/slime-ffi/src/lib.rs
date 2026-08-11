@@ -2264,6 +2264,31 @@ mod tests {
     }
 
     #[cfg(feature = "neural")]
+    fn verify_exact_katakana_script_cohesion(model: &str) {
+        // Preserve a dictionary-confirmed katakana word when the model splits
+        // only that word into an unnatural hiragana/katakana mixture.
+        let handle = slime_create();
+        // SAFETY: The handle and model path are live for this synchronous call.
+        assert_eq!(
+            unsafe { enable_high_accuracy_neural(handle, model) },
+            STATUS_OK
+        );
+        wait_for_neural_model();
+        let mut capture = TypedCapture::default();
+        for character in "あるごるたいようけいのわくせいかんをいどうするためのうちゅうせん".chars()
+        {
+            process_typed_event(handle, EVENT_CHARACTER, character.into(), &mut capture);
+        }
+        process_typed_event(handle, EVENT_SPACE, 0, &mut capture);
+        assert_eq!(
+            capture.candidates.first().map(String::as_str),
+            Some("アルゴル太陽系の惑星間を移動するための宇宙船")
+        );
+        // SAFETY: The isolated handle is released exactly once.
+        unsafe { slime_destroy(handle) };
+    }
+
+    #[cfg(feature = "neural")]
     fn verify_context_contrast(handle: *mut super::SlimeHandle) {
         // The unconditioned model and dictionary narrowly prefer 乗せ. The
         // surrounding sentence specifically supports the written-form 載せ.
@@ -2583,6 +2608,7 @@ mod tests {
         verify_confident_full_lattice_generation(handle);
         verify_model_verified_whole_generation(&model);
         verify_exact_region_spelling(&model);
+        verify_exact_katakana_script_cohesion(&model);
         measure_prefix_diagnostics();
         let left_context = "文章の途中で";
         let right_context = "を編集する";

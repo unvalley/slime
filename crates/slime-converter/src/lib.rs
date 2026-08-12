@@ -6626,6 +6626,20 @@ const SPOKEN_LATIN_LETTERS: &[(&str, u8)] = &[
     ("わい", b'Y'),
 ];
 
+const SPOKEN_ENGLISH_DIGITS: &[(&str, u8)] = &[
+    ("しっくす", 6),
+    ("ふぁいぶ", 5),
+    ("すりー", 3),
+    ("ふぉー", 4),
+    ("せぶん", 7),
+    ("えいと", 8),
+    ("ないん", 9),
+    ("とぅー", 2),
+    ("ぜろ", 0),
+    ("わん", 1),
+    ("つー", 2),
+];
+
 fn push_spoken_latin_letter_entries<'a>(
     reading: &str,
     start: usize,
@@ -6633,6 +6647,7 @@ fn push_spoken_latin_letter_entries<'a>(
     out: &mut Vec<SyntheticEntry<'a>>,
 ) {
     const MAX_LETTERS: usize = 8;
+    const MAX_DIGITS: usize = 4;
     const LETTER_COST: i32 = 3_000;
 
     let suffix = &reading[start..];
@@ -6659,7 +6674,7 @@ fn push_spoken_latin_letter_entries<'a>(
     }) {
         return;
     }
-    let mut surface = BumpString::with_capacity_in(MAX_LETTERS, arena);
+    let mut surface = BumpString::with_capacity_in(MAX_LETTERS + MAX_DIGITS, arena);
     let mut consumed = 0_usize;
     while surface.len() < MAX_LETTERS {
         let rest = &suffix[consumed..];
@@ -6685,6 +6700,62 @@ fn push_spoken_latin_letter_entries<'a>(
             });
         }
     }
+
+    if surface.len() < 2 {
+        return;
+    }
+    let digit_start = consumed;
+    let mut digit_count = 0_usize;
+    while digit_count < MAX_DIGITS {
+        let rest = &suffix[consumed..];
+        let Some(&(digit_reading, digit)) = SPOKEN_ENGLISH_DIGITS
+            .iter()
+            .find(|(digit_reading, _)| rest.starts_with(digit_reading))
+        else {
+            break;
+        };
+        surface.push(char::from(b'0' + digit));
+        consumed += digit_reading.len();
+        digit_count += 1;
+    }
+    if consumed > digit_start && is_spoken_identifier_boundary(&suffix[consumed..]) {
+        out.push(SyntheticEntry {
+            end: start + consumed,
+            surface: arena.alloc_str(surface.as_str()),
+            left_id: UNKNOWN_POS_ID,
+            right_id: UNKNOWN_POS_ID,
+            cost: katakana_run_base_cost().saturating_add(
+                LETTER_COST
+                    .saturating_mul(i32::try_from(surface.len()).expect("identifier fits i32")),
+            ),
+            numeric: false,
+        });
+    }
+}
+
+fn is_spoken_identifier_boundary(rest: &str) -> bool {
+    rest.is_empty()
+        || [
+            "から",
+            "まで",
+            "より",
+            "として",
+            "では",
+            "には",
+            "なら",
+            "は",
+            "が",
+            "を",
+            "に",
+            "で",
+            "と",
+            "の",
+            "へ",
+            "も",
+            "や",
+        ]
+        .iter()
+        .any(|particle| rest.starts_with(particle))
 }
 
 fn is_katakana_run_character(character: char) -> bool {
@@ -9142,6 +9213,15 @@ mod tests {
         assert_eq!(dictionary.candidates("じーけー")[0].surface, "GK");
         assert_eq!(dictionary.candidates("えーあい")[0].surface, "AI");
         assert_eq!(dictionary.candidates("えすえぬえす")[0].surface, "SNS");
+        assert_eq!(dictionary.candidates("えむあいしっくす")[0].surface, "MI6");
+        assert_eq!(dictionary.candidates("えむぴーすりー")[0].surface, "MP3");
+        assert!(
+            dictionary
+                .candidates("えーあいふぉーらむ")
+                .iter()
+                .all(|candidate| !candidate.surface.starts_with("AI4")),
+            "an English digit reading inside a word is not an identifier boundary"
+        );
         assert!(
             dictionary
                 .candidates("じー")

@@ -1842,6 +1842,24 @@ fn should_expand_alphanumeric_numeric_compound(
         .any(|(length, _)| *length < reading.len())
 }
 
+fn should_expand_numeric_particle_suru(reading: &str, right_context: &str) -> bool {
+    if reading.chars().count() > 12 || !starts_with_suru_inflection(right_context) {
+        return false;
+    }
+    reading.char_indices().any(|(start, _)| {
+        let suffix = &reading[start..];
+        parse_kana_number_prefixes(suffix)
+            .iter()
+            .any(|(numeric_length, _)| {
+                let numeric_reading = &suffix[..*numeric_length];
+                numeric_reading != "さん"
+                    && suffix[*numeric_length..]
+                        .strip_prefix('に')
+                        .is_some_and(|verbal_noun| !verbal_noun.is_empty())
+            })
+    })
+}
+
 fn is_hiragana_character(character: char) -> bool {
     matches!(character, '\u{3040}'..='\u{309f}')
 }
@@ -4106,7 +4124,8 @@ impl Dictionary {
         limit: usize,
     ) -> Vec<Candidate> {
         let expands_search =
-            should_expand_alphanumeric_numeric_compound(reading, left_context, right_context);
+            should_expand_alphanumeric_numeric_compound(reading, left_context, right_context)
+                || should_expand_numeric_particle_suru(reading, right_context);
         let search_limit = if expands_search { limit.max(32) } else { limit };
         let mut candidates = self.candidates_with_context_ranker(
             reading,
@@ -8977,6 +8996,33 @@ mod tests {
             candidates[0].surface, "39編",
             "wrong counter: {candidates:?}"
         );
+    }
+
+    #[test]
+    fn numeric_particle_suru_context_recalls_a_deep_verbal_noun() {
+        let dictionary = Dictionary::bundled();
+        let candidates = dictionary.candidates_with_surrounding_context_limit(
+            "ぐれーどよんにいち",
+            "彼らは、全国平均",
+            "し、全国平均グレード8よりも優れている。",
+            5,
+        );
+        assert_eq!(
+            candidates[0].surface, "グレード4に位置",
+            "wrong numeric verbal noun: {candidates:?}"
+        );
+        assert_eq!(candidates.len(), 5, "the visible candidate width is stable");
+
+        for (reading, right_context) in [
+            ("ぐれーどよんにいち", "を示す"),
+            ("さんにいち", "した"),
+            ("ぐれーどよんに", "した"),
+        ] {
+            assert!(!super::should_expand_numeric_particle_suru(
+                reading,
+                right_context
+            ));
+        }
     }
 
     #[test]

@@ -1423,6 +1423,10 @@ impl SlimeEngine {
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
             )
+            || rescore_changes_calendar_or_clock_ascii_digits(
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
     }
 
     fn rescore_changes_exact_region_segment(
@@ -3316,6 +3320,37 @@ fn rescore_only_expands_ascii_digit_width(base: &str, selected: &str) -> bool {
         return false;
     }
     expanded
+}
+
+/// Preserve the converter's explicit ASCII value inside an unambiguous
+/// multi-part calendar or clock expression. A local model may improve the
+/// words around it, but it must not turn `6月10日` back into `6月トーカ`.
+/// Requiring two components deliberately excludes isolated counters such as
+/// `1007位`, whose numeric parse may itself be the dictionary error.
+fn rescore_changes_calendar_or_clock_ascii_digits(base: &str, selected: &str) -> bool {
+    let base_characters = base.chars().collect::<Vec<_>>();
+    let structured_components = base_characters
+        .iter()
+        .enumerate()
+        .filter(|&(index, character)| {
+            character.is_ascii_digit()
+                && (index == 0 || !base_characters[index - 1].is_ascii_digit())
+                && base_characters[index..]
+                    .iter()
+                    .position(|character| !character.is_ascii_digit())
+                    .and_then(|offset| base_characters.get(index + offset))
+                    .is_some_and(|character| is_calendar_or_clock_unit(*character))
+        })
+        .count();
+    structured_components >= 2
+        && !base
+            .chars()
+            .filter(char::is_ascii_digit)
+            .eq(selected.chars().filter(char::is_ascii_digit))
+}
+
+fn is_calendar_or_clock_unit(character: char) -> bool {
+    matches!(character, '年' | '月' | '日' | '時' | '分' | '秒')
 }
 
 fn anchor_model_rescore_state(
@@ -6220,6 +6255,67 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("digit-width-only rescore should preserve the base candidate");
         assert_eq!(engine.candidates[0], "2014年");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_structured_ascii_numbers() {
+        assert!(super::rescore_changes_calendar_or_clock_ascii_digits(
+            "6月10日",
+            "6月トーカ"
+        ));
+        assert!(super::rescore_changes_calendar_or_clock_ascii_digits(
+            "2026年8月12日",
+            "2026年8月十二日"
+        ));
+        assert!(!super::rescore_changes_calendar_or_clock_ascii_digits(
+            "1990年の家事",
+            "1990年の火事"
+        ));
+        assert!(!super::rescore_changes_calendar_or_clock_ascii_digits(
+            "39編",
+            "サンキュー編"
+        ));
+        assert!(!super::rescore_changes_calendar_or_clock_ascii_digits(
+            "夜1007位",
+            "予選7位"
+        ));
+        assert!(!super::rescore_changes_calendar_or_clock_ascii_digits(
+            "グレード421",
+            "グレード4に位置"
+        ));
+
+        let candidates = vec![
+            Candidate {
+                surface: "6月10日".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "6月トーカ".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "ろくがつとおか".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: "の土曜日".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("structured-number rescore should preserve the base candidate");
+        assert_eq!(engine.candidates[0], "6月10日");
     }
 
     #[test]

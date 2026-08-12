@@ -950,11 +950,11 @@ impl SlimeEngine {
             .is_some_and(requires_dictionary_only_context_ranking)
     }
 
-    /// Whether contextual scoring would replace an exact ideographic segment
-    /// strongly preferred by the context-ablated model with a hiragana spelling
-    /// assembled from smaller fragments. The caller can retain the ablated
-    /// scores without a third model pass when this conservative boundary is
-    /// crossed.
+    /// Whether contextual scoring would break exact dictionary structure that
+    /// the context-ablated model and base ranker both preserve. This covers a
+    /// fragmented ideographic segment and an exact phrase spanning the caret.
+    /// The caller can retain the ablated scores without a third model pass when
+    /// either conservative boundary is crossed.
     #[must_use]
     pub fn candidate_rescore_should_use_context_ablated_scores(
         &self,
@@ -1007,10 +1007,14 @@ impl SlimeEngine {
         else {
             return false;
         };
-        context_ablated_log_likelihoods[ablated] - context_ablated_log_likelihoods[runner_up]
+        if ablated_selected != ablated
+            || state.candidates[ablated].surface == state.candidates[contextual].surface
+        {
+            return false;
+        }
+        let preserves_fragmented_exact_segment = context_ablated_log_likelihoods[ablated]
+            - context_ablated_log_likelihoods[runner_up]
             >= CONTEXT_ABLATED_EXACT_FRAGMENT_MIN_MODEL_MARGIN
-            && ablated_selected == ablated
-            && state.candidates[ablated].surface != state.candidates[contextual].surface
             && bounded_local_substitution(
                 &state.candidates[ablated].surface,
                 &state.candidates[contextual].surface,
@@ -1022,7 +1026,19 @@ impl SlimeEngine {
                     &state.request.reading,
                     &state.candidates[ablated].surface,
                     &state.candidates[contextual].surface,
-                )
+                );
+        let preserves_exact_right_phrase = ablated == 0
+            && self.dictionary.has_exact_right_phrase_continuation(
+                &state.request.reading,
+                &state.candidates[ablated].surface,
+                &state.request.right_context,
+            )
+            && !self.dictionary.has_exact_right_phrase_continuation(
+                &state.request.reading,
+                &state.candidates[contextual].surface,
+                &state.request.right_context,
+            );
+        preserves_fragmented_exact_segment || preserves_exact_right_phrase
     }
 
     /// Whether an already-scored long N-best winner justifies one delayed
@@ -8452,6 +8468,41 @@ mod tests {
                 0.0,
             )
         );
+    }
+
+    #[test]
+    fn context_ablated_scores_preserve_an_exact_phrase_across_the_caret() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context("横浜横須賀", "湘南バイパスは、終日5割引。 ");
+        type_text(&mut engine, "どーろとしん");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("right-phrase alternatives should be scoreable");
+        let exact_phrase = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "道路と新")
+            .expect("exact cross-caret phrase candidate");
+        let contextual = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "道路都心")
+            .expect("contextual alternative");
+        assert_eq!(exact_phrase, 0, "dictionary evidence should rank first");
+        let mut contextual_scores = vec![-10.0; request.candidates.len()];
+        let mut ablated_scores = vec![-10.0; request.candidates.len()];
+        contextual_scores[contextual] = 10.0;
+        ablated_scores[exact_phrase] = 10.0;
+        ablated_scores[contextual] = 9.68;
+
+        assert!(engine.candidate_rescore_should_use_context_ablated_scores(
+            &contextual_scores,
+            &ablated_scores,
+            0.8,
+            0.0,
+        ));
     }
 
     #[test]

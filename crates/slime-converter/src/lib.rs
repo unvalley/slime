@@ -765,6 +765,7 @@ const FIXED_SEGMENT_MAX_STATES: usize = 256;
 const DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS: usize = 2;
 const DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS: usize = 8;
 const DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS: usize = 8;
+const DOCUMENT_RIGHT_CARET_PHRASE_MAX_PREFIX_CHARACTERS: usize = 4;
 // A lower-cost whole compound is stronger evidence than a marginal one. The
 // cap bounds how far dictionary evidence can move an existing N-best item.
 const DOCUMENT_PHRASE_COST_CEILING: i32 = 9_000;
@@ -1968,6 +1969,68 @@ impl Dictionary {
                 && !alternative_is_one_segment
                 && !alternative_has_exact_ideographic_overlap
         })
+    }
+
+    /// Returns whether a bounded suffix of a complete conversion forms an exact
+    /// dictionary phrase with the confirmed text to its right.
+    #[must_use]
+    pub fn has_exact_right_phrase_continuation(
+        &self,
+        reading: &str,
+        surface: &str,
+        right_context: &str,
+    ) -> bool {
+        if right_context.is_empty() {
+            return false;
+        }
+        let Some(compact) = self.bundled else {
+            return false;
+        };
+        let context_end = right_context
+            .char_indices()
+            .nth(DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS)
+            .map_or(right_context.len(), |(index, _)| index);
+        let context_head = &right_context[..context_end];
+        surface
+            .char_indices()
+            .rev()
+            .take(DOCUMENT_RIGHT_CARET_PHRASE_MAX_PREFIX_CHARACTERS)
+            .any(|(start, _)| {
+                let surface_suffix = &surface[start..];
+                surface_suffix.chars().any(is_ideographic_or_digit)
+                    && self
+                        .readings_for_surface(surface_suffix)
+                        .into_iter()
+                        .take(FIXED_SEGMENT_MAX_ENTRIES_PER_SEGMENT)
+                        .any(|reading_suffix| {
+                            if !reading.ends_with(&reading_suffix) {
+                                return false;
+                            }
+                            let mut found = false;
+                            compact.for_each_joined_surface_reading_prefix(
+                                surface_suffix,
+                                context_head,
+                                &reading_suffix,
+                                DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS,
+                                |suffix, entry| {
+                                    found |= !suffix.is_empty()
+                                        && entry.word_cost < DOCUMENT_PHRASE_COST_CEILING
+                                        && !matches!(
+                                            entry.left_id,
+                                            MOZC_PERSONAL_GIVEN_NAME_POS_ID
+                                                | MOZC_PERSONAL_SURNAME_POS_ID
+                                        )
+                                        && !matches!(
+                                            entry.right_id,
+                                            MOZC_PERSONAL_GIVEN_NAME_POS_ID
+                                                | MOZC_PERSONAL_SURNAME_POS_ID
+                                        )
+                                        && right_phrase_suffix_has_boundary(suffix, right_context);
+                                },
+                            );
+                            found
+                        })
+            })
     }
 
     fn changes_exact_named_segment(
@@ -6079,6 +6142,22 @@ mod tests {
                 "に跳ねてくる",
             )
         );
+    }
+
+    #[test]
+    fn exact_right_phrase_continuation_uses_a_bounded_surface_suffix() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(dictionary.has_exact_right_phrase_continuation(
+            "どーろとしん",
+            "道路と新",
+            "湘南バイパスは、終日5割引。",
+        ));
+        assert!(!dictionary.has_exact_right_phrase_continuation(
+            "どーろとしん",
+            "道路都心",
+            "湘南バイパスは、終日5割引。",
+        ));
     }
 
     #[test]

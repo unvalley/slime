@@ -1528,6 +1528,7 @@ impl SlimeEngine {
             || rescore_removes_contextual_chronological_year(state, selected)
             || self.rescore_removes_contextual_genitive_case_frame(state, selected)
             || self.rescore_removes_contextual_repeat_prefix(state, selected)
+            || self.rescore_removes_repeated_document_segment(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
             || rescore_removes_contextual_foreign_name_honorific(state, selected)
     }
@@ -1603,6 +1604,20 @@ impl SlimeEngine {
             && self.dictionary.deconverts_contextual_repeat_prefix(
                 &state.request.reading,
                 &state.request.right_context,
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
+    }
+
+    fn rescore_removes_repeated_document_segment(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self.dictionary.deconverts_repeated_document_segment(
+                &state.request.reading,
+                &state.request.context,
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
             )
@@ -7888,6 +7903,45 @@ mod tests {
             .expect("the repeat prefix should survive model rescoring");
 
         assert_eq!(engine.candidates[0], "アフリカでも再");
+    }
+
+    #[test]
+    fn model_rescore_preserves_a_recently_repeated_document_term() {
+        let reading = "そしてしょきがいんようする";
+        let candidates = vec![
+            Candidate {
+                surface: "そして書紀が引用する".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "そして初期が引用する".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::bundled();
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "漢城陥落は『三国史記』と『日本書紀』".to_owned(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("the repeated document term should survive model rescoring");
+
+        assert_eq!(engine.candidates[0], "そして書紀が引用する");
     }
 
     #[test]

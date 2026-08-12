@@ -58,12 +58,7 @@ impl CandidateRanker for DocumentContextRanker {
             && left_context.contains(&conversion.surface)
         {
             conversion.cost.saturating_sub(DOCUMENT_REPEAT_PROMOTION)
-        } else if conversion.segments.iter().any(|segment| {
-            segment.surface.chars().count() >= DOCUMENT_REPEAT_MIN_SURFACE_CHARACTERS
-                && segment.surface != segment.reading
-                && segment.surface.chars().any(is_kanji)
-                && context_tail_matches_surface(left_context, &segment.surface)
-        }) {
+        } else if has_repeated_ideographic_tail_segment(left_context, conversion) {
             conversion
                 .cost
                 .saturating_sub(DOCUMENT_SEGMENT_REPEAT_PROMOTION)
@@ -71,6 +66,34 @@ impl CandidateRanker for DocumentContextRanker {
             conversion.cost
         }
     }
+}
+
+pub(crate) fn removes_repeated_ideographic_tail_segment(
+    left_context: &str,
+    current: &Conversion,
+    alternative: &Conversion,
+) -> bool {
+    current.segments.iter().any(|segment| {
+        is_repeated_ideographic_tail_segment(left_context, segment)
+            && !alternative.segments.iter().any(|alternative_segment| {
+                alternative_segment.reading == segment.reading
+                    && alternative_segment.surface == segment.surface
+            })
+    })
+}
+
+fn has_repeated_ideographic_tail_segment(left_context: &str, conversion: &Conversion) -> bool {
+    conversion
+        .segments
+        .iter()
+        .any(|segment| is_repeated_ideographic_tail_segment(left_context, segment))
+}
+
+fn is_repeated_ideographic_tail_segment(left_context: &str, segment: &crate::Segment) -> bool {
+    segment.surface.chars().count() >= DOCUMENT_REPEAT_MIN_SURFACE_CHARACTERS
+        && segment.surface != segment.reading
+        && segment.surface.chars().any(is_kanji)
+        && context_tail_matches_surface(left_context, &segment.surface)
 }
 
 fn context_tail_matches_surface(left_context: &str, surface: &str) -> bool {
@@ -88,7 +111,9 @@ fn is_kanji(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidateRanker, DocumentContextRanker};
+    use super::{
+        CandidateRanker, DocumentContextRanker, removes_repeated_ideographic_tail_segment,
+    };
     use crate::{Conversion, Segment};
 
     fn segment(reading: &str, surface: &str) -> Segment {
@@ -121,6 +146,36 @@ mod tests {
             ),
             3_000
         );
+        assert!(removes_repeated_ideographic_tail_segment(
+            "前文は『日本書紀』",
+            &conversion,
+            &Conversion {
+                surface: "そして初期が引用する".to_owned(),
+                segments: vec![
+                    segment("そして", "そして"),
+                    segment("しょき", "初期"),
+                    segment("が", "が"),
+                    segment("いんよう", "引用"),
+                    segment("する", "する"),
+                ],
+                cost: 5_000,
+            },
+        ));
+        assert!(!removes_repeated_ideographic_tail_segment(
+            "前文は『日本書紀』",
+            &conversion,
+            &Conversion {
+                surface: "そして書紀が参照する".to_owned(),
+                segments: vec![
+                    segment("そして", "そして"),
+                    segment("しょき", "書紀"),
+                    segment("が", "が"),
+                    segment("さんしょう", "参照"),
+                    segment("する", "する"),
+                ],
+                cost: 5_000,
+            },
+        ));
     }
 
     #[test]

@@ -2991,6 +2991,33 @@ impl Dictionary {
             && alternative_last.surface.chars().count() == 1
     }
 
+    /// Returns whether an alternative removes a multi-character ideographic
+    /// segment repeated at the immediate tail of confirmed document context.
+    #[must_use]
+    pub fn deconverts_repeated_document_segment(
+        &self,
+        reading: &str,
+        left_context: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface {
+            return false;
+        }
+        let exact_conversion = |surface: &str| {
+            self.convert_n_best_with_surface_prefix(reading, surface, 1)
+                .into_iter()
+                .find(|conversion| conversion.surface == surface)
+        };
+        let Some(current) = exact_conversion(current_surface) else {
+            return false;
+        };
+        let Some(alternative) = exact_conversion(alternative_surface) else {
+            return false;
+        };
+        ranking::removes_repeated_ideographic_tail_segment(left_context, &current, &alternative)
+    }
+
     fn deconverts_exact_ideographic_pronunciation_segment_to_katakana_impl(
         &self,
         reading: &str,
@@ -8003,6 +8030,18 @@ mod tests {
             "セットにはいなかった",
             "事件の際",
             "事件の再",
+        ));
+        assert!(dictionary.deconverts_repeated_document_segment(
+            "そしてしょきがいんようする",
+            "漢城陥落は『三国史記』と『日本書紀』",
+            "そして書紀が引用する",
+            "そして初期が引用する",
+        ));
+        assert!(!dictionary.deconverts_repeated_document_segment(
+            "そしてしょきがいんようする",
+            "漢城陥落は『三国史記』と『日本書紀』",
+            "そして書紀が引用する",
+            "そして書紀が因用する",
         ));
         assert!(
             !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(

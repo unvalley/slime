@@ -1523,6 +1523,7 @@ impl SlimeEngine {
             )
             || rescore_removes_alphanumeric_compound_number(state, selected)
             || rescore_removes_parallel_score(state, selected)
+            || rescore_removes_contextual_roman_numeral(state, selected)
     }
 
     fn rescore_changes_uncontextualized_personal_name(
@@ -3545,6 +3546,23 @@ fn rescore_removes_parallel_score(state: &CandidateRescoreState, selected: usize
     };
     let score_suffix = &state.candidates[0].surface[digit_start..];
     !state.candidates[selected].surface.ends_with(score_suffix)
+}
+
+fn rescore_removes_contextual_roman_numeral(
+    state: &CandidateRescoreState,
+    selected: usize,
+) -> bool {
+    if selected == 0 || !state.request.context.ends_with('・') {
+        return false;
+    }
+    let Some(numeral) = state.candidates[0]
+        .surface
+        .chars()
+        .find(|character| matches!(character, 'Ⅰ'..='Ⅻ'))
+    else {
+        return false;
+    };
+    !state.candidates[selected].surface.contains(numeral)
 }
 
 fn is_ascii_or_fullwidth_digit(character: char) -> bool {
@@ -6504,6 +6522,42 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("matching confirmed percent widths should preserve the base candidate");
         assert_eq!(engine.candidates[0], "％高く");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_contextual_roman_numeral() {
+        let candidates = vec![
+            Candidate {
+                surface: "プライスⅢの顔".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "プライスさんの顔".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "ぷらいすさんのかお".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "アンドレ・".to_owned(),
+                right_context: "をエアマットレスに押し付けた。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a contextual generation suffix should remain structured");
+        assert_eq!(engine.candidates[0], "プライスⅢの顔");
     }
 
     #[test]

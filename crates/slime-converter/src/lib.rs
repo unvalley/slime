@@ -1840,6 +1840,31 @@ fn is_ideographic_or_digit(character: char) -> bool {
     )
 }
 
+fn reading_has_roman_numeral_suffix(reading: &str) -> bool {
+    if !reading.contains('の') {
+        return false;
+    }
+    [
+        "じゅういちの",
+        "じゅうにの",
+        "じゅうの",
+        "きゅうの",
+        "よんの",
+        "しちの",
+        "いちの",
+        "さんの",
+        "ろくの",
+        "ななの",
+        "はちの",
+        "にの",
+        "しの",
+        "ごの",
+        "くの",
+    ]
+    .iter()
+    .any(|suffix| reading.contains(suffix))
+}
+
 fn should_expand_alphanumeric_numeric_compound(
     reading: &str,
     left_context: &str,
@@ -4223,6 +4248,9 @@ impl Dictionary {
                 conversion.cost <= maximum
             }));
         }
+        if reading_has_roman_numeral_suffix(reading) {
+            Self::append_roman_numeral_variants(&mut conversions);
+        }
 
         for conversion in conversions {
             let cost = if conversion.surface == reading {
@@ -4233,6 +4261,10 @@ impl Dictionary {
                     .saturating_sub(
                         self.colloquial_imperative_quotation_promotion(left_context, &conversion),
                     )
+                    .saturating_sub(Self::contextual_roman_numeral_suffix_promotion(
+                        left_context,
+                        &conversion,
+                    ))
             };
             if let Some(existing) = candidates
                 .iter_mut()
@@ -4260,6 +4292,94 @@ impl Dictionary {
         candidates.sort_unstable_by_key(|candidate| candidate.cost);
         symbol_candidates::append_for_reading(reading, &mut candidates);
         candidates
+    }
+
+    fn append_roman_numeral_variants(conversions: &mut Vec<Conversion>) {
+        const ROMAN_VARIANT_COST: i32 = 4_000;
+
+        let variants =
+            conversions
+                .iter()
+                .filter_map(|conversion| {
+                    let (index, numeral) = conversion.segments.windows(3).enumerate().find_map(
+                        |(index, segments)| {
+                            let [prefix, number, particle] = segments else {
+                                return None;
+                            };
+                            if prefix.surface.chars().count() < 4
+                                || !is_full_katakana_surface(&prefix.surface)
+                                || particle.reading != "の"
+                                || particle.surface != "の"
+                            {
+                                return None;
+                            }
+                            Self::roman_numeral(&number.surface).map(|numeral| (index + 1, numeral))
+                        },
+                    )?;
+                    let mut variant = conversion.clone();
+                    numeral.clone_into(&mut variant.segments[index].surface);
+                    variant.segments[index].cost = variant.segments[index]
+                        .cost
+                        .saturating_add(ROMAN_VARIANT_COST);
+                    variant.cost = variant.cost.saturating_add(ROMAN_VARIANT_COST);
+                    variant.surface = variant
+                        .segments
+                        .iter()
+                        .map(|segment| segment.surface.as_str())
+                        .collect();
+                    Some(variant)
+                })
+                .collect::<Vec<_>>();
+        conversions.extend(variants);
+    }
+
+    fn roman_numeral(surface: &str) -> Option<&'static str> {
+        match surface {
+            "1" => Some("Ⅰ"),
+            "2" => Some("Ⅱ"),
+            "3" => Some("Ⅲ"),
+            "4" => Some("Ⅳ"),
+            "5" => Some("Ⅴ"),
+            "6" => Some("Ⅵ"),
+            "7" => Some("Ⅶ"),
+            "8" => Some("Ⅷ"),
+            "9" => Some("Ⅸ"),
+            "10" => Some("Ⅹ"),
+            "11" => Some("Ⅺ"),
+            "12" => Some("Ⅻ"),
+            _ => None,
+        }
+    }
+
+    fn contextual_roman_numeral_suffix_promotion(
+        left_context: &str,
+        conversion: &Conversion,
+    ) -> i32 {
+        const PROMOTION: i32 = 6_000;
+
+        if !left_context.ends_with('・') {
+            return 0;
+        }
+        if conversion.segments.windows(3).any(|segments| {
+            let [name, numeral, particle] = segments else {
+                return false;
+            };
+            name.surface.chars().count() >= 4
+                && is_full_katakana_surface(&name.surface)
+                && Self::is_roman_numeral_surface(&numeral.surface)
+                && particle.reading == "の"
+                && particle.surface == "の"
+        }) {
+            PROMOTION
+        } else {
+            0
+        }
+    }
+
+    fn is_roman_numeral_surface(surface: &str) -> bool {
+        surface
+            .chars()
+            .all(|character| matches!(character, 'Ⅰ'..='Ⅻ'))
     }
 
     /// Returns numeral surfaces generated from the complete reading.
@@ -9494,6 +9614,35 @@ mod tests {
                 "missing {expected} for {reading}: {candidates:?}"
             );
         }
+    }
+
+    #[test]
+    fn small_numbers_after_katakana_names_recall_roman_numerals() {
+        let dictionary = Dictionary::bundled();
+        let candidates = dictionary.candidates_with_limit("ぷらいすさんのかお", 64);
+        assert_eq!(candidates[0].surface, "プライスさんの顔");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.surface == "プライスⅢの顔"),
+            "candidates: {candidates:?}"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ぷらいすさんのかお",
+                "アンドレ・",
+                "をエアマットレスに押し付けた。",
+            )[0]
+            .surface,
+            "プライスⅢの顔"
+        );
+        assert!(
+            dictionary
+                .candidates_with_limit("おじいさんのかお", 64)
+                .iter()
+                .all(|candidate| !candidate.surface.contains('Ⅲ')),
+            "ordinary honorific readings must not gain a roman numeral"
+        );
     }
 
     #[test]

@@ -1515,6 +1515,7 @@ impl SlimeEngine {
             || self.rescore_fragments_exact_katakana_segment(state, selected)
             || self.rescore_fragments_exact_mixed_script_segment(state, selected)
             || self.rescore_changes_exact_verbal_noun_before_particle(state, selected)
+            || self.rescore_removes_contextual_long_right_verb_phrase(state, selected)
             || self.rescore_deconverts_exact_ideographic_pronunciation_segment(state, selected)
             || rescore_only_expands_ascii_digit_width(
                 &state.candidates[0].surface,
@@ -1689,6 +1690,22 @@ impl SlimeEngine {
                 &base.surface,
                 &alternative.surface,
             )
+    }
+
+    fn rescore_removes_contextual_long_right_verb_phrase(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self
+                .dictionary
+                .deconverts_contextual_long_right_verb_phrase(
+                    &state.request.reading,
+                    &state.request.right_context,
+                    &state.candidates[0].surface,
+                    &state.candidates[selected].surface,
+                )
     }
 
     fn safe_whole_result_candidate(
@@ -7092,6 +7109,42 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("a strong exact verbal noun should remain selected");
         assert_eq!(engine.candidates[0], "一気");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_long_right_verb_phrase() {
+        let candidates = vec![
+            Candidate {
+                surface: "火".to_owned(),
+                cost: 2_851,
+            },
+            Candidate {
+                surface: "日".to_owned(),
+                cost: 3_171,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::bundled());
+        engine.reading = "ひ".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "本音としてはこの".to_owned(),
+                right_context: "に油を注ぎたいけれど。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a long right verb phrase should remain selected");
+        assert_eq!(engine.candidates[0], "火");
     }
 
     #[test]

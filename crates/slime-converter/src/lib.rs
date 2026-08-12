@@ -1115,7 +1115,6 @@ const MOZC_GENERAL_GODAN_CONTINUATIVE_POS_ID: u16 = 842;
 const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 const MOZC_NOUN_PREFIX_POS_ID_START: u16 = 2_600;
-const MOZC_EXPLICIT_NOUN_PREFIX_POS_ID_START: u16 = 2_601;
 const MOZC_NOUN_PREFIX_POS_ID_END: u16 = 2_637;
 const MOZC_REPEAT_NOUN_PREFIX_POS_ID: u16 = 2_610;
 
@@ -1196,6 +1195,41 @@ fn is_safe_hiragana_right_phrase_entry(entry: compact::CompactEntry, suffix: &st
     suffix_characters >= 2
         && (MOZC_INDEPENDENT_VERB_POS_ID_START..=MOZC_INDEPENDENT_VERB_POS_ID_END)
             .contains(&entry.left_id)
+}
+
+fn is_dominant_long_right_verb_phrase(
+    candidate_surface: &str,
+    suffix: &str,
+    entry: compact::CompactEntry,
+) -> bool {
+    let candidate_character = candidate_surface.chars().next();
+    let candidate_characters = candidate_surface.chars().count();
+    let suffix_characters = suffix.chars().count();
+    if candidate_characters != 1
+        || !candidate_character.is_some_and(is_ideographic_character)
+        || suffix_characters < 3
+        || candidate_characters.saturating_add(suffix_characters) > 9
+        || entry.left_id != entry.right_id
+        || !(MOZC_INDEPENDENT_VERB_POS_ID_START..=MOZC_INDEPENDENT_VERB_POS_ID_END)
+            .contains(&entry.left_id)
+    {
+        return false;
+    }
+    let ideographs = 1 + suffix
+        .chars()
+        .filter(|character| is_ideographic_character(*character))
+        .count();
+    let particles = suffix
+        .chars()
+        .take(suffix_characters - 1)
+        .filter(|character| {
+            matches!(
+                character,
+                'は' | 'が' | 'を' | 'に' | 'へ' | 'と' | 'で' | 'の'
+            )
+        })
+        .count();
+    ideographs >= 3 && particles >= 2
 }
 
 fn is_sibling_right_phrase_suffix(suffix: &str, right_context: &str) -> bool {
@@ -3050,6 +3084,53 @@ impl Dictionary {
         current_is_verbal_noun && alternative_found && !alternative_is_verbal_noun
     }
 
+    /// Returns whether selecting an alternative removes a unique bounded
+    /// particle-and-verb phrase completed by confirmed right context.
+    #[must_use]
+    pub fn deconverts_contextual_long_right_verb_phrase(
+        &self,
+        reading: &str,
+        right_context: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface {
+            return false;
+        }
+        self.has_dominant_long_right_verb_phrase(reading, current_surface, right_context)
+            && !self.has_dominant_long_right_verb_phrase(
+                reading,
+                alternative_surface,
+                right_context,
+            )
+    }
+
+    fn has_dominant_long_right_verb_phrase(
+        &self,
+        reading: &str,
+        candidate_surface: &str,
+        right_context: &str,
+    ) -> bool {
+        let Some(compact) = self.bundled else {
+            return false;
+        };
+        let context_end = right_context
+            .char_indices()
+            .nth(DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS)
+            .map_or(right_context.len(), |(index, _)| index);
+        let mut found = false;
+        compact.for_each_joined_surface_reading_prefix(
+            candidate_surface,
+            &right_context[..context_end],
+            reading,
+            DOCUMENT_RIGHT_PHRASE_MAX_SUFFIX_CHARACTERS,
+            |suffix, entry| {
+                found |= is_dominant_long_right_verb_phrase(candidate_surface, suffix, entry);
+            },
+        );
+        found
+    }
+
     /// Returns whether an alternative replaces one exact ideographic word,
     /// recovered through an orthographic long-vowel variant, with a literal
     /// katakana rendering of the original pronunciation.
@@ -4036,15 +4117,7 @@ impl Dictionary {
             return None;
         }
         let mut has_left_phrase_evidence = false;
-        let mut has_noun_prefix_candidate = false;
         self.for_each_exact(reading, |entry| {
-            // ID 2600 is Mozc's generic noun-prefix class and contains broad
-            // homophones such as 快/皆. Only a lexeme-specific prefix may
-            // reopen a boundary that already has exact evidence on the left.
-            has_noun_prefix_candidate |= (MOZC_EXPLICIT_NOUN_PREFIX_POS_ID_START
-                ..=MOZC_NOUN_PREFIX_POS_ID_END)
-                .contains(&entry.left_id)
-                && entry.surface.chars().count() == 1;
             has_left_phrase_evidence |= self.document_phrase_promotion(
                 left_context,
                 reading,
@@ -4052,8 +4125,7 @@ impl Dictionary {
                 allows_single_character_phrase_prefix,
             ) > 0;
         });
-        (!has_left_phrase_evidence || has_noun_prefix_candidate)
-            .then_some((numeric_left_context, has_left_phrase_evidence))
+        Some((numeric_left_context, has_left_phrase_evidence))
     }
 
     fn document_right_phrase_promotion(
@@ -4100,6 +4172,8 @@ impl Dictionary {
                     ..=MOZC_NOUN_PREFIX_POS_ID_END)
                     .contains(&entry.left_id)
                     && candidate_surface.chars().count() == 1;
+                let dominant_long_verb_phrase =
+                    is_dominant_long_right_verb_phrase(candidate_surface, suffix, entry);
                 let accepted = !matches!(
                     entry.left_id,
                     MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
@@ -4108,8 +4182,9 @@ impl Dictionary {
                     MOZC_PERSONAL_GIVEN_NAME_POS_ID | MOZC_PERSONAL_SURNAME_POS_ID
                 ) && (!requires_general_noun
                     || (entry.left_id == MOZC_GENERAL_NOUN_POS_ID
-                        && entry.right_id == MOZC_GENERAL_NOUN_POS_ID))
-                    && (!requires_noun_prefix || noun_prefix_entry)
+                        && entry.right_id == MOZC_GENERAL_NOUN_POS_ID)
+                    || dominant_long_verb_phrase)
+                    && (!requires_noun_prefix || noun_prefix_entry || dominant_long_verb_phrase)
                     && (!starts_with_hiragana
                         || is_safe_hiragana_right_phrase_entry(entry, suffix))
                     && (!bounded_nominal_suffix
@@ -9905,6 +9980,48 @@ mod tests {
                 .any(|candidate| candidate.surface == "視"),
             "a broad passive-form rule must not evict an otherwise visible candidate"
         );
+    }
+
+    #[test]
+    fn surrounding_context_prefers_a_long_right_verb_phrase() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ひ",
+                "本音としてはこの",
+                "に油を注ぎたいけれど。",
+            )[0]
+            .surface,
+            "火"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ひ",
+                "本音としてはこの",
+                "に出発する。",
+            )[0]
+            .surface,
+            "日",
+            "an unrelated right clause must not displace the exact left phrase"
+        );
+        assert!(dictionary.deconverts_contextual_long_right_verb_phrase(
+            "ひ",
+            "に油を注ぎたいけれど。",
+            "火",
+            "日",
+        ));
+        assert!(!dictionary.deconverts_contextual_long_right_verb_phrase(
+            "ひ",
+            "に油を注ぎたいけれど。",
+            "日",
+            "火",
+        ));
+        assert!(!dictionary.deconverts_contextual_long_right_verb_phrase(
+            "ひ",
+            "に出発する。",
+            "火",
+            "日",
+        ));
     }
 
     #[test]

@@ -22,8 +22,7 @@ fn main() {
     });
     run_n_best_benchmarks(&dictionary, iterations);
     run_personal_name_guard_benchmarks(&dictionary, iterations);
-    run_model_orthography_guard_benchmarks(&dictionary, iterations);
-    run_mixed_script_fragment_guard_benchmarks(&dictionary, iterations);
+    run_model_guard_benchmarks(&dictionary, iterations);
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
     });
@@ -146,6 +145,12 @@ fn run_personal_name_guard_benchmarks(dictionary: &Dictionary, iterations: u64) 
     );
 }
 
+fn run_model_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run_model_orthography_guard_benchmarks(dictionary, iterations);
+    run_long_right_verb_phrase_guard_benchmarks(dictionary, iterations);
+    run_mixed_script_fragment_guard_benchmarks(dictionary, iterations);
+}
+
 fn run_model_orthography_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
     run(
         "converter/model_orthography_guard_match",
@@ -171,6 +176,29 @@ fn run_model_orthography_guard_benchmarks(dictionary: &Dictionary, iterations: u
                     black_box("チュートー聖堂期"),
                 ),
             );
+        },
+    );
+}
+
+fn run_long_right_verb_phrase_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run("converter/long_right_verb_phrase_guard", iterations, || {
+        black_box(dictionary.deconverts_contextual_long_right_verb_phrase(
+            black_box("ひ"),
+            black_box("に油を注ぎたいけれど。"),
+            black_box("火"),
+            black_box("日"),
+        ));
+    });
+    run(
+        "converter/long_right_verb_phrase_guard_nonmatch",
+        iterations,
+        || {
+            black_box(dictionary.deconverts_contextual_long_right_verb_phrase(
+                black_box("ひ"),
+                black_box("に出発する。"),
+                black_box("火"),
+                black_box("日"),
+            ));
         },
     );
 }
@@ -224,6 +252,7 @@ fn run_n_best_benchmarks(dictionary: &Dictionary, iterations: u64) {
 fn run_phrase_context_benchmarks(dictionary: &Dictionary, iterations: u64) {
     run_document_context_benchmark(dictionary, iterations);
     run_right_numeric_style_lexical_guard_benchmarks(dictionary, iterations);
+    run_long_right_verb_phrase_benchmarks(dictionary, iterations);
     run_left_phrase_conflict_benchmarks(dictionary, iterations);
     run_katakana_general_noun_phrase_benchmarks(dictionary, iterations);
 }
@@ -350,6 +379,27 @@ fn run_right_numeric_style_lexical_guard_benchmarks(dictionary: &Dictionary, ite
             black_box("に入る。"),
         ));
     });
+}
+
+fn run_long_right_verb_phrase_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run("converter/long_right_verb_phrase", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("ひ"),
+            black_box("本音としてはこの"),
+            black_box("に油を注ぎたいけれど。"),
+        ));
+    });
+    run(
+        "converter/long_right_verb_phrase_nonmatch",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("ひ"),
+                black_box("本音としてはこの"),
+                black_box("に出発する。"),
+            ));
+        },
+    );
 }
 
 fn run_left_phrase_conflict_benchmarks(dictionary: &Dictionary, iterations: u64) {

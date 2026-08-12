@@ -189,6 +189,11 @@ fn is_context_phrase_entry(
                 || (entry.left_id == MOZC_VERBAL_NOUN_POS_ID
                     && entry.right_id == MOZC_VERBAL_NOUN_POS_ID))
             && is_bounded_genitive_phrase(&entry.surface))
+        || (entry.word_cost <= MAX_PARTICLE_VERB_CONTEXT_PHRASE_WORD_COST
+            && entry.left_id == entry.right_id
+            && (MOZC_INDEPENDENT_VERB_POS_ID_START..=MOZC_INDEPENDENT_VERB_POS_ID_END)
+                .contains(&entry.left_id)
+            && is_bounded_particle_verb_phrase(&entry.surface))
 }
 
 fn read_entries_by_reading(tsv_path: &Path) -> BTreeMap<String, Vec<Entry>> {
@@ -328,6 +333,9 @@ const MAX_GENERAL_NOUN_CONTEXT_PHRASE_WORD_COST: u16 = 7_200;
 const MAX_SIBLING_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_COORDINATION_CONTEXT_PHRASE_WORD_COST: u16 = 7_500;
 const MAX_GENITIVE_CONTEXT_PHRASE_WORD_COST: u16 = 8_000;
+const MAX_PARTICLE_VERB_CONTEXT_PHRASE_WORD_COST: u16 = 7_000;
+const MOZC_INDEPENDENT_VERB_POS_ID_START: u16 = 577;
+const MOZC_INDEPENDENT_VERB_POS_ID_END: u16 = 856;
 const MOZC_VERBAL_NOUN_POS_ID: u16 = 1_841;
 const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 const MOZC_GENERAL_NOUN_SUFFIX_POS_ID: u16 = 1_949;
@@ -395,6 +403,30 @@ fn is_bounded_genitive_phrase(surface: &str) -> bool {
             .iter()
             .copied()
             .all(is_cjk_ideograph)
+}
+
+fn is_bounded_particle_verb_phrase(surface: &str) -> bool {
+    let characters = surface.chars().collect::<Vec<_>>();
+    (4..=9).contains(&characters.len())
+        && characters
+            .first()
+            .is_some_and(|character| is_cjk_ideograph(*character))
+        && characters
+            .iter()
+            .copied()
+            .filter(|character| is_cjk_ideograph(*character))
+            .count()
+            >= 3
+        && characters[1..characters.len() - 1]
+            .iter()
+            .filter(|character| {
+                matches!(
+                    character,
+                    'は' | 'が' | 'を' | 'に' | 'へ' | 'と' | 'で' | 'の'
+                )
+            })
+            .count()
+            >= 2
 }
 
 fn is_bounded_katakana_stem_compound(

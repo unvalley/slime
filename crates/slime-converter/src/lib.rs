@@ -163,6 +163,7 @@ struct DictionaryDocumentContextRanker<'a> {
     surrounding_notation: Option<(&'static str, i32)>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
+    numeric_style: Option<DocumentNumericStyleEvidence>,
     allows_single_character_phrase_prefix: bool,
     multi_segment_right_phrase_cache: RefCell<Vec<MultiSegmentRightPhraseCacheEntry<'a>>>,
     multi_segment_right_grammar_cache: RefCell<Vec<MultiSegmentRightGrammarCacheEntry<'a>>>,
@@ -237,6 +238,19 @@ enum StrongLeftPhraseEvidence {
     Present,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DocumentNumericStyle {
+    Ascii,
+    Fullwidth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DocumentNumericStyleEvidence {
+    style: DocumentNumericStyle,
+    reading_bytes: usize,
+    kanji: char,
+}
+
 impl<'a> DictionaryDocumentContextRanker<'a> {
     fn new(dictionary: &'a Dictionary, reading: &str, left_context: &str) -> Self {
         Self::new_with_surrounding_context(dictionary, reading, left_context, "")
@@ -301,6 +315,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 ),
             numeric_counter_promotions: dictionary
                 .document_numeric_counter_promotions(reading, left_context),
+            numeric_style: document_numeric_style_evidence(left_context, reading),
             allows_single_character_phrase_prefix,
             multi_segment_right_phrase_cache: RefCell::new(Vec::new()),
             multi_segment_right_grammar_cache: RefCell::new(Vec::new()),
@@ -608,6 +623,12 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .iter()
             .find_map(|(surface, promotion)| (*surface == conversion.surface).then_some(*promotion))
             .unwrap_or(0);
+        let numeric_style_promotion = self
+            .numeric_style
+            .filter(|evidence| {
+                conversion_matches_numeric_style(self.dictionary, conversion, *evidence)
+            })
+            .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION);
         let region_suffix_promotion = if self.follows_region_name {
             document_region_suffix_promotion(reading, &conversion.surface)
         } else {
@@ -650,6 +671,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
+            .max(numeric_style_promotion)
             .max(region_suffix_promotion);
         let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
@@ -868,6 +890,7 @@ const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_COST_CEILING: i32 = 9_000;
 const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION: i32 = 4_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
+const DOCUMENT_NUMERIC_STYLE_PROMOTION: i32 = 3_000;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
 const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
@@ -1025,6 +1048,137 @@ fn is_document_region_suffix_reading(reading: &str) -> bool {
 
 fn structured_notation_matches(left_context: &str, reading: &str, surface: &str) -> bool {
     structured_notation_surface(left_context, reading).is_some_and(|preferred| preferred == surface)
+}
+
+fn document_numeric_style(left_context: &str) -> Option<DocumentNumericStyle> {
+    left_context
+        .chars()
+        .rev()
+        .take(32)
+        .take_while(|character| !matches!(character, '。' | '！' | '？' | '\n' | '\r'))
+        .find_map(|character| match character {
+            '0'..='9' => Some(DocumentNumericStyle::Ascii),
+            '０'..='９' => Some(DocumentNumericStyle::Fullwidth),
+            _ => None,
+        })
+}
+
+fn document_numeric_style_evidence(
+    left_context: &str,
+    reading: &str,
+) -> Option<DocumentNumericStyleEvidence> {
+    let style = document_numeric_style(left_context)?;
+    let (numeric_reading, kanji) = [
+        ("きゅう", '九'),
+        ("ぜろ", '〇'),
+        ("れい", '〇'),
+        ("いち", '一'),
+        ("さん", '三'),
+        ("よん", '四'),
+        ("なな", '七'),
+        ("しち", '七'),
+        ("はち", '八'),
+        ("ろく", '六'),
+    ]
+    .into_iter()
+    .find(|(numeric_reading, _)| reading.starts_with(numeric_reading))?;
+    Some(DocumentNumericStyleEvidence {
+        style,
+        reading_bytes: numeric_reading.len(),
+        kanji,
+    })
+}
+
+fn conversion_matches_numeric_style(
+    dictionary: &Dictionary,
+    conversion: &Conversion,
+    evidence: DocumentNumericStyleEvidence,
+) -> bool {
+    let [numeric, following, ..] = conversion.segments.as_slice() else {
+        return false;
+    };
+    {
+        if numeric.reading.len() != evidence.reading_bytes {
+            return false;
+        }
+        let matching_width = !numeric.surface.is_empty()
+            && numeric
+                .surface
+                .chars()
+                .all(|character| match evidence.style {
+                    DocumentNumericStyle::Ascii => character.is_ascii_digit(),
+                    DocumentNumericStyle::Fullwidth => matches!(character, '０'..='９'),
+                });
+        if !matching_width {
+            return false;
+        }
+        if !is_productive_numeric_style_suffix(&following.surface) {
+            return false;
+        }
+
+        // Do not promote every parseable number merely because a digit appeared
+        // earlier in the sentence. Only a leading single digit may inherit the
+        // style of an established kanji compound with a productive numeric
+        // suffix. This admits 3+塁 for 三塁 while leaving lexical numeric words
+        // such as 一部 and 九州, as well as 仙台 and 前立腺, unchanged.
+        let mut compound_reading = String::with_capacity(
+            numeric
+                .reading
+                .len()
+                .saturating_add(following.reading.len()),
+        );
+        compound_reading.push_str(&numeric.reading);
+        compound_reading.push_str(&following.reading);
+        let mut compound_surface = String::with_capacity(
+            evidence
+                .kanji
+                .len_utf8()
+                .saturating_add(following.surface.len()),
+        );
+        compound_surface.push(evidence.kanji);
+        compound_surface.push_str(&following.surface);
+        dictionary.has_exact_entry(&compound_reading, &compound_surface)
+    }
+}
+
+fn is_productive_numeric_style_suffix(surface: &str) -> bool {
+    matches!(
+        surface,
+        "人" | "個"
+            | "回"
+            | "件"
+            | "本"
+            | "枚"
+            | "台"
+            | "匹"
+            | "冊"
+            | "杯"
+            | "階"
+            | "歳"
+            | "年"
+            | "月"
+            | "日"
+            | "時"
+            | "分"
+            | "秒"
+            | "円"
+            | "番"
+            | "号"
+            | "位"
+            | "点"
+            | "塁"
+            | "段"
+            | "組"
+            | "校"
+            | "社"
+            | "戸"
+            | "軒"
+            | "票"
+            | "席"
+            | "戦"
+            | "勝"
+            | "敗"
+    )
 }
 
 fn structured_notation_context_matches(left_context: &str, reading: &str) -> bool {
@@ -7395,6 +7549,61 @@ mod tests {
         assert_ne!(
             dictionary.candidates_with_context("げん", "-3%")[0].surface,
             "減"
+        );
+    }
+
+    #[test]
+    fn document_context_preserves_recent_arabic_digit_width_in_numeric_segments() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(dictionary.candidates("さんるいから")[0].surface, "三塁から");
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "さんるいから",
+                "桜井高校はランナー1.",
+                "内野ゴロで先制します。",
+            )[0]
+            .surface,
+            "3塁から"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("さんるいから", "打者はランナー１．")[0].surface,
+            "３塁から"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("さんるいから", "2024年。次の打者は")[0].surface,
+            "三塁から",
+            "numeric style does not cross a completed sentence"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "せんだいさんきゅう",
+                "地域別では田老66・0%、",
+                "・6%と地域差が大きかった。",
+            )[0]
+            .surface,
+            "仙台39",
+            "a multi-digit lexical prefix is not resegmented as a number"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "らいぶらりのいちぶ",
+                "Enterprise Linuxのバージョン3から搭載され、現在ではGNU C",
+                "となっている。",
+            )[0]
+            .surface,
+            "ライブラリの一部",
+            "an internal numeral compound keeps its lexical spelling"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("いちぶ", "バージョン3では")[0].surface,
+            "一部",
+            "a standalone lexical numeral compound is not treated as a counter"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("きゅうしゅう", "2024年は")[0].surface,
+            "九州",
+            "a proper noun beginning with a numeral keeps its lexical spelling"
         );
     }
 

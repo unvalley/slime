@@ -803,6 +803,8 @@ const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
 const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
 const DOCUMENT_NUMERIC_PARTICLE_SURU_PROMOTION: i32 = 6_500;
 const DOCUMENT_QUOTATION_REPORTING_PROMOTION: i32 = 1_500;
+const EMBEDDED_COLLOQUIAL_IMPERATIVE_PROMOTION: i32 = 3_000;
+const DOCUMENT_COLLOQUIAL_IMPERATIVE_PROMOTION: i32 = 4_500;
 const DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN: i32 = 1_500;
 const DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN: i32 = 1_000;
 const MOZC_PAST_AUXILIARY_POS_ID: u16 = 142;
@@ -827,6 +829,42 @@ const MOZC_MONO_NON_INDEPENDENT_NOUN_POS_ID: u16 = 2_090;
 const MOZC_TAME_ADVERBIAL_NOUN_POS_ID: u16 = 2_140;
 const MOZC_YOU_AUXILIARY_STEM_NOUN_POS_ID: u16 = 2_192;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
+
+fn is_mozc_independent_imperative_pos_id(pos_id: u16) -> bool {
+    matches!(
+        pos_id,
+        586..=589
+            | 605..=608
+            | 619..=620
+            | 630..=632
+            | 641
+            | 666..=679
+            | 710..=712
+            | 722
+            | 730
+            | 738
+            | 759..=762
+            | 789..=790
+            | 798
+            | 809..=812
+            | 836
+            | 844
+            | 850..=851
+    )
+}
+
+fn document_context_ends_with_clause_boundary(context: &str) -> bool {
+    context
+        .trim_end_matches(|character: char| character.is_whitespace() && character != '\n')
+        .chars()
+        .next_back()
+        .is_some_and(|character| {
+            matches!(
+                character,
+                '、' | '。' | ',' | '，' | ':' | '：' | ';' | '；' | '!' | '！' | '?' | '？' | '\n'
+            )
+        })
+}
 const CALENDAR_KA_ENDING_DAYS: &[u32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 24];
 const COMMON_RADICES: &[u32] = &[2, 8, 10, 16];
 const STRINGED_INSTRUMENT_PREFIXES: &[&str] = &[
@@ -3351,6 +3389,50 @@ impl Dictionary {
         }
     }
 
+    fn segment_has_exact_pos(&self, segment: &Segment, predicate: impl Fn(u16) -> bool) -> bool {
+        let mut found = false;
+        self.for_each_exact(&segment.reading, |entry| {
+            found |= entry.surface == segment.surface
+                && (predicate(entry.left_id) || predicate(entry.right_id));
+        });
+        found
+    }
+
+    /// Promotes the colloquial `目的語 + 命令形 + って` frame without teaching
+    /// the dictionary a phrase-specific surface. Mozc's conjugation POS keeps
+    /// homographic nouns such as 賭け out, while a noun immediately before the
+    /// verb distinguishes the ellipsis from arbitrary kana fragmentation.
+    fn colloquial_imperative_quotation_promotion(
+        &self,
+        left_context: &str,
+        conversion: &Conversion,
+    ) -> i32 {
+        let [prefix @ .., imperative, quotation] = conversion.segments.as_slice() else {
+            return 0;
+        };
+        let Some(object) = prefix.last() else {
+            return 0;
+        };
+        if quotation.reading != "って"
+            || quotation.surface != "って"
+            || imperative.surface == imperative.reading
+            || !imperative.surface.chars().any(is_ideographic_or_digit)
+            || !self.segment_has_exact_pos(imperative, is_mozc_independent_imperative_pos_id)
+            || !self.segment_has_exact_pos(object, |pos_id| {
+                matches!(pos_id, MOZC_VERBAL_NOUN_POS_ID | MOZC_GENERAL_NOUN_POS_ID)
+            })
+        {
+            return 0;
+        }
+        if document_context_ends_with_clause_boundary(left_context) {
+            DOCUMENT_COLLOQUIAL_IMPERATIVE_PROMOTION
+        } else if prefix.len() >= 2 {
+            EMBEDDED_COLLOQUIAL_IMPERATIVE_PROMOTION
+        } else {
+            0
+        }
+    }
+
     /// Calls `callback(prefix_bytes, entry)` for every entry whose reading is
     /// a prefix of `suffix`.
     fn for_each_prefix<'s>(&'s self, suffix: &str, mut callback: impl FnMut(usize, EntryView<'s>)) {
@@ -3571,7 +3653,11 @@ impl Dictionary {
             let cost = if conversion.surface == reading {
                 LITERAL_CANDIDATE_COST
             } else {
-                ranker.ranking_cost_with_context(reading, left_context, &conversion)
+                ranker
+                    .ranking_cost_with_context(reading, left_context, &conversion)
+                    .saturating_sub(
+                        self.colloquial_imperative_quotation_promotion(left_context, &conversion),
+                    )
             };
             if let Some(existing) = candidates
                 .iter_mut()
@@ -7607,6 +7693,32 @@ mod tests {
             .surface,
             "警察に行っ",
             "a destination without a quotation case must keep the motion verb"
+        );
+    }
+
+    #[test]
+    fn colloquial_imperative_quotation_uses_structure_and_confirmed_context() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates("だいじょうぶじしんもてって")[0].surface,
+            "大丈夫自信持てって",
+            "an embedded noun plus imperative must beat a fragmented kana suffix"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("じしんもてって", "大丈夫、")[0].surface,
+            "自信持てって",
+            "a confirmed clause boundary must supply the missing left phrase"
+        );
+        assert_eq!(
+            dictionary.candidates("じしんもてって")[0].surface,
+            "自身もてって",
+            "a single noun without document context is too ambiguous to promote"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("あのかけって", "これは、")[0].surface,
+            "あの賭けって",
+            "an adnominal noun phrase must not be reinterpreted as an imperative"
         );
     }
 

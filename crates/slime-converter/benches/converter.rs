@@ -22,6 +22,7 @@ fn main() {
     });
     run_n_best_benchmarks(&dictionary, iterations);
     run_personal_name_guard_benchmarks(&dictionary, iterations);
+    run_model_orthography_guard_benchmarks(&dictionary, iterations);
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
     });
@@ -140,6 +141,35 @@ fn run_personal_name_guard_benchmarks(dictionary: &Dictionary, iterations: u64) 
                 black_box("不忠社"),
                 black_box("不忠者"),
             ));
+        },
+    );
+}
+
+fn run_model_orthography_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/model_orthography_guard_match",
+        iterations,
+        || {
+            black_box(
+                dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                    black_box("ちゅーとーせいどうき"),
+                    black_box("中東青銅器"),
+                    black_box("チュートー青銅器"),
+                ),
+            );
+        },
+    );
+    run(
+        "converter/model_orthography_guard_nonmatch",
+        iterations,
+        || {
+            black_box(
+                dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                    black_box("ちゅーとーせいどうき"),
+                    black_box("中東青銅器"),
+                    black_box("チュートー聖堂期"),
+                ),
+            );
         },
     );
 }

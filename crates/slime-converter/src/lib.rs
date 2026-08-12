@@ -2080,6 +2080,19 @@ fn is_full_katakana_surface(surface: &str) -> bool {
             .all(|character| matches!(character, '\u{30a0}'..='\u{30ff}'))
 }
 
+fn literal_katakana_surface(reading: &str) -> Option<String> {
+    reading
+        .chars()
+        .map(|character| match character {
+            'ぁ'..='ゖ' => {
+                Some(char::from_u32(u32::from(character) + 0x60).expect("valid katakana scalar"))
+            }
+            'ー' => Some('ー'),
+            _ => None,
+        })
+        .collect()
+}
+
 fn is_ideographic_or_digit(character: char) -> bool {
     matches!(
         character,
@@ -2842,6 +2855,119 @@ impl Dictionary {
                 && !alternative_is_one_segment
                 && !alternative_has_exact_ideographic_overlap
         })
+    }
+
+    /// Returns whether an alternative replaces one exact ideographic word,
+    /// recovered through an orthographic long-vowel variant, with a literal
+    /// katakana rendering of the original pronunciation.
+    ///
+    /// The check is deliberately segment-local. Both conversions must retain
+    /// identical surfaces before and after the word, the protected word must
+    /// contain at least two ideographs, and the katakana spelling must not be
+    /// an exact dictionary entry itself. This preserves lexical conversions
+    /// such as `中東 -> チュートー` without blocking established katakana
+    /// spellings or unrelated model substitutions.
+    #[must_use]
+    pub fn deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface || !reading.contains('ー') {
+            return false;
+        }
+        let exact_conversion = |surface: &str| {
+            self.convert_n_best_with_surface_prefix(reading, surface, 1)
+                .into_iter()
+                .find(|conversion| conversion.surface == surface)
+        };
+        let Some(current) = exact_conversion(current_surface) else {
+            return false;
+        };
+        let Some(alternative) = exact_conversion(alternative_surface) else {
+            return false;
+        };
+        let follows_original_reading = |conversion: &Conversion| {
+            conversion
+                .segments
+                .iter()
+                .flat_map(|segment| segment.reading.chars())
+                .eq(reading.chars())
+        };
+        if !follows_original_reading(&current) || !follows_original_reading(&alternative) {
+            return false;
+        }
+
+        let has_exact_pronunciation_entry = |segment_reading: &str, surface: &str| {
+            self.has_exact_entry(segment_reading, surface)
+                || orthographic_long_vowel_variants(segment_reading)
+                    .into_iter()
+                    .any(|variant| self.has_exact_entry(&variant.reading, surface))
+        };
+        let mut current_reading_start = 0usize;
+        for (current_index, segment) in current.segments.iter().enumerate() {
+            let reading_end = current_reading_start + segment.reading.len();
+            let lexical_ideographs = segment.reading.contains('ー')
+                && segment.surface.chars().count() >= 2
+                && segment.surface.chars().all(is_ideographic_character)
+                && has_exact_pronunciation_entry(&segment.reading, &segment.surface);
+            if !lexical_ideographs {
+                current_reading_start = reading_end;
+                continue;
+            }
+            let Some(phonetic_surface) = literal_katakana_surface(&segment.reading) else {
+                current_reading_start = reading_end;
+                continue;
+            };
+            if has_exact_pronunciation_entry(&segment.reading, &phonetic_surface) {
+                current_reading_start = reading_end;
+                continue;
+            }
+
+            let mut alternative_reading_start = 0usize;
+            let mut alternative_start = None;
+            let mut alternative_end = None;
+            for (index, alternative_segment) in alternative.segments.iter().enumerate() {
+                if alternative_reading_start == current_reading_start {
+                    alternative_start = Some(index);
+                }
+                alternative_reading_start += alternative_segment.reading.len();
+                if alternative_reading_start == reading_end {
+                    alternative_end = Some(index + 1);
+                    break;
+                }
+                if alternative_reading_start > reading_end {
+                    break;
+                }
+            }
+            let Some((alternative_start, alternative_end)) = alternative_start.zip(alternative_end)
+            else {
+                current_reading_start = reading_end;
+                continue;
+            };
+            let alternative_word = alternative.segments[alternative_start..alternative_end]
+                .iter()
+                .map(|segment| segment.surface.as_str())
+                .collect::<String>();
+            let same_prefix = current.segments[..current_index]
+                .iter()
+                .map(|segment| segment.surface.as_str())
+                .eq(alternative.segments[..alternative_start]
+                    .iter()
+                    .map(|segment| segment.surface.as_str()));
+            let same_suffix = current.segments[current_index + 1..]
+                .iter()
+                .map(|segment| segment.surface.as_str())
+                .eq(alternative.segments[alternative_end..]
+                    .iter()
+                    .map(|segment| segment.surface.as_str()));
+            if alternative_word == phonetic_surface && same_prefix && same_suffix {
+                return true;
+            }
+            current_reading_start = reading_end;
+        }
+        false
     }
 
     /// Returns whether a bounded suffix of a complete conversion forms an exact
@@ -7687,6 +7813,40 @@ mod tests {
                 "にはねてくる",
                 "には寝てくる",
                 "に跳ねてくる",
+            )
+        );
+    }
+
+    #[test]
+    fn exact_long_vowel_ideographs_reject_only_literal_katakana_deconversion() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(
+            dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                "ちゅーとーせいどうき",
+                "中東青銅器",
+                "チュートー青銅器",
+            )
+        );
+        assert!(
+            !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                "せーじしはいか",
+                "政治支配下",
+                "セージ支配下",
+            )
+        );
+        assert!(
+            !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                "ちゅーとーせいどうき",
+                "中東青銅器",
+                "チュートー聖堂期",
+            )
+        );
+        assert!(
+            !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                "ちゅうとうせいどうき",
+                "中東青銅器",
+                "チュウトウ青銅器",
             )
         );
     }

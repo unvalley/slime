@@ -1512,6 +1512,7 @@ impl SlimeEngine {
         self.rescore_changes_exact_region_segment(state, selected)
             || self.rescore_changes_uncontextualized_personal_name(state, selected)
             || self.rescore_fragments_exact_katakana_segment(state, selected)
+            || self.rescore_deconverts_exact_ideographic_pronunciation_segment(state, selected)
             || rescore_only_expands_ascii_digit_width(
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
@@ -1559,6 +1560,21 @@ impl SlimeEngine {
                 base,
                 &state.candidates[selected].surface,
             )
+    }
+
+    fn rescore_deconverts_exact_ideographic_pronunciation_segment(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self
+                .dictionary
+                .deconverts_exact_ideographic_pronunciation_segment_to_katakana(
+                    &state.request.reading,
+                    &state.candidates[0].surface,
+                    &state.candidates[selected].surface,
+                )
     }
 
     fn rescore_fragments_exact_katakana_segment(
@@ -7724,6 +7740,45 @@ mod tests {
             .expect("mixed-script fragment should not replace exact katakana");
 
         assert_eq!(engine.candidates[0], "アルゴル太陽系");
+    }
+
+    #[test]
+    fn model_rescore_preserves_lexical_kanji_from_literal_long_vowel_katakana() {
+        let reading = "ちゅーとーせいどうき";
+        let candidates = vec![
+            Candidate {
+                surface: "中東青銅器".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "チュートー青銅器".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::bundled();
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "これらは紀元前1600年、".to_owned(),
+                right_context: "時代の遺構".to_owned(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("literal katakana should not replace the lexical word");
+
+        assert_eq!(engine.candidates[0], "中東青銅器");
     }
 
     #[test]

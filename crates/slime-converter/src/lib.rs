@@ -685,6 +685,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         };
         let quotation_reporting_promotion =
             self.quotation_reporting_promotion(left_context, conversion);
+        let foreign_name_honorific_promotion =
+            foreign_name_honorific_promotion(left_context, self.right_context, conversion);
         let specialized_promotion = phrase_promotion
             .max(notation_promotion)
             .max(numeric_counter_promotion)
@@ -705,6 +707,41 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(right_grammar_promotion.max(unique_right_grammar_promotion))
             .saturating_sub(unique_right_suru_promotion)
             .saturating_sub(quotation_reporting_promotion)
+            .saturating_sub(foreign_name_honorific_promotion)
+    }
+}
+
+fn foreign_name_honorific_promotion(
+    left_context: &str,
+    right_context: &str,
+    conversion: &Conversion,
+) -> i32 {
+    const PROMOTION: i32 = 500;
+
+    if !left_context.ends_with('・')
+        || !right_context.chars().next().is_some_and(|character| {
+            matches!(character, 'は' | 'が' | 'を' | 'に' | 'の' | 'と' | 'も')
+        })
+    {
+        return 0;
+    }
+    let [name @ .., honorific] = conversion.segments.as_slice() else {
+        return 0;
+    };
+    let name_characters = name
+        .iter()
+        .map(|segment| segment.surface.chars().count())
+        .sum::<usize>();
+    if honorific.reading == "し"
+        && honorific.surface == "氏"
+        && name_characters >= 5
+        && name
+            .iter()
+            .all(|segment| is_full_katakana_surface(&segment.surface))
+    {
+        PROMOTION
+    } else {
+        0
     }
 }
 
@@ -9642,6 +9679,33 @@ mod tests {
                 .iter()
                 .all(|candidate| !candidate.surface.contains('Ⅲ')),
             "ordinary honorific readings must not gain a roman numeral"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_preserves_a_foreign_name_honorific_boundary() {
+        let dictionary = Dictionary::bundled();
+        assert_ne!(
+            dictionary.candidates("すたーんりーぶし")[0].surface,
+            "スターンリーブ氏"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "すたーんりーぶし",
+                "ジョー・",
+                "は発表した。",
+            )[0]
+            .surface,
+            "スターンリーブ氏"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context(
+                "すたーんりーぶし",
+                "無関係な文脈",
+                "は発表した。",
+            )[0]
+            .surface,
+            "スターンリーブ氏"
         );
     }
 

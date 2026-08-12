@@ -1524,6 +1524,7 @@ impl SlimeEngine {
             || rescore_removes_alphanumeric_compound_number(state, selected)
             || rescore_removes_parallel_score(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
+            || rescore_removes_contextual_foreign_name_honorific(state, selected)
     }
 
     fn rescore_changes_uncontextualized_personal_name(
@@ -3563,6 +3564,33 @@ fn rescore_removes_contextual_roman_numeral(
         return false;
     };
     !state.candidates[selected].surface.contains(numeral)
+}
+
+fn rescore_removes_contextual_foreign_name_honorific(
+    state: &CandidateRescoreState,
+    selected: usize,
+) -> bool {
+    if selected == 0
+        || !state.request.context.ends_with('・')
+        || !state
+            .request
+            .right_context
+            .chars()
+            .next()
+            .is_some_and(|character| {
+                matches!(character, 'は' | 'が' | 'を' | 'に' | 'の' | 'と' | 'も')
+            })
+    {
+        return false;
+    }
+    let Some(name) = state.candidates[0].surface.strip_suffix('氏') else {
+        return false;
+    };
+    name.chars().count() >= 5
+        && name
+            .chars()
+            .all(|character| matches!(character, '\u{30a0}'..='\u{30ff}'))
+        && !state.candidates[selected].surface.ends_with('氏')
 }
 
 fn is_ascii_or_fullwidth_digit(character: char) -> bool {
@@ -6558,6 +6586,42 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("a contextual generation suffix should remain structured");
         assert_eq!(engine.candidates[0], "プライスⅢの顔");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_contextual_foreign_name_honorific() {
+        let candidates = vec![
+            Candidate {
+                surface: "スターンリーブ氏".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "スターンリー武士".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "すたーんりーぶし".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "ジョー・".to_owned(),
+                right_context: "は発表した。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a contextual foreign-name honorific should remain structured");
+        assert_eq!(engine.candidates[0], "スターンリーブ氏");
     }
 
     #[test]

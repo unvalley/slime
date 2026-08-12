@@ -1097,8 +1097,9 @@ fn document_numeric_style_evidence(
     right_context: &str,
 ) -> Option<DocumentNumericStyleEvidence> {
     let left_style = left_document_numeric_style(left_context);
-    let right_style = reading
-        .contains("いっ")
+    let right_style = ["いっ", "ろっ", "はっ", "ふたり"]
+        .iter()
+        .any(|numeric_reading| reading.contains(numeric_reading))
         .then(|| right_document_numeric_style(right_context))
         .flatten();
     let style = reconcile_document_numeric_style(left_style, right_style)?;
@@ -1193,10 +1194,16 @@ fn assimilated_counter_surface_matches_style(
     segment: &Segment,
     style: DocumentNumericStyle,
 ) -> bool {
-    let Some(counter_reading) = segment.reading.strip_prefix("いっ") else {
+    if segment.reading == "ふたり" {
+        return match style {
+            DocumentNumericStyle::Ascii => segment.surface == "2人",
+            DocumentNumericStyle::Fullwidth => segment.surface == "２人",
+        };
+    }
+    let Some((_, counter_reading)) = assimilated_numeric_prefix(&segment.reading) else {
         return false;
     };
-    if !ASSIMILATED_ONE_COUNTER_READINGS.contains(&counter_reading) {
+    if !ASSIMILATED_NUMERIC_COUNTER_READINGS.contains(&counter_reading) {
         return false;
     }
     let surface = segment.surface.as_str();
@@ -1217,7 +1224,7 @@ fn assimilated_counter_surface_matches_style(
     saw_digit
         && suffix_start
             .and_then(|start| surface.get(start..))
-            .is_some_and(is_assimilated_one_numeric_suffix)
+            .is_some_and(is_assimilated_numeric_suffix)
 }
 
 fn is_productive_numeric_style_suffix(surface: &str) -> bool {
@@ -1260,11 +1267,31 @@ fn is_productive_numeric_style_suffix(surface: &str) -> bool {
     )
 }
 
-fn is_assimilated_one_numeric_suffix(surface: &str) -> bool {
+fn is_assimilated_numeric_suffix(surface: &str) -> bool {
     is_productive_numeric_style_suffix(surface)
         || matches!(
             surface,
-            "版" | "隻" | "足" | "着" | "頭" | "棟" | "局" | "区" | "丁" | "通"
+            "版" | "隻"
+                | "足"
+                | "着"
+                | "頭"
+                | "棟"
+                | "局"
+                | "区"
+                | "丁"
+                | "通"
+                | "期"
+                | "カ国"
+                | "か国"
+                | "ヶ国"
+                | "ヵ国"
+                | "ケ国"
+                | "箇所"
+                | "カ所"
+                | "か所"
+                | "ヶ所"
+                | "ヵ所"
+                | "ケ所"
         )
 }
 
@@ -5727,6 +5754,21 @@ fn synthetic_entries_by_start<'a>(
         push_digit_run_entry(reading, start, &mut by_start[start]);
         push_number_entries(reading, start, arena, &mut by_start[start]);
         push_spoken_digit_entries(reading, start, arena, &mut by_start[start]);
+        if ASSIMILATED_NUMERIC_PREFIXES
+            .iter()
+            .any(|prefix| reading[start..].starts_with(prefix.reading))
+        {
+            push_assimilated_counter_number_entries(
+                dictionary,
+                reading,
+                start,
+                arena,
+                &mut by_start[start],
+            );
+        }
+        if reading[start..].starts_with("ふたり") {
+            push_native_two_person_entries(dictionary, start, arena, &mut by_start[start]);
+        }
         push_katakana_entries(
             reading,
             start,
@@ -5735,16 +5777,36 @@ fn synthetic_entries_by_start<'a>(
             &mut by_start[start],
         );
     }
-    for (start, _) in reading.match_indices("いっ") {
-        push_assimilated_counter_number_entries(
-            dictionary,
-            reading,
-            start,
-            arena,
-            &mut by_start[start],
-        );
-    }
     by_start
+}
+
+fn push_native_two_person_entries<'a>(
+    dictionary: &Dictionary,
+    start: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    dictionary.for_each_exact("ふたり", |entry| {
+        if entry.surface != "二人" {
+            return;
+        }
+        for (surface, variant_cost) in [
+            ("2人", entry.word_cost.saturating_add(NUMBER_VARIANT_STEP)),
+            (
+                "２人",
+                entry.word_cost.saturating_add(2 * NUMBER_VARIANT_STEP),
+            ),
+        ] {
+            out.push(SyntheticEntry {
+                end: start + "ふたり".len(),
+                surface: arena.alloc_str(surface),
+                left_id: entry.left_id,
+                right_id: entry.right_id,
+                cost: variant_cost,
+                numeric: true,
+            });
+        }
+    });
 }
 
 fn push_assimilated_counter_number_entries<'a>(
@@ -5754,19 +5816,20 @@ fn push_assimilated_counter_number_entries<'a>(
     arena: &'a Bump,
     out: &mut Vec<SyntheticEntry<'a>>,
 ) {
-    let Some(counter_reading) = reading[start..].strip_prefix("いっ") else {
+    let Some((numeric, counter_reading)) = assimilated_numeric_prefix(&reading[start..]) else {
         return;
     };
     if counter_reading.is_empty() {
         return;
     }
     let connection = ConnectionMatrix::bundled();
-    for &counter_prefix in ASSIMILATED_ONE_COUNTER_READINGS {
+    let prefix_length = reading[start..].len() - counter_reading.len();
+    for &counter_prefix in ASSIMILATED_NUMERIC_COUNTER_READINGS {
         if !counter_reading.starts_with(counter_prefix) {
             continue;
         }
         dictionary.for_each_exact(counter_prefix, |entry| {
-            if !is_assimilated_one_numeric_suffix(entry.surface) {
+            if !is_assimilated_numeric_suffix(entry.surface) {
                 return;
             }
             let counter_connection = connection.cost(ARABIC_NUMBER_POS_ID, entry.left_id);
@@ -5777,15 +5840,15 @@ fn push_assimilated_counter_number_entries<'a>(
                 .saturating_add(counter_connection)
                 .saturating_add(entry.word_cost);
             for (digit, variant_cost) in [
-                ("1", cost),
-                ("１", cost.saturating_add(NUMBER_VARIANT_STEP)),
+                (numeric.ascii, cost),
+                (numeric.fullwidth, cost.saturating_add(NUMBER_VARIANT_STEP)),
             ] {
                 let mut surface =
                     BumpString::with_capacity_in(digit.len() + entry.surface.len(), arena);
                 surface.push_str(digit);
                 surface.push_str(entry.surface);
                 out.push(SyntheticEntry {
-                    end: start + "いっ".len() + counter_prefix.len(),
+                    end: start + prefix_length + counter_prefix.len(),
                     surface: arena.alloc_str(surface.as_str()),
                     left_id: ARABIC_NUMBER_POS_ID,
                     right_id: entry.right_id,
@@ -5863,10 +5926,38 @@ const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
 
 const RISKY_SINGLE_NUMBER_READINGS: &[&str] = &["に", "し", "ご", "く", "ぜん", "じゅっ", "じっ"];
 
-const ASSIMILATED_ONE_COUNTER_READINGS: &[&str] = &[
+#[derive(Clone, Copy)]
+struct AssimilatedNumericPrefix {
+    reading: &'static str,
+    ascii: &'static str,
+    fullwidth: &'static str,
+}
+
+const ASSIMILATED_NUMERIC_PREFIXES: &[AssimilatedNumericPrefix] = &[
+    AssimilatedNumericPrefix {
+        reading: "いっ",
+        ascii: "1",
+        fullwidth: "１",
+    },
+    AssimilatedNumericPrefix {
+        reading: "ろっ",
+        ascii: "6",
+        fullwidth: "６",
+    },
+    AssimilatedNumericPrefix {
+        reading: "はっ",
+        ascii: "8",
+        fullwidth: "８",
+    },
+];
+
+const ASSIMILATED_NUMERIC_COUNTER_READINGS: &[&str] = &[
     "かい",
+    "かこく",
+    "かしょ",
     "こ",
     "けん",
+    "き",
     "ぽん",
     "ぴき",
     "ぷん",
@@ -5885,6 +5976,14 @@ const ASSIMILATED_ONE_COUNTER_READINGS: &[&str] = &[
     "つう",
     "てん",
 ];
+
+fn assimilated_numeric_prefix(reading: &str) -> Option<(AssimilatedNumericPrefix, &str)> {
+    ASSIMILATED_NUMERIC_PREFIXES.iter().find_map(|prefix| {
+        reading
+            .strip_prefix(prefix.reading)
+            .map(|rest| (*prefix, rest))
+    })
+}
 
 /// Parses kana numeral prefixes of `suffix`. Returns every token boundary at
 /// which the consumed prefix forms a complete number, with its value.
@@ -8794,7 +8893,7 @@ mod tests {
     }
 
     #[test]
-    fn assimilated_one_composes_only_before_dictionary_counters() {
+    fn assimilated_numbers_compose_only_before_dictionary_counters() {
         let dictionary = Dictionary::bundled();
         let arena = bumpalo::Bump::new();
         let generated = synthetic_entries_by_start(
@@ -8815,6 +8914,10 @@ mod tests {
             ("しゅういっかい", "週1回"),
             ("おにぎりいっこ", "おにぎり1個"),
             ("さつじんといっけん", "殺人と1件"),
+            ("ろっかこく", "6カ国"),
+            ("いっかしょ", "1カ所"),
+            ("だいいっき", "第1期"),
+            ("ふたりをはけん", "2人を派遣"),
         ] {
             let candidates = dictionary.candidates_with_limit(reading, 32);
             assert!(
@@ -8837,6 +8940,8 @@ mod tests {
             ("いっけん", "一見"),
             ("いっぱん", "一般"),
             ("いっこう", "一行"),
+            ("いっき", "一気"),
+            ("はっきり", "ハッキリ"),
             ("いった", "行った"),
         ] {
             assert_eq!(
@@ -8851,6 +8956,25 @@ mod tests {
                 !conversion.surface.starts_with('1') && !conversion.surface.starts_with('１')
             }),
             "a reading without a following counter gained a number: {conversions:?}"
+        );
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ろっかこく",
+                "前回は2地域、",
+                "から代表が集まった。",
+            )[0]
+            .surface,
+            "6カ国"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ふたりをはけん",
+                "前回は２人、今回は",
+                "する。",
+            )[0]
+            .surface,
+            "２人を派遣"
         );
     }
 

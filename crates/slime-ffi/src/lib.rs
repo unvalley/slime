@@ -134,6 +134,8 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 #[cfg(any(feature = "neural", test))]
 const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
 #[cfg(any(feature = "neural", test))]
+const SHORT_GENITIVE_INPUT_MAX_CHARACTERS: usize = 8;
+#[cfg(any(feature = "neural", test))]
 const CONFIRMED_SURNAME_HONORIFIC_CONTEXT_CONTRAST_WEIGHT: f64 = 0.15;
 #[cfg(feature = "neural")]
 const PREFIX_CORRECTION_MIN_CHARACTERS: usize = 4;
@@ -146,6 +148,7 @@ const GENERATIVE_RECALL_MAX_OUTPUT_TOKENS: usize = 64;
 struct NeuralProfileParameters {
     candidate_weight: f64,
     very_long_input_candidate_weight: f64,
+    short_genitive_candidate_weight: f64,
     long_input_candidate_limit: usize,
     confidence_bypass_candidate_limit: usize,
     bypass_long_input_confidence: bool,
@@ -161,6 +164,7 @@ impl NeuralProfileParameters {
     const BALANCED: Self = Self {
         candidate_weight: 0.7,
         very_long_input_candidate_weight: 0.7,
+        short_genitive_candidate_weight: 0.7,
         long_input_candidate_limit: 16,
         confidence_bypass_candidate_limit: 8,
         bypass_long_input_confidence: false,
@@ -175,6 +179,7 @@ impl NeuralProfileParameters {
     const HIGH_ACCURACY: Self = Self {
         candidate_weight: 0.8,
         very_long_input_candidate_weight: 0.74,
+        short_genitive_candidate_weight: 0.85,
         long_input_candidate_limit: 32,
         confidence_bypass_candidate_limit: 8,
         bypass_long_input_confidence: true,
@@ -192,6 +197,21 @@ impl NeuralProfileParameters {
             self.very_long_input_candidate_weight
         } else {
             self.candidate_weight
+        }
+    }
+
+    #[cfg(any(feature = "neural", test))]
+    fn candidate_weight_for_context(
+        self,
+        input_characters: usize,
+        has_right_context: bool,
+        left_context: &str,
+    ) -> f64 {
+        if input_characters <= SHORT_GENITIVE_INPUT_MAX_CHARACTERS && left_context.ends_with('の')
+        {
+            self.short_genitive_candidate_weight
+        } else {
+            self.candidate_weight_for(input_characters, has_right_context)
         }
     }
 
@@ -749,9 +769,11 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
             has_right_context,
             dictionary_only_ranking,
         );
-        let candidate_weight = handle
-            .neural_profile
-            .candidate_weight_for(request.reading.chars().count(), has_right_context);
+        let candidate_weight = handle.neural_profile.candidate_weight_for_context(
+            request.reading.chars().count(),
+            has_right_context,
+            &request.context,
+        );
         let context_contrast_weight =
             context_contrast_weight_for_request(handle.neural_profile, &request);
         let score_request = prepare_generative_score_request(handle, service, request);
@@ -1919,6 +1941,10 @@ mod tests {
         assert_close(balanced.candidate_weight_for(19, false), 0.7);
         assert_close(balanced.candidate_weight_for(20, false), 0.7);
         assert_close(balanced.candidate_weight_for(20, true), 0.7);
+        assert_close(
+            balanced.candidate_weight_for_context(2, true, "党錮の"),
+            0.7,
+        );
         assert_eq!(balanced.long_input_candidate_limit, 16);
         assert_eq!(balanced.confidence_bypass_candidate_limit, 8);
         assert!(!balanced.bypass_long_input_confidence);
@@ -1936,6 +1962,18 @@ mod tests {
         assert_close(high_accuracy.candidate_weight_for(19, false), 0.8);
         assert_close(high_accuracy.candidate_weight_for(20, false), 0.74);
         assert_close(high_accuracy.candidate_weight_for(20, true), 0.8);
+        assert_close(
+            high_accuracy.candidate_weight_for_context(2, true, "党錮の"),
+            0.85,
+        );
+        assert_close(
+            high_accuracy.candidate_weight_for_context(9, true, "党錮の"),
+            0.8,
+        );
+        assert_close(
+            high_accuracy.candidate_weight_for_context(2, true, "それ故に"),
+            0.8,
+        );
         assert_eq!(high_accuracy.long_input_candidate_limit, 32);
         assert_eq!(high_accuracy.confidence_bypass_candidate_limit, 8);
         assert!(high_accuracy.bypass_long_input_confidence);

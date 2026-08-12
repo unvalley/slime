@@ -57,6 +57,7 @@ const SHORT_CONFIRMED_CONTEXT_RESCORE_COST_GAP: i32 = 2_000;
 const LONG_RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 2_500;
 const MODEL_KATAKANA_RECALL_ADDITIONAL_CANDIDATES: usize = 3;
 const MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS: usize = 5;
+const SHORT_KATAKANA_RECALL_SEARCH_LIMIT: usize = 32;
 const SHORT_KATAKANA_RECALL_MIN_BASE_COST: i32 = 20_000;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
@@ -791,6 +792,7 @@ impl SlimeEngine {
         if self.model_rescore_dictionary.is_none()
             && reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
             && base_winner.cost < SHORT_KATAKANA_RECALL_MIN_BASE_COST
+            && !has_short_initial_katakana_run(&base_winner.surface)
         {
             return Some(current.clone());
         }
@@ -809,6 +811,8 @@ impl SlimeEngine {
             .as_ref()
             .unwrap_or(&self.dictionary);
         let model_recall_dictionary = model_dictionary.with_model_recall_katakana_cost();
+        let recall_candidate_limit =
+            model_katakana_recall_search_limit(candidate_limit, &base_winner.surface);
         let model_candidates = Self::dictionary_candidates_for_context_from(
             model_dictionary,
             reading,
@@ -819,14 +823,14 @@ impl SlimeEngine {
         let recall_candidates = Self::dictionary_candidates_for_context_from(
             &model_recall_dictionary,
             reading,
-            Some(candidate_limit),
+            Some(recall_candidate_limit),
             previous_surface,
             right_context,
         );
         if self.model_rescore_dictionary.is_none()
             && reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
             && !recall_candidates.iter().any(|candidate| {
-                is_mixed_katakana_recall_surface(&candidate.surface)
+                is_model_katakana_recall_surface(&candidate.surface, &base_winner.surface)
                     && !base_candidates
                         .iter()
                         .any(|base| base.surface == candidate.surface)
@@ -874,6 +878,8 @@ impl SlimeEngine {
             .as_ref()
             .unwrap_or(&self.dictionary);
         let model_recall_dictionary = model_dictionary.with_model_recall_katakana_cost();
+        let recall_candidate_limit =
+            model_katakana_recall_search_limit(candidate_limit, &base_winner.surface);
         let state = self
             .conversion_candidate_set_for_reading_with_limit_and_context_policy_from(
                 model_dictionary,
@@ -889,7 +895,7 @@ impl SlimeEngine {
         let recall_candidates = Self::dictionary_candidates_for_context_from(
             &model_recall_dictionary,
             reading,
-            Some(candidate_limit),
+            Some(recall_candidate_limit),
             previous_surface,
             right_context,
         );
@@ -3339,6 +3345,13 @@ fn append_model_katakana_recall_candidates(
     base_candidates: &[Candidate],
     base_limit: usize,
 ) {
+    let Some(base_surface) = state
+        .candidates
+        .first()
+        .map(|candidate| candidate.surface.clone())
+    else {
+        return;
+    };
     let maximum = base_limit
         .saturating_add(MODEL_KATAKANA_RECALL_ADDITIONAL_CANDIDATES)
         .min(MAX_EXTENDED_LONG_RESCORE_CANDIDATES);
@@ -3346,7 +3359,7 @@ fn append_model_katakana_recall_candidates(
         if state.candidates.len() >= maximum {
             break;
         }
-        if !is_mixed_katakana_recall_surface(&candidate.surface)
+        if !is_model_katakana_recall_surface(&candidate.surface, &base_surface)
             || base_candidates
                 .iter()
                 .any(|base| base.surface == candidate.surface)
@@ -3363,12 +3376,57 @@ fn append_model_katakana_recall_candidates(
     }
 }
 
+fn is_model_katakana_recall_surface(surface: &str, base_surface: &str) -> bool {
+    is_mixed_katakana_recall_surface(surface)
+        || extends_short_initial_katakana_run(surface, base_surface)
+}
+
+fn model_katakana_recall_search_limit(candidate_limit: usize, base_surface: &str) -> usize {
+    if has_short_initial_katakana_run(base_surface) {
+        candidate_limit.max(SHORT_KATAKANA_RECALL_SEARCH_LIMIT)
+    } else {
+        candidate_limit
+    }
+}
+
+fn is_katakana_character(character: char) -> bool {
+    matches!(character, '\u{30A1}'..='\u{30FA}' | '\u{30FD}'..='\u{30FF}' | 'ー')
+}
+
+fn initial_katakana_run_characters(surface: &str) -> usize {
+    surface
+        .chars()
+        .take_while(|&character| is_katakana_character(character))
+        .count()
+}
+
+fn has_short_initial_katakana_run(surface: &str) -> bool {
+    (2..MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS.saturating_sub(1))
+        .contains(&initial_katakana_run_characters(surface))
+}
+
+fn extends_short_initial_katakana_run(surface: &str, base_surface: &str) -> bool {
+    let surface_run = initial_katakana_run_characters(surface);
+    let base_run = initial_katakana_run_characters(base_surface);
+    surface_run + 1 == MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS
+        && (2..surface_run).contains(&base_run)
+        && surface
+            .chars()
+            .zip(base_surface.chars())
+            .take(base_run)
+            .all(|(surface, base)| surface == base)
+        && surface
+            .chars()
+            .skip(surface_run)
+            .any(|character| is_hiragana(character) || is_kanji(character))
+}
+
 fn is_mixed_katakana_recall_surface(surface: &str) -> bool {
     let mut maximum_katakana_run = 0_usize;
     let mut current_katakana_run = 0_usize;
     let mut has_japanese_non_katakana = false;
     for character in surface.chars() {
-        if matches!(character, '\u{30A1}'..='\u{30FA}' | '\u{30FD}'..='\u{30FF}' | 'ー') {
+        if is_katakana_character(character) {
             current_katakana_run += 1;
             maximum_katakana_run = maximum_katakana_run.max(current_katakana_run);
         } else {
@@ -6452,6 +6510,43 @@ mod tests {
     }
 
     #[test]
+    fn ready_external_scorer_extends_a_short_existing_katakana_prefix() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context(
+            "ブリリアニアは、ノルウェー南部のクリスチャンサン付近から",
+            "たエリアまで続く、岩礁で保護された水路です。",
+        );
+        type_text(&mut engine, "riresanwokoe");
+        engine.handle(InputEvent::Space);
+        let base = engine.snapshot().preedit;
+
+        assert_eq!(base, "リレさんを超え");
+        engine.prepare_extended_candidate_rescore_with_limit(32);
+        let request = engine
+            .candidate_rescore_request()
+            .expect("existing katakana prefix should expose model recall");
+        assert_eq!(request.candidates[0], base);
+        assert!(
+            request.candidates.contains(&"リレサンを越え".to_owned()),
+            "model recall request: {request:?}"
+        );
+    }
+
+    #[test]
+    fn short_katakana_recall_does_not_deepen_an_all_kanji_base() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context("", "弟にあたる。");
+        type_text(&mut engine, "りゅーゆーのいぼ");
+        engine.handle(InputEvent::Space);
+
+        assert_eq!(engine.snapshot().preedit, "劉裕の異母");
+        engine.prepare_extended_candidate_rescore_with_limit(32);
+        assert!(engine.candidate_rescore_request().is_none_or(|request| {
+            !request.candidates.contains(&"リューユーの異母".to_owned())
+        }));
+    }
+
+    #[test]
     fn short_japanese_phrase_does_not_rebuild_model_pool_for_katakana_recall() {
         let mut engine = SlimeEngine::bundled();
         engine.set_external_context(
@@ -6469,11 +6564,24 @@ mod tests {
     }
 
     #[test]
-    fn katakana_model_recall_requires_a_long_mixed_script_candidate() {
+    fn katakana_model_recall_requires_mixed_script_or_a_short_prefix_extension() {
         assert!(super::is_mixed_katakana_recall_surface("アケメネイド軍"));
         assert!(!super::is_mixed_katakana_recall_surface("メンカラ測ら"));
         assert!(!super::is_mixed_katakana_recall_surface("サンシャの過"));
         assert!(!super::is_mixed_katakana_recall_surface("アケメネイド"));
+        assert!(super::is_model_katakana_recall_surface(
+            "リレサンを越え",
+            "リレさんを越え"
+        ));
+        assert!(!super::is_model_katakana_recall_surface(
+            "メンカラ測ら",
+            "面から測ら"
+        ));
+        assert!(!super::is_model_katakana_recall_surface(
+            "サンシャの過",
+            "三者の過"
+        ));
+        assert!(!super::has_short_initial_katakana_run("テストー語"));
     }
 
     fn accepts_foreign_prefix(

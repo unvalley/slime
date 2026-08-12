@@ -78,7 +78,16 @@ jobs:
           path: target/package/x86
       - name: Install pinned NSIS
         shell: pwsh
-        run: choco install nsis --version=3.12.0 --yes --no-progress
+        run: |
+          $maximumAttempts = 3
+          for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+            choco install nsis --version=3.12.0 --yes --no-progress
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -eq $maximumAttempts) {
+              throw "NSIS installation failed after $maximumAttempts attempts"
+            }
+            Start-Sleep -Seconds (15 * $attempt)
+          }
       - name: Resolve package version
         id: version
         shell: pwsh

@@ -164,6 +164,7 @@ struct DictionaryDocumentContextRanker<'a> {
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
     numeric_style: Option<DocumentNumericStyleEvidence>,
+    measurement_abbreviation_style: Option<DocumentNumericStyle>,
     allows_single_character_phrase_prefix: bool,
     multi_segment_right_phrase_cache: RefCell<Vec<MultiSegmentRightPhraseCacheEntry<'a>>>,
     multi_segment_right_grammar_cache: RefCell<Vec<MultiSegmentRightGrammarCacheEntry<'a>>>,
@@ -321,6 +322,10 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             numeric_counter_promotions: dictionary
                 .document_numeric_counter_promotions(reading, left_context),
             numeric_style: document_numeric_style_evidence(left_context, reading, right_context),
+            measurement_abbreviation_style: document_measurement_abbreviation_style(
+                left_context,
+                reading,
+            ),
             allows_single_character_phrase_prefix,
             multi_segment_right_phrase_cache: RefCell::new(Vec::new()),
             multi_segment_right_grammar_cache: RefCell::new(Vec::new()),
@@ -634,6 +639,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
                 conversion_matches_numeric_style(self.dictionary, conversion, *evidence)
             })
             .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION);
+        let measurement_abbreviation_promotion =
+            measurement_abbreviation_promotion(self.measurement_abbreviation_style, conversion);
         let region_suffix_promotion = if self.follows_region_name {
             document_region_suffix_promotion(reading, &conversion.surface)
         } else {
@@ -677,6 +684,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(notation_promotion)
             .max(numeric_counter_promotion)
             .max(numeric_style_promotion)
+            .max(measurement_abbreviation_promotion)
             .max(region_suffix_promotion);
         let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
@@ -693,6 +701,15 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(unique_right_suru_promotion)
             .saturating_sub(quotation_reporting_promotion)
     }
+}
+
+fn measurement_abbreviation_promotion(
+    style: Option<DocumentNumericStyle>,
+    conversion: &Conversion,
+) -> i32 {
+    style
+        .filter(|style| conversion_matches_measurement_abbreviation(conversion, *style))
+        .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION)
 }
 
 /// A borrowed view of one dictionary entry during lattice construction. The
@@ -1089,6 +1106,103 @@ fn reconcile_document_numeric_style(
         (Some(style), _) | (_, Some(style)) => Some(style),
         (None, None) => None,
     }
+}
+
+fn document_measurement_abbreviation_style(
+    left_context: &str,
+    reading: &str,
+) -> Option<DocumentNumericStyle> {
+    if !MEASUREMENT_ABBREVIATIONS
+        .iter()
+        .any(|(unit_reading, _, _, _)| reading.contains(unit_reading))
+    {
+        return None;
+    }
+    let recent_start = left_context
+        .char_indices()
+        .rev()
+        .take(32)
+        .take_while(|(_, character)| !matches!(character, '。' | '！' | '？' | '\n' | '\r'))
+        .last()
+        .map_or(left_context.len(), |(index, _)| index);
+    let recent = &left_context[recent_start..];
+    let ascii = contains_numeric_measurement_abbreviation(
+        recent,
+        &["km", "cm", "mm", "m"],
+        DocumentNumericStyle::Ascii,
+    );
+    let fullwidth = contains_numeric_measurement_abbreviation(
+        recent,
+        &["ｋｍ", "ｃｍ", "ｍｍ", "ｍ"],
+        DocumentNumericStyle::Fullwidth,
+    );
+    match (ascii, fullwidth) {
+        (true, false) => Some(DocumentNumericStyle::Ascii),
+        (false, true) => Some(DocumentNumericStyle::Fullwidth),
+        _ => None,
+    }
+}
+
+fn contains_numeric_measurement_abbreviation(
+    text: &str,
+    units: &[&str],
+    style: DocumentNumericStyle,
+) -> bool {
+    units.iter().any(|unit| {
+        text.match_indices(unit).any(|(index, _)| {
+            let has_matching_digit =
+                text[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| match style {
+                        DocumentNumericStyle::Ascii => character.is_ascii_digit(),
+                        DocumentNumericStyle::Fullwidth => matches!(character, '０'..='９'),
+                    });
+            let has_boundary = text[index + unit.len()..]
+                .chars()
+                .next()
+                .is_none_or(|character| {
+                    !matches!(
+                        character,
+                        '0'..='9'
+                            | 'A'..='Z'
+                            | 'a'..='z'
+                            | '０'..='９'
+                            | 'Ａ'..='Ｚ'
+                            | 'ａ'..='ｚ'
+                    )
+                });
+            has_matching_digit && has_boundary
+        })
+    })
+}
+
+fn conversion_matches_measurement_abbreviation(
+    conversion: &Conversion,
+    style: DocumentNumericStyle,
+) -> bool {
+    conversion.segments.iter().any(|segment| {
+        let matches_unit = match style {
+            DocumentNumericStyle::Ascii => ["km", "cm", "mm", "m"]
+                .iter()
+                .any(|unit| segment.surface.ends_with(unit)),
+            DocumentNumericStyle::Fullwidth => ["ｋｍ", "ｃｍ", "ｍｍ", "ｍ"]
+                .iter()
+                .any(|unit| segment.surface.ends_with(unit)),
+        };
+        matches_unit
+            && segment
+                .surface
+                .chars()
+                .next()
+                .is_some_and(|character| match style {
+                    DocumentNumericStyle::Ascii => character.is_ascii_digit(),
+                    DocumentNumericStyle::Fullwidth => matches!(character, '０'..='９'),
+                })
+            && MEASUREMENT_ABBREVIATIONS
+                .iter()
+                .any(|(reading, _, _, _)| segment.reading.ends_with(reading))
+    })
 }
 
 fn document_numeric_style_evidence(
@@ -5750,9 +5864,21 @@ fn synthetic_entries_by_start<'a>(
     katakana_character_cost: i32,
 ) -> Vec<Vec<SyntheticEntry<'a>>> {
     let mut by_start: Vec<Vec<SyntheticEntry>> = (0..=reading.len()).map(|_| Vec::new()).collect();
+    let has_measurement_reading = reading.contains("めーとる");
     for (start, _) in reading.char_indices() {
+        let numeric_prefixes = parse_kana_number_prefixes(&reading[start..]);
         push_digit_run_entry(reading, start, &mut by_start[start]);
-        push_number_entries(reading, start, arena, &mut by_start[start]);
+        push_number_entries_with_prefixes(&numeric_prefixes, start, arena, &mut by_start[start]);
+        if has_measurement_reading && !numeric_prefixes.is_empty() {
+            push_numbered_measurement_entries(
+                dictionary,
+                reading,
+                start,
+                &numeric_prefixes,
+                arena,
+                &mut by_start[start],
+            );
+        }
         push_spoken_digit_entries(reading, start, arena, &mut by_start[start]);
         if ASSIMILATED_NUMERIC_PREFIXES
             .iter()
@@ -5778,6 +5904,69 @@ fn synthetic_entries_by_start<'a>(
         );
     }
     by_start
+}
+
+const MEASUREMENT_ABBREVIATION_COST: i32 = 250;
+const MEASUREMENT_ABBREVIATIONS: &[(&str, &str, &str, &str)] = &[
+    ("きろめーとる", "キロメートル", "km", "ｋｍ"),
+    ("せんちめーとる", "センチメートル", "cm", "ｃｍ"),
+    ("みりめーとる", "ミリメートル", "mm", "ｍｍ"),
+    ("めーとる", "メートル", "m", "ｍ"),
+];
+
+fn push_numbered_measurement_entries<'a>(
+    dictionary: &Dictionary,
+    reading: &'a str,
+    start: usize,
+    numeric_prefixes: &[(usize, u64)],
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    let connection = ConnectionMatrix::bundled();
+    for &(numeric_length, value) in numeric_prefixes {
+        let remainder = &reading[start + numeric_length..];
+        for &(unit_reading, unit_surface, ascii_unit, fullwidth_unit) in MEASUREMENT_ABBREVIATIONS {
+            if !remainder.starts_with(unit_reading) {
+                continue;
+            }
+            dictionary.for_each_exact(unit_reading, |entry| {
+                if entry.surface != unit_surface {
+                    return;
+                }
+                let connection_cost = connection.cost(ARABIC_NUMBER_POS_ID, entry.left_id);
+                if connection_cost >= INVALID_CONNECTION_COST {
+                    return;
+                }
+                let cost = number_cost()
+                    .saturating_add(connection_cost)
+                    .saturating_add(entry.word_cost)
+                    .saturating_add(MEASUREMENT_ABBREVIATION_COST);
+                let digits = value.to_string();
+                let fullwidth_digits = to_fullwidth_digits(&digits);
+                for (digits, unit, variant_cost) in [
+                    (digits.as_str(), ascii_unit, cost),
+                    (
+                        fullwidth_digits.as_str(),
+                        fullwidth_unit,
+                        cost.saturating_add(NUMBER_VARIANT_STEP),
+                    ),
+                ] {
+                    let mut surface =
+                        BumpString::with_capacity_in(digits.len() + unit.len(), arena);
+                    surface.push_str(digits);
+                    surface.push_str(unit);
+                    out.push(SyntheticEntry {
+                        end: start + numeric_length + unit_reading.len(),
+                        surface: arena.alloc_str(surface.as_str()),
+                        left_id: ARABIC_NUMBER_POS_ID,
+                        right_id: entry.right_id,
+                        cost: variant_cost,
+                        numeric: true,
+                    });
+                }
+            });
+        }
+    }
 }
 
 fn push_native_two_person_entries<'a>(
@@ -6157,7 +6346,17 @@ fn push_number_entries<'a>(
     arena: &'a Bump,
     out: &mut Vec<SyntheticEntry<'a>>,
 ) {
-    for (length, value) in parse_kana_number_prefixes(&reading[start..]) {
+    let prefixes = parse_kana_number_prefixes(&reading[start..]);
+    push_number_entries_with_prefixes(&prefixes, start, arena, out);
+}
+
+fn push_number_entries_with_prefixes<'a>(
+    prefixes: &[(usize, u64)],
+    start: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    for &(length, value) in prefixes {
         let arabic = value.to_string();
         if let Some(mixed) = mixed_numeral(value) {
             out.push(SyntheticEntry {
@@ -7910,6 +8109,41 @@ mod tests {
             )
             .is_none_or(|evidence| evidence.leading.is_none()),
             "right-context digits cannot style a leading numeric interpretation"
+        );
+    }
+
+    #[test]
+    fn document_context_preserves_measurement_abbreviations() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates("ながさいちめーとる")[0].surface,
+            "長さ1メートル"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ながさいちめーとる",
+                "麺棒は直径2~3cm、",
+                "程度のものが一般的だ。",
+            )[0]
+            .surface,
+            "長さ1m"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ながさいちめーとる", "直径２〜３ｃｍ、")[0].surface,
+            "長さ１ｍ"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ながさいちめーとる", "直径2cmだった。次は")[0]
+                .surface,
+            "長さ1メートル",
+            "measurement style does not cross a completed sentence"
+        );
+        assert_eq!(
+            dictionary.candidates_with_context("ながさいちめーとる", "version2millionでは")[0]
+                .surface,
+            "長さ1メートル",
+            "a unit letter inside an alphanumeric word is not style evidence"
         );
     }
 

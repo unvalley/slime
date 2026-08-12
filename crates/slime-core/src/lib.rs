@@ -51,6 +51,7 @@ const LONG_RESCORE_READING_CHARACTERS: usize = MAX_EXPANDED_READING_CHARACTERS +
 const DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 16;
 const MAX_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 32;
 const RESCORE_MAX_BASE_COST_GAP: i32 = 1_000;
+const EXACT_VERBAL_NOUN_RESCORE_MIN_COST_GAP: i32 = 500;
 const RESCORE_MAX_CANDIDATE_COST_GAP: i32 = 1_500;
 const SHORT_CONFIRMED_CONTEXT_RESCORE_MAX_READING_CHARACTERS: usize = 6;
 const SHORT_CONFIRMED_CONTEXT_RESCORE_COST_GAP: i32 = 2_000;
@@ -1513,6 +1514,7 @@ impl SlimeEngine {
             || self.rescore_changes_uncontextualized_personal_name(state, selected)
             || self.rescore_fragments_exact_katakana_segment(state, selected)
             || self.rescore_fragments_exact_mixed_script_segment(state, selected)
+            || self.rescore_changes_exact_verbal_noun_before_particle(state, selected)
             || self.rescore_deconverts_exact_ideographic_pronunciation_segment(state, selected)
             || rescore_only_expands_ascii_digit_width(
                 &state.candidates[0].surface,
@@ -1666,6 +1668,26 @@ impl SlimeEngine {
                 &state.request.reading,
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
+            )
+    }
+
+    fn rescore_changes_exact_verbal_noun_before_particle(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        let Some((base, alternative)) =
+            state.candidates.first().zip(state.candidates.get(selected))
+        else {
+            return false;
+        };
+        selected != 0
+            && alternative.cost.saturating_sub(base.cost) >= EXACT_VERBAL_NOUN_RESCORE_MIN_COST_GAP
+            && state.request.right_context.starts_with('に')
+            && self.dictionary.changes_exact_verbal_noun_to_other_pos(
+                &state.request.reading,
+                &base.surface,
+                &alternative.surface,
             )
     }
 
@@ -7028,6 +7050,48 @@ mod tests {
             engine.candidates[0],
             "ゴルファーとしても有名で30も半ばにして突然"
         );
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_strong_exact_verbal_noun_before_a_particle() {
+        let candidates = vec![
+            Candidate {
+                surface: "一気".to_owned(),
+                cost: 6_779,
+            },
+            Candidate {
+                surface: "一期".to_owned(),
+                cost: 7_459,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::bundled());
+        engine.reading = "いっき".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "そして次巻では".to_owned(),
+                right_context: "に時間が20年後へと飛ぶ。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        };
+        assert!(engine.rescore_changes_exact_verbal_noun_before_particle(&state, 1));
+        let mut close_alternative = state.clone();
+        close_alternative.candidates[1].cost = 6_844;
+        assert!(!engine.rescore_changes_exact_verbal_noun_before_particle(&close_alternative, 1,));
+
+        engine.candidate_rescore = Some(state);
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a strong exact verbal noun should remain selected");
+        assert_eq!(engine.candidates[0], "一気");
     }
 
     #[test]

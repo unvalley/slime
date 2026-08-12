@@ -223,6 +223,7 @@ fn run_n_best_benchmarks(dictionary: &Dictionary, iterations: u64) {
 
 fn run_phrase_context_benchmarks(dictionary: &Dictionary, iterations: u64) {
     run_document_context_benchmark(dictionary, iterations);
+    run_right_numeric_style_lexical_guard_benchmarks(dictionary, iterations);
     run_left_phrase_conflict_benchmarks(dictionary, iterations);
     run_katakana_general_noun_phrase_benchmarks(dictionary, iterations);
 }
@@ -328,6 +329,27 @@ fn run_document_context_benchmark(dictionary: &Dictionary, iterations: u64) {
             ));
         },
     );
+}
+
+fn run_right_numeric_style_lexical_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/right_numeric_style_lexical_guard",
+        iterations,
+        || {
+            black_box(dictionary.candidates_with_surrounding_context(
+                black_box("いっき"),
+                black_box("そして次巻では"),
+                black_box("に時間が20年後へと飛ぶ。"),
+            ));
+        },
+    );
+    run("converter/left_numeric_style_counter", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("いっき"),
+            black_box("第2期に続き、第"),
+            black_box("に入る。"),
+        ));
+    });
 }
 
 fn run_left_phrase_conflict_benchmarks(dictionary: &Dictionary, iterations: u64) {

@@ -256,6 +256,7 @@ enum DocumentNumericStyle {
 struct DocumentNumericStyleEvidence {
     style: DocumentNumericStyle,
     leading: Option<DocumentLeadingNumericStyle>,
+    right_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -739,7 +740,12 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         let numeric_style = self
             .numeric_style
             .filter(|evidence| {
-                conversion_matches_numeric_style(self.dictionary, conversion, *evidence)
+                conversion_matches_numeric_style(
+                    self.dictionary,
+                    self.right_context,
+                    conversion,
+                    *evidence,
+                )
             })
             .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION);
         let region_suffix = if self.follows_region_name {
@@ -1569,11 +1575,17 @@ fn document_numeric_style_evidence(
                 kanji,
             })
         });
-    Some(DocumentNumericStyleEvidence { style, leading })
+    let right_only = left_style.is_none() && right_style == Some(style);
+    Some(DocumentNumericStyleEvidence {
+        style,
+        leading,
+        right_only,
+    })
 }
 
 fn conversion_matches_numeric_style(
     dictionary: &Dictionary,
+    right_context: &str,
     conversion: &Conversion,
     evidence: DocumentNumericStyleEvidence,
 ) -> bool {
@@ -1582,7 +1594,12 @@ fn conversion_matches_numeric_style(
         .iter()
         .any(|segment| assimilated_counter_surface_matches_style(segment, evidence.style))
     {
-        return true;
+        return !right_only_numeric_style_conflicts_with_exact_verbal_noun(
+            dictionary,
+            right_context,
+            conversion,
+            evidence,
+        );
     }
     let Some(leading) = evidence.leading else {
         return false;
@@ -1632,6 +1649,31 @@ fn conversion_matches_numeric_style(
         compound_surface.push_str(&following.surface);
         dictionary.has_exact_entry(&compound_reading, &compound_surface)
     }
+}
+
+fn right_only_numeric_style_conflicts_with_exact_verbal_noun(
+    dictionary: &Dictionary,
+    right_context: &str,
+    conversion: &Conversion,
+    evidence: DocumentNumericStyleEvidence,
+) -> bool {
+    let [segment] = conversion.segments.as_slice() else {
+        return false;
+    };
+    if !evidence.right_only || !right_context.starts_with('に') {
+        return false;
+    }
+    let mut has_exact_verbal_noun = false;
+    dictionary.for_each_exact(&segment.reading, |entry| {
+        has_exact_verbal_noun |= entry.surface != segment.surface
+            && !entry
+                .surface
+                .chars()
+                .any(|character| decimal_digit(character).is_some())
+            && entry.left_id == MOZC_VERBAL_NOUN_POS_ID
+            && entry.right_id == MOZC_VERBAL_NOUN_POS_ID;
+    });
+    has_exact_verbal_noun
 }
 
 fn assimilated_counter_surface_matches_style(
@@ -2976,6 +3018,36 @@ impl Dictionary {
                         )
                     })
         })
+    }
+
+    /// Returns whether a whole-reading exact verbal noun is replaced by an
+    /// exact dictionary entry whose matching entries all use another part of
+    /// speech.
+    #[must_use]
+    pub fn changes_exact_verbal_noun_to_other_pos(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface {
+            return false;
+        }
+        let mut current_is_verbal_noun = false;
+        let mut alternative_found = false;
+        let mut alternative_is_verbal_noun = false;
+        self.for_each_exact(reading, |entry| {
+            let is_verbal_noun = entry.left_id == MOZC_VERBAL_NOUN_POS_ID
+                && entry.right_id == MOZC_VERBAL_NOUN_POS_ID;
+            if entry.surface == current_surface {
+                current_is_verbal_noun |= is_verbal_noun;
+            }
+            if entry.surface == alternative_surface {
+                alternative_found = true;
+                alternative_is_verbal_noun |= is_verbal_noun;
+            }
+        });
+        current_is_verbal_noun && alternative_found && !alternative_is_verbal_noun
     }
 
     /// Returns whether an alternative replaces one exact ideographic word,
@@ -8112,6 +8184,16 @@ mod tests {
     }
 
     #[test]
+    fn exact_verbal_noun_recognizes_only_a_change_to_another_part_of_speech() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(dictionary.changes_exact_verbal_noun_to_other_pos("いっき", "一気", "一期",));
+        assert!(!dictionary.changes_exact_verbal_noun_to_other_pos("いっき", "一気", "一揆",));
+        assert!(!dictionary.changes_exact_verbal_noun_to_other_pos("いっき", "一期", "一気",));
+        assert!(!dictionary.changes_exact_verbal_noun_to_other_pos("いっき", "一気", "一気",));
+    }
+
+    #[test]
     fn exact_long_vowel_ideographs_reject_only_literal_katakana_deconversion() {
         let dictionary = Dictionary::bundled();
 
@@ -9333,6 +9415,23 @@ mod tests {
             .surface,
             "おにぎり1個",
             "a productive internal counter inherits confirmed right-context style"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "いっき",
+                "そして次巻では",
+                "に時間が20年後へと飛ぶ。",
+            )[0]
+            .surface,
+            "一気",
+            "a later number cannot reinterpret an exact verbal noun before a particle"
+        );
+        assert_eq!(
+            dictionary
+                .candidates_with_surrounding_context("いっき", "第2期に続き、第", "に入る。",)[0]
+                .surface,
+            "1期",
+            "established left numeric style still applies to a standalone counter"
         );
         assert_eq!(
             dictionary.candidates_with_surrounding_context(

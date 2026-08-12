@@ -1418,6 +1418,7 @@ impl SlimeEngine {
 
     fn rescore_requires_base(&self, state: &CandidateRescoreState, selected: usize) -> bool {
         self.rescore_changes_exact_region_segment(state, selected)
+            || self.rescore_changes_uncontextualized_personal_name(state, selected)
             || self.rescore_fragments_exact_katakana_segment(state, selected)
             || rescore_only_expands_ascii_digit_width(
                 &state.candidates[0].surface,
@@ -1427,6 +1428,20 @@ impl SlimeEngine {
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
             )
+    }
+
+    fn rescore_changes_uncontextualized_personal_name(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && state.request.context.is_empty()
+            && self.dictionary.is_exact_full_personal_name_surface(
+                &state.request.reading,
+                &state.candidates[0].surface,
+            )
+            && state.candidates[0].surface != state.candidates[selected].surface
     }
 
     fn rescore_changes_exact_region_segment(
@@ -6973,6 +6988,67 @@ mod tests {
 
         assert_eq!(engine.candidates[0], "片瀬志麻たち");
         assert!(!engine.candidates.contains(&"片瀬志摩たち".to_owned()));
+    }
+
+    #[test]
+    fn model_rescore_preserves_an_uncontextualized_personal_name() {
+        const GIVEN_NAME_POS_ID: u16 = 1922;
+        const SURNAME_POS_ID: u16 = 1923;
+        let reading = "かたせしま";
+        let dictionary = Dictionary::new(vec![
+            DictionaryEntry::with_pos(
+                "かたせしま",
+                "片瀬志麻",
+                SURNAME_POS_ID,
+                GIVEN_NAME_POS_ID,
+                10,
+            ),
+            DictionaryEntry::with_pos("かたせ", "片瀬", SURNAME_POS_ID, SURNAME_POS_ID, 20),
+            DictionaryEntry::with_pos("しま", "志摩", GIVEN_NAME_POS_ID, GIVEN_NAME_POS_ID, 20),
+        ]);
+        let candidates = vec![
+            Candidate {
+                surface: "片瀬志麻".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "片瀬志摩".to_owned(),
+                cost: 200,
+            },
+        ];
+        let make_engine = |context: &str| {
+            let mut engine = SlimeEngine::new(dictionary.clone());
+            engine.reading = reading.to_owned();
+            engine.candidate_kind = Some(CandidateKind::Conversion);
+            engine.candidates = candidates
+                .iter()
+                .map(|candidate| candidate.surface.clone())
+                .collect();
+            engine.candidate_rescore = Some(CandidateRescoreState {
+                request: CandidateRescoreRequest {
+                    context: context.to_owned(),
+                    right_context: "を訪ねた".to_owned(),
+                    reading: reading.to_owned(),
+                    candidates: engine.candidates.clone(),
+                },
+                model_supplemental: vec![false; candidates.len()],
+                generative_consensus: None,
+                candidates: candidates.clone(),
+            });
+            engine
+        };
+
+        let mut without_left_context = make_engine("");
+        without_left_context
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("aligned scores should preserve the uncontextualized name");
+        assert_eq!(without_left_context.candidates[0], "片瀬志麻");
+
+        let mut with_left_context = make_engine("同級生の");
+        with_left_context
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("confirmed left context should allow contextual name ranking");
+        assert_eq!(with_left_context.candidates[0], "片瀬志摩");
     }
 
     #[test]

@@ -1584,6 +1584,36 @@ impl Dictionary {
         self.changes_exact_named_segment(reading, current_surface, alternative_surface, true, false)
     }
 
+    /// Returns whether the whole surface is one exact full personal name.
+    ///
+    /// A surname or given name alone is deliberately insufficient. The exact
+    /// conversion path must either contain one full-name entry or an adjacent
+    /// surname and given-name pair with no surrounding ordinary segments.
+    #[must_use]
+    pub fn is_exact_full_personal_name_surface(&self, reading: &str, surface: &str) -> bool {
+        let Some(conversion) = self
+            .convert_n_best_with_surface_prefix(reading, surface, 1)
+            .into_iter()
+            .find(|conversion| conversion.surface == surface)
+        else {
+            return false;
+        };
+        match conversion.segments.as_slice() {
+            [name] => {
+                self.exact_personal_name_roles(&name.reading, &name.surface)
+                    .full_name
+            }
+            [surname, given_name] => {
+                self.exact_personal_name_roles(&surname.reading, &surname.surface)
+                    .surname
+                    && self
+                        .exact_personal_name_roles(&given_name.reading, &given_name.surface)
+                        .given_name
+            }
+            _ => false,
+        }
+    }
+
     /// Returns whether a surface substitution changes a dictionary-confirmed
     /// personal-name or sufficiently specific region segment in the exact path
     /// for `current_surface`.
@@ -5721,6 +5751,12 @@ mod tests {
             "不忠社",
             "不忠者",
         ));
+        assert!(dictionary.is_exact_full_personal_name_surface("かたせしま", "片瀬志麻"));
+        assert!(dictionary.is_exact_full_personal_name_surface("かたせしま", "片瀬志摩"));
+        assert!(
+            !dictionary.is_exact_full_personal_name_surface("かたせしまかてい", "片瀬志麻課程",)
+        );
+        assert!(!dictionary.is_exact_full_personal_name_surface("ふちゅう", "不忠"));
     }
 
     #[test]

@@ -133,6 +133,8 @@ pub type SlimeStringCallback = unsafe extern "C" fn(*mut c_void, SlimeStringView
 
 #[cfg(any(feature = "neural", test))]
 const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
+#[cfg(any(feature = "neural", test))]
+const CONFIRMED_SURNAME_HONORIFIC_CONTEXT_CONTRAST_WEIGHT: f64 = 0.15;
 #[cfg(feature = "neural")]
 const PREFIX_CORRECTION_MIN_CHARACTERS: usize = 4;
 #[cfg(feature = "neural")]
@@ -203,6 +205,45 @@ impl NeuralProfileParameters {
             self.short_input_minimum_score_margin
         }
     }
+}
+
+#[cfg(any(feature = "neural", test))]
+fn context_contrast_weight_for_request(
+    profile: NeuralProfileParameters,
+    request: &slime_core::CandidateRescoreRequest,
+) -> f64 {
+    if profile.context_contrast_weight > 0.0 && has_confirmed_surname_before_honorific(request) {
+        profile
+            .context_contrast_weight
+            .max(CONFIRMED_SURNAME_HONORIFIC_CONTEXT_CONTRAST_WEIGHT)
+    } else {
+        profile.context_contrast_weight
+    }
+}
+
+#[cfg(any(feature = "neural", test))]
+fn has_confirmed_surname_before_honorific(request: &slime_core::CandidateRescoreRequest) -> bool {
+    if !request.reading.ends_with('し')
+        || request
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.ends_with('氏'))
+            .take(2)
+            .count()
+            < 2
+    {
+        return false;
+    }
+    let mut context = request.context.chars().rev();
+    context.next().is_some_and(is_kanji) && context.next().is_some_and(is_kanji)
+}
+
+#[cfg(any(feature = "neural", test))]
+fn is_kanji(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
+    )
 }
 
 #[cfg(any(feature = "neural", test))]
@@ -689,13 +730,15 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let candidate_weight = handle
             .neural_profile
             .candidate_weight_for(request.reading.chars().count(), has_right_context);
+        let context_contrast_weight =
+            context_contrast_weight_for_request(handle.neural_profile, &request);
         let score_request = prepare_generative_score_request(handle, service, request);
         let scored = if handle.neural_profile.prefix_correction {
             service
                 .rescorer
                 .score_all_with_prefix_diagnostics_and_context_contrast(
                     std::slice::from_ref(&score_request),
-                    handle.neural_profile.context_contrast_weight,
+                    context_contrast_weight,
                 )
         } else {
             service
@@ -1863,6 +1906,52 @@ mod tests {
             0.75,
         );
         assert_eq!(super::neural_profile_parameters(u32::MAX), None);
+    }
+
+    #[test]
+    fn confirmed_surname_strengthens_only_ambiguous_honorific_context() {
+        let balanced = super::neural_profile_parameters(super::NEURAL_PROFILE_BALANCED).unwrap();
+        let high_accuracy =
+            super::neural_profile_parameters(super::NEURAL_PROFILE_HIGH_ACCURACY).unwrap();
+        let request = slime_core::CandidateRescoreRequest {
+            context: "大川".to_owned(),
+            right_context: "を支持する".to_owned(),
+            reading: "たかのりし".to_owned(),
+            candidates: vec![
+                "貴教氏".to_owned(),
+                "隆法氏".to_owned(),
+                "隆則氏".to_owned(),
+            ],
+        };
+
+        assert_close(
+            super::context_contrast_weight_for_request(high_accuracy, &request),
+            0.15,
+        );
+        assert_close(
+            super::context_contrast_weight_for_request(balanced, &request),
+            0.0,
+        );
+
+        for request in [
+            slime_core::CandidateRescoreRequest {
+                context: "ジョー・".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                reading: "たかのり".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                candidates: vec!["貴教氏".to_owned(), "貴教師".to_owned()],
+                ..request.clone()
+            },
+        ] {
+            assert_close(
+                super::context_contrast_weight_for_request(high_accuracy, &request),
+                0.1,
+            );
+        }
     }
 
     #[cfg(feature = "neural")]

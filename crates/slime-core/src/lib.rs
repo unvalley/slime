@@ -1521,6 +1521,7 @@ impl SlimeEngine {
                 &state.candidates[selected].surface,
             )
             || rescore_removes_alphanumeric_compound_number(state, selected)
+            || rescore_removes_parallel_score(state, selected)
     }
 
     fn rescore_changes_uncontextualized_personal_name(
@@ -3486,6 +3487,37 @@ fn rescore_removes_alphanumeric_compound_number(
         .take_while(char::is_ascii_digit)
         .collect::<String>();
     !base_digits.is_empty() && !state.candidates[selected].surface.starts_with(&base_digits)
+}
+
+fn rescore_removes_parallel_score(state: &CandidateRescoreState, selected: usize) -> bool {
+    if selected == 0
+        || !state
+            .request
+            .right_context
+            .chars()
+            .next()
+            .is_some_and(is_ascii_or_fullwidth_digit)
+    {
+        return false;
+    }
+    let Some(before_counter) = state.candidates[0].surface.strip_suffix('対') else {
+        return false;
+    };
+    let Some(digit_start) = before_counter
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_ascii_or_fullwidth_digit(*character))
+        .last()
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    let score_suffix = &state.candidates[0].surface[digit_start..];
+    !state.candidates[selected].surface.ends_with(score_suffix)
+}
+
+fn is_ascii_or_fullwidth_digit(character: char) -> bool {
+    matches!(character, '0'..='9' | '０'..='９')
 }
 
 fn is_ideographic_or_digit(character: char) -> bool {
@@ -6513,6 +6545,34 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0, -10.0], 0.8, 0.0)
             .expect("structured alphanumeric rescore should preserve the number");
         assert_eq!(engine.candidates[0], "9幹線");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_parallel_score() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context("相手", "1になったりだとか、完全にフリーでシュートを打つ。");
+        for character in "じーけーといったい".chars() {
+            engine.handle(InputEvent::Character(character));
+        }
+        engine.handle(InputEvent::Space);
+        assert_eq!(engine.snapshot().preedit, "GKと1対");
+
+        engine.prepare_extended_candidate_rescore_with_limit_and_confidence(32, 8, true);
+        let request = engine
+            .candidate_rescore_request()
+            .expect("score wording should remain model-scoreable")
+            .clone();
+        let lexical = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "GKと一体")
+            .expect("lexical homophone should remain available");
+        let mut scores = vec![0.0; request.candidates.len()];
+        scores[lexical] = 10.0;
+        engine
+            .apply_candidate_rescore(&scores, 0.8, 0.0)
+            .expect("rescore should preserve the confirmed score structure");
+        assert_eq!(engine.snapshot().preedit, "GKと1対");
     }
 
     #[test]

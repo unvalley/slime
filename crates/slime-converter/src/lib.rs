@@ -594,6 +594,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             .find_map(|(surface, promotion)| (*surface == conversion.surface).then_some(*promotion))
             .unwrap_or(0)
             .max(preferred_numeric_counter_variant_promotion(conversion))
+            .max(assimilated_score_promotion(self.right_context, conversion))
     }
 }
 
@@ -734,6 +735,23 @@ fn preferred_numeric_counter_variant_promotion(conversion: &Conversion) -> i32 {
         return 0;
     }
     DOCUMENT_PREFERRED_NUMERIC_COUNTER_VARIANT_PROMOTION
+}
+
+fn assimilated_score_promotion(right_context: &str, conversion: &Conversion) -> i32 {
+    let expected_surface = match right_context.chars().next() {
+        Some('1') => "1対",
+        Some('１') => "１対",
+        _ => return 0,
+    };
+    if conversion
+        .segments
+        .iter()
+        .any(|segment| segment.reading == "いったい" && segment.surface == expected_surface)
+    {
+        DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION
+    } else {
+        0
+    }
 }
 
 /// A borrowed view of one dictionary entry during lattice construction. The
@@ -1394,6 +1412,7 @@ fn is_productive_numeric_style_suffix(surface: &str) -> bool {
             | "点"
             | "塁"
             | "段"
+            | "対"
             | "組"
             | "校"
             | "社"
@@ -5953,6 +5972,7 @@ fn synthetic_entries_by_start<'a>(
             );
         }
         push_spoken_digit_entries(reading, start, arena, &mut by_start[start]);
+        push_spoken_latin_letter_entries(reading, start, arena, &mut by_start[start]);
         if ASSIMILATED_NUMERIC_PREFIXES
             .iter()
             .any(|prefix| reading[start..].starts_with(prefix.reading))
@@ -6227,6 +6247,7 @@ const ASSIMILATED_NUMERIC_COUNTER_READINGS: &[&str] = &[
     "さつ",
     "せき",
     "そく",
+    "たい",
     "ちゃく",
     "とう",
     "ぱい",
@@ -6574,6 +6595,96 @@ fn push_spoken_digit_surface<'a>(
         cost: number_cost(),
         numeric: true,
     });
+}
+
+const SPOKEN_LATIN_LETTERS: &[(&str, u8)] = &[
+    ("だぶりゅー", b'W'),
+    ("えっくす", b'X'),
+    ("えいち", b'H'),
+    ("じぇー", b'J'),
+    ("きゅー", b'Q'),
+    ("あーる", b'R'),
+    ("えす", b'S'),
+    ("てぃー", b'T'),
+    ("ぜっと", b'Z'),
+    ("でぃー", b'D'),
+    ("えー", b'A'),
+    ("びー", b'B'),
+    ("しー", b'C'),
+    ("いー", b'E'),
+    ("えふ", b'F'),
+    ("じー", b'G'),
+    ("あい", b'I'),
+    ("けー", b'K'),
+    ("える", b'L'),
+    ("えむ", b'M'),
+    ("えぬ", b'N'),
+    ("おー", b'O'),
+    ("ぴー", b'P'),
+    ("ゆー", b'U'),
+    ("ぶい", b'V'),
+    ("わい", b'Y'),
+];
+
+fn push_spoken_latin_letter_entries<'a>(
+    reading: &str,
+    start: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    const MAX_LETTERS: usize = 8;
+    const LETTER_COST: i32 = 3_000;
+
+    let suffix = &reading[start..];
+    if !suffix.chars().next().is_some_and(|character| {
+        matches!(
+            character,
+            'あ' | 'い'
+                | 'え'
+                | 'お'
+                | 'き'
+                | 'け'
+                | 'し'
+                | 'じ'
+                | 'ぜ'
+                | 'だ'
+                | 'て'
+                | 'で'
+                | 'び'
+                | 'ぴ'
+                | 'ぶ'
+                | 'ゆ'
+                | 'わ'
+        )
+    }) {
+        return;
+    }
+    let mut surface = BumpString::with_capacity_in(MAX_LETTERS, arena);
+    let mut consumed = 0_usize;
+    while surface.len() < MAX_LETTERS {
+        let rest = &suffix[consumed..];
+        let Some(&(letter_reading, letter)) = SPOKEN_LATIN_LETTERS
+            .iter()
+            .find(|(letter_reading, _)| rest.starts_with(letter_reading))
+        else {
+            break;
+        };
+        surface.push(char::from(letter));
+        consumed += letter_reading.len();
+        if surface.len() >= 2 {
+            out.push(SyntheticEntry {
+                end: start + consumed,
+                surface: arena.alloc_str(surface.as_str()),
+                left_id: UNKNOWN_POS_ID,
+                right_id: UNKNOWN_POS_ID,
+                cost: katakana_run_base_cost()
+                    .saturating_add(LETTER_COST.saturating_mul(
+                        i32::try_from(surface.len()).expect("letter run fits i32"),
+                    )),
+                numeric: false,
+            });
+        }
+    }
 }
 
 fn is_katakana_run_character(character: char) -> bool {
@@ -9023,6 +9134,48 @@ mod tests {
                 right_context
             ));
         }
+    }
+
+    #[test]
+    fn assimilated_numeric_score_recalls_one_to_one_notation() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(dictionary.candidates("じーけー")[0].surface, "GK");
+        assert_eq!(dictionary.candidates("えーあい")[0].surface, "AI");
+        assert_eq!(dictionary.candidates("えすえぬえす")[0].surface, "SNS");
+        assert!(
+            dictionary
+                .candidates("じー")
+                .iter()
+                .all(|candidate| candidate.surface != "G"),
+            "a single spoken letter is too ambiguous"
+        );
+        let score = dictionary.candidates_with_surrounding_context("いったい", "", "1になった。");
+        assert!(
+            score
+                .iter()
+                .take(2)
+                .any(|candidate| candidate.surface == "1対"),
+            "missing score: {score:?}"
+        );
+        let ascii = dictionary.candidates_with_surrounding_context(
+            "じーけーといったい",
+            "相手",
+            "1になったりだとか、完全にフリーでシュートを打つ。",
+        );
+        assert_eq!(
+            ascii[0].surface, "GKと1対",
+            "wrong score notation: {ascii:?}"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "じーけーといったい",
+                "相手",
+                "１になった。",
+            )[0]
+            .surface,
+            "GKと１対"
+        );
+        assert_eq!(dictionary.candidates("いったい")[0].surface, "一体");
     }
 
     #[test]

@@ -587,6 +587,14 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             0
         }
     }
+
+    fn numeric_counter_promotion(&self, conversion: &Conversion) -> i32 {
+        self.numeric_counter_promotions
+            .iter()
+            .find_map(|(surface, promotion)| (*surface == conversion.surface).then_some(*promotion))
+            .unwrap_or(0)
+            .max(preferred_numeric_counter_variant_promotion(conversion))
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -628,11 +636,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
                     .filter(|(surface, _)| *surface == conversion.surface)
                     .map_or(0, |(_, promotion)| promotion)
             };
-        let numeric_counter_promotion = self
-            .numeric_counter_promotions
-            .iter()
-            .find_map(|(surface, promotion)| (*surface == conversion.surface).then_some(*promotion))
-            .unwrap_or(0);
+        let numeric_counter_promotion = self.numeric_counter_promotion(conversion);
         let numeric_style_promotion = self
             .numeric_style
             .filter(|evidence| {
@@ -710,6 +714,26 @@ fn measurement_abbreviation_promotion(
     style
         .filter(|style| conversion_matches_measurement_abbreviation(conversion, *style))
         .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION)
+}
+
+fn preferred_numeric_counter_variant_promotion(conversion: &Conversion) -> i32 {
+    let [numeric @ .., counter] = conversion.segments.as_slice() else {
+        return 0;
+    };
+    if numeric.is_empty()
+        || counter.reading != "へん"
+        || counter.surface != "編"
+        || !numeric.iter().all(|segment| {
+            !segment.surface.is_empty()
+                && segment
+                    .surface
+                    .chars()
+                    .all(|character| matches!(character, '0'..='9' | '０'..='９'))
+        })
+    {
+        return 0;
+    }
+    DOCUMENT_PREFERRED_NUMERIC_COUNTER_VARIANT_PROMOTION
 }
 
 /// A borrowed view of one dictionary entry during lattice construction. The
@@ -913,6 +937,7 @@ const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION: i32 = 4_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
 const DOCUMENT_NUMERIC_STYLE_PROMOTION: i32 = 3_000;
+const DOCUMENT_PREFERRED_NUMERIC_COUNTER_VARIANT_PROMOTION: i32 = 750;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
 const DOCUMENT_GRAMMATICAL_PHRASE_PROMOTION: i32 = 400;
@@ -1221,6 +1246,7 @@ fn document_numeric_style_evidence(
         .filter(|left_style| *left_style == style)
         .and_then(|_| {
             [
+                ("きゅー", '九'),
                 ("きゅう", '九'),
                 ("ぜろ", '〇'),
                 ("れい", '〇'),
@@ -1793,6 +1819,27 @@ fn is_ideographic_or_digit(character: char) -> bool {
             | '\u{4e00}'..='\u{9fff}'
             | '\u{f900}'..='\u{faff}'
     )
+}
+
+fn should_expand_alphanumeric_numeric_compound(
+    reading: &str,
+    left_context: &str,
+    right_context: &str,
+) -> bool {
+    if reading.chars().count() > 8
+        || !left_context.chars().next_back().is_some_and(
+            |character| matches!(character, 'A'..='Z' | 'a'..='z' | 'Ａ'..='Ｚ' | 'ａ'..='ｚ'),
+        )
+        || !right_context
+            .chars()
+            .next()
+            .is_some_and(is_ideographic_or_digit)
+    {
+        return false;
+    }
+    parse_kana_number_prefixes(reading)
+        .iter()
+        .any(|(length, _)| *length < reading.len())
 }
 
 fn is_hiragana_character(character: char) -> bool {
@@ -4058,17 +4105,24 @@ impl Dictionary {
         right_context: &str,
         limit: usize,
     ) -> Vec<Candidate> {
-        self.candidates_with_context_ranker(
+        let expands_search =
+            should_expand_alphanumeric_numeric_compound(reading, left_context, right_context);
+        let search_limit = if expands_search { limit.max(32) } else { limit };
+        let mut candidates = self.candidates_with_context_ranker(
             reading,
             left_context,
-            limit,
+            search_limit,
             &DictionaryDocumentContextRanker::new_with_surrounding_context(
                 self,
                 reading,
                 left_context,
                 right_context,
             ),
-        )
+        );
+        if expands_search {
+            candidates.truncate(limit);
+        }
+        candidates
     }
 
     #[must_use]
@@ -6084,6 +6138,7 @@ enum NumberToken {
 /// overwhelmingly grammatical (に, し, く, ご) never form a number on their
 /// own; they only contribute inside longer sequences.
 const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
+    ("きゅー", NumberToken::Digit(9)),
     ("きゅう", NumberToken::Digit(9)),
     ("ぜろ", NumberToken::Digit(0)),
     ("れい", NumberToken::Digit(0)),
@@ -8874,6 +8929,53 @@ mod tests {
             .surface,
             "願い",
             "right-side evidence must not reuse a surface already covered by the reading"
+        );
+    }
+
+    #[test]
+    fn alphanumeric_numeric_context_recalls_a_deep_compound() {
+        let dictionary = Dictionary::bundled();
+        let candidates = dictionary.candidates_with_surrounding_context_limit(
+            "きゅーかんせん",
+            "デドフスクにはM",
+            "道路が通るほか、モスクワからリガに向かう鉄道も通る。 ",
+            5,
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.surface == "9幹線"),
+            "missing M9 compound: {candidates:?}"
+        );
+        assert_eq!(
+            candidates[0].surface, "9幹線",
+            "wrong M9 winner: {candidates:?}"
+        );
+        assert_eq!(candidates.len(), 5, "the visible candidate width is stable");
+
+        for (left_context, right_context) in [
+            ("デドフスクには", "道路が通る"),
+            ("デドフスクにはM。", "道路が通る"),
+            ("デドフスクにはM", "として知られる"),
+        ] {
+            assert!(!super::should_expand_alphanumeric_numeric_compound(
+                "きゅーかんせん",
+                left_context,
+                right_context,
+            ));
+        }
+    }
+
+    #[test]
+    fn numeric_work_counter_prefers_the_modern_variant() {
+        let candidates = Dictionary::bundled().candidates_with_surrounding_context(
+            "さんきゅーへん",
+            "1887年6月にかけて、",
+            "の物語を発表した。",
+        );
+        assert_eq!(
+            candidates[0].surface, "39編",
+            "wrong counter: {candidates:?}"
         );
     }
 

@@ -1520,6 +1520,7 @@ impl SlimeEngine {
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
             )
+            || rescore_removes_alphanumeric_compound_number(state, selected)
     }
 
     fn rescore_changes_uncontextualized_personal_name(
@@ -3454,6 +3455,48 @@ fn rescore_changes_calendar_or_clock_ascii_digits(base: &str, selected: &str) ->
             .chars()
             .filter(char::is_ascii_digit)
             .eq(selected.chars().filter(char::is_ascii_digit))
+}
+
+/// Preserve a dictionary-selected number when it completes a compact
+/// alphanumeric designation across the caret (for example, a letter followed
+/// by a spoken digit and an ideographic suffix). In this structure the
+/// confirmed letter and following noun are stronger evidence than a language
+/// model's preference for spelling the spoken digit as katakana.
+fn rescore_removes_alphanumeric_compound_number(
+    state: &CandidateRescoreState,
+    selected: usize,
+) -> bool {
+    if selected == 0
+        || state.request.reading.chars().count() > 8
+        || !state.request.context.chars().next_back().is_some_and(
+            |character| matches!(character, 'A'..='Z' | 'a'..='z' | 'Ａ'..='Ｚ' | 'ａ'..='ｚ'),
+        )
+        || !state
+            .request
+            .right_context
+            .chars()
+            .next()
+            .is_some_and(is_ideographic_or_digit)
+    {
+        return false;
+    }
+    let base_digits = state.candidates[0]
+        .surface
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    !base_digits.is_empty() && !state.candidates[selected].surface.starts_with(&base_digits)
+}
+
+fn is_ideographic_or_digit(character: char) -> bool {
+    matches!(
+        character,
+        '0'..='9'
+            | '\u{ff10}'..='\u{ff19}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+    )
 }
 
 fn is_calendar_or_clock_unit(character: char) -> bool {
@@ -6423,6 +6466,53 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("structured-number rescore should preserve the base candidate");
         assert_eq!(engine.candidates[0], "6月10日");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_alphanumeric_compound_numbers() {
+        let candidates = vec![
+            Candidate {
+                surface: "9幹線".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "キュー幹線".to_owned(),
+                cost: 150,
+            },
+            Candidate {
+                surface: "9感染".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "きゅーかんせん".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "デドフスクにはM".to_owned(),
+                right_context: "道路が通る".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        };
+        assert!(super::rescore_removes_alphanumeric_compound_number(
+            &state, 1
+        ));
+        assert!(!super::rescore_removes_alphanumeric_compound_number(
+            &state, 2
+        ));
+        engine.candidate_rescore = Some(state);
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0, -10.0], 0.8, 0.0)
+            .expect("structured alphanumeric rescore should preserve the number");
+        assert_eq!(engine.candidates[0], "9幹線");
     }
 
     #[test]

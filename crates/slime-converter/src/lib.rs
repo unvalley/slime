@@ -5973,6 +5973,7 @@ fn synthetic_entries_by_start<'a>(
         }
         push_spoken_digit_entries(reading, start, arena, &mut by_start[start]);
         push_spoken_latin_letter_entries(reading, start, arena, &mut by_start[start]);
+        push_spoken_percent_width_entry(dictionary, reading, start, arena, &mut by_start[start]);
         if ASSIMILATED_NUMERIC_PREFIXES
             .iter()
             .any(|prefix| reading[start..].starts_with(prefix.reading))
@@ -6762,6 +6763,31 @@ fn is_spoken_identifier_boundary(rest: &str) -> bool {
         ]
         .iter()
         .any(|particle| rest.starts_with(particle))
+}
+
+fn push_spoken_percent_width_entry<'a>(
+    dictionary: &Dictionary,
+    reading: &str,
+    start: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    const PERCENT_READING: &str = "ぱーせんと";
+    if !reading[start..].starts_with(PERCENT_READING) {
+        return;
+    }
+    dictionary.for_each_exact(PERCENT_READING, |entry| {
+        if entry.surface == "%" {
+            out.push(SyntheticEntry {
+                end: start + PERCENT_READING.len(),
+                surface: arena.alloc_str("％"),
+                left_id: entry.left_id,
+                right_id: entry.right_id,
+                cost: entry.word_cost.saturating_add(NUMBER_VARIANT_STEP),
+                numeric: false,
+            });
+        }
+    });
 }
 
 fn is_katakana_run_character(character: char) -> bool {
@@ -9432,6 +9458,22 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.surface == "ゼロ戦"),
             "candidates: {lexical_zero:?}"
+        );
+
+        let percent = dictionary.candidates("ぱーせんと");
+        assert_eq!(percent[0].surface, "%");
+        assert!(
+            percent.iter().any(|candidate| candidate.surface == "％"),
+            "candidates: {percent:?}"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ぱーせんとたかく",
+                "り10％高くなると、紛争の可能性が約3％低下し、その一方で成長率が研究平均より1",
+                "なると、内戦が発生する確率が約1％低下したのである。",
+            )[0]
+            .surface,
+            "％高く"
         );
     }
 

@@ -1516,6 +1516,7 @@ impl SlimeEngine {
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
             )
+            || rescore_only_changes_confirmed_percent_width(state, selected)
             || rescore_changes_calendar_or_clock_ascii_digits(
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
@@ -3429,6 +3430,36 @@ fn rescore_only_expands_ascii_digit_width(base: &str, selected: &str) -> bool {
         return false;
     }
     expanded
+}
+
+fn rescore_only_changes_confirmed_percent_width(
+    state: &CandidateRescoreState,
+    selected: usize,
+) -> bool {
+    if selected == 0 || !state.request.reading.starts_with("ぱーせんと") {
+        return false;
+    }
+    let left_width = state
+        .request
+        .context
+        .chars()
+        .rev()
+        .find(|character| matches!(character, '%' | '％'));
+    let right_width = state
+        .request
+        .right_context
+        .chars()
+        .find(|character| matches!(character, '%' | '％'));
+    let Some(width) = left_width.filter(|left| Some(*left) == right_width) else {
+        return false;
+    };
+    let base = &state.candidates[0].surface;
+    let selected = &state.candidates[selected].surface;
+    let Some(base_tail) = base.strip_prefix(width) else {
+        return false;
+    };
+    let alternate = if width == '%' { '％' } else { '%' };
+    selected.strip_prefix(alternate) == Some(base_tail)
 }
 
 /// Preserve the converter's explicit ASCII value inside an unambiguous
@@ -6437,6 +6468,42 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("digit-width-only rescore should preserve the base candidate");
         assert_eq!(engine.candidates[0], "2014年");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_confirmed_percent_width() {
+        let candidates = vec![
+            Candidate {
+                surface: "％高く".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "%高く".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "ぱーせんとたかく".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "10％高く、3％低下し、1".to_owned(),
+                right_context: "なると、約1％低下した。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("matching confirmed percent widths should preserve the base candidate");
+        assert_eq!(engine.candidates[0], "％高く");
     }
 
     #[test]

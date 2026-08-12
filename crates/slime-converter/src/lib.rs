@@ -361,6 +361,22 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         }
     }
 
+    fn multi_segment_left_phrase_promotion(
+        &self,
+        left_context: &str,
+        conversion: &Conversion,
+    ) -> i32 {
+        let [first, .., _] = conversion.segments.as_slice() else {
+            return 0;
+        };
+        self.dictionary.document_phrase_promotion(
+            left_context,
+            &first.reading,
+            &first.surface,
+            self.allows_single_character_phrase_prefix,
+        )
+    }
+
     fn right_function_word_promotion(&self, conversion: &Conversion) -> i32 {
         self.right_function_word_costs
             .iter()
@@ -602,6 +618,45 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             approximate_quantity_promotion(self.right_context, conversion),
         )
     }
+
+    fn specialized_promotion(
+        &self,
+        reading: &str,
+        left_context: &str,
+        conversion: &Conversion,
+    ) -> i32 {
+        let phrase = self
+            .phrase_promotion(reading, left_context, &conversion.surface)
+            .max(self.multi_segment_left_phrase_promotion(left_context, conversion));
+        let notation = if structured_notation_matches(left_context, reading, &conversion.surface) {
+            DOCUMENT_STRUCTURED_NOTATION_PROMOTION
+        } else {
+            self.surrounding_notation
+                .filter(|(surface, _)| *surface == conversion.surface)
+                .map_or(0, |(_, promotion)| promotion)
+        };
+        let numeric_style = self
+            .numeric_style
+            .filter(|evidence| {
+                conversion_matches_numeric_style(self.dictionary, conversion, *evidence)
+            })
+            .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION);
+        let region_suffix = if self.follows_region_name {
+            document_region_suffix_promotion(reading, &conversion.surface)
+        } else {
+            0
+        };
+        phrase
+            .max(notation)
+            .max(self.numeric_counter_promotion(conversion))
+            .max(numeric_style)
+            .max(measurement_abbreviation_promotion(
+                self.measurement_abbreviation_style,
+                conversion,
+            ))
+            .max(region_suffix)
+            .max(self.right_structured_promotion(conversion))
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -617,7 +672,6 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
     ) -> i32 {
         let repeated_cost =
             DocumentContextRanker.ranking_cost_with_context(reading, left_context, conversion);
-        let phrase_promotion = self.phrase_promotion(reading, left_context, &conversion.surface);
         let right_phrase_promotion = self
             .right_phrase_promotions
             .iter()
@@ -635,28 +689,6 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
         let right_grammar_promotion = self
             .right_grammar_promotion(conversion)
             .max(self.multi_segment_right_grammar_promotion(conversion));
-        let notation_promotion =
-            if structured_notation_matches(left_context, reading, &conversion.surface) {
-                DOCUMENT_STRUCTURED_NOTATION_PROMOTION
-            } else {
-                self.surrounding_notation
-                    .filter(|(surface, _)| *surface == conversion.surface)
-                    .map_or(0, |(_, promotion)| promotion)
-            };
-        let numeric_counter_promotion = self.numeric_counter_promotion(conversion);
-        let numeric_style_promotion = self
-            .numeric_style
-            .filter(|evidence| {
-                conversion_matches_numeric_style(self.dictionary, conversion, *evidence)
-            })
-            .map_or(0, |_| DOCUMENT_NUMERIC_STYLE_PROMOTION);
-        let measurement_abbreviation_promotion =
-            measurement_abbreviation_promotion(self.measurement_abbreviation_style, conversion);
-        let region_suffix_promotion = if self.follows_region_name {
-            document_region_suffix_promotion(reading, &conversion.surface)
-        } else {
-            0
-        };
         let right_inflection_promotion = self
             .right_inflection_promotions
             .iter()
@@ -693,16 +725,14 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             self.quotation_reporting_promotion(left_context, conversion);
         let foreign_name_honorific_promotion =
             foreign_name_honorific_promotion(left_context, self.right_context, conversion);
-        let specialized_promotion = phrase_promotion
-            .max(notation_promotion)
-            .max(numeric_counter_promotion)
-            .max(numeric_style_promotion)
-            .max(measurement_abbreviation_promotion)
-            .max(region_suffix_promotion)
-            .max(self.right_structured_promotion(conversion));
+        let specialized_promotion = self.specialized_promotion(reading, left_context, conversion);
         let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
             .saturating_add(boundary_adjustment)
+            .saturating_add(invalid_right_particle_boundary_penalty(
+                self.right_context,
+                conversion,
+            ))
             .saturating_sub(specialized_promotion)
             .saturating_sub(
                 right_phrase_promotion
@@ -715,6 +745,23 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(unique_right_suru_promotion)
             .saturating_sub(quotation_reporting_promotion)
             .saturating_sub(foreign_name_honorific_promotion)
+    }
+}
+
+fn invalid_right_particle_boundary_penalty(right_context: &str, conversion: &Conversion) -> i32 {
+    let begins_case_phrase = right_context
+        .strip_prefix('に')
+        .and_then(|remainder| remainder.chars().next())
+        .is_some_and(is_ideographic_or_digit);
+    if begins_case_phrase
+        && conversion
+            .segments
+            .last()
+            .is_some_and(|last| last.reading == "は" && last.surface == "は")
+    {
+        DOCUMENT_INVALID_PARTICLE_BOUNDARY_PENALTY
+    } else {
+        0
     }
 }
 
@@ -1080,6 +1127,7 @@ const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
 const DOCUMENT_NUMERIC_STYLE_PROMOTION: i32 = 3_000;
 const DOCUMENT_CHRONOLOGICAL_YEAR_PROMOTION: i32 = 1_000;
 const DOCUMENT_APPROXIMATE_QUANTITY_PROMOTION: i32 = 750;
+const DOCUMENT_INVALID_PARTICLE_BOUNDARY_PENALTY: i32 = 1_500;
 const DOCUMENT_PREFERRED_NUMERIC_COUNTER_VARIANT_PROMOTION: i32 = 750;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
@@ -7077,13 +7125,14 @@ fn push_katakana_entries<'a>(
 mod tests {
     use super::{
         ARABIC_NUMBER_POS_ID, Candidate, CandidateRanker, ConnectionCostCache, ConnectionMatrix,
-        Conversion, Dictionary, DictionaryEntry, DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID,
-        MOZC_PERSONAL_SURNAME_POS_ID, MOZC_REGION_POS_IDS, MOZC_VERBAL_NOUN_POS_ID, NBestBucket,
-        NBestNode, NUMERIC_START_PROTECTED, SyntheticEntry, UNKNOWN_POS_ID,
+        Conversion, DOCUMENT_INVALID_PARTICLE_BOUNDARY_PENALTY, Dictionary, DictionaryEntry,
+        DictionaryLayer, MOZC_PERSONAL_GIVEN_NAME_POS_ID, MOZC_PERSONAL_SURNAME_POS_ID,
+        MOZC_REGION_POS_IDS, MOZC_VERBAL_NOUN_POS_ID, NBestBucket, NBestNode,
+        NUMERIC_START_PROTECTED, Segment, SyntheticEntry, UNKNOWN_POS_ID,
         document_context_ends_with_honorific_prefix, document_region_suffix_promotion,
-        guarded_cost, insert_n_best_node, numeric_interior_dictionary_penalty,
-        numeric_start_states, orthographic_long_vowel_variants, synthetic_entries_by_start,
-        trailing_numeric_surface,
+        guarded_cost, insert_n_best_node, invalid_right_particle_boundary_penalty,
+        numeric_interior_dictionary_penalty, numeric_start_states,
+        orthographic_long_vowel_variants, synthetic_entries_by_start, trailing_numeric_surface,
     };
     use crate::pronunciation::{
         MAX_READING_CHARACTERS as LONG_VOWEL_MAX_READING_CHARACTERS,
@@ -9852,6 +9901,51 @@ mod tests {
             .surface,
             "するには約",
             "a unit without a confirmed number is not a quantity boundary"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_propagates_a_left_compound_to_the_first_segment() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "とうがたすうは",
+                "下院34議席を獲得したが、民主",
+                "に留まった。",
+            )[0]
+            .surface,
+            "党が多数派"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context(
+                "とうがたすうは",
+                "無関係な文脈",
+                "に留まった。",
+            )[0]
+            .surface,
+            "党が多数派"
+        );
+    }
+
+    #[test]
+    fn invalid_topic_case_boundary_requires_an_ideographic_case_phrase() {
+        let conversion = Conversion {
+            surface: "多数は".to_owned(),
+            segments: vec![Segment {
+                reading: "は".to_owned(),
+                surface: "は".to_owned(),
+                cost: 0,
+            }],
+            cost: 0,
+        };
+        assert_eq!(
+            invalid_right_particle_boundary_penalty("に留まった", &conversion),
+            DOCUMENT_INVALID_PARTICLE_BOUNDARY_PENALTY
+        );
+        assert_eq!(
+            invalid_right_particle_boundary_penalty("にわかに変わった", &conversion),
+            0,
+            "a hiragana word beginning with に is not a confirmed case boundary"
         );
     }
 

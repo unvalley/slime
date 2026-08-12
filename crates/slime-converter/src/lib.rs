@@ -16,6 +16,7 @@ use pronunciation::{
     PATHS_PER_VARIANT as LONG_VOWEL_PATHS_PER_VARIANT, orthographic_long_vowel_variants,
     remap_conversion as remap_pronunciation_conversion,
     sort_and_deduplicate as sort_and_deduplicate_conversions,
+    substitution_cost as long_vowel_substitution_cost,
 };
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -600,6 +601,27 @@ struct CompoundPath {
     surface: String,
     cost: i32,
     right_id: u16,
+    segment_count: u8,
+    substituted_segments: u8,
+    katakana_segments: u8,
+    ideographic_segments: u8,
+}
+
+impl CompoundPath {
+    fn pronunciation_safe(&self) -> bool {
+        if self.substituted_segments == 0 {
+            return true;
+        }
+        if self.substituted_segments & self.ideographic_segments == 0 {
+            return false;
+        }
+        (1..self.segment_count.saturating_sub(1)).all(|index| {
+            let bit = 1_u8 << index;
+            self.substituted_segments & bit == 0
+                || self.katakana_segments & (bit >> 1) == 0
+                || self.katakana_segments & (bit << 1) == 0
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -626,6 +648,8 @@ const COMPOUND_MAX_SEGMENTS: usize = 6;
 const COMPOUND_MAX_READING_CHARACTERS: usize = 16;
 const COMPOUND_MAX_ENTRIES_PER_SEGMENT: usize = 8;
 const COMPOUND_MAX_CANDIDATES: usize = 64;
+const LONG_VOWEL_COMPOUND_CANDIDATES_PER_VARIANT: usize = 20;
+const LONG_VOWEL_COMPOUND_MAX_VARIANTS: usize = 6;
 const PERSONAL_NAME_MIN_READING_CHARACTERS: usize = 2;
 const PERSONAL_NAME_MAX_READING_CHARACTERS: usize = 16;
 const PERSONAL_NAME_MAX_ENTRIES_PER_PART: usize = 64;
@@ -1246,14 +1270,66 @@ fn retain_best_candidates(candidates: &mut Vec<Candidate>, limit: usize) {
     candidates.truncate(limit);
 }
 
-fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
+fn is_full_katakana_surface(surface: &str) -> bool {
+    !surface.is_empty()
+        && surface
+            .chars()
+            .all(|character| matches!(character, '\u{30a0}'..='\u{30ff}'))
+}
+
+fn is_ideographic_or_digit(character: char) -> bool {
+    matches!(
+        character,
+        '0'..='9'
+            | '\u{ff10}'..='\u{ff19}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+    )
+}
+
+fn trim_compound_paths(
+    paths: &mut Vec<CompoundPath>,
+    limit: usize,
+    preserve_pronunciation_shapes: bool,
+) {
+    if !preserve_pronunciation_shapes {
+        paths.sort_unstable_by(|left, right| {
+            left.surface
+                .cmp(&right.surface)
+                .then_with(|| left.right_id.cmp(&right.right_id))
+                .then_with(|| left.cost.cmp(&right.cost))
+        });
+        paths.dedup_by(|left, right| {
+            left.surface == right.surface && left.right_id == right.right_id
+        });
+        paths.sort_unstable_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| left.surface.cmp(&right.surface))
+                .then_with(|| left.right_id.cmp(&right.right_id))
+        });
+        paths.truncate(limit);
+        return;
+    }
     paths.sort_unstable_by(|left, right| {
         left.surface
             .cmp(&right.surface)
             .then_with(|| left.right_id.cmp(&right.right_id))
+            .then_with(|| left.segment_count.cmp(&right.segment_count))
+            .then_with(|| left.substituted_segments.cmp(&right.substituted_segments))
+            .then_with(|| left.katakana_segments.cmp(&right.katakana_segments))
+            .then_with(|| left.ideographic_segments.cmp(&right.ideographic_segments))
             .then_with(|| left.cost.cmp(&right.cost))
     });
-    paths.dedup_by(|left, right| left.surface == right.surface && left.right_id == right.right_id);
+    paths.dedup_by(|left, right| {
+        left.surface == right.surface
+            && left.right_id == right.right_id
+            && left.segment_count == right.segment_count
+            && left.substituted_segments == right.substituted_segments
+            && left.katakana_segments == right.katakana_segments
+            && left.ideographic_segments == right.ideographic_segments
+    });
     paths.sort_unstable_by(|left, right| {
         left.cost
             .cmp(&right.cost)
@@ -1261,6 +1337,46 @@ fn trim_compound_paths(paths: &mut Vec<CompoundPath>, limit: usize) {
             .then_with(|| left.right_id.cmp(&right.right_id))
     });
     paths.truncate(limit);
+}
+
+fn extend_compound_path(
+    path: &CompoundPath,
+    entry: EntryView<'_>,
+    segment_index: usize,
+    segment_start: usize,
+    segment_end: usize,
+    substituted_offsets: &[usize],
+    transition_cost: i32,
+) -> CompoundPath {
+    let mut surface = String::with_capacity(path.surface.len().saturating_add(entry.surface.len()));
+    surface.push_str(&path.surface);
+    surface.push_str(entry.surface);
+    let segment_bit = 1_u8 << segment_index;
+    let substituted = substituted_offsets
+        .iter()
+        .any(|offset| (segment_start..segment_end).contains(offset));
+    CompoundPath {
+        surface,
+        cost: path
+            .cost
+            .saturating_add(transition_cost)
+            .saturating_add(entry.word_cost),
+        right_id: entry.right_id,
+        segment_count: path.segment_count + 1,
+        substituted_segments: path.substituted_segments | if substituted { segment_bit } else { 0 },
+        katakana_segments: path.katakana_segments
+            | if is_full_katakana_surface(entry.surface) {
+                segment_bit
+            } else {
+                0
+            },
+        ideographic_segments: path.ideographic_segments
+            | if entry.surface.chars().any(is_ideographic_or_digit) {
+                segment_bit
+            } else {
+                0
+            },
+    }
 }
 
 fn trim_fixed_segment_paths(paths: &mut Vec<FixedSegmentPath>, limit: usize) {
@@ -1385,6 +1501,39 @@ impl Dictionary {
         entries_per_segment: usize,
         limit: usize,
     ) -> Vec<Candidate> {
+        let mut candidates =
+            self.compound_candidates_exact(reading, entries_per_segment, limit, &[]);
+        let long_mark_count = reading
+            .chars()
+            .filter(|character| *character == 'ー')
+            .count();
+        let mut variants = orthographic_long_vowel_variants(reading);
+        variants.sort_by_key(|variant| {
+            (
+                variant.secondary_options > 0,
+                variant.substituted_offsets.len() != long_mark_count,
+                variant.substituted_offsets.len(),
+            )
+        });
+        for variant in variants.into_iter().take(LONG_VOWEL_COMPOUND_MAX_VARIANTS) {
+            candidates.extend(self.compound_candidates_exact(
+                &variant.reading,
+                entries_per_segment,
+                limit.min(LONG_VOWEL_COMPOUND_CANDIDATES_PER_VARIANT),
+                &variant.substituted_offsets,
+            ));
+        }
+        retain_best_candidates(&mut candidates, limit.min(COMPOUND_MAX_CANDIDATES));
+        candidates
+    }
+
+    fn compound_candidates_exact(
+        &self,
+        reading: &str,
+        entries_per_segment: usize,
+        limit: usize,
+        substituted_offsets: &[usize],
+    ) -> Vec<Candidate> {
         let character_count = reading.chars().count();
         if entries_per_segment == 0
             || limit == 0
@@ -1411,6 +1560,10 @@ impl Dictionary {
             surface: String::new(),
             cost: 0,
             right_id: BOS_EOS_POS_ID,
+            segment_count: 0,
+            substituted_segments: 0,
+            katakana_segments: 0,
+            ideographic_segments: 0,
         });
 
         for segment_count in 0..COMPOUND_MAX_SEGMENTS {
@@ -1430,24 +1583,20 @@ impl Dictionary {
                     let destination = &mut states[segment_count + 1][end_position];
                     for path in &preceding {
                         for entry in &entries {
-                            let mut surface = String::with_capacity(
-                                path.surface.len().saturating_add(entry.surface.len()),
-                            );
-                            surface.push_str(&path.surface);
-                            surface.push_str(entry.surface);
                             let transition_cost = connection
                                 .map_or(0, |matrix| matrix.cost(path.right_id, entry.left_id));
-                            destination.push(CompoundPath {
-                                surface,
-                                cost: path
-                                    .cost
-                                    .saturating_add(transition_cost)
-                                    .saturating_add(entry.word_cost),
-                                right_id: entry.right_id,
-                            });
+                            destination.push(extend_compound_path(
+                                path,
+                                *entry,
+                                segment_count,
+                                boundaries[start_position],
+                                boundaries[end_position],
+                                substituted_offsets,
+                                transition_cost,
+                            ));
                         }
                     }
-                    trim_compound_paths(destination, state_limit);
+                    trim_compound_paths(destination, state_limit, !substituted_offsets.is_empty());
                 }
             }
         }
@@ -1460,12 +1609,15 @@ impl Dictionary {
             .map(|segments| &segments[final_position])
         {
             for path in paths {
-                if path.surface == reading {
+                if path.surface == reading || !path.pronunciation_safe() {
                     continue;
                 }
-                let cost = path.cost.saturating_add(
-                    connection.map_or(0, |matrix| matrix.cost(path.right_id, BOS_EOS_POS_ID)),
-                );
+                let cost = path
+                    .cost
+                    .saturating_add(
+                        connection.map_or(0, |matrix| matrix.cost(path.right_id, BOS_EOS_POS_ID)),
+                    )
+                    .saturating_add(long_vowel_substitution_cost(substituted_offsets.len()));
                 if let Some(existing) = candidates
                     .iter_mut()
                     .find(|candidate| candidate.surface == path.surface)
@@ -6181,6 +6333,42 @@ mod tests {
 
         assert_eq!(conversions[0].surface, "中国");
         assert_eq!(conversions[0].segments[0].reading, "ちゅーごく");
+    }
+
+    #[test]
+    fn pronunciation_compounds_recover_safe_low_rank_paths() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.compound_candidates("あさいり", 8, 32),
+            dictionary.compound_candidates_exact("あさいり", 8, 32, &[]),
+            "readings without long marks must retain the exact compound path",
+        );
+        assert!(
+            dictionary
+                .compound_candidates("こーてーけん", 8, 32)
+                .iter()
+                .any(|candidate| candidate.surface == "皇帝兼")
+        );
+        assert!(
+            dictionary
+                .compound_candidates("とらんすこーかしあ", 8, 32)
+                .iter()
+                .all(|candidate| candidate.surface != "トランス効果シア")
+        );
+
+        for (reading, expected) in [
+            ("こーてーけん", "皇帝兼"),
+            ("こーこてんき", "後古典期"),
+            ("きょーがしき", "卿が指揮"),
+        ] {
+            assert!(
+                dictionary
+                    .convert_n_best_with_surface_prefix(reading, expected, 1)
+                    .iter()
+                    .any(|conversion| conversion.surface == expected),
+                "missing constrained path for {reading} -> {expected}",
+            );
+        }
     }
 
     #[test]

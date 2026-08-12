@@ -13,6 +13,7 @@ const MAX_MARKS: usize = 4;
 pub(crate) struct ReadingVariant {
     pub(crate) reading: String,
     pub(crate) substituted_offsets: Vec<usize>,
+    pub(crate) secondary_options: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +98,7 @@ pub(crate) fn orthographic_long_vowel_variants(reading: &str) -> Vec<ReadingVari
             ReadingVariant {
                 reading: variant,
                 substituted_offsets,
+                secondary_options: state.secondary_options,
             }
         })
         .collect()
@@ -197,4 +199,10 @@ pub(crate) fn sort_and_deduplicate(conversions: &mut Vec<Conversion>, limit: usi
 fn substitution_penalty() -> i32 {
     static VALUE: OnceLock<i32> = OnceLock::new();
     *VALUE.get_or_init(|| tuning_parameter("SLIME_LONG_VOWEL_PENALTY", 2_000))
+}
+
+pub(crate) fn substitution_cost(substitutions: usize) -> i32 {
+    i32::try_from(substitutions)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(substitution_penalty())
 }

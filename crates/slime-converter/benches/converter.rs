@@ -39,9 +39,7 @@ fn main() {
     run("converter/short_candidates_expanded", iterations, || {
         black_box(dictionary.candidates_with_limit(black_box("あさいり"), black_box(32)));
     });
-    run("converter/short_compound_recall", iterations, || {
-        black_box(dictionary.compound_candidates(black_box("あさいり"), 8, 32));
-    });
+    run_pronounced_compound_benchmarks(&dictionary, iterations);
     let three_part_dictionary = three_part_dictionary();
     run("converter/three_part_compound_recall", iterations, || {
         black_box(three_part_dictionary.compound_candidates(
@@ -107,6 +105,18 @@ fn main() {
     run("converter/short_dictionary_layer", iterations, || {
         black_box(short_dictionary_layer());
     });
+}
+
+fn run_pronounced_compound_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    for (name, reading) in [
+        ("short_compound_recall", "あさいり"),
+        ("orthographic_compound_recall", "こうていけん"),
+        ("pronounced_compound_recall", "こーてーけん"),
+    ] {
+        run(&format!("converter/{name}"), iterations, || {
+            black_box(dictionary.compound_candidates(black_box(reading), 8, 32));
+        });
+    }
 }
 
 fn run_personal_name_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {

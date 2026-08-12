@@ -8553,6 +8553,23 @@ mod tests {
     }
 
     #[test]
+    fn bounded_compound_recall_uses_pronunciation_style_long_marks() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "こーてーけん");
+        engine.handle(InputEvent::Space);
+
+        let target = "皇帝兼".to_owned();
+        let initial_count = engine.snapshot().candidates.len();
+        assert!(!engine.snapshot().candidates.contains(&target));
+        for _ in 0..initial_count {
+            engine.handle(InputEvent::NextCandidate);
+        }
+
+        assert!(engine.snapshot().candidates.contains(&target));
+        assert_eq!(engine.conversion_search, ConversionSearch::Expanded);
+    }
+
+    #[test]
     fn bounded_compound_recall_reaches_deeper_component_and_product_candidates() {
         let mut entries = Vec::new();
         for (reading, prefix) in [("あいうえお", "左"), ("かきくけこ", "右")] {

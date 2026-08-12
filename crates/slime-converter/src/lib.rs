@@ -6313,7 +6313,13 @@ fn parse_kana_number_prefixes(suffix: &str) -> Vec<(usize, u64)> {
             NumberToken::Small(unit) => {
                 // Positional units must strictly descend within a section
                 // (千→百→十); せんぜん or じゅうじゅう is not a numeral.
-                if pending_digits > 1 || pending >= 10 || unit >= last_small_unit {
+                // A leading zero cannot multiply a positional unit either:
+                // ぜろせん is a lexical compound, not the quantity 1,000.
+                if pending_digits > 1
+                    || (pending_digits > 0 && pending == 0)
+                    || pending >= 10
+                    || unit >= last_small_unit
+                {
                     break;
                 }
                 section += pending.max(1) * unit;
@@ -9414,6 +9420,19 @@ mod tests {
             Some("1億2345万")
         );
         assert_eq!(super::mixed_numeral(1_991), None);
+        assert!(
+            super::parse_kana_number_prefixes("ぜろせん")
+                .iter()
+                .all(|(length, value)| *length < "ぜろせん".len() || *value != 1_000),
+            "a leading zero must not multiply a positional unit"
+        );
+        let lexical_zero = dictionary.candidates_with_limit("ぜろせん", 64);
+        assert!(
+            lexical_zero
+                .iter()
+                .any(|candidate| candidate.surface == "ゼロ戦"),
+            "candidates: {lexical_zero:?}"
+        );
     }
 
     #[test]

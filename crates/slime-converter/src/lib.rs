@@ -3018,6 +3018,29 @@ impl Dictionary {
         ranking::removes_repeated_ideographic_tail_segment(left_context, &current, &alternative)
     }
 
+    /// Returns whether an alternative removes a structured suffix selected
+    /// from confirmed numeric or calendar context.
+    #[must_use]
+    pub fn deconverts_contextual_structured_suffix(
+        &self,
+        reading: &str,
+        left_context: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface
+            || structured_notation_surface(left_context, reading) != Some(current_surface)
+        {
+            return false;
+        }
+        let has_exact_conversion = |surface: &str| {
+            self.convert_n_best_with_surface_prefix(reading, surface, 1)
+                .into_iter()
+                .any(|conversion| conversion.surface == surface)
+        };
+        has_exact_conversion(current_surface) && has_exact_conversion(alternative_surface)
+    }
+
     fn deconverts_exact_ideographic_pronunciation_segment_to_katakana_impl(
         &self,
         reading: &str,
@@ -8042,6 +8065,21 @@ mod tests {
             "漢城陥落は『三国史記』と『日本書紀』",
             "そして書紀が引用する",
             "そして書紀が因用する",
+        ));
+        assert!(
+            dictionary.deconverts_contextual_structured_suffix("か", "2007年9月5", "日", "化",)
+        );
+        assert!(!dictionary.deconverts_contextual_structured_suffix(
+            "か",
+            "2007年13月5",
+            "日",
+            "化",
+        ));
+        assert!(!dictionary.deconverts_contextual_structured_suffix(
+            "か",
+            "2007年9月5",
+            "化",
+            "日",
         ));
         assert!(
             !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(

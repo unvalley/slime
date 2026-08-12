@@ -1529,6 +1529,7 @@ impl SlimeEngine {
             || self.rescore_removes_contextual_genitive_case_frame(state, selected)
             || self.rescore_removes_contextual_repeat_prefix(state, selected)
             || self.rescore_removes_repeated_document_segment(state, selected)
+            || self.rescore_removes_contextual_structured_suffix(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
             || rescore_removes_contextual_foreign_name_honorific(state, selected)
     }
@@ -1616,6 +1617,20 @@ impl SlimeEngine {
     ) -> bool {
         selected != 0
             && self.dictionary.deconverts_repeated_document_segment(
+                &state.request.reading,
+                &state.request.context,
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
+    }
+
+    fn rescore_removes_contextual_structured_suffix(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self.dictionary.deconverts_contextual_structured_suffix(
                 &state.request.reading,
                 &state.request.context,
                 &state.candidates[0].surface,
@@ -7942,6 +7957,45 @@ mod tests {
             .expect("the repeated document term should survive model rescoring");
 
         assert_eq!(engine.candidates[0], "そして書紀が引用する");
+    }
+
+    #[test]
+    fn model_rescore_preserves_a_calendar_day_suffix() {
+        let reading = "か";
+        let candidates = vec![
+            Candidate {
+                surface: "日".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "化".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::bundled();
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "2007年9月5".to_owned(),
+                right_context: "発売".to_owned(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("the calendar suffix should survive model rescoring");
+
+        assert_eq!(engine.candidates[0], "日");
     }
 
     #[test]

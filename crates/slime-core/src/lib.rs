@@ -1527,6 +1527,7 @@ impl SlimeEngine {
             || rescore_removes_contextual_approximate_quantity(state, selected)
             || rescore_removes_contextual_chronological_year(state, selected)
             || self.rescore_removes_contextual_genitive_case_frame(state, selected)
+            || self.rescore_removes_contextual_repeat_prefix(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
             || rescore_removes_contextual_foreign_name_honorific(state, selected)
     }
@@ -1587,6 +1588,20 @@ impl SlimeEngine {
             && self.dictionary.deconverts_contextual_genitive_case_frame(
                 &state.request.reading,
                 &state.request.context,
+                &state.request.right_context,
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
+    }
+
+    fn rescore_removes_contextual_repeat_prefix(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self.dictionary.deconverts_contextual_repeat_prefix(
+                &state.request.reading,
                 &state.request.right_context,
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
@@ -7834,6 +7849,45 @@ mod tests {
             .expect("the confirmed case frame should survive model rescoring");
 
         assert_eq!(engine.candidates[0], "政治支配下");
+    }
+
+    #[test]
+    fn model_rescore_preserves_a_repeat_prefix_before_a_confirmed_noun() {
+        let reading = "あふりかでもさい";
+        let candidates = vec![
+            Candidate {
+                surface: "アフリカでも再".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "アフリカでも最".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::bundled();
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "そのほとんどがパプアニューギニアだったが、".to_owned(),
+                right_context: "栽培化されていた".to_owned(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("the repeat prefix should survive model rescoring");
+
+        assert_eq!(engine.candidates[0], "アフリカでも再");
     }
 
     #[test]

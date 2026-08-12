@@ -1111,6 +1111,7 @@ const MOZC_GENERAL_NOUN_POS_ID: u16 = 1_851;
 const MOZC_NOUN_PREFIX_POS_ID_START: u16 = 2_600;
 const MOZC_EXPLICIT_NOUN_PREFIX_POS_ID_START: u16 = 2_601;
 const MOZC_NOUN_PREFIX_POS_ID_END: u16 = 2_637;
+const MOZC_REPEAT_NOUN_PREFIX_POS_ID: u16 = 2_610;
 
 fn is_bounded_coordination_suffix(suffix: &str) -> bool {
     let mut characters = suffix.chars();
@@ -2938,6 +2939,58 @@ impl Dictionary {
             )
     }
 
+    /// Returns whether selecting `alternative_surface` would replace a
+    /// productive repeat prefix immediately before a confirmed repeatable noun.
+    #[must_use]
+    pub fn deconverts_contextual_repeat_prefix(
+        &self,
+        reading: &str,
+        right_context: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface {
+            return false;
+        }
+        let exact_conversion = |surface: &str| {
+            self.convert_n_best_with_surface_prefix(reading, surface, 1)
+                .into_iter()
+                .find(|conversion| conversion.surface == surface)
+        };
+        let Some(current) = exact_conversion(current_surface) else {
+            return false;
+        };
+        let Some((current_last, current_prefix)) = current.segments.split_last() else {
+            return false;
+        };
+        if current_last.surface.chars().count() != 1
+            || !self.document_has_exact_pos_surface(
+                &current_last.reading,
+                &current_last.surface,
+                MOZC_REPEAT_NOUN_PREFIX_POS_ID,
+            )
+            || !self.document_context_starts_with_repeatable_noun(right_context)
+        {
+            return false;
+        }
+        let Some(alternative) = exact_conversion(alternative_surface) else {
+            return false;
+        };
+        let Some((alternative_last, alternative_prefix)) = alternative.segments.split_last() else {
+            return false;
+        };
+        current_prefix.len() == alternative_prefix.len()
+            && current_prefix
+                .iter()
+                .zip(alternative_prefix)
+                .all(|(current, alternative)| {
+                    current.reading == alternative.reading && current.surface == alternative.surface
+                })
+            && current_last.reading == alternative_last.reading
+            && current_last.surface != alternative_last.surface
+            && alternative_last.surface.chars().count() == 1
+    }
+
     fn deconverts_exact_ideographic_pronunciation_segment_to_katakana_impl(
         &self,
         reading: &str,
@@ -3943,6 +3996,17 @@ impl Dictionary {
     }
 
     fn document_context_starts_with_general_noun(&self, right_context: &str) -> bool {
+        self.document_context_starts_with_pos(right_context, &[MOZC_GENERAL_NOUN_POS_ID])
+    }
+
+    fn document_context_starts_with_repeatable_noun(&self, right_context: &str) -> bool {
+        self.document_context_starts_with_pos(
+            right_context,
+            &[MOZC_VERBAL_NOUN_POS_ID, MOZC_GENERAL_NOUN_POS_ID],
+        )
+    }
+
+    fn document_context_starts_with_pos(&self, right_context: &str, pos_ids: &[u16]) -> bool {
         if right_context.is_empty() {
             return false;
         }
@@ -3962,34 +4026,34 @@ impl Dictionary {
         for end in boundaries {
             let prefix = &context_head[..end];
             let mut best_cost = i32::MAX;
-            let mut best_general_noun_cost = i32::MAX;
+            let mut best_matching_cost = i32::MAX;
             self.for_each_exact(prefix, |entry| {
                 if entry.surface != prefix {
                     return;
                 }
                 best_cost = best_cost.min(entry.word_cost);
-                if entry.left_id == MOZC_GENERAL_NOUN_POS_ID {
-                    best_general_noun_cost = best_general_noun_cost.min(entry.word_cost);
+                if pos_ids.contains(&entry.left_id) {
+                    best_matching_cost = best_matching_cost.min(entry.word_cost);
                 }
             });
             if let Some(compact) = self.bundled {
                 compact.for_each_surface_entry(prefix, |entry| {
                     best_cost = best_cost.min(entry.word_cost);
-                    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID {
-                        best_general_noun_cost = best_general_noun_cost.min(entry.word_cost);
+                    if pos_ids.contains(&entry.left_id) {
+                        best_matching_cost = best_matching_cost.min(entry.word_cost);
                     }
                 });
             }
             for layer in self.layers.iter() {
                 for entry in layer.entries.iter().filter(|entry| entry.surface == prefix) {
                     best_cost = best_cost.min(entry.word_cost);
-                    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID {
-                        best_general_noun_cost = best_general_noun_cost.min(entry.word_cost);
+                    if pos_ids.contains(&entry.left_id) {
+                        best_matching_cost = best_matching_cost.min(entry.word_cost);
                     }
                 }
             }
             if best_cost != i32::MAX {
-                return best_general_noun_cost
+                return best_matching_cost
                     <= best_cost.saturating_add(DOCUMENT_POS_SURFACE_COST_GAP);
             }
         }
@@ -7921,6 +7985,24 @@ mod tests {
             "に似た香り",
             "政治支配下",
             "セージ支配下",
+        ));
+        assert!(dictionary.deconverts_contextual_repeat_prefix(
+            "あふりかでもさい",
+            "栽培化されていた",
+            "アフリカでも再",
+            "アフリカでも最",
+        ));
+        assert!(!dictionary.deconverts_contextual_repeat_prefix(
+            "あふりかでもさい",
+            "された",
+            "アフリカでも再",
+            "アフリカでも最",
+        ));
+        assert!(!dictionary.deconverts_contextual_repeat_prefix(
+            "じけんのさい",
+            "セットにはいなかった",
+            "事件の際",
+            "事件の再",
         ));
         assert!(
             !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(

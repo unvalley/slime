@@ -153,6 +153,7 @@ struct DictionaryDocumentContextRanker<'a> {
     strong_left_phrase_evidence: StrongLeftPhraseEvidence,
     right_function_word_costs: Vec<DocumentContextualCost<'a>>,
     right_particle_costs: Vec<DocumentContextualCost<'a>>,
+    right_general_noun_evidence: RightGeneralNounEvidence,
     right_grammar_costs: Vec<DocumentContextualCost<'a>>,
     right_inflection_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
@@ -240,6 +241,12 @@ enum StrongLeftPhraseEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RightGeneralNounEvidence {
+    Absent,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DocumentNumericStyle {
     Ascii,
     Fullwidth,
@@ -296,6 +303,13 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             right_function_word_costs: dictionary
                 .document_right_function_word_costs(reading, right_context),
             right_particle_costs: dictionary.document_right_particle_costs(reading, right_context),
+            right_general_noun_evidence: if dictionary
+                .document_context_starts_with_general_noun(right_context)
+            {
+                RightGeneralNounEvidence::Present
+            } else {
+                RightGeneralNounEvidence::Absent
+            },
             right_grammar_costs: dictionary.document_right_grammar_costs(reading, right_context),
             right_inflection_promotions: dictionary
                 .document_right_inflection_promotions(reading, right_context),
@@ -414,6 +428,30 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    fn multi_segment_attributive_adjective_promotion(&self, conversion: &Conversion) -> i32 {
+        if self.right_general_noun_evidence == RightGeneralNounEvidence::Absent
+            || !self.right_phrase_promotions.is_empty()
+            || self.strong_left_phrase_evidence == StrongLeftPhraseEvidence::Present
+            || conversion.segments.len() < 2
+        {
+            return 0;
+        }
+        let Some(last) = conversion.segments.last() else {
+            return 0;
+        };
+        if last.reading.chars().count() < 2
+            || last.surface.chars().count() < 2
+            || !self.dictionary.document_has_exact_pos_surface(
+                &last.reading,
+                &last.surface,
+                MOZC_I_ADJECTIVE_ATTRIBUTIVE_POS_ID,
+            )
+        {
+            return 0;
+        }
+        DOCUMENT_RIGHT_ATTRIBUTIVE_ADJECTIVE_PROMOTION
     }
 
     fn right_grammar_promotion(&self, conversion: &Conversion) -> i32 {
@@ -720,6 +758,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(self.multi_segment_right_phrase_promotion(conversion));
         let right_function_word_promotion = self.right_function_word_promotion(conversion);
         let right_particle_promotion = self.right_particle_promotion(conversion);
+        let right_attributive_adjective_promotion =
+            self.multi_segment_attributive_adjective_promotion(conversion);
         let right_grammar_promotion = self
             .right_grammar_promotion(conversion)
             .max(self.multi_segment_right_grammar_promotion(conversion));
@@ -771,7 +811,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(
                 right_phrase_promotion
                     .max(right_function_word_promotion)
-                    .max(right_particle_promotion),
+                    .max(right_particle_promotion)
+                    .max(right_attributive_adjective_promotion),
             )
             .saturating_sub(right_inflection_promotion)
             .saturating_sub(right_auxiliary_promotion)
@@ -1176,6 +1217,7 @@ const DOCUMENT_POLITE_AUXILIARY_PROMOTION: i32 = 1_000;
 const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP: i32 = 1_100;
 const DOCUMENT_RIGHT_PARTICLE_PROMOTION_CAP: i32 = 1_600;
+const DOCUMENT_RIGHT_ATTRIBUTIVE_ADJECTIVE_PROMOTION: i32 = 600;
 const DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_MULTI_SEGMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_STRONG_KANA_GRAMMAR_PROMOTION_CAP: i32 = 1_000;
@@ -1211,6 +1253,7 @@ const MOZC_MONO_NON_INDEPENDENT_NOUN_POS_ID: u16 = 2_090;
 const MOZC_TAME_ADVERBIAL_NOUN_POS_ID: u16 = 2_140;
 const MOZC_YOU_AUXILIARY_STEM_NOUN_POS_ID: u16 = 2_192;
 const MOZC_REGION_POS_IDS: [u16; 5] = [1924, 1925, 1926, 1927, 1928];
+const MOZC_I_ADJECTIVE_ATTRIBUTIVE_POS_ID: u16 = 2_425;
 
 fn is_mozc_independent_imperative_pos_id(pos_id: u16) -> bool {
     matches!(
@@ -3698,6 +3741,69 @@ impl Dictionary {
             }
         }
         false
+    }
+
+    fn document_context_starts_with_general_noun(&self, right_context: &str) -> bool {
+        if right_context.is_empty() {
+            return false;
+        }
+        let context_end = right_context
+            .char_indices()
+            .nth(DOCUMENT_BOUNDARY_MAX_CONTEXT_CHARACTERS)
+            .map_or(right_context.len(), |(index, _)| index);
+        let context_head = &right_context[..context_end];
+        let mut boundaries = context_head
+            .char_indices()
+            .skip(1)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(context_head.len()))
+            .collect::<Vec<_>>();
+        boundaries.reverse();
+
+        for end in boundaries {
+            let prefix = &context_head[..end];
+            let mut best_cost = i32::MAX;
+            let mut best_general_noun_cost = i32::MAX;
+            self.for_each_exact(prefix, |entry| {
+                if entry.surface != prefix {
+                    return;
+                }
+                best_cost = best_cost.min(entry.word_cost);
+                if entry.left_id == MOZC_GENERAL_NOUN_POS_ID {
+                    best_general_noun_cost = best_general_noun_cost.min(entry.word_cost);
+                }
+            });
+            if let Some(compact) = self.bundled {
+                compact.for_each_surface_entry(prefix, |entry| {
+                    best_cost = best_cost.min(entry.word_cost);
+                    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID {
+                        best_general_noun_cost = best_general_noun_cost.min(entry.word_cost);
+                    }
+                });
+            }
+            for layer in self.layers.iter() {
+                for entry in layer.entries.iter().filter(|entry| entry.surface == prefix) {
+                    best_cost = best_cost.min(entry.word_cost);
+                    if entry.left_id == MOZC_GENERAL_NOUN_POS_ID {
+                        best_general_noun_cost = best_general_noun_cost.min(entry.word_cost);
+                    }
+                }
+            }
+            if best_cost != i32::MAX {
+                return best_general_noun_cost
+                    <= best_cost.saturating_add(DOCUMENT_POS_SURFACE_COST_GAP);
+            }
+        }
+        false
+    }
+
+    fn document_has_exact_pos_surface(&self, reading: &str, surface: &str, pos_id: u16) -> bool {
+        let mut found = false;
+        self.for_each_exact(reading, |entry| {
+            found |=
+                entry.surface == surface && entry.left_id == pos_id && entry.right_id == pos_id;
+        });
+        found
     }
 
     fn document_context_boundary_right_ids(&self, left_context: &str) -> Vec<u16> {
@@ -10014,6 +10120,30 @@ mod tests {
             .surface,
             "3社",
             "confirmed digit style keeps a productive ordinal counter numeric"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_prefers_an_attributive_adjective_before_a_noun() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "はんたいするふかい",
+                "しかし、任意の新しい法律に",
+                "宗教的信念を持つ議員が数多くいる。",
+            )[0]
+            .surface,
+            "反対する深い"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "はんたいするふかい",
+                "しかし、任意の新しい法律に",
+                "ので、議論になった。",
+            )[0]
+            .surface,
+            "反対する不快",
+            "a following function word does not invent an attributive noun boundary"
         );
     }
 

@@ -1523,6 +1523,7 @@ impl SlimeEngine {
             )
             || rescore_removes_alphanumeric_compound_number(state, selected)
             || rescore_removes_parallel_score(state, selected)
+            || rescore_removes_contextual_chronological_year(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
             || rescore_removes_contextual_foreign_name_honorific(state, selected)
     }
@@ -3547,6 +3548,45 @@ fn rescore_removes_parallel_score(state: &CandidateRescoreState, selected: usize
     };
     let score_suffix = &state.candidates[0].surface[digit_start..];
     !state.candidates[selected].surface.ends_with(score_suffix)
+}
+
+fn rescore_removes_contextual_chronological_year(
+    state: &CandidateRescoreState,
+    selected: usize,
+) -> bool {
+    if selected == 0 || !state.request.right_context.starts_with('年') {
+        return false;
+    }
+    let base = &state.candidates[0].surface;
+    let is_chronological_year = ["紀元前", "紀元後", "西暦"].into_iter().any(|prefix| {
+        base.strip_prefix(prefix).is_some_and(|year| {
+            !year.is_empty() && year.chars().all(is_chronological_year_character)
+        })
+    });
+    is_chronological_year && state.candidates[selected].surface != *base
+}
+
+fn is_chronological_year_character(character: char) -> bool {
+    is_ascii_or_fullwidth_digit(character)
+        || matches!(
+            character,
+            '〇' | '零'
+                | '一'
+                | '二'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+                | '千'
+                | '万'
+                | '億'
+                | '兆'
+        )
 }
 
 fn rescore_removes_contextual_roman_numeral(
@@ -6622,6 +6662,42 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("a contextual foreign-name honorific should remain structured");
         assert_eq!(engine.candidates[0], "スターンリーブ氏");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_contextual_chronological_year() {
+        let candidates = vec![
+            Candidate {
+                surface: "紀元前511".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "期限1511".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "きげんぜんごいちいち".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "結局、".to_owned(),
+                right_context: "年から512年に続く。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a contextual chronological year should remain structured");
+        assert_eq!(engine.candidates[0], "紀元前511");
     }
 
     #[test]

@@ -692,7 +692,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(numeric_counter_promotion)
             .max(numeric_style_promotion)
             .max(measurement_abbreviation_promotion)
-            .max(region_suffix_promotion);
+            .max(region_suffix_promotion)
+            .max(chronological_year_promotion(self.right_context, conversion));
         let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
             .saturating_add(boundary_adjustment)
@@ -708,6 +709,29 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(unique_right_suru_promotion)
             .saturating_sub(quotation_reporting_promotion)
             .saturating_sub(foreign_name_honorific_promotion)
+    }
+}
+
+fn chronological_year_promotion(right_context: &str, conversion: &Conversion) -> i32 {
+    if !right_context.starts_with('年') {
+        return 0;
+    }
+    let [.., era, year] = conversion.segments.as_slice() else {
+        return 0;
+    };
+    let is_chronological_era = matches!(
+        (era.reading.as_str(), era.surface.as_str()),
+        ("きげんぜん", "紀元前") | ("きげんご", "紀元後") | ("せいれき", "西暦")
+    );
+    if is_chronological_era
+        && !year.surface.is_empty()
+        && year.surface.chars().all(|character| {
+            decimal_digit(character).is_some() || is_japanese_numeric_character(character)
+        })
+    {
+        DOCUMENT_CHRONOLOGICAL_YEAR_PROMOTION
+    } else {
+        0
     }
 }
 
@@ -992,6 +1016,7 @@ const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION: i32 = 4_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
 const DOCUMENT_NUMERIC_STYLE_PROMOTION: i32 = 3_000;
+const DOCUMENT_CHRONOLOGICAL_YEAR_PROMOTION: i32 = 1_000;
 const DOCUMENT_PREFERRED_NUMERIC_COUNTER_VARIANT_PROMOTION: i32 = 750;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
@@ -9706,6 +9731,34 @@ mod tests {
             )[0]
             .surface,
             "スターンリーブ氏"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_recognizes_a_chronological_year_boundary() {
+        let dictionary = Dictionary::bundled();
+        assert_ne!(
+            dictionary.candidates("きげんぜんごいちいち")[0].surface,
+            "紀元前511"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "きげんぜんごいちいち",
+                "結局、",
+                "年から512年にマケドニアの王は",
+            )[0]
+            .surface,
+            "紀元前511"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context(
+                "きげんぜんごいちいち",
+                "結局、",
+                "件を調査した。",
+            )[0]
+            .surface,
+            "紀元前511",
+            "an unrelated numeric continuation must not imply a chronological year"
         );
     }
 

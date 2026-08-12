@@ -56,6 +56,9 @@ pub struct ScoredItem {
     pub logliks: Vec<f64>,
     /// `log P(candidate | prompt)` before the EOS contribution.
     pub candidate_logliks: Vec<f64>,
+    /// Candidate scores from the same request with surrounding context
+    /// removed. Present only when context contrast requested the ablated pass.
+    pub context_ablated_candidate_logliks: Option<Vec<f64>>,
     /// Token counts used to derive length-normalized evaluation scores.
     pub candidate_token_counts: Vec<usize>,
     /// Wall-clock time spent scoring this item (prefix + all candidates).
@@ -386,6 +389,8 @@ impl Rescorer {
                     )?;
                     apply_context_contrast(&mut scored.logliks, &context_ablated.logliks, weight)?;
                     scored.latency += context_ablated.latency;
+                    scored.context_ablated_candidate_logliks =
+                        Some(context_ablated.candidate_logliks);
                 }
                 Ok(scored)
             })
@@ -434,6 +439,7 @@ impl Rescorer {
             return Ok(ScoredItem {
                 logliks: vec![0.0; request.candidates.len()],
                 candidate_logliks: vec![0.0; request.candidates.len()],
+                context_ablated_candidate_logliks: None,
                 candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
                 latency: started.elapsed(),
                 first_mismatch_prefixes: vec![None; request.candidates.len()],
@@ -613,6 +619,7 @@ impl Rescorer {
         Ok(ScoredItem {
             logliks,
             candidate_logliks,
+            context_ablated_candidate_logliks: None,
             candidate_token_counts: candidate_tokens.iter().map(Vec::len).collect(),
             latency: started.elapsed(),
             first_mismatch_prefixes,

@@ -261,6 +261,28 @@ fn minimum_score_margin_for_request(
     }
 }
 
+#[cfg(feature = "neural")]
+fn context_guarded_log_likelihoods<'a>(
+    engine: &SlimeEngine,
+    scored: &'a slime_neural::ScoredItem,
+    candidate_weight: f64,
+    minimum_margin: f64,
+) -> (&'a [f64], bool) {
+    let Some(ablated) = scored.context_ablated_candidate_logliks.as_deref() else {
+        return (&scored.candidate_logliks, false);
+    };
+    if engine.candidate_rescore_should_use_context_ablated_scores(
+        &scored.candidate_logliks,
+        ablated,
+        candidate_weight,
+        minimum_margin,
+    ) {
+        (ablated, true)
+    } else {
+        (&scored.candidate_logliks, false)
+    }
+}
+
 pub struct SlimeHandle {
     engine: SlimeEngine,
     neural_enabled: bool,
@@ -751,44 +773,75 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
         let Some(scored) = scored.first() else {
             return actions;
         };
-        prepare_delayed_long_generative_consensus(handle, service, &score_request, scored);
-        let rescored_actions =
-            if handle.neural_profile.prefix_correction && !dictionary_only_ranking {
-                let constraints = scored
-                    .first_mismatch_prefixes
-                    .iter()
-                    .map(|diagnostic| diagnostic.as_ref().and_then(prefix_constraint))
-                    .collect::<Vec<_>>();
-                let followup_prefix = handle
-                    .engine
-                    .candidate_rescore_prefix_followup_request(
-                        &scored.candidate_logliks,
-                        &constraints,
-                        candidate_weight,
-                        minimum_margin,
-                    )
-                    .and_then(|request| score_followup_prefix(service, request));
-                handle
-                    .engine
-                    .apply_candidate_rescore_with_prefix_constraints_and_followup(
-                        &scored.candidate_logliks,
-                        &constraints,
-                        followup_prefix.as_deref(),
-                        candidate_weight,
-                        minimum_margin,
-                    )
+        let (selected_logliks, use_context_ablated) = context_guarded_log_likelihoods(
+            &handle.engine,
+            scored,
+            candidate_weight,
+            minimum_margin,
+        );
+        if !use_context_ablated {
+            prepare_delayed_long_generative_consensus(handle, service, &score_request, scored);
+        }
+        let rescored_actions = apply_scored_candidates(
+            handle,
+            service,
+            scored,
+            selected_logliks,
+            candidate_weight,
+            if use_context_ablated {
+                0.0
             } else {
-                handle.engine.apply_candidate_rescore(
-                    &scored.candidate_logliks,
-                    candidate_weight,
-                    minimum_margin,
-                )
-            };
+                minimum_margin
+            },
+            dictionary_only_ranking || use_context_ablated,
+        );
         if let Some(rescored_actions) = rescored_actions {
             return rescored_actions;
         }
     }
     actions
+}
+
+#[cfg(feature = "neural")]
+fn apply_scored_candidates(
+    handle: &mut SlimeHandle,
+    service: &NeuralService,
+    scored: &slime_neural::ScoredItem,
+    selected_logliks: &[f64],
+    candidate_weight: f64,
+    minimum_margin: f64,
+    disables_prefix_correction: bool,
+) -> Option<Vec<SlimeAction>> {
+    if !handle.neural_profile.prefix_correction || disables_prefix_correction {
+        return handle.engine.apply_candidate_rescore(
+            selected_logliks,
+            candidate_weight,
+            minimum_margin,
+        );
+    }
+    let constraints = scored
+        .first_mismatch_prefixes
+        .iter()
+        .map(|diagnostic| diagnostic.as_ref().and_then(prefix_constraint))
+        .collect::<Vec<_>>();
+    let followup_prefix = handle
+        .engine
+        .candidate_rescore_prefix_followup_request(
+            &scored.candidate_logliks,
+            &constraints,
+            candidate_weight,
+            minimum_margin,
+        )
+        .and_then(|request| score_followup_prefix(service, request));
+    handle
+        .engine
+        .apply_candidate_rescore_with_prefix_constraints_and_followup(
+            selected_logliks,
+            &constraints,
+            followup_prefix.as_deref(),
+            candidate_weight,
+            minimum_margin,
+        )
 }
 
 #[cfg(feature = "neural")]

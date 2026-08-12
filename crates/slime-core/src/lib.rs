@@ -60,6 +60,7 @@ const MODEL_KATAKANA_RECALL_MIN_RUN_CHARACTERS: usize = 5;
 const SHORT_KATAKANA_RECALL_SEARCH_LIMIT: usize = 32;
 const SHORT_KATAKANA_RECALL_MIN_BASE_COST: i32 = 20_000;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
+const CONTEXT_ABLATED_EXACT_FRAGMENT_MIN_MODEL_MARGIN: f64 = 0.75;
 const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
 const PREFIX_CONSTRAINED_INITIAL_CANDIDATE_LIMIT: usize = 8;
 const PREFIX_CONSTRAINED_MAX_CANDIDATE_LIMIT: usize = 32;
@@ -947,6 +948,81 @@ impl SlimeEngine {
         self.candidate_rescore
             .as_ref()
             .is_some_and(requires_dictionary_only_context_ranking)
+    }
+
+    /// Whether contextual scoring would replace an exact ideographic segment
+    /// strongly preferred by the context-ablated model with a hiragana spelling
+    /// assembled from smaller fragments. The caller can retain the ablated
+    /// scores without a third model pass when this conservative boundary is
+    /// crossed.
+    #[must_use]
+    pub fn candidate_rescore_should_use_context_ablated_scores(
+        &self,
+        contextual_log_likelihoods: &[f64],
+        context_ablated_log_likelihoods: &[f64],
+        lambda: f64,
+        minimum_margin: f64,
+    ) -> bool {
+        let Some(state) = self.candidate_rescore.as_ref() else {
+            return false;
+        };
+        if state.request.context.is_empty() && state.request.right_context.is_empty() {
+            return false;
+        }
+        let Some((_, _, contextual)) = candidate_rescore_order_for_state(
+            state,
+            contextual_log_likelihoods,
+            lambda,
+            minimum_margin,
+        ) else {
+            return false;
+        };
+        if self
+            .safe_whole_result_candidate(state, &state.candidates[contextual].surface)
+            .is_some_and(|whole| {
+                state.candidates[whole].surface != state.candidates[contextual].surface
+            })
+        {
+            return false;
+        }
+        if state.candidates.len() != context_ablated_log_likelihoods.len()
+            || context_ablated_log_likelihoods
+                .iter()
+                .any(|score| !score.is_finite())
+        {
+            return false;
+        }
+        let mut ablated_order = (0..state.candidates.len()).collect::<Vec<_>>();
+        ablated_order.sort_by(|&left, &right| {
+            context_ablated_log_likelihoods[right].total_cmp(&context_ablated_log_likelihoods[left])
+        });
+        let Some((&ablated, runner_up)) = ablated_order
+            .split_first()
+            .and_then(|(top, rest)| rest.first().map(|runner_up| (top, *runner_up)))
+        else {
+            return false;
+        };
+        let Some((_, _, ablated_selected)) =
+            candidate_rescore_order_for_state(state, context_ablated_log_likelihoods, lambda, 0.0)
+        else {
+            return false;
+        };
+        context_ablated_log_likelihoods[ablated] - context_ablated_log_likelihoods[runner_up]
+            >= CONTEXT_ABLATED_EXACT_FRAGMENT_MIN_MODEL_MARGIN
+            && ablated_selected == ablated
+            && state.candidates[ablated].surface != state.candidates[contextual].surface
+            && bounded_local_substitution(
+                &state.candidates[ablated].surface,
+                &state.candidates[contextual].surface,
+                PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS,
+            )
+            && self
+                .dictionary
+                .fragments_exact_ideographic_segment_into_hiragana(
+                    &state.request.reading,
+                    &state.candidates[ablated].surface,
+                    &state.candidates[contextual].surface,
+                )
     }
 
     /// Whether an already-scored long N-best winner justifies one delayed
@@ -8303,6 +8379,79 @@ mod tests {
         assert!(established.candidate_rescore_request().is_none());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn context_ablated_scores_preserve_an_exact_word_from_hiragana_fragments() {
+        let mut engine = SlimeEngine::bundled();
+        engine.set_external_context("途中でジュールが", "エドモンが完成。");
+        type_text(&mut engine, "なくなったためあに");
+        engine.handle(InputEvent::Space);
+
+        let request = engine
+            .candidate_rescore_request()
+            .expect("close exact and fragmented candidates should be scoreable");
+        let exact = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "亡くなったため兄")
+            .expect("exact candidate");
+        let fragmented = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "なくなったため兄")
+            .expect("fragmented candidate");
+        let mut contextual = vec![-10.0; request.candidates.len()];
+        let mut ablated = vec![-10.0; request.candidates.len()];
+        contextual[fragmented] = 10.0;
+        ablated[exact] = 10.0;
+        ablated[fragmented] = 9.26;
+
+        assert!(!engine.candidate_rescore_should_use_context_ablated_scores(
+            &contextual,
+            &ablated,
+            0.8,
+            0.0,
+        ));
+
+        ablated[fragmented] = 9.25;
+
+        assert!(engine.candidate_rescore_should_use_context_ablated_scores(
+            &contextual,
+            &ablated,
+            0.8,
+            0.0,
+        ));
+
+        let mut intentional = SlimeEngine::bundled();
+        intentional.set_external_left_context("つまり");
+        type_text(&mut intentional, "いういみあい");
+        intentional.handle(InputEvent::Space);
+        let request = intentional
+            .candidate_rescore_request()
+            .expect("orthographic alternatives should be scoreable");
+        let kanji = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "言う意味合い")
+            .expect("kanji candidate");
+        let hiragana = request
+            .candidates
+            .iter()
+            .position(|candidate| candidate == "いう意味合い")
+            .expect("hiragana candidate");
+        let mut contextual = vec![-10.0; request.candidates.len()];
+        let mut ablated = vec![-10.0; request.candidates.len()];
+        contextual[hiragana] = 10.0;
+        ablated[kanji] = 10.0;
+        assert!(
+            !intentional.candidate_rescore_should_use_context_ablated_scores(
+                &contextual,
+                &ablated,
+                0.8,
+                0.0,
+            )
+        );
     }
 
     #[test]

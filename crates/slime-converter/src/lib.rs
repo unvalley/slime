@@ -1288,6 +1288,10 @@ fn is_ideographic_or_digit(character: char) -> bool {
     )
 }
 
+fn is_hiragana_character(character: char) -> bool {
+    matches!(character, '\u{3040}'..='\u{309f}')
+}
+
 fn trim_compound_paths(
     paths: &mut Vec<CompoundPath>,
     limit: usize,
@@ -1887,6 +1891,82 @@ impl Dictionary {
                 .all(|(index, _)| (surface_start..surface_end).contains(&index));
             surface_start = surface_end;
             fragmented && changes_only_this_segment
+        })
+    }
+
+    /// Returns whether an alternative replaces an exact ideographic segment
+    /// with a hiragana spelling that is not itself one complete dictionary
+    /// entry for the same reading.
+    ///
+    /// This distinguishes an intentional orthographic alternative such as
+    /// `言う -> いう` from fragmentation such as `亡くなっ -> なく + なっ`.
+    #[must_use]
+    pub fn fragments_exact_ideographic_segment_into_hiragana(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        let current_characters = current_surface.chars().collect::<Vec<_>>();
+        let alternative_characters = alternative_surface.chars().collect::<Vec<_>>();
+        if current_characters.len() != alternative_characters.len()
+            || current_characters == alternative_characters
+        {
+            return false;
+        }
+        let Some(conversion) = self
+            .convert_n_best_with_surface_prefix(reading, current_surface, 1)
+            .into_iter()
+            .find(|conversion| conversion.surface == current_surface)
+        else {
+            return false;
+        };
+        let Some(alternative_conversion) = self
+            .convert_n_best_with_surface_prefix(reading, alternative_surface, 1)
+            .into_iter()
+            .find(|conversion| conversion.surface == alternative_surface)
+        else {
+            return false;
+        };
+        let mut alternative_start = 0;
+        let alternative_segments = alternative_conversion
+            .segments
+            .into_iter()
+            .map(|segment| {
+                let start = alternative_start;
+                alternative_start += segment.surface.chars().count();
+                (start, alternative_start, segment.reading, segment.surface)
+            })
+            .collect::<Vec<_>>();
+        let mut surface_start = 0;
+        conversion.segments.into_iter().any(|segment| {
+            let segment_characters = segment.surface.chars().count();
+            let surface_end = surface_start + segment_characters;
+            let alternative_segment = alternative_characters[surface_start..surface_end]
+                .iter()
+                .collect::<String>();
+            let alternative_is_one_segment = alternative_segments.iter().any(
+                |(start, end, alternative_reading, alternative_surface)| {
+                    *start == surface_start
+                        && *end == surface_end
+                        && alternative_reading == &segment.reading
+                        && alternative_surface == &alternative_segment
+                },
+            );
+            let alternative_has_exact_ideographic_overlap = alternative_segments.iter().any(
+                |(start, end, alternative_reading, alternative_surface)| {
+                    *start < surface_end
+                        && *end > surface_start
+                        && alternative_surface.chars().any(is_ideographic_or_digit)
+                        && self.has_exact_entry(alternative_reading, alternative_surface)
+                },
+            );
+            surface_start = surface_end;
+            segment.surface.chars().any(is_ideographic_or_digit)
+                && alternative_segment.chars().all(is_hiragana_character)
+                && self.has_exact_entry(&segment.reading, &segment.surface)
+                && !alternative_is_one_segment
+                && !alternative_has_exact_ideographic_overlap
         })
     }
 
@@ -5972,6 +6052,33 @@ mod tests {
         assert!(!dictionary.fragments_exact_katakana_segment("あるごる", "アルゴル", "あるごる",));
         assert!(!dictionary.fragments_exact_katakana_segment("そふと", "ソフト", "そふと",));
         assert!(!dictionary.fragments_exact_katakana_segment("はむ", "ハム", "はム"));
+    }
+
+    #[test]
+    fn exact_ideographic_segment_distinguishes_hiragana_words_from_fragments() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(
+            dictionary.fragments_exact_ideographic_segment_into_hiragana(
+                "なくなったためあに",
+                "亡くなったため兄",
+                "なくなったため兄",
+            )
+        );
+        assert!(
+            !dictionary.fragments_exact_ideographic_segment_into_hiragana(
+                "いういみあい",
+                "言う意味合い",
+                "いう意味合い",
+            )
+        );
+        assert!(
+            !dictionary.fragments_exact_ideographic_segment_into_hiragana(
+                "にはねてくる",
+                "には寝てくる",
+                "に跳ねてくる",
+            )
+        );
     }
 
     #[test]

@@ -1525,6 +1525,10 @@ impl SlimeEngine {
             )
             || rescore_removes_alphanumeric_compound_number(state, selected)
             || rescore_removes_parallel_score(state, selected)
+            || rescore_removes_midpoint_age_number(
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
             || rescore_removes_contextual_approximate_quantity(state, selected)
             || rescore_removes_contextual_chronological_year(state, selected)
             || self.rescore_removes_contextual_genitive_case_frame(state, selected)
@@ -3640,6 +3644,41 @@ fn rescore_removes_parallel_score(state: &CandidateRescoreState, selected: usize
     };
     let score_suffix = &state.candidates[0].surface[digit_start..];
     !state.candidates[selected].surface.ends_with(score_suffix)
+}
+
+/// Preserve a multi-character numeral in the conventional `30も半ばにして`
+/// age expression. A lexical homophone such as `三重` has the same reading,
+/// but no longer denotes an age. Numeric spelling variants remain eligible.
+fn rescore_removes_midpoint_age_number(base: &str, selected: &str) -> bool {
+    const MARKER: &str = "も半ばにして";
+
+    let Some(marker_start) = base.find(MARKER) else {
+        return false;
+    };
+    let before_marker = &base[..marker_start];
+    let Some(number_start) = before_marker
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_chronological_year_character(*character))
+        .last()
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    let number = &base[number_start..marker_start];
+    if number.chars().count() < 2 {
+        return false;
+    }
+
+    let prefix = &base[..number_start];
+    let suffix = &base[marker_start..];
+    let Some(alternative) = selected
+        .strip_prefix(prefix)
+        .and_then(|remaining| remaining.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    !alternative.is_empty() && !alternative.chars().all(is_chronological_year_character)
 }
 
 fn rescore_removes_contextual_chronological_year(
@@ -6933,6 +6972,62 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("structured-number rescore should preserve the base candidate");
         assert_eq!(engine.candidates[0], "6月10日");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_midpoint_age_number() {
+        assert!(super::rescore_removes_midpoint_age_number(
+            "ゴルファーとしても有名で30も半ばにして突然",
+            "ゴルファーとしても有名で三重も半ばにして突然",
+        ));
+        assert!(!super::rescore_removes_midpoint_age_number(
+            "ゴルファーとしても有名で30も半ばにして突然",
+            "ゴルファーとしても有名で三十も半ばにして突然",
+        ));
+        assert!(!super::rescore_removes_midpoint_age_number(
+            "その後30県を訪れた",
+            "その後三重県を訪れた",
+        ));
+        assert!(!super::rescore_removes_midpoint_age_number(
+            "ゴルファーとしても有名で30も半ばにして突然",
+            "ゴルファーとしては有名で30も半ばにして突然",
+        ));
+
+        let candidates = vec![
+            Candidate {
+                surface: "ゴルファーとしても有名で30も半ばにして突然".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "ゴルファーとしても有名で三重も半ばにして突然".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "ごるふぁーとしてもゆうめいでさんじゅうもなかばにしてとつぜん".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a midpoint age number should remain numeric");
+        assert_eq!(
+            engine.candidates[0],
+            "ゴルファーとしても有名で30も半ばにして突然"
+        );
     }
 
     #[test]

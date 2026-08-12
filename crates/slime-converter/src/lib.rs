@@ -619,6 +619,35 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         )
     }
 
+    fn embedded_ordinal_style_promotion(&self, conversion: &Conversion) -> i32 {
+        let Some(evidence) = self.numeric_style else {
+            return 0;
+        };
+        if !self.right_context.starts_with('目') {
+            return 0;
+        }
+        let matches_ordinal = conversion.segments.windows(2).skip(1).any(|segments| {
+            let [numeric, ordinal] = segments else {
+                return false;
+            };
+            ordinal.reading == "ばん"
+                && ordinal.surface == "番"
+                && numeric.surface.chars().count() == 1
+                && numeric
+                    .surface
+                    .chars()
+                    .all(|character| match evidence.style {
+                        DocumentNumericStyle::Ascii => character.is_ascii_digit(),
+                        DocumentNumericStyle::Fullwidth => matches!(character, '０'..='９'),
+                    })
+        });
+        if matches_ordinal {
+            DOCUMENT_NUMERIC_STYLE_PROMOTION
+        } else {
+            0
+        }
+    }
+
     fn specialized_promotion(
         &self,
         reading: &str,
@@ -656,6 +685,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             ))
             .max(region_suffix)
             .max(self.right_structured_promotion(conversion))
+            .max(self.embedded_ordinal_style_promotion(conversion))
     }
 }
 
@@ -1125,6 +1155,7 @@ const DOCUMENT_RIGHT_NOUN_PREFIX_PHRASE_PROMOTION: i32 = 4_500;
 const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
 const DOCUMENT_NUMERIC_STYLE_PROMOTION: i32 = 3_000;
+const DOCUMENT_LEFT_NUMERIC_STYLE_MAX_CHARACTERS: usize = 64;
 const DOCUMENT_CHRONOLOGICAL_YEAR_PROMOTION: i32 = 1_000;
 const DOCUMENT_APPROXIMATE_QUANTITY_PROMOTION: i32 = 750;
 const DOCUMENT_INVALID_PARTICLE_BOUNDARY_PENALTY: i32 = 1_500;
@@ -1292,7 +1323,7 @@ fn left_document_numeric_style(left_context: &str) -> Option<DocumentNumericStyl
     left_context
         .chars()
         .rev()
-        .take(32)
+        .take(DOCUMENT_LEFT_NUMERIC_STYLE_MAX_CHARACTERS)
         .take_while(|character| !matches!(character, '。' | '！' | '？' | '\n' | '\r'))
         .find_map(|character| match character {
             '0'..='9' => Some(DocumentNumericStyle::Ascii),
@@ -9924,6 +9955,30 @@ mod tests {
             )[0]
             .surface,
             "党が多数派"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_applies_numeric_style_to_an_embedded_ordinal() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "せかいでにばん",
+                "1888年に設立された公園は、世界で",
+                "目となる国立公園でした。",
+            )[0]
+            .surface,
+            "世界で2番"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "せかいでにばん",
+                "公式に設立されたものとしては",
+                "目となる国立公園でした。",
+            )[0]
+            .surface,
+            "世界で二番",
+            "an ordinal without confirmed numeric style keeps its lexical spelling"
         );
     }
 

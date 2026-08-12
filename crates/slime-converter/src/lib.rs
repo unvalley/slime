@@ -369,11 +369,15 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         let [first, .., _] = conversion.segments.as_slice() else {
             return 0;
         };
+        let allows_committed_ordinal_lexical_prefix = self.numeric_style.is_none()
+            && left_context.ends_with('第')
+            && first.surface.chars().count() >= 2
+            && first.surface.chars().all(is_ideographic_character);
         self.dictionary.document_phrase_promotion(
             left_context,
             &first.reading,
             &first.surface,
-            self.allows_single_character_phrase_prefix,
+            self.allows_single_character_phrase_prefix || allows_committed_ordinal_lexical_prefix,
         )
     }
 
@@ -2041,6 +2045,13 @@ fn is_ideographic_or_digit(character: char) -> bool {
             | '\u{3400}'..='\u{4dbf}'
             | '\u{4e00}'..='\u{9fff}'
             | '\u{f900}'..='\u{faff}'
+    )
+}
+
+fn is_ideographic_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
     )
 }
 
@@ -9979,6 +9990,30 @@ mod tests {
             .surface,
             "世界で二番",
             "an ordinal without confirmed numeric style keeps its lexical spelling"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_completes_a_lexical_word_after_committed_ordinal_prefix() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "さんしゃのか",
+                "第",
+                "半数、具体的には367票（550票の中で）が必要である。",
+            )[0]
+            .surface,
+            "三者の過"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "さんしゃ",
+                "2026年、取引先の第",
+                "が共同で開発した。",
+            )[0]
+            .surface,
+            "3社",
+            "confirmed digit style keeps a productive ordinal counter numeric"
         );
     }
 

@@ -136,6 +136,10 @@ const HIGH_ACCURACY_VERY_LONG_INPUT_MIN_CHARACTERS: usize = 20;
 #[cfg(any(feature = "neural", test))]
 const SHORT_GENITIVE_INPUT_MAX_CHARACTERS: usize = 8;
 #[cfg(any(feature = "neural", test))]
+const SHORT_SURROUNDING_CONTEXT_MAX_CHARACTERS: usize = 4;
+#[cfg(any(feature = "neural", test))]
+const SHORT_SURROUNDING_CONTEXT_CONTRAST_WEIGHT: f64 = 0.25;
+#[cfg(any(feature = "neural", test))]
 const CONFIRMED_SURNAME_HONORIFIC_CONTEXT_CONTRAST_WEIGHT: f64 = 0.15;
 #[cfg(feature = "neural")]
 const PREFIX_CORRECTION_MIN_CHARACTERS: usize = 4;
@@ -232,13 +236,34 @@ fn context_contrast_weight_for_request(
     profile: NeuralProfileParameters,
     request: &slime_core::CandidateRescoreRequest,
 ) -> f64 {
-    if profile.context_contrast_weight > 0.0 && has_confirmed_surname_before_honorific(request) {
+    if profile.context_contrast_weight <= 0.0 {
+        return 0.0;
+    }
+    if has_short_semantic_surrounding_context(request) {
+        profile
+            .context_contrast_weight
+            .max(SHORT_SURROUNDING_CONTEXT_CONTRAST_WEIGHT)
+    } else if has_confirmed_surname_before_honorific(request) {
         profile
             .context_contrast_weight
             .max(CONFIRMED_SURNAME_HONORIFIC_CONTEXT_CONTRAST_WEIGHT)
     } else {
         profile.context_contrast_weight
     }
+}
+
+#[cfg(any(feature = "neural", test))]
+fn has_short_semantic_surrounding_context(request: &slime_core::CandidateRescoreRequest) -> bool {
+    request.reading.chars().count() <= SHORT_SURROUNDING_CONTEXT_MAX_CHARACTERS
+        && !request.context.is_empty()
+        && !request.right_context.is_empty()
+        && !request
+            .candidates
+            .iter()
+            .any(|candidate| candidate.ends_with('氏'))
+        && !["さん", "氏", "君", "ちゃん", "様", "として", "とな", "ない"]
+            .iter()
+            .any(|boundary| request.right_context.starts_with(boundary))
 }
 
 #[cfg(any(feature = "neural", test))]
@@ -2035,6 +2060,63 @@ mod tests {
             },
             slime_core::CandidateRescoreRequest {
                 candidates: vec!["貴教氏".to_owned(), "貴教師".to_owned()],
+                ..request.clone()
+            },
+        ] {
+            assert_close(
+                super::context_contrast_weight_for_request(high_accuracy, &request),
+                0.1,
+            );
+        }
+    }
+
+    #[test]
+    fn short_input_strengthens_only_complete_surrounding_context() {
+        let balanced = super::neural_profile_parameters(super::NEURAL_PROFILE_BALANCED).unwrap();
+        let high_accuracy =
+            super::neural_profile_parameters(super::NEURAL_PROFILE_HIGH_ACCURACY).unwrap();
+        let request = slime_core::CandidateRescoreRequest {
+            context: "作曲は彩木".to_owned(),
+            right_context: "である。".to_owned(),
+            reading: "まさお".to_owned(),
+            candidates: vec!["正雄".to_owned(), "雅夫".to_owned()],
+        };
+
+        assert_close(
+            super::context_contrast_weight_for_request(high_accuracy, &request),
+            0.25,
+        );
+        assert_close(
+            super::context_contrast_weight_for_request(balanced, &request),
+            0.0,
+        );
+        for request in [
+            slime_core::CandidateRescoreRequest {
+                context: String::new(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                right_context: String::new(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                reading: "たかのりし".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                right_context: "さん71歳です。".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                right_context: "としての任を預けられた。".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                right_context: "となり、死去した。".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                right_context: "ない。".to_owned(),
                 ..request.clone()
             },
         ] {

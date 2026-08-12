@@ -2854,6 +2854,17 @@ impl SlimeEngine {
                 ) {
                     push_unique(&mut suggestions, surface.to_owned());
                 }
+            } else if let Some(previous_surface) = self.session_history.previous_surface() {
+                for surface in self
+                    .user_data
+                    .contextual_completion_surfaces_for_external_surface(
+                        previous_surface,
+                        &self.reading,
+                        9,
+                    )
+                {
+                    push_unique(&mut suggestions, surface.to_owned());
+                }
             }
             for surface in self.user_data.completion_surfaces(&self.reading, 9) {
                 push_unique(&mut suggestions, surface);
@@ -5009,6 +5020,41 @@ mod tests {
         type_text(&mut document, "shoumei");
         document.handle(InputEvent::Space);
         assert_eq!(document.snapshot().preedit, "証明");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_document_context_reuses_repeated_local_completion_history() {
+        let directory = test_directory("external-adaptive-completion");
+        fs::write(
+            directory.join("context_history.tsv"),
+            "# slime-context-history-v1\n\
+             ぶんしょう\t文章\tしょうめいけいかく\t証明計画\t10\t10\n\
+             へや\t部屋\tしょうめいけいかく\t照明計画\t2\t20\n",
+        )
+        .unwrap();
+        let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        engine.set_preferences(EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        });
+        engine.set_external_left_context("既存文書の部屋");
+
+        type_text(&mut engine, "shoumei");
+
+        assert_eq!(engine.snapshot().candidates.first().unwrap(), "照明計画");
+        assert_eq!(
+            fs::read_to_string(directory.join("context_history.tsv")).unwrap(),
+            "# slime-context-history-v1\n\
+             ぶんしょう\t文章\tしょうめいけいかく\t証明計画\t10\t10\n\
+             へや\t部屋\tしょうめいけいかく\t照明計画\t2\t20\n",
+            "reading external context must not persist a learned edge"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

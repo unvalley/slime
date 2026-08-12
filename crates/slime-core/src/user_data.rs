@@ -244,6 +244,49 @@ impl UserData {
         surfaces
     }
 
+    /// Returns repeated completions whose learned previous surface is a
+    /// meaningful suffix of text supplied by the input client. External text
+    /// has no reading, so keep the same two-character anchor requirement as
+    /// exact contextual conversion history.
+    #[must_use]
+    pub(crate) fn contextual_completion_surfaces_for_external_surface(
+        &self,
+        external_surface: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<&str> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let prefix_length = prefix.chars().count();
+        let mut entries: Vec<_> = self
+            .context_history
+            .iter()
+            .filter(|entry| {
+                entry.previous_surface.chars().count() >= 2
+                    && external_surface.ends_with(&entry.previous_surface)
+                    && entry.count >= MIN_CONTEXT_USE_COUNT
+                    && entry.reading.starts_with(prefix)
+                    && entry.reading.chars().count().saturating_sub(prefix_length)
+                        >= MIN_COMPLETION_REMAINING_CHARS
+                    && is_useful_context_anchor(&entry.previous_reading, &entry.previous_surface)
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .collect();
+        sort_context_history(&mut entries);
+
+        let mut surfaces = Vec::with_capacity(limit);
+        for entry in entries {
+            if !surfaces.contains(&entry.surface.as_str()) {
+                surfaces.push(entry.surface.as_str());
+            }
+            if surfaces.len() == limit {
+                break;
+            }
+        }
+        surfaces
+    }
+
     pub fn dictionary_entries(&self) -> impl Iterator<Item = (&str, &str)> {
         self.dictionary
             .iter()
@@ -1284,6 +1327,38 @@ mod tests {
             reloaded
                 .contextual_completion_surfaces("ぶんしょう", "文章", "かんじへんか", 9)
                 .is_empty()
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_surface_context_can_anchor_a_repeated_completion() {
+        let directory = test_directory("external-context-completion");
+        fs::write(
+            directory.join("context_history.tsv"),
+            format!(
+                "{CONTEXT_HISTORY_HEADER}\n\
+                 ひと\t人\tしょうめいけいかく\t証明計画\t20\t30\n\
+                 へや\t部屋\tしょうめいけいかく\t照明計画\t2\t20\n\
+                 ほんにん\t本人\tしょうめいけいかく\t証明計画\t1\t40\n"
+            ),
+        )
+        .unwrap();
+
+        let data = UserData::load(&directory);
+        assert_eq!(
+            data.contextual_completion_surfaces_for_external_surface(
+                "既存文書の部屋",
+                "しょうめい",
+                9,
+            ),
+            ["照明計画"]
+        );
+        assert!(
+            data.contextual_completion_surfaces_for_external_surface("本人", "しょうめい", 9)
+                .is_empty(),
+            "a one-character anchor or one-off context must not predict"
         );
 
         fs::remove_dir_all(directory).unwrap();

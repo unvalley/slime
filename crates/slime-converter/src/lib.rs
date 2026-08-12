@@ -247,6 +247,11 @@ enum DocumentNumericStyle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DocumentNumericStyleEvidence {
     style: DocumentNumericStyle,
+    leading: Option<DocumentLeadingNumericStyle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DocumentLeadingNumericStyle {
     reading_bytes: usize,
     kanji: char,
 }
@@ -315,7 +320,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 ),
             numeric_counter_promotions: dictionary
                 .document_numeric_counter_promotions(reading, left_context),
-            numeric_style: document_numeric_style_evidence(left_context, reading),
+            numeric_style: document_numeric_style_evidence(left_context, reading, right_context),
             allows_single_character_phrase_prefix,
             multi_segment_right_phrase_cache: RefCell::new(Vec::new()),
             multi_segment_right_grammar_cache: RefCell::new(Vec::new()),
@@ -1050,7 +1055,7 @@ fn structured_notation_matches(left_context: &str, reading: &str, surface: &str)
     structured_notation_surface(left_context, reading).is_some_and(|preferred| preferred == surface)
 }
 
-fn document_numeric_style(left_context: &str) -> Option<DocumentNumericStyle> {
+fn left_document_numeric_style(left_context: &str) -> Option<DocumentNumericStyle> {
     left_context
         .chars()
         .rev()
@@ -1063,30 +1068,63 @@ fn document_numeric_style(left_context: &str) -> Option<DocumentNumericStyle> {
         })
 }
 
+fn right_document_numeric_style(right_context: &str) -> Option<DocumentNumericStyle> {
+    right_context
+        .chars()
+        .take(32)
+        .take_while(|character| !matches!(character, '。' | '！' | '？' | '\n' | '\r'))
+        .find_map(|character| match character {
+            '0'..='9' => Some(DocumentNumericStyle::Ascii),
+            '０'..='９' => Some(DocumentNumericStyle::Fullwidth),
+            _ => None,
+        })
+}
+
+fn reconcile_document_numeric_style(
+    left: Option<DocumentNumericStyle>,
+    right: Option<DocumentNumericStyle>,
+) -> Option<DocumentNumericStyle> {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => None,
+        (Some(style), _) | (_, Some(style)) => Some(style),
+        (None, None) => None,
+    }
+}
+
 fn document_numeric_style_evidence(
     left_context: &str,
     reading: &str,
+    right_context: &str,
 ) -> Option<DocumentNumericStyleEvidence> {
-    let style = document_numeric_style(left_context)?;
-    let (numeric_reading, kanji) = [
-        ("きゅう", '九'),
-        ("ぜろ", '〇'),
-        ("れい", '〇'),
-        ("いち", '一'),
-        ("さん", '三'),
-        ("よん", '四'),
-        ("なな", '七'),
-        ("しち", '七'),
-        ("はち", '八'),
-        ("ろく", '六'),
-    ]
-    .into_iter()
-    .find(|(numeric_reading, _)| reading.starts_with(numeric_reading))?;
-    Some(DocumentNumericStyleEvidence {
-        style,
-        reading_bytes: numeric_reading.len(),
-        kanji,
-    })
+    let left_style = left_document_numeric_style(left_context);
+    let right_style = reading
+        .contains("いっ")
+        .then(|| right_document_numeric_style(right_context))
+        .flatten();
+    let style = reconcile_document_numeric_style(left_style, right_style)?;
+    let leading = left_style
+        .filter(|left_style| *left_style == style)
+        .and_then(|_| {
+            [
+                ("きゅう", '九'),
+                ("ぜろ", '〇'),
+                ("れい", '〇'),
+                ("いち", '一'),
+                ("さん", '三'),
+                ("よん", '四'),
+                ("なな", '七'),
+                ("しち", '七'),
+                ("はち", '八'),
+                ("ろく", '六'),
+            ]
+            .into_iter()
+            .find(|(numeric_reading, _)| reading.starts_with(numeric_reading))
+            .map(|(numeric_reading, kanji)| DocumentLeadingNumericStyle {
+                reading_bytes: numeric_reading.len(),
+                kanji,
+            })
+        });
+    Some(DocumentNumericStyleEvidence { style, leading })
 }
 
 fn conversion_matches_numeric_style(
@@ -1094,11 +1132,21 @@ fn conversion_matches_numeric_style(
     conversion: &Conversion,
     evidence: DocumentNumericStyleEvidence,
 ) -> bool {
+    if conversion
+        .segments
+        .iter()
+        .any(|segment| assimilated_counter_surface_matches_style(segment, evidence.style))
+    {
+        return true;
+    }
+    let Some(leading) = evidence.leading else {
+        return false;
+    };
     let [numeric, following, ..] = conversion.segments.as_slice() else {
         return false;
     };
     {
-        if numeric.reading.len() != evidence.reading_bytes {
+        if numeric.reading.len() != leading.reading_bytes {
             return false;
         }
         let matching_width = !numeric.surface.is_empty()
@@ -1130,15 +1178,46 @@ fn conversion_matches_numeric_style(
         compound_reading.push_str(&numeric.reading);
         compound_reading.push_str(&following.reading);
         let mut compound_surface = String::with_capacity(
-            evidence
+            leading
                 .kanji
                 .len_utf8()
                 .saturating_add(following.surface.len()),
         );
-        compound_surface.push(evidence.kanji);
+        compound_surface.push(leading.kanji);
         compound_surface.push_str(&following.surface);
         dictionary.has_exact_entry(&compound_reading, &compound_surface)
     }
+}
+
+fn assimilated_counter_surface_matches_style(
+    segment: &Segment,
+    style: DocumentNumericStyle,
+) -> bool {
+    let Some(counter_reading) = segment.reading.strip_prefix("いっ") else {
+        return false;
+    };
+    if !ASSIMILATED_ONE_COUNTER_READINGS.contains(&counter_reading) {
+        return false;
+    }
+    let surface = segment.surface.as_str();
+    let mut saw_digit = false;
+    let mut suffix_start = None;
+    for (index, character) in surface.char_indices() {
+        let matching_digit = match style {
+            DocumentNumericStyle::Ascii => character.is_ascii_digit(),
+            DocumentNumericStyle::Fullwidth => matches!(character, '０'..='９'),
+        };
+        if matching_digit {
+            saw_digit = true;
+        } else {
+            suffix_start = Some(index);
+            break;
+        }
+    }
+    saw_digit
+        && suffix_start
+            .and_then(|start| surface.get(start..))
+            .is_some_and(is_assimilated_one_numeric_suffix)
 }
 
 fn is_productive_numeric_style_suffix(surface: &str) -> bool {
@@ -1179,6 +1258,14 @@ fn is_productive_numeric_style_suffix(surface: &str) -> bool {
             | "勝"
             | "敗"
     )
+}
+
+fn is_assimilated_one_numeric_suffix(surface: &str) -> bool {
+    is_productive_numeric_style_suffix(surface)
+        || matches!(
+            surface,
+            "版" | "隻" | "足" | "着" | "頭" | "棟" | "局" | "区" | "丁" | "通"
+        )
 }
 
 fn structured_notation_context_matches(left_context: &str, reading: &str) -> bool {
@@ -4230,8 +4317,12 @@ impl Dictionary {
 
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
-        let synthetic_by_start =
-            synthetic_entries_by_start(reading, &synthetic_arena, self.katakana_run_character_cost);
+        let synthetic_by_start = synthetic_entries_by_start(
+            self,
+            reading,
+            &synthetic_arena,
+            self.katakana_run_character_cost,
+        );
         let mut numeric_start_states = numeric_start_states(reading, synthetic_by_start.as_slice());
         let mut lattice: Vec<Vec<LatticeNode<'_>>> =
             (0..=reading.len()).map(|_| Vec::new()).collect();
@@ -4329,8 +4420,12 @@ impl Dictionary {
     ) -> Vec<Conversion> {
         let connection = ConnectionMatrix::bundled();
         let synthetic_arena = Bump::new();
-        let synthetic_by_start =
-            synthetic_entries_by_start(reading, &synthetic_arena, self.katakana_run_character_cost);
+        let synthetic_by_start = synthetic_entries_by_start(
+            self,
+            reading,
+            &synthetic_arena,
+            self.katakana_run_character_cost,
+        );
         let mut numeric_start_states = numeric_start_states(reading, synthetic_by_start.as_slice());
         let mut arena = Vec::<NBestNode<'_>>::with_capacity(n_best_arena_capacity(reading, limit));
         let mut lattice: Vec<NBestBucket> = (0..=reading.len())
@@ -5622,6 +5717,7 @@ fn is_strong_sokuon_number(reading: &str) -> bool {
 }
 
 fn synthetic_entries_by_start<'a>(
+    dictionary: &Dictionary,
     reading: &'a str,
     arena: &'a Bump,
     katakana_character_cost: i32,
@@ -5639,7 +5735,66 @@ fn synthetic_entries_by_start<'a>(
             &mut by_start[start],
         );
     }
+    for (start, _) in reading.match_indices("いっ") {
+        push_assimilated_counter_number_entries(
+            dictionary,
+            reading,
+            start,
+            arena,
+            &mut by_start[start],
+        );
+    }
     by_start
+}
+
+fn push_assimilated_counter_number_entries<'a>(
+    dictionary: &Dictionary,
+    reading: &'a str,
+    start: usize,
+    arena: &'a Bump,
+    out: &mut Vec<SyntheticEntry<'a>>,
+) {
+    let Some(counter_reading) = reading[start..].strip_prefix("いっ") else {
+        return;
+    };
+    if counter_reading.is_empty() {
+        return;
+    }
+    let connection = ConnectionMatrix::bundled();
+    for &counter_prefix in ASSIMILATED_ONE_COUNTER_READINGS {
+        if !counter_reading.starts_with(counter_prefix) {
+            continue;
+        }
+        dictionary.for_each_exact(counter_prefix, |entry| {
+            if !is_assimilated_one_numeric_suffix(entry.surface) {
+                return;
+            }
+            let counter_connection = connection.cost(ARABIC_NUMBER_POS_ID, entry.left_id);
+            if counter_connection >= INVALID_CONNECTION_COST {
+                return;
+            }
+            let cost = number_cost()
+                .saturating_add(counter_connection)
+                .saturating_add(entry.word_cost);
+            for (digit, variant_cost) in [
+                ("1", cost),
+                ("１", cost.saturating_add(NUMBER_VARIANT_STEP)),
+            ] {
+                let mut surface =
+                    BumpString::with_capacity_in(digit.len() + entry.surface.len(), arena);
+                surface.push_str(digit);
+                surface.push_str(entry.surface);
+                out.push(SyntheticEntry {
+                    end: start + "いっ".len() + counter_prefix.len(),
+                    surface: arena.alloc_str(surface.as_str()),
+                    left_id: ARABIC_NUMBER_POS_ID,
+                    right_id: entry.right_id,
+                    cost: variant_cost,
+                    numeric: true,
+                });
+            }
+        });
+    }
 }
 
 fn push_digit_run_entry<'a>(reading: &'a str, start: usize, out: &mut Vec<SyntheticEntry<'a>>) {
@@ -5707,6 +5862,29 @@ const NUMBER_TOKENS: &[(&str, NumberToken)] = &[
 ];
 
 const RISKY_SINGLE_NUMBER_READINGS: &[&str] = &["に", "し", "ご", "く", "ぜん", "じゅっ", "じっ"];
+
+const ASSIMILATED_ONE_COUNTER_READINGS: &[&str] = &[
+    "かい",
+    "こ",
+    "けん",
+    "ぽん",
+    "ぴき",
+    "ぷん",
+    "さつ",
+    "せき",
+    "そく",
+    "ちゃく",
+    "とう",
+    "ぱい",
+    "さい",
+    "せん",
+    "しょう",
+    "きょく",
+    "く",
+    "ちょう",
+    "つう",
+    "てん",
+];
 
 /// Parses kana numeral prefixes of `suffix`. Returns every token boundary at
 /// which the consumed prefix forms a complete number, with its value.
@@ -7605,6 +7783,35 @@ mod tests {
             "九州",
             "a proper noun beginning with a numeral keeps its lexical spelling"
         );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "おにぎりいっこ",
+                "毛布にくるまって寒さをしのぎ、",
+                "を家族4人で分け合った。",
+            )[0]
+            .surface,
+            "おにぎり1個",
+            "a productive internal counter inherits confirmed right-context style"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "おにぎりいっこ",
+                "2人に",
+                "を家族４人で分けた。",
+            )[0]
+            .surface,
+            "おにぎり一個",
+            "conflicting confirmed digit widths do not impose either style"
+        );
+        assert!(
+            super::document_numeric_style_evidence(
+                "第",
+                "さんしゃのか",
+                "半数、具体的には367票が必要である。",
+            )
+            .is_none_or(|evidence| evidence.leading.is_none()),
+            "right-context digits cannot style a leading numeric interpretation"
+        );
     }
 
     #[test]
@@ -8587,6 +8794,67 @@ mod tests {
     }
 
     #[test]
+    fn assimilated_one_composes_only_before_dictionary_counters() {
+        let dictionary = Dictionary::bundled();
+        let arena = bumpalo::Bump::new();
+        let generated = synthetic_entries_by_start(
+            &dictionary,
+            "しゅういっかい",
+            &arena,
+            super::katakana_run_character_cost(),
+        );
+        assert!(
+            generated["しゅう".len()]
+                .iter()
+                .any(|entry| entry.surface == "1回"),
+            "missing combined counter node: {:?}",
+            generated["しゅう".len()]
+        );
+
+        for (reading, expected) in [
+            ("しゅういっかい", "週1回"),
+            ("おにぎりいっこ", "おにぎり1個"),
+            ("さつじんといっけん", "殺人と1件"),
+        ] {
+            let candidates = dictionary.candidates_with_limit(reading, 32);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.surface == expected),
+                "missing {expected} for {reading}: {candidates:?}"
+            );
+        }
+
+        let homicide_candidates = dictionary.candidates_with_limit("さつじんといっけん", 32);
+        assert!(homicide_candidates.iter().all(|candidate| {
+            !candidate.surface.contains("1県")
+                && !candidate.surface.contains("1兼")
+                && !candidate.surface.contains("１県")
+                && !candidate.surface.contains("１兼")
+        }));
+
+        for (reading, expected) in [
+            ("いっけん", "一見"),
+            ("いっぱん", "一般"),
+            ("いっこう", "一行"),
+            ("いった", "行った"),
+        ] {
+            assert_eq!(
+                dictionary.candidates(reading)[0].surface,
+                expected,
+                "an assimilated counter alternative must not replace the established word"
+            );
+        }
+        let conversions = dictionary.convert_n_best("いった", 32);
+        assert!(
+            conversions.iter().all(|conversion| {
+                !conversion.surface.starts_with('1') && !conversion.surface.starts_with('１')
+            }),
+            "a reading without a following counter gained a number: {conversions:?}"
+        );
+    }
+
+    #[test]
     fn sokuon_ten_reading_composes_inside_numbers_and_before_minutes() {
         let dictionary = Dictionary::bundled();
         for (reading, expected) in [
@@ -8620,8 +8888,12 @@ mod tests {
         let dictionary = Dictionary::bundled();
         let states_after_dictionary_scan = |reading: &str| {
             let arena = bumpalo::Bump::new();
-            let entries =
-                synthetic_entries_by_start(reading, &arena, super::katakana_run_character_cost());
+            let entries = synthetic_entries_by_start(
+                &dictionary,
+                reading,
+                &arena,
+                super::katakana_run_character_cost(),
+            );
             let mut states = numeric_start_states(reading, entries.as_slice());
             for (start, _) in reading.char_indices() {
                 dictionary.for_each_prefix_guarding_numeric_starts(

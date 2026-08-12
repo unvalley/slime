@@ -2892,6 +2892,92 @@ impl Dictionary {
         })
     }
 
+    /// Returns whether an alternative fragments one exact mixed-script word
+    /// into multiple dictionary segments over the same reading span.
+    #[must_use]
+    pub fn fragments_exact_mixed_script_segment(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        if current_surface == alternative_surface {
+            return false;
+        }
+        let exact_conversion = |surface: &str| {
+            self.convert_n_best_with_surface_prefix(reading, surface, 1)
+                .into_iter()
+                .find(|conversion| conversion.surface == surface)
+        };
+        let Some(current) = exact_conversion(current_surface) else {
+            return false;
+        };
+        let Some(alternative) = exact_conversion(alternative_surface) else {
+            return false;
+        };
+        let reading_ranges = |conversion: &Conversion| {
+            let mut start = 0;
+            conversion
+                .segments
+                .iter()
+                .enumerate()
+                .map(|(index, segment)| {
+                    let end = start + segment.reading.len();
+                    let range = (start, end, index);
+                    start = end;
+                    range
+                })
+                .collect::<Vec<_>>()
+        };
+        let current_ranges = reading_ranges(&current);
+        let alternative_ranges = reading_ranges(&alternative);
+
+        current_ranges.iter().any(|(start, end, segment_index)| {
+            let segment = &current.segments[*segment_index];
+            let exact_mixed_word = segment.surface.chars().count() >= 4
+                && segment.surface.chars().any(is_ideographic_character)
+                && segment
+                    .surface
+                    .chars()
+                    .any(|character| matches!(character, 'ァ'..='ヿ'))
+                && self.has_exact_entry(&segment.reading, &segment.surface);
+            if !exact_mixed_word {
+                return false;
+            }
+            let overlapping = alternative_ranges
+                .iter()
+                .filter(|(alternative_start, alternative_end, _)| {
+                    alternative_start < end && alternative_end > start
+                })
+                .collect::<Vec<_>>();
+            overlapping.len() >= 2
+                && overlapping
+                    .first()
+                    .is_some_and(|(first_start, _, _)| first_start == start)
+                && overlapping
+                    .last()
+                    .is_some_and(|(_, last_end, _)| last_end == end)
+                && current_ranges
+                    .iter()
+                    .filter(|(current_start, current_end, _)| {
+                        current_end <= start || current_start >= end
+                    })
+                    .all(|(current_start, current_end, current_segment_index)| {
+                        let current_segment = &current.segments[*current_segment_index];
+                        alternative_ranges.iter().any(
+                            |(alternative_start, alternative_end, alternative_segment_index)| {
+                                let alternative_segment =
+                                    &alternative.segments[*alternative_segment_index];
+                                alternative_start == current_start
+                                    && alternative_end == current_end
+                                    && alternative_segment.reading == current_segment.reading
+                                    && alternative_segment.surface == current_segment.surface
+                            },
+                        )
+                    })
+        })
+    }
+
     /// Returns whether an alternative replaces one exact ideographic word,
     /// recovered through an orthographic long-vowel variant, with a literal
     /// katakana rendering of the original pronunciation.
@@ -8002,6 +8088,27 @@ mod tests {
                 "に跳ねてくる",
             )
         );
+    }
+
+    #[test]
+    fn exact_mixed_script_word_rejects_only_segment_fragmentation() {
+        let dictionary = Dictionary::bundled();
+
+        assert!(dictionary.fragments_exact_mixed_script_segment(
+            "しょうねんいんにはおんがくがこうせいぷろぐらむとしてもうけられ",
+            "少年院には音楽が更生プログラムとして設けられ",
+            "少年院には音楽が構成プログラムとして設けられ",
+        ));
+        assert!(!dictionary.fragments_exact_mixed_script_segment(
+            "しょうねんいんにはおんがくがこうせいぷろぐらむとしてもうけられ",
+            "少年院には音楽が更生プログラムとして設けられ",
+            "少年員には音楽が構成プログラムとして設けられ",
+        ));
+        assert!(!dictionary.fragments_exact_mixed_script_segment(
+            "しょうねんいんにはおんがくがこうせいぷろぐらむとしてもうけられ",
+            "少年院には音楽が更生プログラムとして設けられ",
+            "少年院には音楽が更生プログラムとして儲けられ",
+        ));
     }
 
     #[test]

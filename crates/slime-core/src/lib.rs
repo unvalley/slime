@@ -1512,6 +1512,7 @@ impl SlimeEngine {
         self.rescore_changes_exact_region_segment(state, selected)
             || self.rescore_changes_uncontextualized_personal_name(state, selected)
             || self.rescore_fragments_exact_katakana_segment(state, selected)
+            || self.rescore_fragments_exact_mixed_script_segment(state, selected)
             || self.rescore_deconverts_exact_ideographic_pronunciation_segment(state, selected)
             || rescore_only_expands_ascii_digit_width(
                 &state.candidates[0].surface,
@@ -1645,6 +1646,19 @@ impl SlimeEngine {
     ) -> bool {
         selected != 0
             && self.dictionary.fragments_exact_katakana_segment(
+                &state.request.reading,
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
+    }
+
+    fn rescore_fragments_exact_mixed_script_segment(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self.dictionary.fragments_exact_mixed_script_segment(
                 &state.request.reading,
                 &state.candidates[0].surface,
                 &state.candidates[selected].surface,
@@ -7996,6 +8010,48 @@ mod tests {
             .expect("the calendar suffix should survive model rescoring");
 
         assert_eq!(engine.candidates[0], "日");
+    }
+
+    #[test]
+    fn model_rescore_preserves_an_exact_mixed_script_compound() {
+        let reading = "しょうねんいんにはおんがくがこうせいぷろぐらむとしてもうけられ";
+        let candidates = vec![
+            Candidate {
+                surface: "少年院には音楽が更生プログラムとして設けられ".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "少年院には音楽が構成プログラムとして設けられ".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::bundled();
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: String::new(),
+                right_context: String::new(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("the exact mixed-script word should survive model rescoring");
+
+        assert_eq!(
+            engine.candidates[0],
+            "少年院には音楽が更生プログラムとして設けられ"
+        );
     }
 
     #[test]

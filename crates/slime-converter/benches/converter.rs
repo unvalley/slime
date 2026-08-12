@@ -23,6 +23,7 @@ fn main() {
     run_n_best_benchmarks(&dictionary, iterations);
     run_personal_name_guard_benchmarks(&dictionary, iterations);
     run_model_orthography_guard_benchmarks(&dictionary, iterations);
+    run_mixed_script_fragment_guard_benchmarks(&dictionary, iterations);
     run("converter/n_best_phrase", iterations, || {
         black_box(dictionary.candidates(black_box("わたしはにほん")));
     });
@@ -170,6 +171,31 @@ fn run_model_orthography_guard_benchmarks(dictionary: &Dictionary, iterations: u
                     black_box("チュートー聖堂期"),
                 ),
             );
+        },
+    );
+}
+
+fn run_mixed_script_fragment_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run(
+        "converter/mixed_script_fragment_guard_match",
+        iterations,
+        || {
+            black_box(dictionary.fragments_exact_mixed_script_segment(
+                black_box("しょうねんいんにはおんがくがこうせいぷろぐらむとしてもうけられ"),
+                black_box("少年院には音楽が更生プログラムとして設けられ"),
+                black_box("少年院には音楽が構成プログラムとして設けられ"),
+            ));
+        },
+    );
+    run(
+        "converter/mixed_script_fragment_guard_nonmatch",
+        iterations,
+        || {
+            black_box(dictionary.fragments_exact_mixed_script_segment(
+                black_box("しょうねんいんにはおんがくがこうせいぷろぐらむとしてもうけられ"),
+                black_box("少年院には音楽が更生プログラムとして設けられ"),
+                black_box("少年員には音楽が構成プログラムとして設けられ"),
+            ));
         },
     );
 }

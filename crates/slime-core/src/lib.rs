@@ -1526,6 +1526,7 @@ impl SlimeEngine {
             || rescore_removes_parallel_score(state, selected)
             || rescore_removes_contextual_approximate_quantity(state, selected)
             || rescore_removes_contextual_chronological_year(state, selected)
+            || self.rescore_removes_contextual_genitive_case_frame(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
             || rescore_removes_contextual_foreign_name_honorific(state, selected)
     }
@@ -1575,6 +1576,21 @@ impl SlimeEngine {
                     &state.candidates[0].surface,
                     &state.candidates[selected].surface,
                 )
+    }
+
+    fn rescore_removes_contextual_genitive_case_frame(
+        &self,
+        state: &CandidateRescoreState,
+        selected: usize,
+    ) -> bool {
+        selected != 0
+            && self.dictionary.deconverts_contextual_genitive_case_frame(
+                &state.request.reading,
+                &state.request.context,
+                &state.request.right_context,
+                &state.candidates[0].surface,
+                &state.candidates[selected].surface,
+            )
     }
 
     fn rescore_fragments_exact_katakana_segment(
@@ -7779,6 +7795,45 @@ mod tests {
             .expect("literal katakana should not replace the lexical word");
 
         assert_eq!(engine.candidates[0], "中東青銅器");
+    }
+
+    #[test]
+    fn model_rescore_preserves_a_contextual_genitive_case_frame() {
+        let reading = "せーじしはいか";
+        let candidates = vec![
+            Candidate {
+                surface: "政治支配下".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "セージ支配下".to_owned(),
+                cost: 200,
+            },
+        ];
+        let mut engine = SlimeEngine::bundled();
+        engine.reading = reading.to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "アイスランドはデンマークの".to_owned(),
+                right_context: "に置かれていた".to_owned(),
+                reading: reading.to_owned(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("the confirmed case frame should survive model rescoring");
+
+        assert_eq!(engine.candidates[0], "政治支配下");
     }
 
     #[test]

@@ -690,6 +690,36 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         }
     }
 
+    fn genitive_case_frame_promotion(&self, left_context: &str, conversion: &Conversion) -> i32 {
+        let [first, ..] = conversion.segments.as_slice() else {
+            return 0;
+        };
+        if !left_context.ends_with('の')
+            || !self.right_context.starts_with('に')
+            || !first.reading.contains('ー')
+            || first.surface.chars().count() < 2
+            || !first.surface.chars().all(is_ideographic_character)
+            || !orthographic_long_vowel_variants(&first.reading)
+                .into_iter()
+                .any(|variant| {
+                    self.dictionary
+                        .has_exact_entry(&variant.reading, &first.surface)
+                })
+        {
+            return 0;
+        }
+        let has_phonetic_competitor = conversion
+            .segments
+            .first()
+            .and_then(|segment| literal_katakana_surface(&segment.reading))
+            .is_some_and(|surface| self.dictionary.has_exact_entry(&first.reading, &surface));
+        if has_phonetic_competitor {
+            DOCUMENT_GENITIVE_CASE_FRAME_PROMOTION
+        } else {
+            0
+        }
+    }
+
     fn specialized_promotion(
         &self,
         reading: &str,
@@ -799,6 +829,8 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             self.quotation_reporting_promotion(left_context, conversion);
         let foreign_name_honorific_promotion =
             foreign_name_honorific_promotion(left_context, self.right_context, conversion);
+        let genitive_case_frame_promotion =
+            self.genitive_case_frame_promotion(left_context, conversion);
         let specialized_promotion = self.specialized_promotion(reading, left_context, conversion);
         let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
@@ -820,6 +852,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(unique_right_suru_promotion)
             .saturating_sub(quotation_reporting_promotion)
             .saturating_sub(foreign_name_honorific_promotion)
+            .saturating_sub(genitive_case_frame_promotion)
     }
 }
 
@@ -1218,6 +1251,7 @@ const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP: i32 = 1_100;
 const DOCUMENT_RIGHT_PARTICLE_PROMOTION_CAP: i32 = 1_600;
 const DOCUMENT_RIGHT_ATTRIBUTIVE_ADJECTIVE_PROMOTION: i32 = 600;
+const DOCUMENT_GENITIVE_CASE_FRAME_PROMOTION: i32 = 750;
 const DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_MULTI_SEGMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_STRONG_KANA_GRAMMAR_PROMOTION_CAP: i32 = 1_000;
@@ -2874,6 +2908,43 @@ impl Dictionary {
         current_surface: &str,
         alternative_surface: &str,
     ) -> bool {
+        self.deconverts_exact_ideographic_pronunciation_segment_to_katakana_impl(
+            reading,
+            current_surface,
+            alternative_surface,
+            false,
+        )
+    }
+
+    /// Returns whether confirmed `...の | conversion | に...` context would
+    /// lose a lexical long-vowel word by selecting its dictionary-listed
+    /// phonetic katakana competitor.
+    #[must_use]
+    pub fn deconverts_contextual_genitive_case_frame(
+        &self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+    ) -> bool {
+        left_context.ends_with('の')
+            && right_context.starts_with('に')
+            && self.deconverts_exact_ideographic_pronunciation_segment_to_katakana_impl(
+                reading,
+                current_surface,
+                alternative_surface,
+                true,
+            )
+    }
+
+    fn deconverts_exact_ideographic_pronunciation_segment_to_katakana_impl(
+        &self,
+        reading: &str,
+        current_surface: &str,
+        alternative_surface: &str,
+        allows_exact_katakana: bool,
+    ) -> bool {
         if current_surface == alternative_surface || !reading.contains('ー') {
             return false;
         }
@@ -2920,7 +2991,9 @@ impl Dictionary {
                 current_reading_start = reading_end;
                 continue;
             };
-            if has_exact_pronunciation_entry(&segment.reading, &phonetic_surface) {
+            if !allows_exact_katakana
+                && has_exact_pronunciation_entry(&segment.reading, &phonetic_surface)
+            {
                 current_reading_start = reading_end;
                 continue;
             }
@@ -7835,6 +7908,20 @@ mod tests {
                 "セージ支配下",
             )
         );
+        assert!(dictionary.deconverts_contextual_genitive_case_frame(
+            "せーじしはいか",
+            "デンマークの",
+            "に置かれた",
+            "政治支配下",
+            "セージ支配下",
+        ));
+        assert!(!dictionary.deconverts_contextual_genitive_case_frame(
+            "せーじしはいか",
+            "庭には",
+            "に似た香り",
+            "政治支配下",
+            "セージ支配下",
+        ));
         assert!(
             !dictionary.deconverts_exact_ideographic_pronunciation_segment_to_katakana(
                 "ちゅーとーせいどうき",
@@ -10304,6 +10391,30 @@ mod tests {
             .surface,
             "反対する不快",
             "a following function word does not invent an attributive noun boundary"
+        );
+    }
+
+    #[test]
+    fn surrounding_genitive_case_frame_prefers_a_lexical_long_vowel_word() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "せーじしはいか",
+                "アイスランドはデンマークの",
+                "に置かれていた",
+            )[0]
+            .surface,
+            "政治支配下",
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "せーじしはいか",
+                "庭には",
+                "に似た香りがある",
+            )[0]
+            .surface,
+            "セージ支配下",
         );
     }
 

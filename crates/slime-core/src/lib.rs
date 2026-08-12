@@ -1523,6 +1523,7 @@ impl SlimeEngine {
             )
             || rescore_removes_alphanumeric_compound_number(state, selected)
             || rescore_removes_parallel_score(state, selected)
+            || rescore_removes_contextual_approximate_quantity(state, selected)
             || rescore_removes_contextual_chronological_year(state, selected)
             || rescore_removes_contextual_roman_numeral(state, selected)
             || rescore_removes_contextual_foreign_name_honorific(state, selected)
@@ -3564,6 +3565,52 @@ fn rescore_removes_contextual_chronological_year(
         })
     });
     is_chronological_year && state.candidates[selected].surface != *base
+}
+
+fn rescore_removes_contextual_approximate_quantity(
+    state: &CandidateRescoreState,
+    selected: usize,
+) -> bool {
+    selected != 0
+        && state.candidates[0].surface.ends_with("には約")
+        && right_context_starts_with_quantity(&state.request.right_context)
+        && state.candidates[selected].surface != state.candidates[0].surface
+}
+
+fn right_context_starts_with_quantity(right_context: &str) -> bool {
+    let mut characters = right_context.chars().peekable();
+    let decimal = characters
+        .peek()
+        .copied()
+        .is_some_and(is_ascii_or_fullwidth_digit);
+    let japanese = characters
+        .peek()
+        .copied()
+        .is_some_and(is_chronological_year_character);
+    if !decimal && !japanese {
+        return false;
+    }
+    if decimal {
+        while characters
+            .peek()
+            .is_some_and(|character| is_ascii_or_fullwidth_digit(*character))
+        {
+            characters.next();
+        }
+    } else {
+        while characters
+            .peek()
+            .is_some_and(|character| is_chronological_year_character(*character))
+        {
+            characters.next();
+        }
+    }
+    characters.next().is_some_and(|unit| {
+        matches!(
+            unit,
+            '年' | '月' | '日' | '時' | '分' | '秒' | '件' | '人' | '個' | '回' | '円'
+        )
+    })
 }
 
 fn is_chronological_year_character(character: char) -> bool {
@@ -6698,6 +6745,42 @@ mod tests {
             .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
             .expect("a contextual chronological year should remain structured");
         assert_eq!(engine.candidates[0], "紀元前511");
+    }
+
+    #[test]
+    fn neural_rescoring_preserves_a_contextual_approximate_quantity() {
+        let candidates = vec![
+            Candidate {
+                surface: "するには約".to_owned(),
+                cost: 100,
+            },
+            Candidate {
+                surface: "するに早く".to_owned(),
+                cost: 150,
+            },
+        ];
+        let mut engine = SlimeEngine::new(Dictionary::new(Vec::new()));
+        engine.reading = "するにはやく".to_owned();
+        engine.candidate_kind = Some(CandidateKind::Conversion);
+        engine.candidates = candidates
+            .iter()
+            .map(|candidate| candidate.surface.clone())
+            .collect();
+        engine.candidate_rescore = Some(CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "実現可能性調査は、川を横断".to_owned(),
+                right_context: "4分かかるだろう。".to_owned(),
+                reading: engine.reading.clone(),
+                candidates: engine.candidates.clone(),
+            },
+            model_supplemental: vec![false; candidates.len()],
+            generative_consensus: None,
+            candidates,
+        });
+        engine
+            .apply_candidate_rescore(&[0.0, 10.0], 0.8, 0.0)
+            .expect("a contextual approximate quantity should remain structured");
+        assert_eq!(engine.candidates[0], "するには約");
     }
 
     #[test]

@@ -596,6 +596,12 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             .max(preferred_numeric_counter_variant_promotion(conversion))
             .max(assimilated_score_promotion(self.right_context, conversion))
     }
+
+    fn right_structured_promotion(&self, conversion: &Conversion) -> i32 {
+        chronological_year_promotion(self.right_context, conversion).max(
+            approximate_quantity_promotion(self.right_context, conversion),
+        )
+    }
 }
 
 impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
@@ -693,7 +699,7 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(numeric_style_promotion)
             .max(measurement_abbreviation_promotion)
             .max(region_suffix_promotion)
-            .max(chronological_year_promotion(self.right_context, conversion));
+            .max(self.right_structured_promotion(conversion));
         let boundary_adjustment = self.boundary_adjustment(conversion, specialized_promotion);
         repeated_cost
             .saturating_add(boundary_adjustment)
@@ -710,6 +716,62 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .saturating_sub(quotation_reporting_promotion)
             .saturating_sub(foreign_name_honorific_promotion)
     }
+}
+
+fn approximate_quantity_promotion(right_context: &str, conversion: &Conversion) -> i32 {
+    if !right_context_starts_with_quantity(right_context) {
+        return 0;
+    }
+    let [.., case, topic, approximate] = conversion.segments.as_slice() else {
+        return 0;
+    };
+    if case.reading == "に"
+        && case.surface == "に"
+        && topic.reading == "は"
+        && topic.surface == "は"
+        && approximate.reading == "やく"
+        && approximate.surface == "約"
+    {
+        DOCUMENT_APPROXIMATE_QUANTITY_PROMOTION
+    } else {
+        0
+    }
+}
+
+fn right_context_starts_with_quantity(right_context: &str) -> bool {
+    let mut characters = right_context.chars().peekable();
+    let decimal = characters
+        .peek()
+        .copied()
+        .is_some_and(|character| decimal_digit(character).is_some());
+    let japanese = characters
+        .peek()
+        .copied()
+        .is_some_and(is_japanese_numeric_character);
+    if !decimal && !japanese {
+        return false;
+    }
+    if decimal {
+        while characters
+            .peek()
+            .is_some_and(|character| decimal_digit(*character).is_some())
+        {
+            characters.next();
+        }
+    } else {
+        while characters
+            .peek()
+            .is_some_and(|character| is_japanese_numeric_character(*character))
+        {
+            characters.next();
+        }
+    }
+    characters.next().is_some_and(|unit| {
+        matches!(
+            unit,
+            '年' | '月' | '日' | '時' | '分' | '秒' | '件' | '人' | '個' | '回' | '円'
+        )
+    })
 }
 
 fn chronological_year_promotion(right_context: &str, conversion: &Conversion) -> i32 {
@@ -1017,6 +1079,7 @@ const DOCUMENT_STRUCTURED_NOTATION_PROMOTION: i32 = 3_000;
 const DOCUMENT_STRONG_STRUCTURED_NOTATION_PROMOTION: i32 = 4_000;
 const DOCUMENT_NUMERIC_STYLE_PROMOTION: i32 = 3_000;
 const DOCUMENT_CHRONOLOGICAL_YEAR_PROMOTION: i32 = 1_000;
+const DOCUMENT_APPROXIMATE_QUANTITY_PROMOTION: i32 = 750;
 const DOCUMENT_PREFERRED_NUMERIC_COUNTER_VARIANT_PROMOTION: i32 = 750;
 const DOCUMENT_NUMERIC_COMPOUND_COST_CEILING: i32 = 8_500;
 const DOCUMENT_NUMERIC_COMPOUND_PROMOTION_CAP: i32 = 2_500;
@@ -9759,6 +9822,36 @@ mod tests {
             .surface,
             "紀元前511",
             "an unrelated numeric continuation must not imply a chronological year"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_recognizes_an_approximate_quantity_boundary() {
+        let dictionary = Dictionary::bundled();
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "するにはやく",
+                "実現可能性調査は、川を横断",
+                "4分かかるだろう。",
+            )[0]
+            .surface,
+            "するには約"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("はやく", "彼は", "4分で終えた。",)[0]
+                .surface,
+            "早く",
+            "a quantity alone must not split the adverb into a topic and approximation"
+        );
+        assert_ne!(
+            dictionary.candidates_with_surrounding_context(
+                "するにはやく",
+                "実現可能性調査は、川を横断",
+                "分ほどかかるだろう。",
+            )[0]
+            .surface,
+            "するには約",
+            "a unit without a confirmed number is not a quantity boundary"
         );
     }
 

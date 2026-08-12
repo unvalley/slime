@@ -158,12 +158,14 @@ struct DictionaryDocumentContextRanker<'a> {
     right_auxiliary_costs: Vec<DocumentContextualCost<'a>>,
     unique_right_grammar_surface: Option<&'a str>,
     has_polite_right_context: bool,
+    right_grammar_pos_id: Option<u16>,
     unique_right_suru_surface: Option<&'a str>,
     surrounding_notation: Option<(&'static str, i32)>,
     follows_region_name: bool,
     numeric_counter_promotions: Vec<(&'static str, i32)>,
     allows_single_character_phrase_prefix: bool,
     multi_segment_right_phrase_cache: RefCell<Vec<MultiSegmentRightPhraseCacheEntry<'a>>>,
+    multi_segment_right_grammar_cache: RefCell<Vec<MultiSegmentRightGrammarCacheEntry<'a>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -184,6 +186,49 @@ struct MultiSegmentRightPhraseCacheEntry<'a> {
     reading: CompactString,
     prefix_surface: CompactString,
     promotions: Vec<(&'a str, i32)>,
+}
+
+#[derive(Debug)]
+struct MultiSegmentRightGrammarCacheEntry<'a> {
+    reading: CompactString,
+    costs: Vec<DocumentContextualCost<'a>>,
+    unique_surface: Option<&'a str>,
+    protects_strong_kana_surface: bool,
+}
+
+impl MultiSegmentRightGrammarCacheEntry<'_> {
+    fn promotion_for(&self, surface: &str, has_polite_right_context: bool) -> i32 {
+        let contextual = self
+            .costs
+            .iter()
+            .filter(|contextual| contextual.surface == surface)
+            .map(|contextual| {
+                DOCUMENT_MULTI_SEGMENT_RIGHT_GRAMMAR_PROMOTION_CAP
+                    .saturating_sub(contextual.relative_cost)
+                    .clamp(0, DOCUMENT_MULTI_SEGMENT_RIGHT_GRAMMAR_PROMOTION_CAP)
+            })
+            .max()
+            .unwrap_or(0);
+        let unique = if self.unique_surface == Some(surface) {
+            if has_polite_right_context {
+                DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION
+            } else {
+                DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION
+            }
+        } else {
+            0
+        };
+        let promotion = contextual.max(unique);
+        // A multi-character kana verb with a very low dictionary cost is an
+        // established spelling, not merely an unconverted fallback. Grammar
+        // can keep an ideographic alternative visible but must not erase that
+        // lexical evidence on its own.
+        if self.protects_strong_kana_surface {
+            promotion.min(DOCUMENT_STRONG_KANA_GRAMMAR_PROMOTION_CAP)
+        } else {
+            promotion
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +284,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             unique_right_grammar_surface: dictionary
                 .document_unique_right_grammar_surface(reading, right_context),
             has_polite_right_context: starts_with_polite_auxiliary(right_context),
+            right_grammar_pos_id: document_right_grammar_pos_id(right_context),
             unique_right_suru_surface: dictionary
                 .document_unique_right_suru_surface(reading, right_context),
             surrounding_notation: surrounding_structured_notation(
@@ -257,6 +303,7 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
                 .document_numeric_counter_promotions(reading, left_context),
             allows_single_character_phrase_prefix,
             multi_segment_right_phrase_cache: RefCell::new(Vec::new()),
+            multi_segment_right_grammar_cache: RefCell::new(Vec::new()),
         }
     }
 
@@ -408,6 +455,40 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         promotion
     }
 
+    fn multi_segment_right_grammar_promotion(&self, conversion: &Conversion) -> i32 {
+        if self.right_grammar_pos_id.is_none() || conversion.segments.len() < 2 {
+            return 0;
+        }
+        let Some(last) = conversion.segments.last() else {
+            return 0;
+        };
+        let cached = self.multi_segment_right_grammar_cache.borrow();
+        if let Some(entry) = cached.iter().find(|entry| entry.reading == last.reading) {
+            return entry.promotion_for(last.surface.as_str(), self.has_polite_right_context);
+        }
+        drop(cached);
+
+        let costs = self
+            .dictionary
+            .document_right_grammar_costs(&last.reading, self.right_context);
+        let unique_surface = self
+            .dictionary
+            .document_unique_right_grammar_surface(&last.reading, self.right_context);
+        let entry = MultiSegmentRightGrammarCacheEntry {
+            reading: last.reading.as_str().into(),
+            costs,
+            unique_surface,
+            protects_strong_kana_surface: self
+                .dictionary
+                .document_has_strong_kana_verb_surface(&last.reading),
+        };
+        let promotion = entry.promotion_for(last.surface.as_str(), self.has_polite_right_context);
+        self.multi_segment_right_grammar_cache
+            .borrow_mut()
+            .push(entry);
+        promotion
+    }
+
     fn boundary_adjustment(&self, conversion: &Conversion, specialized_promotion: i32) -> i32 {
         if specialized_promotion > 0
             || self.strong_left_phrase_evidence == StrongLeftPhraseEvidence::Present
@@ -511,7 +592,9 @@ impl CandidateRanker for DictionaryDocumentContextRanker<'_> {
             .max(self.multi_segment_right_phrase_promotion(conversion));
         let right_function_word_promotion = self.right_function_word_promotion(conversion);
         let right_particle_promotion = self.right_particle_promotion(conversion);
-        let right_grammar_promotion = self.right_grammar_promotion(conversion);
+        let right_grammar_promotion = self
+            .right_grammar_promotion(conversion)
+            .max(self.multi_segment_right_grammar_promotion(conversion));
         let notation_promotion =
             if structured_notation_matches(left_context, reading, &conversion.surface) {
                 DOCUMENT_STRUCTURED_NOTATION_PROMOTION
@@ -798,6 +881,9 @@ const DOCUMENT_RIGHT_AUXILIARY_PROMOTION_CAP: i32 = 1_500;
 const DOCUMENT_RIGHT_FUNCTION_WORD_PROMOTION_CAP: i32 = 1_100;
 const DOCUMENT_RIGHT_PARTICLE_PROMOTION_CAP: i32 = 1_600;
 const DOCUMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
+const DOCUMENT_MULTI_SEGMENT_RIGHT_GRAMMAR_PROMOTION_CAP: i32 = 1_500;
+const DOCUMENT_STRONG_KANA_GRAMMAR_PROMOTION_CAP: i32 = 1_000;
+const DOCUMENT_STRONG_KANA_VERB_COST_CEILING: i32 = 500;
 const DOCUMENT_UNIQUE_RIGHT_GRAMMAR_PROMOTION: i32 = 1_500;
 const DOCUMENT_UNIQUE_RIGHT_POLITE_PROMOTION: i32 = 2_000;
 const DOCUMENT_UNIQUE_RIGHT_SURU_PROMOTION: i32 = 2_500;
@@ -3246,6 +3332,21 @@ impl Dictionary {
             }
         }
         costs
+    }
+
+    fn document_has_strong_kana_verb_surface(&self, reading: &str) -> bool {
+        if reading.chars().count() < 2 || !reading.chars().all(is_hiragana_character) {
+            return false;
+        }
+        let mut found = false;
+        self.for_each_exact(reading, |entry| {
+            found |= entry.surface == reading
+                && entry.left_id == entry.right_id
+                && (MOZC_INDEPENDENT_VERB_POS_ID_START..=MOZC_INDEPENDENT_VERB_POS_ID_END)
+                    .contains(&entry.left_id)
+                && entry.word_cost <= DOCUMENT_STRONG_KANA_VERB_COST_CEILING;
+        });
+        found
     }
 
     fn document_unique_right_grammar_surface<'s>(
@@ -7541,6 +7642,49 @@ mod tests {
             .surface,
             "模試",
             "ambiguous compatible verb surfaces require semantic evidence"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_applies_grammar_to_the_last_converted_segment() {
+        let dictionary = Dictionary::bundled();
+
+        for (reading, left_context, right_context, expected) in [
+            (
+                "こうしとしてこ",
+                "有名な先生方が",
+                "られています。",
+                "講師として来",
+            ),
+            (
+                "でざーとまでつい",
+                "最後に穀物の珈琲と",
+                "てくるのです。",
+                "デザートまで付い",
+            ),
+        ] {
+            let candidates = dictionary.candidates_with_surrounding_context(
+                reading,
+                left_context,
+                right_context,
+            );
+            assert_eq!(candidates[0].surface, expected, "{candidates:?}");
+        }
+
+        assert_eq!(
+            dictionary.candidates_with_context("こうしとしてこ", "有名な先生方が")[0].surface,
+            "講師としてこ",
+            "the unconfirmed continuation must not be inferred"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "とおもいもよら",
+                "父から励まされる",
+                "ない言葉だった。"
+            )[0]
+            .surface,
+            "と思いもよら",
+            "grammar compatibility alone must not erase a conventional kana form"
         );
     }
 

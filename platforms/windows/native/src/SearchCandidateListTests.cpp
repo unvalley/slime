@@ -124,6 +124,12 @@ void TypeAscii(SlimeHandle *handle, TypedActionCapture &capture,
   }
 }
 
+void EnableTypoCorrection(SlimeHandle *handle) {
+  SlimeBuffer response = slime_set_options_v6(
+      handle, false, false, false, 0, false, kWindowsAllDateFormatMask, true);
+  slime_buffer_destroy(response);
+}
+
 std::size_t CandidateIndex(const TypedActionCapture &capture,
                            const std::string_view expected) {
   const auto found = std::find(capture.candidates.begin(),
@@ -136,6 +142,7 @@ std::size_t CandidateIndex(const TypedActionCapture &capture,
 void TestTypedCorrectionSelectionAndAcceptance() {
   SlimeHandle *handle = slime_create();
   CHECK(handle != nullptr);
+  EnableTypoCorrection(handle);
   TypedActionCapture capture;
   TypeAscii(handle, capture, "nihpn");
   ProcessTyped(handle, capture, SLIME_EVENT_SPACE);
@@ -157,6 +164,7 @@ void TestTypedCorrectionSelectionAndAcceptance() {
 void TestTypedCorrectionPresentationV2() {
   SlimeHandle *handle = slime_create();
   CHECK(handle != nullptr);
+  EnableTypoCorrection(handle);
   TypedActionCaptureV2 capture;
   for (const unsigned char character : std::string_view("nihpn")) {
     CHECK(slime_process_actions_v2(handle, SLIME_EVENT_CHARACTER, character,

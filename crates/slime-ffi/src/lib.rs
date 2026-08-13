@@ -138,7 +138,7 @@ const SHORT_GENITIVE_INPUT_MAX_CHARACTERS: usize = 8;
 #[cfg(any(feature = "neural", test))]
 const SHORT_SURROUNDING_CONTEXT_MAX_CHARACTERS: usize = 4;
 #[cfg(any(feature = "neural", test))]
-const SHORT_SURROUNDING_CONTEXT_CONTRAST_WEIGHT: f64 = 0.25;
+const SHORT_SURROUNDING_CONTEXT_CONTRAST_WEIGHT: f64 = 0.3;
 #[cfg(any(feature = "neural", test))]
 const CONFIRMED_SURNAME_HONORIFIC_CONTEXT_CONTRAST_WEIGHT: f64 = 0.15;
 #[cfg(feature = "neural")]
@@ -257,6 +257,7 @@ fn has_short_semantic_surrounding_context(request: &slime_core::CandidateRescore
     request.reading.chars().count() <= SHORT_SURROUNDING_CONTEXT_MAX_CHARACTERS
         && !request.context.is_empty()
         && !request.right_context.is_empty()
+        && !request.right_context.starts_with('_')
         && !request
             .candidates
             .iter()
@@ -2084,7 +2085,7 @@ mod tests {
 
         assert_close(
             super::context_contrast_weight_for_request(high_accuracy, &request),
-            0.25,
+            0.3,
         );
         assert_close(
             super::context_contrast_weight_for_request(balanced, &request),
@@ -2117,6 +2118,10 @@ mod tests {
             },
             slime_core::CandidateRescoreRequest {
                 right_context: "ない。".to_owned(),
+                ..request.clone()
+            },
+            slime_core::CandidateRescoreRequest {
+                right_context: "_ネット。".to_owned(),
                 ..request.clone()
             },
         ] {

@@ -9,10 +9,11 @@ namespace {
 
 constexpr wchar_t kSettingsWindowClass[] = L"SlimeIME.SettingsWindow";
 constexpr int kWindowWidth = 640;
-constexpr int kWindowHeight = 720;
+constexpr int kWindowHeight = 752;
 
 enum ControlId : int {
   kLiveConversion = 100,
+  kTypoCorrection,
   kHistoryCompletion,
   kHistoryLearning,
   kDictionaryTechnology,
@@ -70,6 +71,7 @@ bool IsChecked(const HWND window, const int id) noexcept {
 void PresentPreferences(const HWND window,
                         const WindowsPreferences &preferences) noexcept {
   SetChecked(window, kLiveConversion, preferences.liveConversion);
+  SetChecked(window, kTypoCorrection, preferences.typoCorrectionEnabled);
   SetChecked(window, kHistoryCompletion, preferences.historyCompletion);
   SetChecked(window, kHistoryLearning, preferences.historyLearning);
   SetChecked(window, kDictionaryTechnology,
@@ -97,6 +99,7 @@ void PresentPreferences(const HWND window,
 WindowsPreferences ReadPreferences(const HWND window) noexcept {
   WindowsPreferences preferences;
   preferences.liveConversion = IsChecked(window, kLiveConversion);
+  preferences.typoCorrectionEnabled = IsChecked(window, kTypoCorrection);
   preferences.historyCompletion = IsChecked(window, kHistoryCompletion);
   preferences.historyLearning = IsChecked(window, kHistoryLearning);
   preferences.dictionaryPacks =
@@ -169,30 +172,33 @@ void CreateSettingsControls(const HWND window,
              L"設定はすべてこのPC内に保存され、入力内容は外部に送信されません。",
              SS_LEFT, 24, 48, 580, 24, 0, dpi, state.font);
 
-  AddControl(window, L"BUTTON", L"変換", BS_GROUPBOX, 20, 82, 590, 74, 0,
+  AddControl(window, L"BUTTON", L"変換", BS_GROUPBOX, 20, 82, 590, 106, 0,
              dpi, state.font);
   AddControl(window, L"BUTTON", L"ライブ変換", BS_AUTOCHECKBOX | WS_TABSTOP,
              38, 110, 220, 28, kLiveConversion, dpi, state.font);
+  AddControl(window, L"BUTTON", L"入力ミスの訂正候補を表示",
+             BS_AUTOCHECKBOX | WS_TABSTOP, 38, 142, 300, 28,
+             kTypoCorrection, dpi, state.font);
 
-  AddControl(window, L"BUTTON", L"入力履歴", BS_GROUPBOX, 20, 166, 590, 102,
+  AddControl(window, L"BUTTON", L"入力履歴", BS_GROUPBOX, 20, 198, 590, 102,
              0, dpi, state.font);
   AddControl(window, L"BUTTON", L"入力履歴を変換候補に使用",
-             BS_AUTOCHECKBOX | WS_TABSTOP, 38, 194, 300, 28,
+             BS_AUTOCHECKBOX | WS_TABSTOP, 38, 226, 300, 28,
              kHistoryCompletion, dpi, state.font);
   AddControl(window, L"BUTTON", L"新しい確定結果を学習",
-             BS_AUTOCHECKBOX | WS_TABSTOP, 38, 226, 300, 28,
+             BS_AUTOCHECKBOX | WS_TABSTOP, 38, 258, 300, 28,
              kHistoryLearning, dpi, state.font);
 
-  AddControl(window, L"BUTTON", L"分野別辞書", BS_GROUPBOX, 20, 278, 590,
+  AddControl(window, L"BUTTON", L"分野別辞書", BS_GROUPBOX, 20, 310, 590,
              132, 0, dpi, state.font);
   AddControl(window, L"BUTTON", L"テクノロジー", BS_AUTOCHECKBOX | WS_TABSTOP,
-             38, 306, 250, 28, kDictionaryTechnology, dpi, state.font);
+             38, 338, 250, 28, kDictionaryTechnology, dpi, state.font);
   AddControl(window, L"BUTTON", L"ビジネス", BS_AUTOCHECKBOX | WS_TABSTOP, 38,
-             338, 250, 28, kDictionaryBusiness, dpi, state.font);
+             370, 250, 28, kDictionaryBusiness, dpi, state.font);
   AddControl(window, L"BUTTON", L"クリエイティブ", BS_AUTOCHECKBOX | WS_TABSTOP,
-             38, 370, 250, 28, kDictionaryCreative, dpi, state.font);
+             38, 402, 250, 28, kDictionaryCreative, dpi, state.font);
 
-  AddControl(window, L"BUTTON", L"日付候補", BS_GROUPBOX, 20, 420, 590, 166,
+  AddControl(window, L"BUTTON", L"日付候補", BS_GROUPBOX, 20, 452, 590, 166,
              0, dpi, state.font);
   const std::array<std::pair<const wchar_t *, int>, 7> dateControls{{
       {L"月/日", kDateShortNumeric},
@@ -208,15 +214,15 @@ void CreateSettingsControls(const HWND window,
     const int row = static_cast<int>(index / 2);
     AddControl(window, L"BUTTON", dateControls[index].first,
                BS_AUTOCHECKBOX | WS_TABSTOP, 38 + column * 280,
-               448 + row * 32, 250, 28, dateControls[index].second, dpi,
+               480 + row * 32, 250, 28, dateControls[index].second, dpi,
                state.font);
   }
 
   AddControl(window, L"BUTTON", L"既定値に戻す", BS_PUSHBUTTON | WS_TABSTOP,
-             310, 608, 130, 34, kRestoreDefaults, dpi, state.font);
+             310, 640, 130, 34, kRestoreDefaults, dpi, state.font);
   AddControl(window, L"BUTTON", L"設定を保存", BS_DEFPUSHBUTTON | WS_TABSTOP,
-             450, 608, 150, 34, kSave, dpi, state.font);
-  state.status = AddControl(window, L"STATIC", L"", SS_LEFT, 24, 654, 576,
+             450, 640, 150, 34, kSave, dpi, state.font);
+  state.status = AddControl(window, L"STATIC", L"", SS_LEFT, 24, 686, 576,
                             34, kStatus, dpi, state.font);
   PresentPreferences(window, state.preferences);
 }

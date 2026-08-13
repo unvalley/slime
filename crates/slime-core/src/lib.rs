@@ -483,6 +483,13 @@ enum TransformStyle {
     HalfAlphanumeric,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TypoCorrectionPolicy {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -500,6 +507,7 @@ pub struct SlimeEngine {
     raw_input: String,
     candidates: Vec<String>,
     candidate_corrections: Vec<CandidateCorrection>,
+    typo_correction_policy: TypoCorrectionPolicy,
     candidate_rescore: Option<CandidateRescoreState>,
     selected: usize,
     candidate_kind: Option<CandidateKind>,
@@ -533,6 +541,7 @@ impl SlimeEngine {
             raw_input: String::new(),
             candidates: Vec::new(),
             candidate_corrections: Vec::new(),
+            typo_correction_policy: TypoCorrectionPolicy::Disabled,
             candidate_rescore: None,
             selected: 0,
             candidate_kind: None,
@@ -615,6 +624,19 @@ impl SlimeEngine {
         self.live_preview_suppressed = false;
         self.refresh_live_preview();
         self.refresh_completion_actions(true)
+    }
+
+    /// Enables optional romaji typo suggestions for explicit conversion.
+    ///
+    /// The feature is disabled by default because a speculative correction can
+    /// crowd out the user's intended conversion even when it is not selected
+    /// automatically. Platform settings must opt in explicitly.
+    pub fn set_typo_correction_enabled(&mut self, enabled: bool) {
+        self.typo_correction_policy = if enabled {
+            TypoCorrectionPolicy::Enabled
+        } else {
+            TypoCorrectionPolicy::Disabled
+        };
     }
 
     pub fn reload_user_data(&mut self) -> Vec<SlimeAction> {
@@ -2276,7 +2298,8 @@ impl SlimeEngine {
     ) {
         let ordinary =
             self.conversion_candidate_set_for_reading_with_limit_and_context(reading, None, None);
-        if self.dictionary.has_exact_reading(reading)
+        if self.typo_correction_policy == TypoCorrectionPolicy::Disabled
+            || self.dictionary.has_exact_reading(reading)
             || self
                 .user_data
                 .exact_dictionary_surfaces(reading)
@@ -5264,6 +5287,7 @@ mod tests {
 
         let dictionary = Dictionary::new(vec![DictionaryEntry::new("にほん", "日本", 10)]);
         let mut correction_engine = SlimeEngine::new(dictionary);
+        correction_engine.set_typo_correction_enabled(true);
         type_text(&mut correction_engine, "nihpn");
         let correction_actions = correction_engine.handle(InputEvent::Space);
         let correction = shown_candidate_details(&correction_actions)
@@ -6565,6 +6589,7 @@ mod tests {
             private_mode: false,
             date_format_mask: ALL_DATE_FORMATS,
         });
+        engine.set_typo_correction_enabled(true);
 
         type_text(&mut engine, "nihpn");
         let original = "にhpん".to_owned();
@@ -6596,6 +6621,24 @@ mod tests {
         assert!(history.contains("にほん\t日本\t1\t"));
         assert!(!history.contains(&format!("{original}\t日本")));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn typo_correction_is_disabled_by_default() {
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "nihpn");
+        let actions = engine.handle(InputEvent::Space);
+
+        assert!(!engine.snapshot().candidates.contains(&"日本".to_owned()));
+        assert!(actions.iter().all(|action| {
+            !matches!(
+                action,
+                SlimeAction::ShowCandidates { details, .. }
+                    if details.iter().any(|detail| {
+                        detail.annotation == CandidateAnnotation::Correction
+                    })
+            )
+        }));
     }
 
     #[test]
@@ -9621,6 +9664,7 @@ mod tests {
         assert!(history.candidate_rescore_request().is_none());
 
         let mut typo = SlimeEngine::bundled();
+        typo.set_typo_correction_enabled(true);
         type_text(&mut typo, "nihpn");
         typo.handle(InputEvent::Space);
         assert!(
@@ -9856,6 +9900,7 @@ mod tests {
             DictionaryEntry::new("にほん", "日本", 0),
         ]);
         let mut engine = SlimeEngine::new(dictionary);
+        engine.set_typo_correction_enabled(true);
         type_text(&mut engine, "nihpn");
         let actions = engine.handle(InputEvent::Space);
 
@@ -9872,6 +9917,7 @@ mod tests {
     #[test]
     fn typo_correction_recovers_one_missing_vowel() {
         let mut engine = SlimeEngine::bundled();
+        engine.set_typo_correction_enabled(true);
         type_text(&mut engine, "nihn");
 
         let actions = engine.handle(InputEvent::Space);

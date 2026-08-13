@@ -25,6 +25,7 @@ fn main() {
 
     run("engine/typo_correction_neighbor", iterations, || {
         let mut engine = SlimeEngine::bundled();
+        engine.set_typo_correction_enabled(true);
         for character in black_box("nihpn").chars() {
             black_box(engine.handle(InputEvent::Character(character)));
         }
@@ -32,6 +33,7 @@ fn main() {
     });
     run("engine/typo_correction_missing_vowel", iterations, || {
         let mut engine = SlimeEngine::bundled();
+        engine.set_typo_correction_enabled(true);
         for character in black_box("nihn").chars() {
             black_box(engine.handle(InputEvent::Character(character)));
         }
@@ -42,6 +44,7 @@ fn main() {
         iterations,
         || {
             let mut engine = SlimeEngine::bundled();
+            engine.set_typo_correction_enabled(true);
             for character in black_box("keka").chars() {
                 black_box(engine.handle(InputEvent::Character(character)));
             }
@@ -53,6 +56,7 @@ fn main() {
         iterations,
         || {
             let mut engine = SlimeEngine::bundled();
+            engine.set_typo_correction_enabled(true);
             for character in black_box("paokon").chars() {
                 black_box(engine.handle(InputEvent::Character(character)));
             }

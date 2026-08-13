@@ -267,12 +267,14 @@ void TestWindowsPreferencesParser() {
   CHECK(ParseWindowsPreferences(
       "[slime-settings-v1]\n"
       "live_conversion=0\n"
+      "typo_correction_enabled=1\n"
       "history_completion=1\n"
       "history_learning=0\n"
       "dictionary_packs=5\n"
       "date_format_mask=65\n",
       parsed));
   CHECK(!parsed.liveConversion);
+  CHECK(parsed.typoCorrectionEnabled);
   CHECK(parsed.historyCompletion);
   CHECK(!parsed.historyLearning);
   CHECK(parsed.dictionaryPacks == 5);
@@ -281,6 +283,7 @@ void TestWindowsPreferencesParser() {
   WindowsPreferences defaults;
   CHECK(ParseWindowsPreferences("[slime-settings-v1]\n", defaults));
   CHECK(defaults == WindowsPreferences{});
+  CHECK(!defaults.typoCorrectionEnabled);
   CHECK(!ParseWindowsPreferences(
       "[slime-settings-v1]\nlive_conversion=1\nlive_conversion=0\n",
       parsed));
@@ -288,7 +291,7 @@ void TestWindowsPreferencesParser() {
       "[slime-settings-v1]\ndictionary_packs=8\n", parsed));
   CHECK(!ParseWindowsPreferences("live_conversion=1\n", parsed));
 
-  const WindowsPreferences expected{false, true, false, 3, 9};
+  const WindowsPreferences expected{false, true, true, false, 3, 9};
   CHECK(ParseWindowsPreferences(SerializeWindowsPreferences(expected), parsed));
   CHECK(parsed == expected);
 }
@@ -299,7 +302,7 @@ void TestWindowsPreferencesAtomicSave() {
   wchar_t path[MAX_PATH]{};
   CHECK(GetTempFileNameW(directory, L"slm", 0, path) != 0);
 
-  const WindowsPreferences expected{false, false, true, 7, 0};
+  const WindowsPreferences expected{false, true, false, true, 7, 0};
   CHECK(SaveWindowsPreferences(path, expected) == ERROR_SUCCESS);
   WindowsPreferences loaded;
   CHECK(LoadWindowsPreferences(path, loaded) ==
@@ -322,7 +325,7 @@ void TestWindowsPreferencesMonitor() {
   {
     WindowsPreferencesMonitor monitor;
     CHECK(monitor.Start(settingsPath));
-    const WindowsPreferences preferences{false, true, true, 2, 3};
+    const WindowsPreferences preferences{false, true, true, true, 2, 3};
     CHECK(SaveWindowsPreferences(settingsPath, preferences) == ERROR_SUCCESS);
     bool observed = false;
     for (int attempt = 0; attempt < 100 && !observed; ++attempt) {

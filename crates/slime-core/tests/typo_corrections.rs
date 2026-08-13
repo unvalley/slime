@@ -21,6 +21,7 @@ fn conservative_typo_fixture_keeps_input_and_labels_every_correction() {
         );
 
         let mut engine = SlimeEngine::bundled();
+        engine.set_typo_correction_enabled(true);
         for character in raw.chars() {
             engine.handle(InputEvent::Character(character));
         }
@@ -96,6 +97,7 @@ fn conservative_typo_fixture_does_not_annotate_known_or_unsupported_input() {
         );
 
         let mut engine = SlimeEngine::bundled();
+        engine.set_typo_correction_enabled(true);
         for character in raw.chars() {
             engine.handle(InputEvent::Character(character));
         }

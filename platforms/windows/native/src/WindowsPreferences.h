@@ -13,6 +13,7 @@ inline constexpr std::uint32_t kWindowsAllDateFormatMask = 0x7f;
 
 struct WindowsPreferences {
   bool liveConversion = true;
+  bool typoCorrectionEnabled = false;
   bool historyCompletion = true;
   bool historyLearning = true;
   std::uint32_t dictionaryPacks = 0;

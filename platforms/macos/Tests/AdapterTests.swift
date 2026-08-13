@@ -25,8 +25,9 @@ enum AdapterTests {
             secureEventInput: false
         )
         try expect(
-            ordinaryInputOptions.historyLearning,
-            "ordinary input should preserve the user's history learning setting"
+            ordinaryInputOptions.historyLearning
+                && !ordinaryInputOptions.typoCorrectionEnabled,
+            "ordinary input should preserve learning and keep typo correction opt-in"
         )
         let secureInputOptions = InputRuntimeOptions(
             liveConversion: true,
@@ -143,6 +144,11 @@ enum AdapterTests {
         )
 
         let typoEngine = try RustEngine(dataDirectory: testDirectory)
+        _ = try typoEngine.setOptions(
+            liveConversion: false,
+            historyCompletion: false,
+            typoCorrectionEnabled: true
+        )
         let typoTextView = NSTextView(frame: .zero)
         for scalar in "nihpn".unicodeScalars {
             for action in try typoEngine.process(.character(scalar)) {

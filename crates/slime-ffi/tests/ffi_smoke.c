@@ -203,6 +203,9 @@ int main(void) {
 
   handle = slime_create();
   assert(handle != NULL);
+  response = slime_set_options_v6(handle, false, false, false, 0, false,
+                                  UINT32_C(0x7f), false);
+  slime_buffer_destroy(response);
   response = slime_set_options(handle, true, false);
   slime_buffer_destroy(response);
   const char *live_input = "raibuhenkannno";

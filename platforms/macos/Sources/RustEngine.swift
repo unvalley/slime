@@ -197,16 +197,18 @@ final class RustEngine {
         historyLearning: Bool? = nil,
         dictionaryPacks: UInt32 = 0,
         privateMode: Bool = false,
-        dateFormatMask: UInt32 = DateCandidateFormat.allMask
+        dateFormatMask: UInt32 = DateCandidateFormat.allMask,
+        typoCorrectionEnabled: Bool = false
     ) throws -> [Action] {
-        let buffer = slime_set_options_v5(
+        let buffer = slime_set_options_v6(
             handle,
             liveConversion,
             historyCompletion,
             historyLearning ?? historyCompletion,
             dictionaryPacks,
             privateMode,
-            dateFormatMask
+            dateFormatMask,
+            typoCorrectionEnabled
         )
         return try decode(buffer)
     }

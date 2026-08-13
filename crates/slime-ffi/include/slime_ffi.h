@@ -184,6 +184,11 @@ SlimeBuffer slime_set_options_v5(SlimeHandle *handle, bool live_conversion,
                              bool history_completion, bool history_learning,
                              uint32_t dictionary_packs, bool private_mode,
                              uint32_t date_format_mask);
+SlimeBuffer slime_set_options_v6(SlimeHandle *handle, bool live_conversion,
+                             bool history_completion, bool history_learning,
+                             uint32_t dictionary_packs, bool private_mode,
+                             uint32_t date_format_mask,
+                             bool typo_correction_enabled);
 SlimeBuffer slime_begin_reconversion(SlimeHandle *handle,
                                  const uint8_t *surface, size_t surface_len);
 /* Breaks transient document context after an external caret, document, or client

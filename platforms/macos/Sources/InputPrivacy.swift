@@ -5,6 +5,7 @@ struct InputRuntimeOptions: Equatable {
     let liveConversion: Bool
     let historyCompletion: Bool
     let historyLearning: Bool
+    let typoCorrectionEnabled: Bool
     let dictionaryPacks: UInt32
     let privateMode: Bool
     let dateFormatMask: UInt32
@@ -16,12 +17,14 @@ struct InputRuntimeOptions: Equatable {
         dictionaryPacks: UInt32,
         secureEventInput: Bool,
         privateMode: Bool = InputPrivacySession.isPrivate,
-        dateFormatMask: UInt32 = DateCandidateFormat.allMask
+        dateFormatMask: UInt32 = DateCandidateFormat.allMask,
+        typoCorrectionEnabled: Bool = false
     ) {
         self.liveConversion = liveConversion
         self.privateMode = privateMode || secureEventInput
         self.historyCompletion = historyCompletion && !self.privateMode
         self.historyLearning = historyLearning && !self.privateMode
+        self.typoCorrectionEnabled = typoCorrectionEnabled
         self.dictionaryPacks = dictionaryPacks
         self.dateFormatMask = dateFormatMask
     }

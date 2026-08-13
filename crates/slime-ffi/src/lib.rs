@@ -1338,6 +1338,40 @@ pub unsafe extern "C" fn slime_set_options_v5(
     }
 }
 
+/// Updates all runtime options, including opt-in romaji typo suggestions.
+///
+/// # Safety
+///
+/// `handle` must be a live, exclusively accessed pointer returned by an IME
+/// creation function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slime_set_options_v6(
+    handle: *mut SlimeHandle,
+    live_conversion: bool,
+    history_completion: bool,
+    history_learning: bool,
+    dictionary_packs: u32,
+    private_mode: bool,
+    date_format_mask: u32,
+    typo_correction_enabled: bool,
+) -> SlimeBuffer {
+    // SAFETY: This function's contract requires a live, exclusive handle.
+    unsafe {
+        engine_control(handle, |engine| {
+            let actions = engine.set_preferences(EnginePreferences {
+                live_conversion,
+                history_completion,
+                history_learning,
+                dictionary_packs,
+                private_mode,
+                date_format_mask,
+            });
+            engine.set_typo_correction_enabled(typo_correction_enabled);
+            actions
+        })
+    }
+}
+
 /// Starts explicit reconversion of a selected committed UTF-8 surface.
 ///
 /// # Safety
@@ -1956,12 +1990,31 @@ mod tests {
         slime_process_actions_v2, slime_record_external_selection, slime_reset_context,
         slime_set_external_context, slime_set_external_left_context, slime_set_options,
         slime_set_options_v2, slime_set_options_v3, slime_set_options_v4, slime_set_options_v5,
+        slime_set_options_v6,
     };
     use std::ffi::c_void;
     use std::fs;
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < f64::EPSILON);
+    }
+
+    fn enable_typo_correction(handle: *mut super::SlimeHandle) {
+        // SAFETY: Test handles are live and used serially.
+        let buffer = unsafe {
+            slime_set_options_v6(
+                handle,
+                false,
+                false,
+                false,
+                0,
+                false,
+                slime_core::ALL_DATE_FORMATS,
+                true,
+            )
+        };
+        // SAFETY: The returned buffer is released exactly once.
+        unsafe { slime_buffer_destroy(buffer) };
     }
 
     #[test]
@@ -3274,6 +3327,7 @@ mod tests {
     #[test]
     fn typo_annotation_crosses_json_and_typed_action_boundaries() {
         let json_handle = slime_create();
+        enable_typo_correction(json_handle);
         for character in "nihpn".chars() {
             // SAFETY: The handle is live and used serially.
             let buffer = unsafe { slime_process(json_handle, EVENT_CHARACTER, character.into()) };
@@ -3296,6 +3350,7 @@ mod tests {
         }
 
         let typed_handle = slime_create();
+        enable_typo_correction(typed_handle);
         let mut capture = TypedCapture::default();
         for character in "nihpn".chars() {
             // SAFETY: Pointers remain live for the synchronous callback.
@@ -3366,8 +3421,31 @@ mod tests {
     }
 
     #[test]
+    fn typo_correction_requires_explicit_ffi_opt_in() {
+        let handle = slime_create();
+        for character in "nihpn".chars() {
+            // SAFETY: The handle is live and used serially.
+            let buffer = unsafe { slime_process(handle, EVENT_CHARACTER, character.into()) };
+            // SAFETY: The returned buffer is released exactly once.
+            unsafe { slime_buffer_destroy(buffer) };
+        }
+        // SAFETY: The handle is live and used serially.
+        let buffer = unsafe { slime_process(handle, EVENT_SPACE, 0) };
+        // SAFETY: The buffer remains live while copied.
+        let json = unsafe { copy_buffer(&buffer) };
+        assert!(!json.contains("に訂正）"), "{json}");
+        assert!(!json.contains("\"annotation\":3"), "{json}");
+        // SAFETY: Both resources are live and released exactly once.
+        unsafe {
+            slime_buffer_destroy(buffer);
+            slime_destroy(handle);
+        }
+    }
+
+    #[test]
     fn correction_metadata_crosses_v2_typed_actions() {
         let handle = slime_create();
+        enable_typo_correction(handle);
         let mut capture = TypedCaptureV2::default();
         for character in "nihpn".chars() {
             // SAFETY: Pointers remain live for the synchronous callback.

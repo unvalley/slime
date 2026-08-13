@@ -492,10 +492,10 @@ void ApplyWindowsPreferences(SlimeHandle *engine,
   if (engine == nullptr) {
     return;
   }
-  SlimeBuffer response = slime_set_options_v5(
+  SlimeBuffer response = slime_set_options_v6(
       engine, preferences.liveConversion, preferences.historyCompletion,
       preferences.historyLearning, preferences.dictionaryPacks, privateMode,
-      preferences.dateFormatMask);
+      preferences.dateFormatMask, preferences.typoCorrectionEnabled);
   slime_buffer_destroy(response);
 }
 

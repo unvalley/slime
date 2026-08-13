@@ -14,6 +14,7 @@ enum IMEPreferences {
     private static let liveConversionKey = "liveConversion"
     private static let historyCompletionKey = "historyCompletion"
     private static let historyLearningKey = "historyLearning"
+    private static let typoCorrectionEnabledKey = "typoCorrectionEnabled"
     private static let dictionaryPacksKey = "dictionaryPacks"
     private static let dateCandidateFormatsKey = "dateCandidateFormats"
 
@@ -45,6 +46,14 @@ enum IMEPreferences {
         }
         set {
             UserDefaults.standard.set(newValue, forKey: historyLearningKey)
+            NotificationCenter.default.post(name: .unvalleyPreferencesDidChange, object: nil)
+        }
+    }
+
+    static var typoCorrectionEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: typoCorrectionEnabledKey) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: typoCorrectionEnabledKey)
             NotificationCenter.default.post(name: .unvalleyPreferencesDidChange, object: nil)
         }
     }

@@ -48,6 +48,14 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    var typoCorrectionEnabled: Bool {
+        get { IMEPreferences.typoCorrectionEnabled }
+        set {
+            objectWillChange.send()
+            IMEPreferences.typoCorrectionEnabled = newValue
+        }
+    }
+
     func isDateCandidateFormatEnabled(_ format: DateCandidateFormat) -> Bool {
         IMEPreferences.dateCandidateFormats & format.rawValue != 0
     }
@@ -343,6 +351,13 @@ private struct GeneralSettingsView: View {
                     set: { model.liveConversion = $0 }
                 ))
                 Text("確度の高い部分だけを変換し、曖昧な末尾はかなのまま保ちます。Escapeで現在の入力中は停止できます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("入力ミスの訂正候補を表示", isOn: Binding(
+                    get: { model.typoCorrectionEnabled },
+                    set: { model.typoCorrectionEnabled = $0 }
+                ))
+                Text("辞書にないローマ字入力から訂正候補を探します。通常の変換を妨げることがあるため、初期状態ではオフです。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

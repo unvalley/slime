@@ -370,6 +370,7 @@ struct InputResult {
 fn evaluate_input(raw_input: &str) -> InputResult {
     let started = Instant::now();
     let mut engine = SlimeEngine::bundled();
+    engine.set_typo_correction_enabled(true);
     for character in raw_input.chars() {
         engine.handle(InputEvent::Character(character));
     }

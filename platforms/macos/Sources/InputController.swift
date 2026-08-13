@@ -297,7 +297,8 @@ final class SlimeController: IMKInputController {
             historyLearning: IMEPreferences.historyLearning,
             dictionaryPacks: IMEPreferences.dictionaryPacks,
             secureEventInput: secureEventInputIsEnabled(),
-            dateFormatMask: IMEPreferences.dateCandidateFormats
+            dateFormatMask: IMEPreferences.dateCandidateFormats,
+            typoCorrectionEnabled: IMEPreferences.typoCorrectionEnabled
         )
         guard force || options != appliedOptions else {
             return true
@@ -311,7 +312,8 @@ final class SlimeController: IMKInputController {
                 historyLearning: options.historyLearning,
                 dictionaryPacks: options.dictionaryPacks,
                 privateMode: options.privateMode,
-                dateFormatMask: options.dateFormatMask
+                dateFormatMask: options.dateFormatMask,
+                typoCorrectionEnabled: options.typoCorrectionEnabled
             )
             appliedOptions = options
             if previousPrivateMode != options.privateMode {

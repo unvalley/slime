@@ -108,6 +108,9 @@ bool ParseWindowsPreferences(const std::string_view contents,
         if (key == "live_conversion") {
           bit = 1U << 0;
           valid = ParseBool(value, parsed.liveConversion);
+        } else if (key == "typo_correction_enabled") {
+          bit = 1U << 5;
+          valid = ParseBool(value, parsed.typoCorrectionEnabled);
         } else if (key == "history_completion") {
           bit = 1U << 1;
           valid = ParseBool(value, parsed.historyCompletion);
@@ -153,6 +156,8 @@ std::string SerializeWindowsPreferences(
   result.append(kSettingsHeader);
   result.append("\r\nlive_conversion=");
   result.push_back(preferences.liveConversion ? '1' : '0');
+  result.append("\r\ntypo_correction_enabled=");
+  result.push_back(preferences.typoCorrectionEnabled ? '1' : '0');
   result.append("\r\nhistory_completion=");
   result.push_back(preferences.historyCompletion ? '1' : '0');
   result.append("\r\nhistory_learning=");

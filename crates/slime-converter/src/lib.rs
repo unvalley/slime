@@ -321,7 +321,14 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             has_polite_right_context: starts_with_polite_auxiliary(right_context),
             right_grammar_pos_id: document_right_grammar_pos_id(right_context),
             unique_right_suru_surface: dictionary
-                .document_unique_right_suru_surface(reading, right_context),
+                .document_unique_right_suru_surface(reading, right_context)
+                .or_else(|| {
+                    dictionary.document_unique_right_passive_suffix_surface(
+                        reading,
+                        left_context,
+                        right_context,
+                    )
+                }),
             surrounding_notation: surrounding_structured_notation(
                 left_context,
                 reading,
@@ -1320,6 +1327,9 @@ const MOZC_CAUSATIVE_SASERU_CONTINUATIVE_POS_ID: u16 = 482;
 const MOZC_CAUSATIVE_SERU_CONTINUATIVE_POS_ID: u16 = 484;
 const MOZC_PASSIVE_RARERU_CONTINUATIVE_POS_ID: u16 = 485;
 const MOZC_PASSIVE_RERU_CONTINUATIVE_POS_ID: u16 = 486;
+const MOZC_SURU_PASSIVE_STEM_POS_ID: u16 = 636;
+const MOZC_SAHEN_SUFFIX_POS_ID_START: u16 = 1_936;
+const MOZC_SAHEN_SUFFIX_POS_ID_END: u16 = 1_948;
 const MOZC_YOU_GENERAL_SUFFIX_NOUN_POS_ID: u16 = 1_950;
 const MOZC_COUNTER_POS_ID: u16 = 2_011;
 const MOZC_KOTO_NON_INDEPENDENT_NOUN_POS_ID: u16 = 2_066;
@@ -4779,6 +4789,51 @@ impl Dictionary {
             .get(1)
             .is_none_or(|(_, next_cost)| {
                 *next_cost > cost.saturating_add(DOCUMENT_UNIQUE_RIGHT_SURU_COMPATIBILITY_MARGIN)
+            })
+            .then_some(surface)
+    }
+
+    fn document_unique_right_passive_suffix_surface<'s>(
+        &'s self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+    ) -> Option<&'s str> {
+        if !self.uses_connection_costs
+            || !right_context.starts_with("され")
+            || !left_context
+                .chars()
+                .next_back()
+                .is_some_and(is_ideographic_character)
+        {
+            return None;
+        }
+        let connection = ConnectionMatrix::bundled();
+        let mut surface_costs = Vec::<(&str, i32)>::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.left_id != entry.right_id
+                || !(MOZC_SAHEN_SUFFIX_POS_ID_START..=MOZC_SAHEN_SUFFIX_POS_ID_END)
+                    .contains(&entry.left_id)
+                || entry.surface == reading
+            {
+                return;
+            }
+            let transition_cost = connection.cost(entry.right_id, MOZC_SURU_PASSIVE_STEM_POS_ID);
+            if let Some((_, cost)) = surface_costs
+                .iter_mut()
+                .find(|(surface, _)| *surface == entry.surface)
+            {
+                *cost = (*cost).min(transition_cost);
+            } else {
+                surface_costs.push((entry.surface, transition_cost));
+            }
+        });
+        surface_costs.sort_unstable_by_key(|(_, cost)| *cost);
+        let (surface, cost) = surface_costs.first().copied()?;
+        surface_costs
+            .get(1)
+            .is_none_or(|(_, next_cost)| {
+                *next_cost > cost.saturating_add(DOCUMENT_RIGHT_GRAMMAR_COMPATIBILITY_MARGIN)
             })
             .then_some(surface)
     }
@@ -9969,16 +10024,25 @@ mod tests {
             "止まる",
             "the binding particle しか must not be parsed as a suru inflection"
         );
-        assert!(
-            dictionary
-                .candidates_with_surrounding_context(
-                    "し",
-                    "星取り参加は当然とされ,不参加は白眼",
-                    "される。"
-                )
-                .iter()
-                .any(|candidate| candidate.surface == "視"),
-            "a broad passive-form rule must not evict an otherwise visible candidate"
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "し",
+                "星取り参加は当然とされ,不参加は白眼",
+                "される。"
+            )[0]
+            .surface,
+            "視",
+            "a passive suru suffix must connect to the preceding noun"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "かんか",
+                "特殊な事情は",
+                "されてはならない。"
+            )[0]
+            .surface,
+            "感化",
+            "passive syntax alone must not choose between verbal nouns"
         );
     }
 

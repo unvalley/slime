@@ -151,6 +151,7 @@ struct DictionaryDocumentContextRanker<'a> {
     boundary_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     right_phrase_promotions: Vec<DocumentBoundaryPromotion<'a>>,
     strong_left_phrase_evidence: StrongLeftPhraseEvidence,
+    unique_person_name_surface: Option<&'a str>,
     right_function_word_costs: Vec<DocumentContextualCost<'a>>,
     right_particle_costs: Vec<DocumentContextualCost<'a>>,
     right_general_noun_evidence: RightGeneralNounEvidence,
@@ -295,12 +296,15 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
             left_context,
             allows_single_character_phrase_prefix,
         );
+        let unique_person_name_surface = dictionary
+            .document_unique_person_name_continuation_surface(reading, left_context, right_context);
         Self {
             dictionary,
             right_context,
             boundary_promotions: dictionary.document_boundary_promotions(reading, left_context),
             right_phrase_promotions,
             strong_left_phrase_evidence,
+            unique_person_name_surface,
             right_function_word_costs: dictionary
                 .document_right_function_word_costs(reading, right_context),
             right_particle_costs: dictionary.document_right_particle_costs(reading, right_context),
@@ -760,7 +764,15 @@ impl<'a> DictionaryDocumentContextRanker<'a> {
         } else {
             0
         };
+        let person_name = if conversion.segments.len() == 1
+            && self.unique_person_name_surface == Some(conversion.surface.as_str())
+        {
+            DOCUMENT_UNIQUE_PERSON_NAME_PROMOTION
+        } else {
+            0
+        };
         phrase
+            .max(person_name)
             .max(notation)
             .max(self.numeric_counter_promotion(conversion))
             .max(numeric_style)
@@ -1269,6 +1281,7 @@ const DOCUMENT_PHRASE_PROMOTION: i32 = 3_500;
 // Competing left phrases or any exact right phrase retain the regular cap.
 const DOCUMENT_UNIQUE_PHRASE_COST_CEILING: i32 = 11_500;
 const DOCUMENT_UNIQUE_PHRASE_PROMOTION: i32 = 5_200;
+const DOCUMENT_UNIQUE_PERSON_NAME_PROMOTION: i32 = 5_000;
 const DOCUMENT_RIGHT_SHORT_PHRASE_COST_CEILING: i32 = 6_300;
 const DOCUMENT_RIGHT_SIBLING_PHRASE_COST_CEILING: i32 = 7_500;
 const DOCUMENT_RIGHT_COORDINATION_PHRASE_COST_CEILING: i32 = 9_300;
@@ -3928,6 +3941,91 @@ impl Dictionary {
             allows_single_character_prefix,
             false,
         )
+    }
+
+    fn document_unique_person_name_continuation_surface<'s>(
+        &'s self,
+        reading: &str,
+        left_context: &str,
+        right_context: &str,
+    ) -> Option<&'s str> {
+        if !self.uses_connection_costs
+            || !starts_with_copula(right_context)
+            || left_context
+                .chars()
+                .next_back()
+                .is_none_or(|character| !is_ideographic_character(character))
+        {
+            return None;
+        }
+        let compact = self.bundled?;
+        let mut given_name_surfaces = Vec::new();
+        self.for_each_exact(reading, |entry| {
+            if entry.left_id == MOZC_PERSONAL_GIVEN_NAME_POS_ID
+                && entry.surface != reading
+                && !given_name_surfaces.contains(&entry.surface)
+            {
+                given_name_surfaces.push(entry.surface);
+            }
+        });
+        if given_name_surfaces.is_empty() {
+            return None;
+        }
+
+        let context_start = left_context
+            .char_indices()
+            .rev()
+            .nth(DOCUMENT_PHRASE_MAX_PREFIX_CHARACTERS.saturating_sub(1))
+            .map_or(0, |(index, _)| index);
+        let context_tail = &left_context[context_start..];
+        let context_characters = context_tail.chars().count();
+        let mut surface = None;
+        let mut ambiguous = false;
+        for (position, (index, _)) in context_tail.char_indices().enumerate() {
+            let prefix_characters = context_characters - position;
+            if prefix_characters < DOCUMENT_PHRASE_MIN_PREFIX_CHARACTERS {
+                break;
+            }
+            let surname_surface = &context_tail[index..];
+            compact.for_each_surface_reading_entry(
+                surname_surface,
+                |surname_reading, surname_entry| {
+                    if ambiguous || surname_entry.right_id != MOZC_PERSONAL_SURNAME_POS_ID {
+                        return;
+                    }
+                    let mut full_reading = CompactString::with_capacity(
+                        surname_reading.len().saturating_add(reading.len()),
+                    );
+                    full_reading.push_str(surname_reading);
+                    full_reading.push_str(reading);
+                    compact.for_each_exact(&full_reading, |full_name| {
+                        if ambiguous
+                            || full_name.left_id != MOZC_PERSONAL_SURNAME_POS_ID
+                            || full_name.right_id != MOZC_PERSONAL_GIVEN_NAME_POS_ID
+                        {
+                            return;
+                        }
+                        let Some(given_name_surface) =
+                            full_name.surface.strip_prefix(surname_surface)
+                        else {
+                            return;
+                        };
+                        if !given_name_surfaces.contains(&given_name_surface) {
+                            return;
+                        }
+                        if surface.is_some_and(|current| current != given_name_surface) {
+                            ambiguous = true;
+                        } else {
+                            surface = Some(given_name_surface);
+                        }
+                    });
+                },
+            );
+            if ambiguous {
+                return None;
+            }
+        }
+        (!ambiguous).then_some(surface).flatten()
     }
 
     fn document_non_person_phrase_word_cost(
@@ -9141,6 +9239,28 @@ mod tests {
             dictionary.candidates_with_context("かき", "防御")[0].surface,
             "垣",
             "a kanji word ending in 御 is not an honorific boundary"
+        );
+    }
+
+    #[test]
+    fn surrounding_context_prefers_an_exact_full_name_before_a_copula() {
+        let dictionary = Dictionary::bundled();
+
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context(
+                "ゆき",
+                "同じく11代目として登場したのが松熊",
+                "である。",
+            )[0]
+            .surface,
+            "由紀"
+        );
+        assert_eq!(
+            dictionary.candidates_with_surrounding_context("ゆき", "今日は松熊", "が降り続いた。",)
+                [0]
+            .surface,
+            "雪",
+            "a full-name entry must not override a non-copular continuation"
         );
     }
 

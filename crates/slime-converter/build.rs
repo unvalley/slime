@@ -38,6 +38,7 @@ fn main() {
 }
 
 fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Path) {
+    let person_name_surname_prefixes = full_name_surname_prefixes(by_reading);
     let productive_single_character_suffixes = by_reading
         .values()
         .flatten()
@@ -58,7 +59,10 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
                 &general_noun_single_character_suffixes,
             );
             if entry.surface == *reading
-                || (entry.word_cost > MAX_RECONVERSION_WORD_COST && !context_phrase_entry)
+                || (entry.word_cost > MAX_RECONVERSION_WORD_COST
+                    && !context_phrase_entry
+                    && !person_name_surname_prefixes
+                        .contains(&(reading.as_str(), entry.surface.as_str())))
             {
                 continue;
             }
@@ -111,6 +115,35 @@ fn write_reverse_dictionary(by_reading: &BTreeMap<String, Vec<Entry>>, out: &Pat
     fs::write(out.join("mozc-reverse.bin"), blocks).expect("write reverse blocks");
     fs::write(out.join("mozc-reverse-readings.bin"), reading_pool)
         .expect("write reverse reading pool");
+}
+
+fn full_name_surname_prefixes(by_reading: &BTreeMap<String, Vec<Entry>>) -> HashSet<(&str, &str)> {
+    let surnames = by_reading
+        .iter()
+        .flat_map(|(reading, entries)| {
+            entries
+                .iter()
+                .filter(|entry| entry.right_id == MOZC_PERSONAL_SURNAME_POS_ID)
+                .map(|entry| (reading.as_str(), entry.surface.as_str()))
+        })
+        .collect::<HashSet<_>>();
+    let mut prefixes = HashSet::new();
+    for (reading, entries) in by_reading {
+        for entry in entries.iter().filter(|entry| {
+            entry.left_id == MOZC_PERSONAL_SURNAME_POS_ID
+                && entry.right_id == MOZC_PERSONAL_GIVEN_NAME_POS_ID
+        }) {
+            for (reading_end, _) in reading.char_indices().skip(1) {
+                for (surface_end, _) in entry.surface.char_indices().skip(1) {
+                    let prefix = (&reading[..reading_end], &entry.surface[..surface_end]);
+                    if surnames.contains(&prefix) {
+                        prefixes.insert(prefix);
+                    }
+                }
+            }
+        }
+    }
+    prefixes
 }
 
 fn is_non_person_context_evidence_entry(entry: &Entry) -> bool {

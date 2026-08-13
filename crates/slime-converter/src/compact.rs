@@ -127,6 +127,15 @@ impl CompactDictionary {
         surface: &str,
         mut callback: impl FnMut(CompactEntry),
     ) {
+        self.for_each_surface_reading_entry(surface, |_, entry| callback(entry));
+    }
+
+    /// Calls `callback` with the reading for every exact surface entry.
+    pub(crate) fn for_each_surface_reading_entry(
+        &self,
+        surface: &str,
+        mut callback: impl FnMut(&'static str, CompactEntry),
+    ) {
         let Some(output) = self.reverse_fst.get(surface.as_bytes()) else {
             return;
         };
@@ -140,7 +149,7 @@ impl CompactDictionary {
             cursor += 2;
             self.for_each_exact(reading, |entry| {
                 if entry.surface == surface {
-                    callback(entry);
+                    callback(reading, entry);
                 }
             });
         }
@@ -484,9 +493,21 @@ mod tests {
     fn reverse_index_visits_matching_surface_entries_without_allocating() {
         let dictionary = CompactDictionary::bundled();
         let mut entries = Vec::new();
-        dictionary.for_each_surface_entry("東海", |entry| {
-            entries.push((entry.left_id, entry.right_id));
+        dictionary.for_each_surface_reading_entry("東海", |reading, entry| {
+            entries.push((reading, entry.left_id, entry.right_id));
         });
-        assert!(entries.contains(&(1924, 1924)), "entries: {entries:?}");
+        assert!(
+            entries.contains(&("とうかい", 1924, 1924)),
+            "entries: {entries:?}"
+        );
+
+        let mut surnames = Vec::new();
+        dictionary.for_each_surface_reading_entry("松熊", |reading, entry| {
+            surnames.push((reading, entry.left_id, entry.right_id));
+        });
+        assert!(
+            surnames.contains(&("まつくま", 1923, 1923)),
+            "a surname that prefixes a full name must remain in the reverse index: {surnames:?}"
+        );
     }
 }

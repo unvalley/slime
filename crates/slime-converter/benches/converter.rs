@@ -13,6 +13,7 @@ fn main() {
         black_box(dictionary.candidates(black_box("にほん")));
     });
     run_phrase_context_benchmarks(&dictionary, iterations);
+    run_person_name_context_benchmarks(&dictionary, iterations);
     run_numeric_context_benchmarks(&dictionary, iterations);
     run_superlative_prefix_context_benchmark(&dictionary, iterations);
     run_honorific_prefix_context_benchmark(&dictionary, iterations);
@@ -143,6 +144,23 @@ fn run_personal_name_guard_benchmarks(dictionary: &Dictionary, iterations: u64) 
             ));
         },
     );
+}
+
+fn run_person_name_context_benchmarks(dictionary: &Dictionary, iterations: u64) {
+    run("converter/person_name_context_match", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("ゆき"),
+            black_box("同じく11代目として登場したのが松熊"),
+            black_box("である。"),
+        ));
+    });
+    run("converter/person_name_context_nonmatch", iterations, || {
+        black_box(dictionary.candidates_with_surrounding_context(
+            black_box("ゆき"),
+            black_box("今日は松熊"),
+            black_box("が降り続いた。"),
+        ));
+    });
 }
 
 fn run_model_guard_benchmarks(dictionary: &Dictionary, iterations: u64) {

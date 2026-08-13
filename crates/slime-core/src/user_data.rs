@@ -518,24 +518,57 @@ impl UserData {
         reading: &str,
         surface: &str,
     ) {
-        if !is_useful_context_anchor(previous_reading, previous_surface)
-            || !is_useful_history(reading, surface)
-        {
+        self.record_contexts([(previous_reading, previous_surface, reading, surface)]);
+    }
+
+    /// Records all useful edges from one confirmed conversion with one
+    /// optimistic file update. A long conversion may contain several useful
+    /// segments; persisting them separately would repeatedly parse and replace
+    /// the same history file on the commit path.
+    pub(crate) fn record_contexts<'a>(
+        &mut self,
+        contexts: impl IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+    ) {
+        let contexts = contexts
+            .into_iter()
+            .filter(|(previous_reading, previous_surface, reading, surface)| {
+                is_useful_context_anchor(previous_reading, previous_surface)
+                    && is_useful_history(reading, surface)
+            })
+            .map(|(previous_reading, previous_surface, reading, surface)| {
+                (
+                    previous_reading.to_owned(),
+                    previous_surface.to_owned(),
+                    reading.to_owned(),
+                    surface.to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut unique_contexts = Vec::with_capacity(contexts.len());
+        for context in contexts {
+            if !unique_contexts.contains(&context) {
+                unique_contexts.push(context);
+            }
+        }
+        let contexts = unique_contexts;
+        if contexts.is_empty() {
             return;
         }
 
         let wall_clock = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
-        let now = next_context_last_used(&self.context_history, wall_clock);
-        update_context_history(
-            &mut self.context_history,
-            previous_reading,
-            previous_surface,
-            reading,
-            surface,
-            now,
-        );
+        for (previous_reading, previous_surface, reading, surface) in &contexts {
+            let now = next_context_last_used(&self.context_history, wall_clock);
+            update_context_history(
+                &mut self.context_history,
+                previous_reading,
+                previous_surface,
+                reading,
+                surface,
+                now,
+            );
+        }
         trim_context_history(&mut self.context_history);
 
         let Some(directory) = &self.directory else {
@@ -546,15 +579,7 @@ impl UserData {
         }
 
         let path = directory.join(CONTEXT_HISTORY_FILE);
-        if write_context_history_optimistically(
-            &path,
-            previous_reading,
-            previous_surface,
-            reading,
-            surface,
-            now,
-        )
-        .is_ok()
+        if write_context_history_optimistically(&path, &contexts, wall_clock).is_ok()
             && let Ok(Some(bytes)) = read_optional(&path)
             && let Ok(history) = parse_context_history(&bytes)
         {
@@ -1037,10 +1062,7 @@ fn write_history_preference_optimistically(
 
 fn write_context_history_optimistically(
     path: &Path,
-    previous_reading: &str,
-    previous_surface: &str,
-    reading: &str,
-    surface: &str,
+    contexts: &[(String, String, String, String)],
     last_used: u64,
 ) -> io::Result<()> {
     for _ in 0..3 {
@@ -1051,15 +1073,17 @@ fn write_context_history_optimistically(
             })?,
             None => Vec::new(),
         };
-        let last_used = next_context_last_used(&history, last_used);
-        update_context_history(
-            &mut history,
-            previous_reading,
-            previous_surface,
-            reading,
-            surface,
-            last_used,
-        );
+        for (previous_reading, previous_surface, reading, surface) in contexts {
+            let last_used = next_context_last_used(&history, last_used);
+            update_context_history(
+                &mut history,
+                previous_reading,
+                previous_surface,
+                reading,
+                surface,
+                last_used,
+            );
+        }
         trim_context_history(&mut history);
         let proposed = serialize_context_history(&history);
         if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
@@ -1212,6 +1236,27 @@ mod tests {
         let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
         assert!(context.starts_with(CONTEXT_HISTORY_HEADER));
         assert!(context.contains("ぶんしょう\t文章\tかんじ\t漢字\t2\t"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn one_confirmed_conversion_counts_a_repeated_edge_once() {
+        let directory = test_directory("context-history-batch-deduplication");
+        let mut data = UserData::load(&directory);
+
+        data.record_contexts([
+            ("へや", "部屋", "しょうめい", "照明"),
+            ("へや", "部屋", "しょうめい", "照明"),
+        ]);
+
+        assert!(
+            data.contextual_history_surfaces("へや", "部屋", "しょうめい")
+                .is_empty(),
+            "one conversion must not satisfy the repetition gate"
+        );
+        let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
+        assert!(context.contains("へや\t部屋\tしょうめい\t照明\t1\t"));
 
         fs::remove_dir_all(directory).unwrap();
     }

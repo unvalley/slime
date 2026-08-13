@@ -80,6 +80,7 @@ fn main() {
 
     run_history_benchmarks((iterations / 10).clamp(1_000, 5_000));
     run_adaptive_context_benchmarks((iterations / 10).clamp(1_000, 5_000));
+    run_confirmed_context_commit_benchmark((iterations / 10).clamp(1_000, 5_000));
     run_static_context_pack_benchmarks((iterations / 10).clamp(1_000, 5_000));
 
     let live_iterations = (iterations / 100).clamp(100, 500);
@@ -106,6 +107,23 @@ fn main() {
             },
         );
     }
+}
+
+fn run_confirmed_context_commit_benchmark(iterations: u64) {
+    let mut engine = SlimeEngine::bundled();
+    black_box(engine.set_preferences(EnginePreferences {
+        live_conversion: false,
+        history_completion: true,
+        history_learning: true,
+        dictionary_packs: 0,
+        private_mode: false,
+        date_format_mask: ALL_DATE_FORMATS,
+    }));
+
+    run("engine/confirmed_phrase_commit", iterations, || {
+        engine.reset_context();
+        commit_reading(&mut engine, "heyashoumei", "部屋照明");
+    });
 }
 
 fn run_static_context_pack_benchmarks(iterations: u64) {

@@ -3185,50 +3185,55 @@ impl SlimeEngine {
 
     fn record_conversion_history(&mut self, reading: &str, surface: &str) {
         if self.preferences.history_learning && !self.preferences.private_mode {
-            let selected_segments: Vec<_> = self
-                .segments
+            let confirmed_segments = if self.segments.is_empty() {
+                self.dictionary
+                    .convert_n_best_with_surface_prefix(reading, surface, 1)
+                    .into_iter()
+                    .find(|conversion| conversion.surface == surface)
+                    .map_or_else(Vec::new, |conversion| {
+                        conversion
+                            .segments
+                            .into_iter()
+                            .map(editable_segment)
+                            .collect()
+                    })
+            } else {
+                self.segments.clone()
+            };
+            let segment_contexts: Vec<_> = confirmed_segments
                 .iter()
                 .enumerate()
-                .filter(|(_, segment)| segment.explicitly_selected)
                 .map(|(index, segment)| {
                     (
                         segment.reading.clone(),
                         segment.surface.clone(),
-                        self.segment_context_before(index),
+                        Self::segment_context_before(&confirmed_segments, index),
                     )
                 })
                 .collect();
+            self.user_data
+                .record_contexts(segment_contexts.iter().filter_map(
+                    |(segment_reading, segment_surface, context)| {
+                        context
+                            .as_ref()
+                            .map(|(previous_reading, previous_surface)| {
+                                (
+                                    previous_reading.as_str(),
+                                    previous_surface.as_str(),
+                                    segment_reading.as_str(),
+                                    segment_surface.as_str(),
+                                )
+                            })
+                    },
+                ));
+            let selected_segments: Vec<_> = segment_contexts
+                .into_iter()
+                .zip(&confirmed_segments)
+                .filter(|(_, segment)| segment.explicitly_selected)
+                .map(|((reading, surface, context), _)| (reading, surface, context))
+                .collect();
             let mut recorded = Vec::with_capacity(selected_segments.len());
-            let mut recorded_contexts = Vec::with_capacity(selected_segments.len());
             for (segment_reading, segment_surface, context) in selected_segments {
-                if let Some((previous_reading, previous_surface)) = context.as_ref()
-                    && !recorded_contexts.iter().any(
-                        |(
-                            recorded_previous_reading,
-                            recorded_previous_surface,
-                            recorded_reading,
-                            recorded_surface,
-                        )| {
-                            recorded_previous_reading == previous_reading
-                                && recorded_previous_surface == previous_surface
-                                && recorded_reading == &segment_reading
-                                && recorded_surface == &segment_surface
-                        },
-                    )
-                {
-                    self.user_data.record_context(
-                        previous_reading,
-                        previous_surface,
-                        &segment_reading,
-                        &segment_surface,
-                    );
-                    recorded_contexts.push((
-                        previous_reading.clone(),
-                        previous_surface.clone(),
-                        segment_reading.clone(),
-                        segment_surface.clone(),
-                    ));
-                }
                 if (segment_reading == reading && segment_surface == surface)
                     || recorded.iter().any(|(recorded_reading, recorded_surface)| {
                         recorded_reading == &segment_reading && recorded_surface == &segment_surface
@@ -3252,16 +3257,19 @@ impl SlimeEngine {
         self.record_history(reading, surface);
     }
 
-    fn segment_context_before(&self, index: usize) -> Option<(String, String)> {
+    fn segment_context_before(
+        segments: &[EditableSegment],
+        index: usize,
+    ) -> Option<(String, String)> {
         // Prefer the shortest useful suffix. A particle-only segment such as
         // `の` is not an anchor by itself, so include the preceding converted
         // segment and retain the discriminating surface `日本の`.
         for start in (0..index).rev() {
-            let reading: String = self.segments[start..index]
+            let reading: String = segments[start..index]
                 .iter()
                 .map(|segment| segment.reading.as_str())
                 .collect();
-            let surface: String = self.segments[start..index]
+            let surface: String = segments[start..index]
                 .iter()
                 .map(|segment| segment.surface.as_str())
                 .collect();
@@ -10563,6 +10571,69 @@ mod tests {
         type_text(&mut contextual, "kaitou");
         contextual.handle(InputEvent::Space);
         assert_eq!(contextual.snapshot().preedit, "解答");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirmed_whole_conversion_learns_its_local_phrase_context() {
+        let directory = test_directory("confirmed-whole-context-learning");
+        let preferences = EnginePreferences {
+            live_conversion: false,
+            history_completion: true,
+            history_learning: true,
+            dictionary_packs: 0,
+            private_mode: false,
+            date_format_mask: ALL_DATE_FORMATS,
+        };
+
+        for repetition in 0..2 {
+            let mut engine = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+            engine.set_preferences(preferences);
+            type_text(&mut engine, "heyashoumei");
+            engine.handle(InputEvent::Space);
+            let selected = engine
+                .snapshot()
+                .candidates
+                .iter()
+                .position(|candidate| candidate == "部屋照明")
+                .expect("whole conversion candidate 部屋照明");
+            engine.handle(InputEvent::SelectCandidate(
+                u32::try_from(selected).unwrap(),
+            ));
+            engine.handle(InputEvent::Enter);
+
+            if repetition == 0 {
+                let mut one_off = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+                one_off.set_preferences(preferences);
+                one_off.set_external_left_context("既存文書の部屋");
+                type_text(&mut one_off, "shoumei");
+                one_off.handle(InputEvent::Space);
+                assert_eq!(one_off.snapshot().preedit, "証明");
+            }
+        }
+
+        let context = fs::read_to_string(directory.join("context_history.tsv")).unwrap();
+        assert!(
+            context
+                .lines()
+                .any(|line| line.starts_with("へや\t部屋\tしょうめい\t照明\t2\t")),
+            "confirmed whole candidates must teach their segment edge: {context}"
+        );
+        let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
+        assert!(
+            !history
+                .lines()
+                .any(|line| line.starts_with("しょうめい\t照明\t")),
+            "implicit segments must not become global preferences: {history}"
+        );
+
+        let mut contextual = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+        contextual.set_preferences(preferences);
+        contextual.set_external_left_context("既存文書の部屋");
+        type_text(&mut contextual, "shoumei");
+        contextual.handle(InputEvent::Space);
+        assert_eq!(contextual.snapshot().preedit, "照明");
 
         fs::remove_dir_all(directory).unwrap();
     }

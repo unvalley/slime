@@ -154,6 +154,7 @@ struct NeuralProfileParameters {
     very_long_input_candidate_weight: f64,
     short_genitive_candidate_weight: f64,
     long_input_candidate_limit: usize,
+    short_input_candidate_limit: usize,
     confidence_bypass_candidate_limit: usize,
     bypass_long_input_confidence: bool,
     short_input_minimum_score_margin: f64,
@@ -170,6 +171,7 @@ impl NeuralProfileParameters {
         very_long_input_candidate_weight: 0.7,
         short_genitive_candidate_weight: 0.7,
         long_input_candidate_limit: 16,
+        short_input_candidate_limit: 5,
         confidence_bypass_candidate_limit: 8,
         bypass_long_input_confidence: false,
         short_input_minimum_score_margin: 0.0,
@@ -185,6 +187,7 @@ impl NeuralProfileParameters {
         very_long_input_candidate_weight: 0.74,
         short_genitive_candidate_weight: 0.85,
         long_input_candidate_limit: 32,
+        short_input_candidate_limit: 16,
         confidence_bypass_candidate_limit: 8,
         bypass_long_input_confidence: true,
         short_input_minimum_score_margin: 0.5,
@@ -771,8 +774,9 @@ fn process_event(handle: &mut SlimeHandle, event: InputEvent) -> Vec<SlimeAction
     if let Some(service) = NEURAL_SERVICE.get() {
         handle
             .engine
-            .prepare_extended_candidate_rescore_with_limit_and_confidence(
+            .prepare_extended_candidate_rescore_with_limits_and_confidence(
                 handle.neural_profile.long_input_candidate_limit,
+                handle.neural_profile.short_input_candidate_limit,
                 handle.neural_profile.confidence_bypass_candidate_limit,
                 handle.neural_profile.bypass_long_input_confidence,
             );
@@ -1972,6 +1976,7 @@ mod tests {
             0.7,
         );
         assert_eq!(balanced.long_input_candidate_limit, 16);
+        assert_eq!(balanced.short_input_candidate_limit, 5);
         assert_eq!(balanced.confidence_bypass_candidate_limit, 8);
         assert!(!balanced.bypass_long_input_confidence);
         assert!(!balanced.prefix_correction);
@@ -2001,6 +2006,7 @@ mod tests {
             0.8,
         );
         assert_eq!(high_accuracy.long_input_candidate_limit, 32);
+        assert_eq!(high_accuracy.short_input_candidate_limit, 16);
         assert_eq!(high_accuracy.confidence_bypass_candidate_limit, 8);
         assert!(high_accuracy.bypass_long_input_confidence);
         assert!(high_accuracy.prefix_correction);

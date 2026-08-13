@@ -46,6 +46,8 @@ const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
 const CONTEXT_RULE_PROMOTION_LIMIT: usize = 8;
 const SHORT_RESCORE_CANDIDATE_LIMIT: usize = 5;
+const MAX_EXTENDED_SHORT_RESCORE_CANDIDATES: usize = 16;
+const EXTENDED_SHORT_RESCORE_MAX_READING_CHARACTERS: usize = 4;
 const LONG_RESCORE_CANDIDATE_LIMIT: usize = 8;
 const LONG_RESCORE_READING_CHARACTERS: usize = MAX_EXPANDED_READING_CHARACTERS + 1;
 const DEFAULT_EXTENDED_LONG_RESCORE_CANDIDATES: usize = 16;
@@ -63,6 +65,7 @@ const SHORT_KATAKANA_RECALL_MIN_BASE_COST: i32 = 20_000;
 const RESCORE_COST_LOG_SCALE: f64 = 500.0;
 const CONTEXT_ABLATED_EXACT_FRAGMENT_MIN_MODEL_MARGIN: f64 = 0.75;
 const MODEL_SUPPLEMENTAL_ADDITIONAL_MARGIN: f64 = 1.5;
+const EXTENDED_SHORT_RESCORE_ADDITIONAL_MARGIN: f64 = 1.5;
 const PREFIX_CONSTRAINED_INITIAL_CANDIDATE_LIMIT: usize = 8;
 const PREFIX_CONSTRAINED_MAX_CANDIDATE_LIMIT: usize = 32;
 const PREFIX_CORRECTION_MAX_CHANGED_CHARACTERS: usize = 2;
@@ -724,25 +727,56 @@ impl SlimeEngine {
         confidence_bypass_candidates: usize,
         bypass_long_input_confidence: bool,
     ) {
+        self.prepare_extended_candidate_rescore_with_limits_and_confidence(
+            requested_candidates,
+            SHORT_RESCORE_CANDIDATE_LIMIT,
+            confidence_bypass_candidates,
+            bypass_long_input_confidence,
+        );
+    }
+
+    /// Prepares independently bounded long- and short-reading pools.
+    ///
+    /// The wider short pool is intended for an explicitly selected accuracy
+    /// profile. Ordinary callers retain the established five-candidate path,
+    /// while the rescoring gate applies an additional margin before a newly
+    /// admitted short candidate can displace that original pool's winner.
+    pub fn prepare_extended_candidate_rescore_with_limits_and_confidence(
+        &mut self,
+        requested_long_candidates: usize,
+        requested_short_candidates: usize,
+        confidence_bypass_candidates: usize,
+        bypass_long_input_confidence: bool,
+    ) {
         let reading_characters = self.reading.chars().count();
         let is_long_input = reading_characters >= LONG_RESCORE_READING_CHARACTERS;
         let supports_katakana_model_recall =
             reading_characters >= GENERATIVE_MIN_READING_CHARACTERS;
+        let short_candidate_limit = requested_short_candidates.clamp(
+            SHORT_RESCORE_CANDIDATE_LIMIT,
+            MAX_EXTENDED_SHORT_RESCORE_CANDIDATES,
+        );
+        let wants_extended_short_pool = !is_long_input
+            && reading_characters <= EXTENDED_SHORT_RESCORE_MAX_READING_CHARACTERS
+            && short_candidate_limit > SHORT_RESCORE_CANDIDATE_LIMIT;
         if self.candidate_kind != Some(CandidateKind::Conversion)
             || self.selected != 0
             || (!is_long_input
                 && !supports_katakana_model_recall
-                && self.model_rescore_dictionary.is_none())
+                && self.model_rescore_dictionary.is_none()
+                && !wants_extended_short_pool)
             || !self.candidate_corrections.is_empty()
         {
             return;
         }
         let reading = self.reading.clone();
         let candidate_limit = if is_long_input {
-            requested_candidates.clamp(
+            requested_long_candidates.clamp(
                 LONG_RESCORE_CANDIDATE_LIMIT,
                 MAX_EXTENDED_LONG_RESCORE_CANDIDATES,
             )
+        } else if wants_extended_short_pool {
+            short_candidate_limit
         } else {
             SHORT_RESCORE_CANDIDATE_LIMIT
         };
@@ -793,6 +827,7 @@ impl SlimeEngine {
         let base_winner = current.candidates.first()?.clone();
         if self.model_rescore_dictionary.is_none()
             && reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            && candidate_limit <= SHORT_RESCORE_CANDIDATE_LIMIT
             && base_winner.cost < SHORT_KATAKANA_RECALL_MIN_BASE_COST
             && !has_short_initial_katakana_run(&base_winner.surface)
         {
@@ -831,6 +866,7 @@ impl SlimeEngine {
         );
         if self.model_rescore_dictionary.is_none()
             && reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            && candidate_limit <= SHORT_RESCORE_CANDIDATE_LIMIT
             && !recall_candidates.iter().any(|candidate| {
                 is_model_katakana_recall_surface(&candidate.surface, &base_winner.surface)
                     && !base_candidates
@@ -849,14 +885,21 @@ impl SlimeEngine {
             candidate_limit,
             bypass_long_input_confidence,
         )?;
-        let mut state =
-            anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)?;
-        append_model_katakana_recall_candidates(
-            &mut state,
-            &recall_candidates,
-            &base_candidates,
-            candidate_limit,
-        );
+        let is_extended_short_pool = reading.chars().count() < LONG_RESCORE_READING_CHARACTERS
+            && candidate_limit > SHORT_RESCORE_CANDIDATE_LIMIT;
+        let mut state = if is_extended_short_pool {
+            anchor_extended_short_rescore_state(state, current, candidate_limit)
+        } else {
+            anchor_model_rescore_state(state, base_winner, &base_candidates, candidate_limit)?
+        };
+        if !is_extended_short_pool {
+            append_model_katakana_recall_candidates(
+                &mut state,
+                &recall_candidates,
+                &base_candidates,
+                candidate_limit,
+            );
+        }
         Some(state)
     }
 
@@ -3908,6 +3951,47 @@ fn anchor_model_rescore_state(
     Some(state)
 }
 
+fn anchor_extended_short_rescore_state(
+    mut expanded: CandidateRescoreState,
+    current: &CandidateRescoreState,
+    candidate_limit: usize,
+) -> CandidateRescoreState {
+    if current.candidates.len() < SHORT_RESCORE_CANDIDATE_LIMIT {
+        return current.clone();
+    }
+    let mut candidates = current.candidates.clone();
+    let mut model_supplemental = current.model_supplemental.clone();
+    for (candidate, supplemental) in expanded
+        .candidates
+        .drain(..)
+        .zip(expanded.model_supplemental.drain(..))
+    {
+        if candidates
+            .iter()
+            .any(|existing| existing.surface == candidate.surface)
+        {
+            continue;
+        }
+        candidates.push(candidate);
+        model_supplemental.push(supplemental);
+        if candidates.len() >= candidate_limit {
+            break;
+        }
+    }
+    if candidates.len() <= current.candidates.len() {
+        return current.clone();
+    }
+    expanded.candidates = candidates;
+    expanded.model_supplemental = model_supplemental;
+    expanded.generative_consensus = None;
+    expanded.request.candidates = expanded
+        .candidates
+        .iter()
+        .map(|candidate| candidate.surface.clone())
+        .collect();
+    expanded
+}
+
 fn append_model_katakana_recall_candidates(
     state: &mut CandidateRescoreState,
     recall_candidates: &[Candidate],
@@ -4052,13 +4136,15 @@ fn candidate_rescore_order_for_state(
     lambda: f64,
     minimum_margin: f64,
 ) -> Option<(Vec<usize>, bool, usize)> {
-    let (mut order, mut margin_protects_base, mut selected) = candidate_rescore_order(
+    let ranking = candidate_rescore_order(
         &state.candidates,
         &state.model_supplemental,
         log_likelihoods,
         lambda,
         minimum_margin,
     )?;
+    let (mut order, mut margin_protects_base, mut selected) =
+        apply_extended_short_rescore_gate(state, log_likelihoods, lambda, minimum_margin, ranking)?;
     let Some(consensus) = state.generative_consensus else {
         return Some((order, margin_protects_base, selected));
     };
@@ -4154,6 +4240,49 @@ fn candidate_rescore_order_for_state(
         order.insert(0, consensus.candidate);
         selected = consensus.candidate;
         margin_protects_base = false;
+    }
+    Some((order, margin_protects_base, selected))
+}
+
+fn apply_extended_short_rescore_gate(
+    state: &CandidateRescoreState,
+    log_likelihoods: &[f64],
+    lambda: f64,
+    minimum_margin: f64,
+    ranking: (Vec<usize>, bool, usize),
+) -> Option<(Vec<usize>, bool, usize)> {
+    let (mut order, mut margin_protects_base, mut selected) = ranking;
+    if state.request.reading.chars().count() > EXTENDED_SHORT_RESCORE_MAX_READING_CHARACTERS
+        || state.candidates.len() <= SHORT_RESCORE_CANDIDATE_LIMIT
+        || state.model_supplemental[SHORT_RESCORE_CANDIDATE_LIMIT..]
+            .iter()
+            .all(|supplemental| *supplemental)
+        || selected < SHORT_RESCORE_CANDIDATE_LIMIT
+    {
+        return Some((order, margin_protects_base, selected));
+    }
+    let original_candidate_count = SHORT_RESCORE_CANDIDATE_LIMIT;
+    let (_, baseline_margin_protects_base, baseline_selected) = candidate_rescore_order(
+        &state.candidates[..original_candidate_count],
+        &state.model_supplemental[..original_candidate_count],
+        &log_likelihoods[..original_candidate_count],
+        lambda,
+        minimum_margin,
+    )?;
+    let combined_score = |index: usize| {
+        (1.0 - lambda) * (-f64::from(state.candidates[index].cost) / RESCORE_COST_LOG_SCALE)
+            + lambda * log_likelihoods[index]
+    };
+    let selects_raw_katakana = state.candidates[selected].surface
+        == text_transform::full_katakana(&state.request.reading)
+        && state.candidates[baseline_selected].surface != state.candidates[selected].surface;
+    let clears_extended_margin = combined_score(selected) - combined_score(baseline_selected)
+        >= EXTENDED_SHORT_RESCORE_ADDITIONAL_MARGIN;
+    if selects_raw_katakana || !clears_extended_margin {
+        order.retain(|&index| index != baseline_selected);
+        order.insert(0, baseline_selected);
+        margin_protects_base = baseline_margin_protects_base;
+        selected = baseline_selected;
     }
     Some((order, margin_protects_base, selected))
 }
@@ -8944,6 +9073,130 @@ mod tests {
             assert_eq!(order[0], expected, "advantage={advantage}");
             assert!(!protected, "combined cost already keeps the base winner");
         }
+    }
+
+    #[test]
+    fn extended_short_pool_requires_margin_over_the_original_pool_winner() {
+        let surfaces = ["基", "現", "三", "四", "五", "韓"];
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "確定済みの左文脈".to_owned(),
+                right_context: "右文脈".to_owned(),
+                reading: "かん".to_owned(),
+                candidates: surfaces.iter().map(ToString::to_string).collect(),
+            },
+            candidates: surfaces
+                .iter()
+                .map(|surface| Candidate {
+                    surface: (*surface).to_owned(),
+                    cost: 0,
+                })
+                .collect(),
+            model_supplemental: vec![false; surfaces.len()],
+            generative_consensus: None,
+        };
+
+        for (expanded_score, expected) in [(2.49, 1), (2.5, 5)] {
+            let (order, protected, selected) = candidate_rescore_order_for_state(
+                &state,
+                &[0.0, 1.0, 0.0, 0.0, 0.0, expanded_score],
+                1.0,
+                0.5,
+            )
+            .expect("aligned finite scores");
+            assert_eq!(selected, expected, "expanded_score={expanded_score}");
+            assert_eq!(order[0], expected, "expanded_score={expanded_score}");
+            assert!(!protected, "the original-pool winner is not the base");
+        }
+    }
+
+    #[test]
+    fn extended_short_pool_does_not_promote_the_raw_katakana_reading() {
+        let surfaces = ["ひろ子", "弘子", "博子", "浩子", "寛子", "ヒロコ"];
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "確定済みの左文脈".to_owned(),
+                right_context: "右文脈".to_owned(),
+                reading: "ひろこ".to_owned(),
+                candidates: surfaces.iter().map(ToString::to_string).collect(),
+            },
+            candidates: surfaces
+                .iter()
+                .map(|surface| Candidate {
+                    surface: (*surface).to_owned(),
+                    cost: 0,
+                })
+                .collect(),
+            model_supplemental: vec![false; surfaces.len()],
+            generative_consensus: None,
+        };
+
+        let (order, protected, selected) =
+            candidate_rescore_order_for_state(&state, &[0.0, 0.0, 0.0, 1.0, 0.0, 100.0], 1.0, 0.5)
+                .expect("aligned finite scores");
+        assert_eq!(selected, 3);
+        assert_eq!(order[0], 3);
+        assert!(!protected, "the original-pool winner is not the base");
+    }
+
+    #[test]
+    fn extended_short_gate_does_not_change_a_supplemental_recall_tail() {
+        let surfaces = ["基", "現", "三", "四", "五", "補助"];
+        let state = CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "確定済みの左文脈".to_owned(),
+                right_context: "右文脈".to_owned(),
+                reading: "かん".to_owned(),
+                candidates: surfaces.iter().map(ToString::to_string).collect(),
+            },
+            candidates: surfaces
+                .iter()
+                .map(|surface| Candidate {
+                    surface: (*surface).to_owned(),
+                    cost: 0,
+                })
+                .collect(),
+            model_supplemental: vec![false, false, false, false, false, true],
+            generative_consensus: None,
+        };
+
+        let (order, protected, selected) =
+            candidate_rescore_order_for_state(&state, &[0.0, 1.0, 0.0, 0.0, 0.0, 2.0], 1.0, 0.5)
+                .expect("aligned finite scores");
+        assert_eq!(selected, 5);
+        assert_eq!(order[0], 5);
+        assert!(
+            !protected,
+            "the supplemental candidate clears its own margin"
+        );
+    }
+
+    #[test]
+    fn extended_short_pool_requires_the_original_pool_to_be_saturated() {
+        let state = |surfaces: &[&str]| CandidateRescoreState {
+            request: CandidateRescoreRequest {
+                context: "確定済みの左文脈".to_owned(),
+                right_context: "右文脈".to_owned(),
+                reading: "よみ".to_owned(),
+                candidates: surfaces.iter().map(ToString::to_string).collect(),
+            },
+            candidates: surfaces
+                .iter()
+                .enumerate()
+                .map(|(index, surface)| Candidate {
+                    surface: (*surface).to_owned(),
+                    cost: i32::try_from(index).unwrap(),
+                })
+                .collect(),
+            model_supplemental: vec![false; surfaces.len()],
+            generative_consensus: None,
+        };
+        let current = state(&["一", "二", "三", "四"]);
+        let expanded = state(&["一", "二", "三", "四", "五", "六"]);
+
+        let anchored = super::anchor_extended_short_rescore_state(expanded, &current, 16);
+
+        assert_eq!(anchored.request.candidates, current.request.candidates);
     }
 
     #[test]

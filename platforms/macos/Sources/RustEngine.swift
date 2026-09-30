@@ -1,5 +1,28 @@
 import Foundation
 
+final class LiveNeuralTask: @unchecked Sendable {
+    fileprivate let handle: OpaquePointer
+    private(set) var runStatus: UInt32?
+    /// Read once at creation: `run()` mutates the snapshot on a worker.
+    let readingCharacterCount: Int
+
+    fileprivate init(handle: OpaquePointer) {
+        self.handle = handle
+        readingCharacterCount = Int(slime_live_neural_task_reading_character_count(handle))
+    }
+
+    deinit {
+        slime_live_neural_task_destroy(handle)
+    }
+
+    @discardableResult
+    func run() -> Bool {
+        let status = slime_live_neural_task_run(handle)
+        runStatus = status
+        return status == SLIME_STATUS_OK.rawValue
+    }
+}
+
 final class RustEngine {
     enum Event {
         case character(Unicode.Scalar)
@@ -22,26 +45,27 @@ final class RustEngine {
         case shrinkSegment
 
         fileprivate var rawValue: UInt32 {
-            switch self {
-            case .character: 0
-            case .space: 1
-            case .enter: 2
-            case .escape: 3
-            case .backspace: 4
-            case .nextCandidate: 5
-            case .previousCandidate: 6
-            case .selectCandidate: 7
-            case .acceptCandidate: 8
-            case .transformHiragana: 9
-            case .transformFullKatakana: 10
-            case .transformHalfKatakana: 11
-            case .transformFullAlphanumeric: 12
-            case .transformHalfAlphanumeric: 13
-            case .nextSegment: 14
-            case .previousSegment: 15
-            case .expandSegment: 16
-            case .shrinkSegment: 17
+            let kind: SlimeEventKind = switch self {
+            case .character: SLIME_EVENT_CHARACTER
+            case .space: SLIME_EVENT_SPACE
+            case .enter: SLIME_EVENT_ENTER
+            case .escape: SLIME_EVENT_ESCAPE
+            case .backspace: SLIME_EVENT_BACKSPACE
+            case .nextCandidate: SLIME_EVENT_NEXT_CANDIDATE
+            case .previousCandidate: SLIME_EVENT_PREVIOUS_CANDIDATE
+            case .selectCandidate: SLIME_EVENT_SELECT_CANDIDATE
+            case .acceptCandidate: SLIME_EVENT_ACCEPT_CANDIDATE
+            case .transformHiragana: SLIME_EVENT_TRANSFORM_HIRAGANA
+            case .transformFullKatakana: SLIME_EVENT_TRANSFORM_FULL_KATAKANA
+            case .transformHalfKatakana: SLIME_EVENT_TRANSFORM_HALF_KATAKANA
+            case .transformFullAlphanumeric: SLIME_EVENT_TRANSFORM_FULL_ALPHANUMERIC
+            case .transformHalfAlphanumeric: SLIME_EVENT_TRANSFORM_HALF_ALPHANUMERIC
+            case .nextSegment: SLIME_EVENT_NEXT_SEGMENT
+            case .previousSegment: SLIME_EVENT_PREVIOUS_SEGMENT
+            case .expandSegment: SLIME_EVENT_EXPAND_SEGMENT
+            case .shrinkSegment: SLIME_EVENT_SHRINK_SEGMENT
             }
+            return kind.rawValue
         }
 
         fileprivate var scalar: UInt32 {
@@ -82,11 +106,20 @@ final class RustEngine {
     }
 
     private let handle: OpaquePointer
+    private(set) var neuralRerankerStatus: UInt32?
+
+    var hasNeuralReranker: Bool {
+        neuralRerankerStatus == SLIME_STATUS_OK.rawValue
+    }
 
     init(
         dataDirectory: URL = UserDataStore.shared.directoryURL,
         dictionaryPackVerificationKeys: String? = nil,
-        dictionaryPackVersionFloors: String? = nil
+        dictionaryPackVersionFloors: String? = nil,
+        neuralModelURL: URL? = nil,
+        neuralLambda: Double? = nil,
+        neuralMaxCostGap: Int32? = nil,
+        loadBundledNeuralReranker: Bool = true
     ) throws {
         let path = Array(dataDirectory.path.utf8)
         let configuredKeys = dictionaryPackVerificationKeys
@@ -131,6 +164,82 @@ final class RustEngine {
             throw EngineError.creationFailed
         }
         self.handle = handle
+        let bundledModelURL = loadBundledNeuralReranker
+            ? (Bundle.main.object(
+                forInfoDictionaryKey: "SlimeNeuralModelResource"
+            ) as? String).flatMap { resource in
+                Bundle.main.url(forResource: resource, withExtension: nil)
+            }
+            : nil
+        if let modelURL = neuralModelURL ?? bundledModelURL {
+            let modelPath = Array(modelURL.path.utf8)
+            let weight = neuralLambda
+                ?? (Bundle.main.object(forInfoDictionaryKey: "SlimeNeuralLambda") as? NSNumber)?
+                    .doubleValue
+                ?? 0.2
+            let maxCostGap = neuralMaxCostGap
+                ?? (Bundle.main.object(
+                    forInfoDictionaryKey: "SlimeNeuralMaxCostGap"
+                ) as? NSNumber)?.int32Value
+                ?? 1_000
+            neuralRerankerStatus = modelPath.withUnsafeBufferPointer { buffer in
+                slime_enable_neural_reranker_with_cost_gap(
+                    handle,
+                    buffer.baseAddress,
+                    buffer.count,
+                    weight,
+                    maxCostGap
+                )
+            }
+            if neuralRerankerStatus == SLIME_STATUS_OK.rawValue,
+               neuralLambda == nil,
+               neuralMaxCostGap == nil,
+               let explicitGap = (Bundle.main.object(
+                   forInfoDictionaryKey: "SlimeNeuralExplicitMaxCostGap"
+               ) as? NSNumber)?.int32Value {
+                _ = slime_set_explicit_neural_cost_gap(handle, explicitGap)
+            }
+            if neuralRerankerStatus == SLIME_STATUS_OK.rawValue,
+               neuralLambda == nil,
+               neuralMaxCostGap == nil,
+               let confidence = (Bundle.main.object(
+                   forInfoDictionaryKey: "SlimeNeuralExplicitConfidenceEnabled"
+               ) as? NSNumber)?.boolValue {
+                _ = slime_set_explicit_neural_confidence(handle, confidence)
+            }
+            if neuralRerankerStatus == SLIME_STATUS_OK.rawValue,
+               neuralLambda == nil,
+               neuralMaxCostGap == nil,
+               let agreement = (Bundle.main.object(
+                   forInfoDictionaryKey: "SlimeNeuralExplicitLiveAgreementEnabled"
+               ) as? NSNumber)?.boolValue {
+                _ = slime_set_explicit_live_agreement(handle, agreement)
+            }
+            if neuralRerankerStatus == SLIME_STATUS_OK.rawValue,
+               neuralLambda == nil,
+               let explicitWeight = (Bundle.main.object(
+                   forInfoDictionaryKey: "SlimeNeuralExplicitLongLambda"
+               ) as? NSNumber)?.doubleValue,
+               let minimum = (Bundle.main.object(
+                   forInfoDictionaryKey: "SlimeNeuralExplicitMinimumCharacters"
+               ) as? NSNumber)?.intValue,
+               minimum >= 0 {
+                // This override applies only to explicit Space conversion.
+                // The runtime's existing LIVE weights remain unchanged.
+                _ = slime_set_explicit_neural_long_reading_weight(
+                    handle, minimum, explicitWeight
+                )
+            }
+            if neuralRerankerStatus == SLIME_STATUS_OK.rawValue,
+               neuralLambda == nil,
+               let mediumWeight = (Bundle.main.object(
+                   forInfoDictionaryKey: "SlimeNeuralExplicitMediumLambda"
+               ) as? NSNumber)?.doubleValue {
+                _ = slime_set_explicit_neural_medium_reading_weight(handle, mediumWeight)
+            }
+        } else {
+            neuralRerankerStatus = nil
+        }
     }
 
     deinit {
@@ -138,17 +247,61 @@ final class RustEngine {
     }
 
     func process(_ event: Event) throws -> [Action] {
+        try collectActions { context in
+            slime_process_actions_v2(
+                handle,
+                event.rawValue,
+                event.scalar,
+                context,
+                collectTypedAction
+            )
+        }
+    }
+
+    func makeLiveNeuralTask(
+        minimumSwitchMargin: Double,
+        longReadingMinimumSwitchMargin: Double,
+        numericBaseSwitchMargin: Double,
+        longReadingLambda: Double
+    ) -> LiveNeuralTask? {
+        guard let task = slime_live_neural_task_create_v2(
+            handle,
+            minimumSwitchMargin,
+            longReadingMinimumSwitchMargin,
+            numericBaseSwitchMargin,
+            longReadingLambda
+        ) else {
+            return nil
+        }
+        return LiveNeuralTask(handle: task)
+    }
+
+    func setLiveNeuralRerankingEnabled(_ enabled: Bool) throws {
+        let status = slime_set_live_neural_ranking_enabled(handle, enabled)
+        guard status == SLIME_STATUS_OK.rawValue else {
+            throw EngineError.rejected("live_neural_enabled_status_\(status)")
+        }
+    }
+
+    func apply(_ task: LiveNeuralTask) throws -> [Action] {
+        try collectActions { context in
+            slime_live_neural_task_apply_actions_v2(
+                handle,
+                task.handle,
+                context,
+                collectTypedAction
+            )
+        }
+    }
+
+    private func collectActions(
+        _ operation: (_ context: UnsafeMutableRawPointer) -> UInt32
+    ) throws -> [Action] {
         let collector = TypedActionCollector()
         let context = Unmanaged.passUnretained(collector).toOpaque()
-        let status = slime_process_actions_v2(
-            handle,
-            event.rawValue,
-            event.scalar,
-            context,
-            collectTypedAction
-        )
+        let status = operation(context)
         guard status == SLIME_STATUS_OK.rawValue else {
-            throw EngineError.rejected("process_status_\(status)")
+            throw EngineError.rejected("action_status_\(status)")
         }
         if let unsupportedKind = collector.unsupportedKind {
             throw EngineError.rejected("unsupported_action_\(unsupportedKind)")
@@ -310,7 +463,8 @@ private func collectTypedAction(
 
     switch action.kind {
     case UInt32(SLIME_ACTION_UPDATE_PREEDIT.rawValue):
-        let hasSelection = action.selection_start != .max
+        // size_t imports as Int, so SLIME_NO_SELECTION (SIZE_MAX) reads as -1.
+        let hasSelection = UInt(bitPattern: action.selection_start) != UInt.max
         collector.actions.append(
             RustEngine.Action(
                 type: "update_preedit",

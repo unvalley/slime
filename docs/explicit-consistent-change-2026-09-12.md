@@ -1,0 +1,30 @@
+# Consistent replacement confidence candidate — 2026-09-12
+
+Status: adopted for default builds after full accuracy, fresh-data, app272, configuration, and timing verification. Existing C API callers remain opt-in. Explicit custom scoring settings retain legacy build behavior unless confidence is separately enabled. No installation or distribution. Earlier investigation text below describes the candidate stage.
+
+After the existing confidence/margin/digit/Hiragana checks, compare written runs separated by literal characters. Written runs comprise Han, Katakana, ASCII alphanumerics, full-width digits, and iteration/long-vowel marks. Literal runs must remain identical. For every changed written run, strip common prefix/suffix and require the same before/after replacement pair. This permits repeated付属→附属 across different surrounding names and blocks unrelated 更新→亢進 plus 障→傷 in separate runs. It is surface consistency, not dictionary segmentation; adjacent words inside one uninterrupted written run are not distinguished. Implementation scans borrowed slices without allocations.
+
+Focused tests cover repeated changes, single changes, Katakana substitution, incompatible replacements, changed particles, no-op strings, and unmatched trailing runs. An initial loop consumed an unmatched trailing run; the test caught it and it was fixed with exhaustive end-state matching. FFI52 tests and Clippy pass. Failure and corrected logs are preserved.
+
+Fixed2745: Space1698→1712 (16gains,2exact losses,7other), LIVE1699 unchanged in every report. Compared with the unguarded confidence candidate, two gains are withheld: unrelated paired corrections in the trial/adoption sentence and theウーロン/通貨 sentence. Repeated付属→附属 is retained. Expected mismatches remain 勲章受賞→受章 and修士課程終了→修了, with no gold edits.
+
+Previous validation200 is now development data because its partial semantic failure informed this guard. Its Space101 count remains unchanged; the offending simultaneous two-part switch is prevented, retaining the baseline output. A fresh200 is selected by a new deterministic seed, without expected-output selection, excluding fixed13 input sets, prior validation200, and QA270 inputs. Fresh Space76→77,1gain,0loss,1partial improvement (発信ゲート→発進ゲート, sentence head still wrong); LIVE unchanged. Source is the existing JWTD train split, so model-training independence and disjointness from every historical diagnostic are not claimed.
+
+The problematic brain-pressure sentence was rescored with its actual context. Correct full output is absent from the current candidate request: the high-score path fixes亢進 but uses傷害, while baseline preserves障害 but has更新. Candidate recombination is a separate opportunity; the surface guard alone does not make this sentence correct. Scores are saved as partial-case-scores.tsv.
+
+Artifacts: `target/evaluation/explicit-consistent-change-20260912/`, including sources, evaluator, full/fresh reports and selection metadata, policy deltas, tests, and prepared latency.py. Baseline/after/direct replay processes were started for272 inputs. No installation/publication or physical InputMethodKit host test.
+
+## Final adoption verification
+
+App272: LIVE outputs identical; direct Enter equals LIVE and normal-mode LIVE for every row. Space38 changed rows:23expected gains,3expected losses,12other changes. Rows include overlaps and roman variants. Losses are the previously documented 機種上げ→機首上げ,受賞→受章,終了→修了 expected-string disagreements; gold is unchanged. Full fixed counts remain1712 Space/1699 LIVE; fresh200 is76→77 Space with no exact losses.
+
+Final app dylib matches the tested replay dylib. The default-settings build has confidence true, original weights/cost limits intact, and valid ad-hoc signature. Actual shell configuration block passes14 combinations: default on, explicit off, six explicit scoring settings each retaining legacy behavior, and explicit confidence opt-in overriding each. An invalid confidence2 is rejected before any bundle file changes. Core source is unchanged; FFI52 neural/51 non-neural tests and Clippy pass. Temporary benchmark code was archived and removed, with FFI source restored byte-for-byte to its candidate snapshot.
+
+102-case alternating three-repeat timing against the immediately prior accepted worker-prepared executable: median-of-run Space p50 54.124667→51.806417ms, p95 107.700458→119.7665ms, max143.821334→197.494917ms. Tail variability remains; this is not a speed improvement claim. A separate release-mode benchmark over242 real candidate/score requests gives median ranking0.959→2.610microseconds per request (five alternating repeats). This isolates the added pure ranking work; it does not remove the measured end-to-end variance or prove all latency differences are noise. No additional model inference is performed.
+
+Default build enables confidence only when none of SLIME_NEURAL_LAMBDA, SLIME_NEURAL_EXPLICIT_LONG_LAMBDA, SLIME_NEURAL_EXPLICIT_MEDIUM_LAMBDA, SLIME_NEURAL_EXPLICIT_MINIMUM_CHARACTERS, SLIME_NEURAL_MAX_COST_GAP, SLIME_NEURAL_EXPLICIT_MAX_COST_GAP is explicitly set. SLIME_NEURAL_EXPLICIT_CONFIDENCE=0|1 takes precedence. Explicit Swift constructor lambda/cost overrides bypass plist confidence. All phases/processes are complete. Hashes, exact policy, and final adoption are frozen in adopted-hashes.json, bundle-policy.json, adoption.json. National-best quality and physical InputMethodKit host behavior remain unverified.
+
+
+## Later replay coverage clarification
+
+The later guided-joint-proof audit found that65 of the272 original replay rows used raw Katakana readings. All65 retained the literal input and recorded no successful ranking. Those rows do not establish model-conversion coverage, although the original literal/commit parity statements remain true. The guided-joint-proof phase preserves the original fixtures and reruns old/new apps on normalized Hiragana readings, with separate per-scalar and burst schedules and direct Enter checks. See `docs/live-guided-joint-proof-2026-09-12.md` for the scoped evidence.

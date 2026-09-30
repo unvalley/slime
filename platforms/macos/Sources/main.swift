@@ -22,10 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DomainDictionaryCatalog.loader = RustEngine.domainDictionaryWords(mask:)
         InstalledDictionaryPackBridge.catalogLoader = {
-            try RustEngine().installedDictionaryPacks()
+            try RustEngine(loadBundledNeuralReranker: false).installedDictionaryPacks()
         }
         InstalledDictionaryPackBridge.wordsLoader = { id in
-            try RustEngine().installedDictionaryPackWords(id: id)
+            try RustEngine(loadBundledNeuralReranker: false).installedDictionaryPackWords(id: id)
         }
         let bundle = Bundle.main
         guard let connectionName = bundle.object(
@@ -39,9 +39,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         sharedServer = server
         SettingsStatusItem.shared.install()
-        Task {
-            await SlimeAccessController.shared.refreshStoredLicense()
-        }
         let registrationStatus = TISRegisterInputSource(bundle.bundleURL as CFURL)
         if registrationStatus != noErr {
             let message = "TISRegisterInputSource failed: \(registrationStatus)\n"

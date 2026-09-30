@@ -14,23 +14,15 @@ mkdir -p "$workspace_dir/target/macos"
 
 swiftc \
   -swift-version 5 \
-  -framework AppKit \
-  -framework Security \
-  "$workspace_dir/platforms/macos/Sources/Licensing.swift" \
-  "$workspace_dir/platforms/macos/Tests/LicensingTests.swift" \
-  -o "$workspace_dir/target/macos/licensing-tests"
-
-"$workspace_dir/target/macos/licensing-tests"
-
-swiftc \
-  -swift-version 5 \
   -import-objc-header "$workspace_dir/crates/slime-ffi/include/slime_ffi.h" \
   -L "$workspace_dir/target/release" \
   -lslime_ffi \
   "$workspace_dir/platforms/macos/Sources/RustEngine.swift" \
+  "$workspace_dir/platforms/macos/Sources/LiveNeuralScheduling.swift" \
   "$workspace_dir/platforms/macos/Sources/UserDataStore.swift" \
   "$workspace_dir/platforms/macos/Sources/DictionaryImporter.swift" \
   "$workspace_dir/platforms/macos/Sources/InputPrivacy.swift" \
+  "$workspace_dir/platforms/macos/Sources/InputVerification.swift" \
   "$workspace_dir/platforms/macos/Sources/InputContextBoundary.swift" \
   "$workspace_dir/platforms/macos/Sources/KeyEventMapping.swift" \
   "$workspace_dir/platforms/macos/Sources/TextClientActions.swift" \

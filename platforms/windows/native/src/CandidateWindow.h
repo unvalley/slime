@@ -3,10 +3,21 @@
 #include <windows.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 inline constexpr std::size_t kSlimeCandidatePageSize = 9;
+
+struct CandidatePresentation {
+  std::wstring value;
+  std::wstring annotation;
+  std::wstring accessibleName;
+};
+
+CandidatePresentation BuildCandidatePresentation(std::wstring value,
+                                                 std::uint32_t annotation,
+                                                 std::wstring detail);
 
 class CandidateAutomationRoot;
 
@@ -25,7 +36,7 @@ public:
   CandidateWindow &operator=(const CandidateWindow &) = delete;
 
   bool Update(HWND owner, const RECT &anchor,
-              const std::vector<std::wstring> &candidates,
+              const std::vector<CandidatePresentation> &candidates,
               std::size_t selected) noexcept;
   void Hide() noexcept;
 
@@ -47,7 +58,7 @@ private:
   bool ownsFont_ = false;
   void *callbackContext_ = nullptr;
   SelectionCallback callback_ = nullptr;
-  std::vector<std::wstring> candidates_;
+  std::vector<CandidatePresentation> candidates_;
   std::size_t selected_ = 0;
   std::size_t pageStart_ = 0;
   UINT rowHeight_ = 0;

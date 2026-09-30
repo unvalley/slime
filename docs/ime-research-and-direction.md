@@ -77,7 +77,7 @@ macOSで完全なゼロクリック有効化を目標にするのは現実的で
 
 ### 3.2 Windows: Text Services Framework（技術スパイク中）
 
-2026-08-02にWindows向けの技術スパイクを開始した。`platforms/windows/native`に、`ITfTextInputProcessorEx`、キーストロークsink、composition、同期edit session、COM/language profile/category登録、`InstallLayoutOrTip`による有効化ヘルパーを実装し、既存RustコアとはJSONを介さない型付きC ABIで接続した。x64/x86のMSVCビルドとDLL export検証もWindows CIへ追加している。候補のsurface循環に加えて、`ITfCandidateListUIElement`で候補・選択・ページ更新をUILess consumerへ公開し、`ITfCandidateListUIElementBehavior`と`ITfIntegratableCandidateListUIElement`でアプリ側からの選択・確定・中止・Search boxキー操作を同じ同期edit sessionへ戻す。`ITfFunctionProvider`/`ITfFnSearchCandidateProvider`は通常compositionを変更しないread-only C ABIから最大20件の変換候補を取得し、重複・prefix overlapを除外して、選択結果だけをローカル履歴へ戻す。TSFがservice側UIを要求した場合は、非activate型の通常desktop候補popupをcomposition位置へ表示し、1–9キー、mouse選択、double-click確定を扱う。popupは`EVENT_OBJECT_IME_SHOW/HIDE/CHANGE`に加え、`IME_Candidate_Window`のUI Automation list、候補名、単一選択、MenuOpened/MenuClosed/SelectionItemイベントを公開する。`SlimeSettings.exe`はライブ変換、履歴利用・学習、分野別辞書、日付形式をversion付き設定へ原子的に保存し、各text serviceはdirectory changeのoverlapped eventだけを入力経路でpollして、composition外で再読み込みする。TSFの`ITfFnConfigure`からも起動でき、secure activationではprivate modeを強制する。x64/x86 payloadを内包し、登録失敗時にrollbackするoffline NSIS installerとunsigned CI artifactまで実装した。各PEとinstallerの署名、Windows実機でのinstall/update/uninstall、popup配置・Search・Narrator・設定伝播・入力・互換性試験はまだ未完了であり、配布可能なWindows IMEではない。
+2026-08-02にWindows向けの技術スパイクを開始した。`platforms/windows/native`に、`ITfTextInputProcessorEx`、キーストロークsink、composition、同期edit session、COM/language profile/category登録、`InstallLayoutOrTip`による有効化ヘルパーを実装し、既存RustコアとはJSONを介さない型付きC ABIで接続した。x64/x86/ARM64のMSVCビルドとDLL export検証もWindows CIへ追加している。候補のsurface循環に加えて、`ITfCandidateListUIElement`で候補・選択・ページ更新をUILess consumerへ公開し、`ITfCandidateListUIElementBehavior`と`ITfIntegratableCandidateListUIElement`でアプリ側からの選択・確定・中止・Search boxキー操作を同じ同期edit sessionへ戻す。`ITfFunctionProvider`/`ITfFnSearchCandidateProvider`は通常compositionを変更しないread-only C ABIから最大20件の変換候補を取得し、重複・prefix overlapを除外して、選択結果だけをローカル履歴へ戻す。TSFがservice側UIを要求した場合は、非activate型の通常desktop候補popupをcomposition位置へ表示し、1–9キー、mouse選択、double-click確定を扱う。popupは`EVENT_OBJECT_IME_SHOW/HIDE/CHANGE`に加え、`IME_Candidate_Window`のUI Automation list、候補名、単一選択、MenuOpened/MenuClosed/SelectionItemイベントを公開する。`SlimeSettings.exe`はライブ変換、履歴利用・学習、分野別辞書、日付形式をversion付き設定へ原子的に保存し、各text serviceはdirectory changeのoverlapped eventだけを入力経路でpollして、composition外で再読み込みする。TSFの`ITfFnConfigure`からも起動でき、secure activationではprivate modeを強制する。x64/x86とARM64X/x86の各payloadを内包し、登録失敗時にrollbackするoffline installerに加え、architectureごとの使い捨てWindows runnerで未署名のclean install、失敗updateのrollback、旧版update、uninstallを実行するworkflowを実装した。install後のnative/x86設定実行ファイルは、隔離したユーザーデータ領域で保存、再読込、変更通知、後始末を非対話self-testする。全payload・uninstaller・外側installerの署名とtimestamp検証、および署名済みconsumer lifecycleもx64/ARM64の両方へ一般化したが、現在の差分はremote runnerと実証明書を持つVMで未実行である。popup配置・Search・Narrator・実行中TSFへの設定反映・入力・各アプリ互換性も実機証拠がなく、配布可能なWindows IMEではない。
 
 新規のWindows IMEは[Text Services Framework (TSF)](https://learn.microsoft.com/en-us/windows/win32/tsf/text-services-framework)で実装する。Microsoftの[カスタムIME要件](https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editor-requirements)は、IMM32方式ではなくTSFを使用するよう求めている。
 
@@ -87,7 +87,7 @@ macOSで完全なゼロクリック有効化を目標にするのは現実的で
 - `ITfTextInputProcessor(Ex)`、キーストロークsink、composition、edit session、display attributes、候補UIを段階的に実装する。
 - UILessモード、Windows Search、UWP/packaged app、通常のWin32アプリを別々に検証する。
 - OSやホストアプリと同じプロセスへロードされるため、panic、例外、重いI/O、ネットワーク処理を入力コールバック内で実行しない。
-- 将来のWindows初期版では、x64 Windows上の32-bitアプリも対象にするため、x64 DLLとx86 DLLを用意する。ARM64はその後の追加候補とする。
+- 将来のWindows初期版では、x64 Windows上の32-bitアプリも対象にするため、x64 DLLとx86 DLLを用意する。ARM64はnative runnerで単独sliceを検証し、x64/ARM64実装をARM64XのCOM/C ABI forwarderから読み分ける署名前artifactも生成する。ARM64-aware installer、署名、native lifecycleが揃うまで、このartifactは配布対象にしない。
 
 配布上の要点:
 
@@ -732,5 +732,5 @@ Windows（技術スパイク中）:
 - 配布物サイズは2026-07-19時点の公開release assetであり、将来変わる。
 - 配布物サイズからRSS、起動時間、変換速度は推定していない。
 - 論文間でデータセット、正解定義、入力単位が異なるため、精度数値を横並びにはしていない。
-- macOSの実アプリ互換性、署名済みinstaller、更新・削除は未実装であり、Phase 0以降で実機確認が必要である。Windowsはunsigned offline installerのartifact生成までで、署名、実機互換性、install/update/uninstallは別途検証する。
+- macOSはversion付きPKGの生成、署名・公証検証、clean install・update・uninstallのscriptまで実装した。Developer ID証明書、公証済みartifact、使い捨てVM、TextEditの物理キー操作による実機証拠はまだない。Windowsはx64とARM64の未署名実ライフサイクル、install後のnative/x86設定self-test、architecture別の署名済み配布gateまで実装したが、未push差分のremote runner、実証明書を持つVM、実アプリ互換性は別途検証する。
 - 辞書ライセンスの記述は技術調査であり、最終的な法的判断ではない。

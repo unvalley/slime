@@ -13,17 +13,17 @@ enum SettingsPreview {
                 InstalledDictionaryPackCatalog(
                     packs: [
                         InstalledDictionaryPack(
-                            id: "sample-pro",
-                            name: "専門用語 Plus",
+                            id: "sample-general",
+                            name: "一般語彙サンプル",
                             version: "2026.07.1",
-                            license: "Proprietary",
+                            license: "Example-Test-Only",
                             entryCount: 51
                         ),
                         InstalledDictionaryPack(
-                            id: "proper-nouns-pro",
-                            name: "固有名詞 Plus",
+                            id: "sample-names",
+                            name: "名前サンプル",
                             version: "2026.07.1",
-                            license: "Proprietary",
+                            license: "Example-Test-Only",
                             entryCount: 33
                         ),
                     ],

@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,12 +11,14 @@ const CONTEXT_HISTORY_FILE: &str = "context_history.tsv";
 const USER_DICTIONARY_HEADER: &str = "# slime-user-dictionary-v1";
 const HISTORY_HEADER: &str = "# slime-history-v1";
 const CONTEXT_HISTORY_HEADER: &str = "# slime-context-history-v1";
-const MAX_HISTORY_ENTRIES: usize = 500;
+const MAX_HISTORY_ENTRIES: usize = 4_096;
 const MAX_CONTEXT_HISTORY_ENTRIES: usize = 500;
 const MIN_COMPLETION_REMAINING_CHARS: usize = 2;
+const MIN_RETAINED_HISTORY_COUNT: u32 = 2;
 const MIN_ESTABLISHED_HISTORY_COUNT: u32 = 5;
 const MIN_ESTABLISHED_CONTEXT_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
 const MIN_CONTEXT_USE_COUNT: u32 = 2;
+const MIN_LIVE_PHRASE_USE_COUNT: u32 = 2;
 const MIN_COMPLETION_USE_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
 const MAX_HISTORY_READING_CHARS: usize = 64;
 const MAX_HISTORY_SURFACE_CHARS: usize = 128;
@@ -101,6 +104,24 @@ impl UserData {
         self.directory.as_deref()
     }
 
+    /// Conservative guard for a worker scope crossing a previously fixed edge.
+    /// A registered or learned reading anywhere in that scope must retain the
+    /// existing personalization path. This query allocates nothing and does no I/O.
+    pub(crate) fn has_personalization_in_reading(
+        &self,
+        reading: &str,
+        include_history: bool,
+    ) -> bool {
+        let overlaps = |key: &str| !key.is_empty() && reading.contains(key);
+        self.dictionary.iter().any(|entry| overlaps(&entry.reading))
+            || (include_history
+                && (self.history.iter().any(|entry| {
+                    overlaps(&entry.reading) && is_useful_history(&entry.reading, &entry.surface)
+                }) || self.context_history.iter().any(|entry| {
+                    entry.count >= MIN_LIVE_PHRASE_USE_COUNT && overlaps(&entry.reading)
+                })))
+    }
+
     pub fn exact_dictionary_surfaces(&self, reading: &str) -> impl Iterator<Item = &str> {
         self.dictionary
             .iter()
@@ -123,7 +144,7 @@ impl UserData {
                     && entry.previous_surface == previous_surface
                     && entry.reading == reading
                     && entry.count >= MIN_CONTEXT_USE_COUNT
-                    && is_useful_history(&entry.reading, &entry.surface)
+                    && is_useful_context_anchor(&entry.reading, &entry.surface)
             })
             .collect();
         sort_context_history(&mut entries);
@@ -147,12 +168,12 @@ impl UserData {
             .context_history
             .iter()
             .filter(|entry| {
-                entry.previous_surface.chars().count() >= 2
-                    && external_surface.ends_with(&entry.previous_surface)
-                    && entry.reading == reading
+                entry.reading == reading
                     && entry.count >= MIN_CONTEXT_USE_COUNT
+                    && external_surface.ends_with(&entry.previous_surface)
+                    && entry.previous_surface.chars().count() >= 2
                     && is_useful_context_anchor(&entry.previous_reading, &entry.previous_surface)
-                    && is_useful_history(&entry.reading, &entry.surface)
+                    && is_useful_context_anchor(&entry.reading, &entry.surface)
             })
             .collect();
         sort_context_history(&mut entries);
@@ -227,6 +248,27 @@ impl UserData {
             .collect()
     }
 
+    /// Returns repeatedly selected exact phrases that are safe to consider for
+    /// personalized live conversion.
+    ///
+    /// A single selection is deliberately insufficient: explicit conversion
+    /// history can be context-specific, while live conversion changes marked
+    /// text without asking. The live-conversion layer applies additional
+    /// reading-length, candidate-recall, and cost-gap gates before using these
+    /// surfaces.
+    #[must_use]
+    pub(crate) fn repeated_live_phrase_surface(&self, reading: &str) -> Option<&str> {
+        self.history
+            .iter()
+            .filter(|entry| {
+                entry.reading == reading
+                    && entry.count >= MIN_LIVE_PHRASE_USE_COUNT
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .min_by(|left, right| compare_history(left, right))
+            .map(|entry| entry.surface.as_str())
+    }
+
     #[must_use]
     pub fn completion_surfaces(&self, prefix: &str, limit: usize) -> Vec<String> {
         let prefix_length = prefix.chars().count();
@@ -234,11 +276,12 @@ impl UserData {
             .history
             .iter()
             .filter(|entry| {
-                is_useful_history(&entry.reading, &entry.surface)
-                    && entry.count >= MIN_COMPLETION_USE_COUNT
+                // Cheap rejections first: this scans every entry per key.
+                entry.count >= MIN_COMPLETION_USE_COUNT
                     && entry.reading.starts_with(prefix)
                     && entry.reading.chars().count().saturating_sub(prefix_length)
                         >= MIN_COMPLETION_REMAINING_CHARS
+                    && is_useful_history(&entry.reading, &entry.surface)
             })
             .collect();
         sort_completions(&mut entries);
@@ -260,11 +303,11 @@ impl UserData {
             .history
             .iter()
             .filter(|entry| {
-                is_useful_history(&entry.reading, &entry.surface)
+                entry.surface == surface
                     && entry.count >= MIN_COMPLETION_USE_COUNT
                     && entry.reading.starts_with(prefix)
                     && entry.reading != prefix
-                    && entry.surface == surface
+                    && is_useful_history(&entry.reading, &entry.surface)
             })
             .collect();
         sort_completions(&mut entries);
@@ -283,23 +326,18 @@ impl UserData {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let now = next_last_used(&self.history, wall_clock);
+        if let Some(directory) = &self.directory
+            && self.history_is_writable
+            && let Ok(history) =
+                write_history_optimistically(&directory.join(HISTORY_FILE), reading, surface, now)
+        {
+            // The written history already merges this record with any
+            // concurrent change, so there is nothing to read back.
+            self.history = history;
+            return;
+        }
         update_history(&mut self.history, reading, surface, now);
         trim_history(&mut self.history);
-
-        let Some(directory) = &self.directory else {
-            return;
-        };
-        if !self.history_is_writable {
-            return;
-        }
-
-        let path = directory.join(HISTORY_FILE);
-        if write_history_optimistically(&path, reading, surface, now).is_ok()
-            && let Ok(Some(bytes)) = read_optional(&path)
-            && let Ok(history) = parse_history(&bytes)
-        {
-            self.history = history;
-        }
     }
 
     pub(crate) fn record_context(
@@ -310,7 +348,7 @@ impl UserData {
         surface: &str,
     ) {
         if !is_useful_context_anchor(previous_reading, previous_surface)
-            || !is_useful_history(reading, surface)
+            || !is_useful_context_anchor(reading, surface)
         {
             return;
         }
@@ -319,6 +357,20 @@ impl UserData {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let now = next_context_last_used(&self.context_history, wall_clock);
+        if let Some(directory) = &self.directory
+            && self.context_history_is_writable
+            && let Ok(history) = write_context_history_optimistically(
+                &directory.join(CONTEXT_HISTORY_FILE),
+                previous_reading,
+                previous_surface,
+                reading,
+                surface,
+                now,
+            )
+        {
+            self.context_history = history;
+            return;
+        }
         update_context_history(
             &mut self.context_history,
             previous_reading,
@@ -328,29 +380,6 @@ impl UserData {
             now,
         );
         trim_context_history(&mut self.context_history);
-
-        let Some(directory) = &self.directory else {
-            return;
-        };
-        if !self.context_history_is_writable {
-            return;
-        }
-
-        let path = directory.join(CONTEXT_HISTORY_FILE);
-        if write_context_history_optimistically(
-            &path,
-            previous_reading,
-            previous_surface,
-            reading,
-            surface,
-            now,
-        )
-        .is_ok()
-            && let Ok(Some(bytes)) = read_optional(&path)
-            && let Ok(history) = parse_context_history(&bytes)
-        {
-            self.context_history = history;
-        }
     }
 }
 
@@ -365,13 +394,15 @@ fn sort_completions(entries: &mut Vec<&HistoryEntry>) {
 }
 
 fn sort_history(entries: &mut Vec<&HistoryEntry>) {
-    entries.sort_unstable_by(|left, right| {
-        history_strength(right)
-            .cmp(&history_strength(left))
-            .then_with(|| right.last_used.cmp(&left.last_used))
-            .then_with(|| right.count.cmp(&left.count))
-            .then_with(|| left.surface.cmp(&right.surface))
-    });
+    entries.sort_unstable_by(|left, right| compare_history(left, right));
+}
+
+fn compare_history(left: &HistoryEntry, right: &HistoryEntry) -> std::cmp::Ordering {
+    history_strength(right)
+        .cmp(&history_strength(left))
+        .then_with(|| right.last_used.cmp(&left.last_used))
+        .then_with(|| right.count.cmp(&left.count))
+        .then_with(|| left.surface.cmp(&right.surface))
 }
 
 fn sort_context_history(entries: &mut Vec<&ContextHistoryEntry>) {
@@ -460,37 +491,32 @@ fn next_context_last_used(history: &[ContextHistoryEntry], wall_clock: u64) -> u
         })
 }
 
+/// Keeps useful, repeated, then recent entries. Keys are computed once per
+/// entry: `is_useful_history` walks both strings, which dominated a
+/// comparator-based sort of a full history on every commit.
 fn trim_history(history: &mut Vec<HistoryEntry>) {
-    history.sort_unstable_by(|left, right| {
-        is_useful_history(&right.reading, &right.surface)
-            .cmp(&is_useful_history(&left.reading, &left.surface))
-            .then_with(|| {
-                right
-                    .last_used
-                    .cmp(&left.last_used)
-                    .then_with(|| right.count.cmp(&left.count))
-            })
+    history.sort_by_cached_key(|entry| {
+        (
+            Reverse(is_useful_history(&entry.reading, &entry.surface)),
+            Reverse(entry.count >= MIN_RETAINED_HISTORY_COUNT),
+            Reverse(entry.last_used),
+            Reverse(entry.count),
+        )
     });
     history.truncate(MAX_HISTORY_ENTRIES);
 }
 
 fn trim_context_history(history: &mut Vec<ContextHistoryEntry>) {
-    history.sort_unstable_by(|left, right| {
-        is_useful_context_anchor(&right.previous_reading, &right.previous_surface)
-            .cmp(&is_useful_context_anchor(
-                &left.previous_reading,
-                &left.previous_surface,
-            ))
-            .then_with(|| {
-                is_useful_history(&right.reading, &right.surface)
-                    .cmp(&is_useful_history(&left.reading, &left.surface))
-            })
-            .then_with(|| {
-                right
-                    .last_used
-                    .cmp(&left.last_used)
-                    .then_with(|| right.count.cmp(&left.count))
-            })
+    history.sort_by_cached_key(|entry| {
+        (
+            Reverse(is_useful_context_anchor(
+                &entry.previous_reading,
+                &entry.previous_surface,
+            )),
+            Reverse(is_useful_context_anchor(&entry.reading, &entry.surface)),
+            Reverse(entry.last_used),
+            Reverse(entry.count),
+        )
     });
     history.truncate(MAX_CONTEXT_HISTORY_ENTRIES);
 }
@@ -506,10 +532,10 @@ pub(crate) fn is_useful_history(reading: &str, surface: &str) -> bool {
             .any(|character| matches!(character, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'))
 }
 
-/// A committed word may be valuable as the left side of a context edge even
-/// when it is too short to retain as a global conversion preference. The
-/// selected surface disambiguates the anchor, while equality and script checks
-/// continue to reject literal kana, punctuation, and raw ASCII input.
+/// A committed word can be either end of a repeated context edge even when
+/// it is too short to retain as a global conversion preference. Contextual
+/// lookup still requires a matching anchor and repeated observations; equality
+/// and script checks reject literal kana, punctuation, and raw ASCII input.
 pub(crate) fn is_useful_context_anchor(reading: &str, surface: &str) -> bool {
     let reading_length = reading.chars().count();
     let surface_length = surface.chars().count();
@@ -635,12 +661,14 @@ fn serialize_context_history(history: &[ContextHistoryEntry]) -> Vec<u8> {
     output.into_bytes()
 }
 
+/// Merges one record into the file's current history and returns what was
+/// written.
 fn write_history_optimistically(
     path: &Path,
     reading: &str,
     surface: &str,
     last_used: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<HistoryEntry>> {
     for _ in 0..3 {
         let base = read_optional(path)?;
         let mut history = match base.as_deref() {
@@ -653,7 +681,7 @@ fn write_history_optimistically(
         trim_history(&mut history);
         let proposed = serialize_history(&history);
         if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
-            return Ok(());
+            return Ok(history);
         }
     }
     Err(io::Error::new(
@@ -669,7 +697,7 @@ fn write_context_history_optimistically(
     reading: &str,
     surface: &str,
     last_used: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<ContextHistoryEntry>> {
     for _ in 0..3 {
         let base = read_optional(path)?;
         let mut history = match base.as_deref() {
@@ -690,7 +718,7 @@ fn write_context_history_optimistically(
         trim_context_history(&mut history);
         let proposed = serialize_context_history(&history);
         if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
-            return Ok(());
+            return Ok(history);
         }
     }
     Err(io::Error::new(
@@ -749,12 +777,31 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_HISTORY_HEADER, HISTORY_HEADER, USER_DICTIONARY_HEADER, UserData,
-        atomic_replace_if_unchanged,
+        CONTEXT_HISTORY_HEADER, HISTORY_HEADER, HistoryEntry, MAX_HISTORY_ENTRIES,
+        MIN_RETAINED_HISTORY_COUNT, USER_DICTIONARY_HEADER, UserData, atomic_replace_if_unchanged,
+        trim_history,
     };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn boundary_scope_protection_respects_registration_and_history_settings() {
+        let mut data = UserData::default();
+        data.dictionary.push(super::UserDictionaryEntry {
+            reading: "もうけ".to_owned(),
+            surface: "儲け".to_owned(),
+        });
+        assert!(data.has_personalization_in_reading("もうける", false));
+        assert!(!data.has_personalization_in_reading("とおす", true));
+        data.record("とおす", "通す");
+        assert!(!data.has_personalization_in_reading("とおす", false));
+        assert!(data.has_personalization_in_reading("みずをとおす", true));
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        assert!(data.has_personalization_in_reading("はしをつかう", true));
+        assert!(!data.has_personalization_in_reading("はしをつかう", false));
+    }
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -898,6 +945,58 @@ mod tests {
     }
 
     #[test]
+    fn short_target_requires_repeated_matching_context_and_survives_reload() {
+        let directory = test_directory("short-context-target");
+        let mut data = UserData::load(&directory);
+        data.record("はし", "箸");
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        assert!(
+            data.contextual_history_surfaces("しょくじ", "食事", "はし")
+                .is_empty()
+        );
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        let reloaded = UserData::load(&directory);
+        assert_eq!(
+            reloaded.contextual_history_surfaces("しょくじ", "食事", "はし"),
+            ["箸"]
+        );
+        assert_eq!(
+            reloaded.contextual_history_surfaces_for_external_surface("今日の食事", "はし"),
+            ["箸"]
+        );
+        assert!(
+            reloaded
+                .contextual_history_surfaces("どうろ", "道路", "はし")
+                .is_empty()
+        );
+        assert!(
+            reloaded
+                .contextual_history_surfaces_for_external_surface("道路", "はし")
+                .is_empty()
+        );
+        assert!(reloaded.exact_history_surfaces("はし").is_empty());
+        assert!(!directory.join("history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn short_context_targets_still_reject_literal_and_non_japanese_readings() {
+        let directory = test_directory("invalid-short-context-target");
+        let mut data = UserData::load(&directory);
+        for (reading, surface) in [
+            ("", "箸"),
+            ("は", ""),
+            ("はし", "はし"),
+            ("1", "一"),
+            ("x", "X"),
+        ] {
+            data.record_context("しょくじ", "食事", reading, surface);
+        }
+        assert!(!directory.join("context_history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn established_context_outranks_a_recent_transient_context() {
         let directory = test_directory("context-strength");
         fs::write(
@@ -986,6 +1085,63 @@ mod tests {
         let data = UserData::load(&directory);
         assert_eq!(data.exact_history_surfaces("かんじ"), ["感じ", "漢字"]);
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repeated_selections_survive_recent_one_off_history_pressure() {
+        let mut history = vec![HistoryEntry {
+            reading: "へんかんせいど".to_owned(),
+            surface: "変換精度".to_owned(),
+            count: MIN_RETAINED_HISTORY_COUNT,
+            last_used: 1,
+        }];
+        for index in 0..MAX_HISTORY_ENTRIES {
+            history.push(HistoryEntry {
+                reading: format!("てすとよみ{index}"),
+                surface: format!("表記{index}"),
+                count: 1,
+                last_used: u64::try_from(index).unwrap() + 2,
+            });
+        }
+
+        trim_history(&mut history);
+
+        assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
+        assert!(history.iter().any(|entry| {
+            entry.reading == "へんかんせいど"
+                && entry.surface == "変換精度"
+                && entry.count == MIN_RETAINED_HISTORY_COUNT
+        }));
+    }
+
+    #[test]
+    fn full_history_remains_writable_and_bounded_after_reload() {
+        let directory = test_directory("full-history");
+        let mut history = Vec::with_capacity(MAX_HISTORY_ENTRIES);
+        for index in 0..MAX_HISTORY_ENTRIES {
+            history.push(HistoryEntry {
+                reading: format!("てすとよみ{index}"),
+                surface: format!("表記{index}"),
+                count: 1,
+                last_used: u64::try_from(index).unwrap() + 1,
+            });
+        }
+        fs::write(
+            directory.join("history.tsv"),
+            super::serialize_history(&history),
+        )
+        .unwrap();
+        let mut data = UserData::load(&directory);
+
+        data.record("へんかんせいど", "変換精度");
+
+        let reloaded = UserData::load(&directory);
+        assert_eq!(reloaded.history.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(
+            reloaded.exact_history_surfaces("へんかんせいど"),
+            ["変換精度"]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

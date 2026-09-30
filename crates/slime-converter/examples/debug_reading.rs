@@ -5,6 +5,10 @@ fn main() {
     let reading = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "いいかんじ".to_owned());
+    let limit = std::env::args()
+        .nth(2)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
     let dictionary = slime_converter::Dictionary::bundled();
 
     println!("== candidates ==");
@@ -13,7 +17,7 @@ fn main() {
     }
 
     println!("== n-best paths ==");
-    for conversion in dictionary.convert_n_best(&reading, 20) {
+    for conversion in dictionary.convert_n_best(&reading, limit) {
         let segments: Vec<String> = conversion
             .segments
             .iter()
@@ -25,6 +29,11 @@ fn main() {
             conversion.surface,
             segments.join(" + ")
         );
+    }
+
+    println!("== recombined top-10 segments ==");
+    for candidate in dictionary.recombined_n_best_variants(&reading, 10, 32) {
+        println!("{:>8}  {}", candidate.cost, candidate.surface);
     }
 
     println!("== convert_best ==");

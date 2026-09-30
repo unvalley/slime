@@ -1,0 +1,25 @@
+# Experimental confident explicit reranking — 2026-09-12
+
+Status: opt-in experiment only. Default behavior and QA app remain the accepted worker-prepared two-word revision. No app bridge/build configuration has enabled this policy; no installation or publication.
+
+The evaluator-only `evaluation_set_explicit_confidence` switch enables a second ranking calculation from the same model scores, not another model inference. For readings of at least20 characters with configured lambda below0.8, compare the existing selected output with lambda0.8. Use the stronger result only when its combined score beats every other candidate by at least1.0, Hiragana subsequence is preserved, and ASCII/full-width digit characters are unchanged. Normal ranking guards and the explicit cost gate still run. Other callers keep existing weights and behavior by default. Model reload resets the experimental switch. CLI: `--explicit-confidence`.
+
+Actual thirteen-report evaluation completed. Fixed2745 Space1698→1714:18gains,2exact losses,7other changes. LIVE1699 and all LIVE outputs unchanged. All changed outputs across thirteen reports exactly match the diagnostic proposal; no unexplained prediction differences. Expected-string losses are 勲章受賞→受章 and 修士課程終了→修了; these should be assessed linguistically, not automatically called semantic regressions. Original gold labels remain untouched. Extra200 has 機種上げ→機首上げ as an additional exact mismatch, also preserved in metrics.
+
+Separate validation200:99→101 Space exact matches,2gains,0losses,2other changes; LIVE unchanged. Mixed partial changes are not counted as gains: one sentence moves 仮安室→カリアムロ while remaining wrong; another corrects 脳圧更新→亢進 but also changes 障害→傷害. These must remain part of the quality assessment.
+
+Core264 and neural FFI50 tests pass, as does Clippy. Focused tests check runner-up ambiguity even when the old candidate is distant, nonfinite/missing scores, and kana/digit protection. Full evaluation here is accuracy-only; runs overlapped other verification. Performance, actual app opt-in bridge, incremental replay, and distribution remain unverified for this policy.
+
+Artifacts in `target/evaluation/explicit-confidence-20260912/`: before/candidate source, frozen evaluator, input/model manifest, full reports, pairwise comparison, separate validation, prediction comparison, test logs, hashes, and explicit non-adopted status. No running process remains from this phase.
+
+## QA bridge and measured app boundary
+
+The opt-in policy now has C ABI `slime_set_explicit_neural_confidence(handle, bool)`, a Swift Info.plist bridge, and `SLIME_NEURAL_EXPLICIT_CONFIDENCE=0|1` build setting. Default remains0. Explicit Swift constructor weight/cost overrides bypass the plist option. Existing native API callers remain off unless they enable it; model reload resets it. The evaluator compatibility helper delegates to the C API. Non-neural/null handles return existing status codes.
+
+Authoritative QA artifacts: `target/evaluation/explicit-confidence-app-20260912/`. First build wrote a false plist value because plutil did not interpret numeric1 as the intended bool; this was fixed using YES/NO and that initial build was excluded. The rebuilt QA app's plist was inspected as true before replay. The baseline uses the frozen previously accepted worker-prepared Swift probe, avoiding linking a new wrapper against an old dylib.
+
+270 QA rows: all LIVE outputs identical,132correct on both sides. Space39 changed rows:24gains,3expected-string losses,12other changes. These rows include overlaps/roman variants, not39 independent utterances. The losses are the already recorded 機種上げ→機首上げ,受賞→受章,終了→修了 differences. Direct LIVE-to-Enter output equals LIVE and normal-mode LIVE for all270. Normal Space-to-Enter consistency is checked by the probe. FFI neural51/non-neural50, focused API tests, Clippy and ad-hoc signature verification pass. No physical InputMethodKit host-app test, installation, notarization, or distribution is claimed.
+
+100-case alternating three-repeat timing (60 historical balanced rows, two prior two-word cases,38 added QA changes): median-of-run Space p50 54.3085→52.789083ms, p95 112.533625→108.559958ms, max153.31575→165.248583ms. Mixed timing does not establish a speed improvement. The same frozen scoring implementation is used; only API naming/bridge changed afterward. Model scores are reused for the confidence ranking.
+
+Adoption remains false. The separate-validation partial change correcting 脳圧更新→亢進 also introduces 機能が障害され→傷害され. A changed-span audit identifies multiple separate edits in this case, in two useful fixed gains, one repeated spelling gain, and an extra-set wrong-to-wrong case. Further work should test whether unrelated multiple lexical changes can be constrained while retaining repeated consistent spelling corrections. `change-span-audit.json` is diagnostic; no such guard is implemented yet. Source build defaults remain off, while the local QA app is deliberately enabled for this experiment. All processes from this phase have completed.

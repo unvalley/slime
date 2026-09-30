@@ -4,7 +4,6 @@
 #include <wrl/client.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iterator>
@@ -62,6 +61,18 @@ constexpr GUID kSearchBoxIntegrationStyle = {
     0x4903,
     {0xae, 0x21, 0x1a, 0x63, 0x97, 0xcd, 0xe2, 0xeb}};
 
+std::wstring Utf8ToWide(SlimeStringView value);
+
+CandidatePresentation MakeCandidatePresentation(
+    const SlimeCandidateViewV2 &candidate) {
+  std::wstring value = Utf8ToWide(candidate.value);
+  if (value.empty()) {
+    value = Utf8ToWide(candidate.display);
+  }
+  return BuildCandidatePresentation(std::move(value), candidate.annotation,
+                                    Utf8ToWide(candidate.detail));
+}
+
 class CandidateUiElement final : public ITfCandidateListUIElementBehavior,
                                  public ITfIntegratableCandidateListUIElement {
 public:
@@ -73,7 +84,7 @@ public:
   using AbortCallback = bool (*)(void *context) noexcept;
 
   CandidateUiElement(ITfDocumentMgr *documentManager,
-                     std::vector<std::wstring> candidates,
+                     std::vector<CandidatePresentation> candidates,
                      const std::size_t selected, void *callbackContext,
                      ShowCallback showCallback,
                      SelectionCallback selectionCallback,
@@ -198,11 +209,13 @@ public:
     }
     *value = nullptr;
     if (index >= candidates_.size() ||
-        candidates_[index].size() > std::numeric_limits<UINT>::max()) {
+        candidates_[index].accessibleName.size() >
+            std::numeric_limits<UINT>::max()) {
       return E_INVALIDARG;
     }
-    *value = SysAllocStringLen(candidates_[index].data(),
-                               static_cast<UINT>(candidates_[index].size()));
+    *value = SysAllocStringLen(
+        candidates_[index].accessibleName.data(),
+        static_cast<UINT>(candidates_[index].accessibleName.size()));
     return *value != nullptr ? S_OK : E_OUTOFMEMORY;
   }
 
@@ -314,7 +327,8 @@ public:
     return Finalize();
   }
 
-  void Update(std::vector<std::wstring> candidates, const std::size_t selected) {
+  void Update(std::vector<CandidatePresentation> candidates,
+              const std::size_t selected) {
     candidates_ = std::move(candidates);
     UpdateSelection(selected);
     ResetPages();
@@ -322,7 +336,8 @@ public:
                     TF_CLUIE_PAGEINDEX | TF_CLUIE_CURRENTPAGE;
   }
 
-  [[nodiscard]] const std::vector<std::wstring> &candidates() const noexcept {
+  [[nodiscard]] const std::vector<CandidatePresentation> &candidates()
+      const noexcept {
     return candidates_;
   }
 
@@ -345,7 +360,7 @@ private:
 
   std::atomic_ulong referenceCount_{1};
   ComPtr<ITfDocumentMgr> documentManager_;
-  std::vector<std::wstring> candidates_;
+  std::vector<CandidatePresentation> candidates_;
   std::vector<UINT> pageStarts_;
   UINT selected_ = 0;
   DWORD updatedFlags_ = TF_CLUIE_DOCUMENTMGR | TF_CLUIE_COUNT | TF_CLUIE_SELECTION |
@@ -361,7 +376,7 @@ private:
 struct EngineAction {
   std::uint32_t kind = SLIME_ACTION_FORWARD_KEY;
   std::wstring text;
-  std::vector<std::wstring> candidates;
+  std::vector<CandidatePresentation> candidates;
   std::size_t selected = std::numeric_limits<std::size_t>::max();
   std::size_t selectionStart = std::numeric_limits<std::size_t>::max();
   std::size_t selectionLength = 0;
@@ -440,7 +455,7 @@ void CollectString(void *context, const SlimeStringView value) noexcept {
   }
 }
 
-void CollectAction(void *context, const SlimeActionView *view) noexcept {
+void CollectActionV2(void *context, const SlimeActionViewV2 *view) noexcept {
   if (context == nullptr || view == nullptr) {
     return;
   }
@@ -458,7 +473,8 @@ void CollectAction(void *context, const SlimeActionView *view) noexcept {
     if (view->candidates != nullptr) {
       action.candidates.reserve(view->candidate_count);
       for (std::size_t index = 0; index < view->candidate_count; ++index) {
-        action.candidates.push_back(Utf8ToWide(view->candidates[index]));
+        action.candidates.push_back(
+            MakeCandidatePresentation(view->candidates[index]));
       }
     }
     collection.actions.push_back(std::move(action));
@@ -467,7 +483,7 @@ void CollectAction(void *context, const SlimeActionView *view) noexcept {
   }
 }
 
-void IgnoreAction(void *, const SlimeActionView *) noexcept {}
+void IgnoreActionV2(void *, const SlimeActionViewV2 *) noexcept {}
 
 void ApplyWindowsPreferences(SlimeHandle *engine,
                              const WindowsPreferences &preferences,
@@ -1578,8 +1594,8 @@ bool TextService::ProcessEvent(const TfEditCookie editCookie, ITfContext *contex
   }
 
   EngineActionCollection collection;
-  const std::uint32_t status = slime_process_actions(engine_, key.kind, key.value, &collection,
-                                                     CollectAction);
+  const std::uint32_t status = slime_process_actions_v2(
+      engine_, key.kind, key.value, &collection, CollectActionV2);
   if (status != SLIME_STATUS_OK) {
     return false;
   }
@@ -1638,10 +1654,13 @@ bool TextService::ProcessEvent(const TfEditCookie editCookie, ITfContext *contex
 }
 
 void TextService::ResetEngineAfterTermination() noexcept {
-  if (engine_ != nullptr) {
-    slime_process_actions(engine_, SLIME_EVENT_ESCAPE, 0, nullptr, IgnoreAction);
-    slime_process_actions(engine_, SLIME_EVENT_ESCAPE, 0, nullptr, IgnoreAction);
+  if (engine_ == nullptr) {
+    return;
   }
+  slime_process_actions_v2(engine_, SLIME_EVENT_ESCAPE, 0, nullptr,
+                           IgnoreActionV2);
+  slime_process_actions_v2(engine_, SLIME_EVENT_ESCAPE, 0, nullptr,
+                           IgnoreActionV2);
   ResetTransientContext();
 }
 
@@ -1869,12 +1888,8 @@ HRESULT SetRegistryString(HKEY root, const std::wstring &subkey, const wchar_t *
   return HRESULT_FROM_WIN32(setResult);
 }
 
-HRESULT RegisterComServer() {
-  std::wstring modulePath;
-  HRESULT result = ModulePath(modulePath);
-  if (FAILED(result)) {
-    return result;
-  }
+HRESULT RegisterComServer(const std::wstring &modulePath) {
+  HRESULT result = S_OK;
   const std::wstring classKey = L"CLSID\\" + GuidString(kTextServiceClsid);
   result = SetRegistryString(HKEY_CLASSES_ROOT, classKey, nullptr, kDescription);
   if (FAILED(result)) {
@@ -1894,7 +1909,7 @@ void UnregisterComServer() noexcept {
   RegDeleteTreeW(HKEY_CLASSES_ROOT, classKey.c_str());
 }
 
-HRESULT RegisterTsfProfile() {
+HRESULT RegisterTsfProfile(const std::wstring &modulePath) {
   ComPtr<ITfInputProcessorProfiles> profiles;
   HRESULT result = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
                                     IID_PPV_ARGS(&profiles));
@@ -1902,11 +1917,6 @@ HRESULT RegisterTsfProfile() {
     return result;
   }
   result = profiles->Register(kTextServiceClsid);
-  if (FAILED(result)) {
-    return result;
-  }
-  std::wstring modulePath;
-  result = ModulePath(modulePath);
   if (FAILED(result)) {
     return result;
   }
@@ -1953,6 +1963,26 @@ void UnregisterTsfProfile() noexcept {
   }
 }
 
+HRESULT RegisterServerAtPath(const std::wstring &modulePath) {
+  const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+    return initializeResult;
+  }
+  const bool uninitialize = SUCCEEDED(initializeResult);
+  HRESULT result = RegisterComServer(modulePath);
+  if (SUCCEEDED(result)) {
+    result = RegisterTsfProfile(modulePath);
+  }
+  if (FAILED(result)) {
+    UnregisterTsfProfile();
+    UnregisterComServer();
+  }
+  if (uninitialize) {
+    CoUninitialize();
+  }
+  return result;
+}
+
 } // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, const DWORD reason, LPVOID) {
@@ -1990,23 +2020,23 @@ extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID classId, REFIID interfac
 }
 
 extern "C" HRESULT __stdcall DllRegisterServer() {
-  const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
-    return initializeResult;
-  }
-  const bool uninitialize = SUCCEEDED(initializeResult);
-  HRESULT result = RegisterComServer();
-  if (SUCCEEDED(result)) {
-    result = RegisterTsfProfile();
-  }
+  std::wstring modulePath;
+  const HRESULT result = ModulePath(modulePath);
   if (FAILED(result)) {
-    UnregisterTsfProfile();
-    UnregisterComServer();
+    return result;
   }
-  if (uninitialize) {
-    CoUninitialize();
+  return RegisterServerAtPath(modulePath);
+}
+
+extern "C" HRESULT __stdcall SlimeRegisterServerAtPath(const wchar_t *modulePath) {
+  if (modulePath == nullptr || modulePath[0] == L'\0') {
+    return E_INVALIDARG;
   }
-  return result;
+  try {
+    return RegisterServerAtPath(modulePath);
+  } catch (...) {
+    return E_OUTOFMEMORY;
+  }
 }
 
 extern "C" HRESULT __stdcall DllUnregisterServer() {

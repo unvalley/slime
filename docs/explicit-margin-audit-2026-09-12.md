@@ -1,0 +1,9 @@
+# Confidence audit for long explicit conversion — 2026-09-12
+
+No product changes. Current Core and FFI source hashes still match the adopted worker-prepared two-word revision. The current neural_scores tool was rebuilt and frozen. It rescored the union of changed cases from the0.55/0.8 experiments, preserving each actual input context. Scores for all242 lambda0.8 changes contain both actual before and after surfaces; none are missing. These are rounded diagnostic scores, not a replacement for runtime gates/postprocessing.
+
+A proposed guard retains the current lambda0.45 result unless lambda0.8 has at least1.0 combined-score advantage over every other candidate, the Hiragana subsequence is unchanged, and decimal characters are preserved. On the existing changed-case diagnostic, fixed2745 would retain18 exact gains,2 exact losses,7 other changes. No actual full evaluator has run this policy yet, and unchanged high-weight cases do not establish that an implementation cannot introduce other changes. These are development-selected conditions, requiring disjoint validation.
+
+The guard excludes the observed semantic regressions 更生→構成, 以後→囲碁, 名称→名勝, and30→三重. Remaining exact losses are 課程終了→課程修了 and 勲章受賞→勲章受章; they warrant linguistic review rather than automatically treating expected text as infallible. Do not alter benchmark labels to improve the reported score. Other changed incorrect outputs also need review; exact counts alone miss partial improvements or new errors.
+
+Next: implement an experimental confidence fallback using one model scoring call, compare actual outputs over the complete fixed suite and a separate validation set, and measure performance and macOS replay before considering adoption. Existing user-specified weights must remain respected. Artifacts: `target/evaluation/explicit-margin-audit-20260912/`, including reproducible collection/analysis scripts, source/model/tool hashes, per-input score tables, and `proposal.json`.

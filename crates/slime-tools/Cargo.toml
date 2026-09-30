@@ -77,3 +77,19 @@ path = "src/term_dictionary_generation.rs"
 [[bin]]
 name = "slime-pack-startup-evaluate"
 path = "src/pack_startup_evaluation.rs"
+
+[[bin]]
+name = "slime-phrase-dictionary"
+path = "src/phrase_dictionary_generation.rs"
+
+[[bin]]
+name = "slime-live-transition-evaluate"
+path = "src/live_transition_evaluation.rs"
+
+[[example]]
+name = "neural_scores"
+required-features = ["neural"]
+
+[[example]]
+name = "debug_neural_score"
+required-features = ["neural"]

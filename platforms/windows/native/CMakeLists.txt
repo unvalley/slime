@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.25)
-project(SlimeIME LANGUAGES CXX)
+if(NOT DEFINED SLIME_VERSION)
+  set(SLIME_VERSION "0.1.0")
+elseif(NOT SLIME_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+  message(FATAL_ERROR "SLIME_VERSION must be a three-part product version")
+endif()
+project(SlimeIME VERSION "${SLIME_VERSION}" LANGUAGES CXX RC)
 
 include(CTest)
 
@@ -10,6 +15,18 @@ endif()
 if(NOT DEFINED SLIME_FFI_LIBRARY)
   message(FATAL_ERROR "SLIME_FFI_LIBRARY must point to the Rust import library")
 endif()
+
+if(NOT DEFINED SLIME_SOURCE_REVISION)
+  set(SLIME_SOURCE_REVISION "development")
+elseif(NOT SLIME_SOURCE_REVISION MATCHES "^[0-9a-f]{40}$")
+  message(FATAL_ERROR "SLIME_SOURCE_REVISION must be a lowercase 40-character Git revision")
+endif()
+configure_file(
+  src/SlimeVersion.rc.in
+  "${CMAKE_CURRENT_BINARY_DIR}/SlimeVersion.rc"
+  @ONLY
+)
+set(SLIME_VERSION_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/SlimeVersion.rc")
 
 get_filename_component(SLIME_FFI_DIRECTORY "${SLIME_FFI_LIBRARY}" DIRECTORY)
 set(SLIME_FFI_RUNTIME "${SLIME_FFI_DIRECTORY}/slime_ffi.dll")
@@ -23,13 +40,15 @@ add_library(SlimeIME SHARED
   src/SlimeIME.cpp
   src/WindowsPreferences.cpp
   src/SlimeIME.def
+  "${SLIME_VERSION_RESOURCE}"
 )
 
-add_executable(SlimeIMERegister src/RegisterIME.cpp)
+add_executable(SlimeIMERegister src/RegisterIME.cpp "${SLIME_VERSION_RESOURCE}")
 
 add_executable(SlimeSettings WIN32
   src/WindowsPreferences.cpp
   src/WindowsSettings.cpp
+  "${SLIME_VERSION_RESOURCE}"
 )
 
 add_executable(SlimeNativeTests
@@ -37,6 +56,7 @@ add_executable(SlimeNativeTests
   src/SearchCandidateList.cpp
   src/SearchCandidateListTests.cpp
   src/WindowsPreferences.cpp
+  "${SLIME_VERSION_RESOURCE}"
 )
 
 target_compile_features(SlimeIME PRIVATE cxx_std_20)
@@ -78,6 +98,9 @@ target_compile_options(SlimeNativeTests PRIVATE /W4 /WX /permissive- /utf-8)
 target_include_directories(SlimeIME PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../crates/slime-ffi/include"
 )
+target_include_directories(SlimeNativeTests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../crates/slime-ffi/include"
+)
 target_link_libraries(SlimeIME PRIVATE
   "${SLIME_FFI_LIBRARY}"
   advapi32
@@ -89,14 +112,16 @@ target_link_libraries(SlimeIME PRIVATE
   uuid
 )
 target_link_libraries(SlimeIMERegister PRIVATE shlwapi)
-target_link_libraries(SlimeSettings PRIVATE gdi32 user32)
+target_link_libraries(SlimeSettings PRIVATE gdi32 shell32 user32)
 target_link_libraries(SlimeNativeTests PRIVATE
+  "${SLIME_FFI_LIBRARY}"
   gdi32
   oleaut32
   uiautomationcore
   user32
   uuid
 )
+add_dependencies(SlimeNativeTests SlimeIME)
 
 add_custom_command(TARGET SlimeIME POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different

@@ -15,6 +15,8 @@ const COMPOUND_ENTRIES_PER_SEGMENT: usize = 8;
 const COMPOUND_CANDIDATE_LIMIT: usize = 32;
 const FIXED_SEGMENT_ENTRIES_PER_SEGMENT: usize = 8;
 const FIXED_SEGMENT_CANDIDATE_LIMIT: usize = 22;
+const RECOMBINED_SOURCE_PATHS: usize = 10;
+const RECOMBINED_CANDIDATE_LIMIT: usize = 32;
 const MAX_EXPANDED_READING_CHARACTERS: usize = 8;
 
 fn main() -> ExitCode {
@@ -45,11 +47,15 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
             .ok_or_else(|| "external dictionary byte size overflowed".to_owned())
     })?;
     let report = if layers.is_empty() {
-        evaluate(&Dictionary::bundled(), &items)
+        evaluate_with_oracle(&Dictionary::bundled(), &items, options.oracle_n_best)
     } else {
-        let baseline = evaluate(&Dictionary::bundled(), &items);
-        evaluate(&Dictionary::bundled_with_layers(layers), &items)
-            .with_dictionary_baseline(&baseline)
+        let baseline = evaluate_with_oracle(&Dictionary::bundled(), &items, options.oracle_n_best);
+        evaluate_with_oracle(
+            &Dictionary::bundled_with_layers(layers),
+            &items,
+            options.oracle_n_best,
+        )
+        .with_dictionary_baseline(&baseline)
     }
     .with_dictionary_bytes(dictionary_bytes);
 
@@ -144,7 +150,7 @@ const fn usage() -> &'static str {
     "usage: slime-recall --input PATH [--dictionary PATH ...] [--details N] \
      [--max-missing N] [--min-recovered N] [--max-regressed N] \
      [--max-top1-regressed N] [--max-top1-changed N] [--max-p95-ms N] \
-     [--max-dictionary-bytes N] [--json]\n\
+     [--max-dictionary-bytes N] [--oracle-n-best] [--json]\n\
      input format: reading<TAB>expected_surface\n\
      dictionary format: reading<TAB>surface[<TAB>cost]"
 }
@@ -161,6 +167,7 @@ struct Options {
     max_top1_changed: Option<usize>,
     max_p95_ms: Option<f64>,
     max_dictionary_bytes: Option<u64>,
+    oracle_n_best: bool,
     json: bool,
 }
 
@@ -176,6 +183,7 @@ impl Options {
         let mut max_top1_changed = None;
         let mut max_p95_ms = None;
         let mut max_dictionary_bytes = None;
+        let mut oracle_n_best = false;
         let mut json = false;
 
         while let Some(argument) = arguments.next() {
@@ -215,6 +223,7 @@ impl Options {
                         Some(parse_u64("--max-dictionary-bytes", arguments.next())?);
                 }
                 "--json" => json = true,
+                "--oracle-n-best" => oracle_n_best = true,
                 "--help" | "-h" => return Err(usage().to_owned()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -231,6 +240,7 @@ impl Options {
             max_top1_changed,
             max_p95_ms,
             max_dictionary_bytes,
+            oracle_n_best,
             json,
         })
     }
@@ -394,6 +404,7 @@ enum RecallStage {
     Expanded,
     Compound,
     FixedSegment,
+    Recombined,
     KnownComponents,
     Missing,
 }
@@ -403,9 +414,16 @@ struct ItemResult {
     reading: String,
     surface: String,
     stage: RecallStage,
+    stage_rank: Option<usize>,
     top1_surface: Option<String>,
     top1_correct: bool,
     initial_latency_ms: f64,
+    fixed_segment_latency_ms: Option<f64>,
+    recombined_latency_ms: Option<f64>,
+    oracle_at_32_rank: Option<usize>,
+    oracle_at_64_rank: Option<usize>,
+    oracle_at_32_latency_ms: Option<f64>,
+    oracle_at_64_latency_ms: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -422,6 +440,7 @@ struct RecallReport {
     expanded: usize,
     compound: usize,
     fixed_segment: usize,
+    recombined: usize,
     known_components: usize,
     unknown_components: usize,
     missing: usize,
@@ -434,6 +453,13 @@ struct RecallReport {
     dictionary_top1_regressed: usize,
     dictionary_top1_changed: usize,
     initial_latency_ms: LatencyReport,
+    fixed_segment_latency_ms: LatencyReport,
+    recombined_latency_ms: LatencyReport,
+    oracle_at_10: usize,
+    oracle_at_32: usize,
+    oracle_at_64: usize,
+    oracle_at_32_latency_ms: LatencyReport,
+    oracle_at_64_latency_ms: LatencyReport,
     baseline_initial_latency_ms: LatencyReport,
     dictionary_bytes: u64,
     results: Vec<ItemResult>,
@@ -446,6 +472,7 @@ struct RecallReportOutput<'a> {
     expanded: usize,
     compound: usize,
     fixed_segment: usize,
+    recombined: usize,
     known_components: usize,
     unknown_components: usize,
     missing: usize,
@@ -458,6 +485,13 @@ struct RecallReportOutput<'a> {
     dictionary_top1_regressed: usize,
     dictionary_top1_changed: usize,
     initial_latency_ms: LatencyReport,
+    fixed_segment_latency_ms: LatencyReport,
+    recombined_latency_ms: LatencyReport,
+    oracle_at_10: usize,
+    oracle_at_32: usize,
+    oracle_at_64: usize,
+    oracle_at_32_latency_ms: LatencyReport,
+    oracle_at_64_latency_ms: LatencyReport,
     baseline_initial_latency_ms: LatencyReport,
     dictionary_bytes: u64,
     results: Vec<&'a ItemResult>,
@@ -472,6 +506,7 @@ impl RecallReport {
             expanded: self.expanded,
             compound: self.compound,
             fixed_segment: self.fixed_segment,
+            recombined: self.recombined,
             known_components: self.known_components,
             unknown_components: self.unknown_components,
             missing: self.missing,
@@ -484,6 +519,13 @@ impl RecallReport {
             dictionary_top1_regressed: self.dictionary_top1_regressed,
             dictionary_top1_changed: self.dictionary_top1_changed,
             initial_latency_ms: self.initial_latency_ms,
+            fixed_segment_latency_ms: self.fixed_segment_latency_ms,
+            recombined_latency_ms: self.recombined_latency_ms,
+            oracle_at_10: self.oracle_at_10,
+            oracle_at_32: self.oracle_at_32,
+            oracle_at_64: self.oracle_at_64,
+            oracle_at_32_latency_ms: self.oracle_at_32_latency_ms,
+            oracle_at_64_latency_ms: self.oracle_at_64_latency_ms,
             baseline_initial_latency_ms: self.baseline_initial_latency_ms,
             dictionary_bytes: self.dictionary_bytes,
             results: self.results.iter().take(limit).collect(),
@@ -519,58 +561,19 @@ impl RecallReport {
     }
 }
 
+#[cfg(test)]
 fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
+    evaluate_with_oracle(dictionary, items, false)
+}
+
+fn evaluate_with_oracle(
+    dictionary: &Dictionary,
+    items: &[RecallItem],
+    oracle_n_best: bool,
+) -> RecallReport {
     let results: Vec<_> = items
         .iter()
-        .map(|item| {
-            let started = Instant::now();
-            let initial = dictionary.candidates(&item.reading);
-            let initial_latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
-            let top1_surface = initial.first().map(|candidate| candidate.surface.clone());
-            let top1_correct = top1_surface.as_deref() == Some(item.surface.as_str());
-            let reading_characters = item.reading.chars().count();
-            let expanded = if reading_characters <= MAX_EXPANDED_READING_CHARACTERS {
-                dictionary.candidates_with_limit(&item.reading, 32)
-            } else {
-                Vec::new()
-            };
-            let compound = dictionary.compound_candidates(
-                &item.reading,
-                COMPOUND_ENTRIES_PER_SEGMENT,
-                COMPOUND_CANDIDATE_LIMIT,
-            );
-            let fixed_segment = if reading_characters > MAX_EXPANDED_READING_CHARACTERS {
-                dictionary.fixed_segment_variants(
-                    &item.reading,
-                    FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
-                    FIXED_SEGMENT_CANDIDATE_LIMIT,
-                )
-            } else {
-                Vec::new()
-            };
-            let stage = classify(
-                &item.surface,
-                initial.iter().map(|candidate| candidate.surface.as_str()),
-                expanded.iter().map(|candidate| candidate.surface.as_str()),
-                compound.iter().map(|candidate| candidate.surface.as_str()),
-                fixed_segment.iter().map(String::as_str),
-            );
-            let stage = if stage == RecallStage::Missing
-                && dictionary.is_exact_compound_surface(&item.reading, &item.surface)
-            {
-                RecallStage::KnownComponents
-            } else {
-                stage
-            };
-            ItemResult {
-                reading: item.reading.clone(),
-                surface: item.surface.clone(),
-                stage,
-                top1_surface,
-                top1_correct,
-                initial_latency_ms,
-            }
-        })
+        .map(|item| evaluate_item(dictionary, item, oracle_n_best))
         .collect();
     let known_components = count_stage(&results, RecallStage::KnownComponents);
     let unknown_components = count_stage(&results, RecallStage::Missing);
@@ -582,12 +585,37 @@ fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
             .map(|result| result.initial_latency_ms)
             .collect(),
     );
+    let fixed_segment_latency_ms = latency_report(
+        results
+            .iter()
+            .filter_map(|result| result.fixed_segment_latency_ms)
+            .collect(),
+    );
+    let recombined_latency_ms = latency_report(
+        results
+            .iter()
+            .filter_map(|result| result.recombined_latency_ms)
+            .collect(),
+    );
+    let oracle_at_32_latency_ms = latency_report(
+        results
+            .iter()
+            .filter_map(|result| result.oracle_at_32_latency_ms)
+            .collect(),
+    );
+    let oracle_at_64_latency_ms = latency_report(
+        results
+            .iter()
+            .filter_map(|result| result.oracle_at_64_latency_ms)
+            .collect(),
+    );
     RecallReport {
         total: results.len(),
         initial: count_stage(&results, RecallStage::Initial),
         expanded: count_stage(&results, RecallStage::Expanded),
         compound: count_stage(&results, RecallStage::Compound),
         fixed_segment: count_stage(&results, RecallStage::FixedSegment),
+        recombined: count_stage(&results, RecallStage::Recombined),
         known_components,
         unknown_components,
         missing,
@@ -600,10 +628,159 @@ fn evaluate(dictionary: &Dictionary, items: &[RecallItem]) -> RecallReport {
         dictionary_top1_regressed: 0,
         dictionary_top1_changed: 0,
         initial_latency_ms,
+        fixed_segment_latency_ms,
+        recombined_latency_ms,
+        oracle_at_10: results
+            .iter()
+            .filter(|result| {
+                result
+                    .stage_rank
+                    .is_some_and(|rank| result.stage == RecallStage::Initial && rank <= 10)
+            })
+            .count(),
+        oracle_at_32: results
+            .iter()
+            .filter(|result| result.oracle_at_32_rank.is_some())
+            .count(),
+        oracle_at_64: results
+            .iter()
+            .filter(|result| result.oracle_at_64_rank.is_some())
+            .count(),
+        oracle_at_32_latency_ms,
+        oracle_at_64_latency_ms,
         baseline_initial_latency_ms: initial_latency_ms,
         dictionary_bytes: 0,
         results,
     }
+}
+
+fn evaluate_item(dictionary: &Dictionary, item: &RecallItem, oracle_n_best: bool) -> ItemResult {
+    let started = Instant::now();
+    let initial = dictionary.candidates(&item.reading);
+    let initial_latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let top1_surface = initial.first().map(|candidate| candidate.surface.clone());
+    let top1_correct = top1_surface.as_deref() == Some(item.surface.as_str());
+    let (oracle_at_32_rank, oracle_at_32_latency_ms) =
+        oracle_rank_and_latency(dictionary, item, 32, oracle_n_best);
+    let (oracle_at_64_rank, oracle_at_64_latency_ms) =
+        oracle_rank_and_latency(dictionary, item, 64, oracle_n_best);
+    let reading_characters = item.reading.chars().count();
+    let expanded = if reading_characters <= MAX_EXPANDED_READING_CHARACTERS {
+        dictionary.candidates_with_limit(&item.reading, 32)
+    } else {
+        Vec::new()
+    };
+    let compound = dictionary.compound_candidates(
+        &item.reading,
+        COMPOUND_ENTRIES_PER_SEGMENT,
+        COMPOUND_CANDIDATE_LIMIT,
+    );
+    let fixed_segment_started = Instant::now();
+    let fixed_segment = if reading_characters > MAX_EXPANDED_READING_CHARACTERS {
+        dictionary.fixed_segment_variants(
+            &item.reading,
+            FIXED_SEGMENT_ENTRIES_PER_SEGMENT,
+            FIXED_SEGMENT_CANDIDATE_LIMIT,
+        )
+    } else {
+        Vec::new()
+    };
+    let fixed_segment_latency_ms = (reading_characters > MAX_EXPANDED_READING_CHARACTERS)
+        .then(|| fixed_segment_started.elapsed().as_secs_f64() * 1_000.0);
+    let recombined_started = Instant::now();
+    let recombined = if reading_characters > MAX_EXPANDED_READING_CHARACTERS {
+        dictionary.recombined_n_best_variants(
+            &item.reading,
+            RECOMBINED_SOURCE_PATHS,
+            RECOMBINED_CANDIDATE_LIMIT,
+        )
+    } else {
+        Vec::new()
+    };
+    let recombined_latency_ms = (reading_characters > MAX_EXPANDED_READING_CHARACTERS)
+        .then(|| recombined_started.elapsed().as_secs_f64() * 1_000.0);
+    let stage = classify(
+        &item.surface,
+        initial.iter().map(|candidate| candidate.surface.as_str()),
+        expanded.iter().map(|candidate| candidate.surface.as_str()),
+        compound.iter().map(|candidate| candidate.surface.as_str()),
+        fixed_segment.iter().map(String::as_str),
+        recombined
+            .iter()
+            .map(|candidate| candidate.surface.as_str()),
+    );
+    let stage = if stage == RecallStage::Missing
+        && dictionary.is_exact_segmented_surface(&item.reading, &item.surface)
+    {
+        RecallStage::KnownComponents
+    } else {
+        stage
+    };
+    let stage_rank = match stage {
+        RecallStage::Initial => candidate_rank(
+            &item.surface,
+            initial.iter().map(|candidate| candidate.surface.as_str()),
+        ),
+        RecallStage::Expanded => candidate_rank(
+            &item.surface,
+            expanded.iter().map(|candidate| candidate.surface.as_str()),
+        ),
+        RecallStage::Compound => candidate_rank(
+            &item.surface,
+            compound.iter().map(|candidate| candidate.surface.as_str()),
+        ),
+        RecallStage::FixedSegment => {
+            candidate_rank(&item.surface, fixed_segment.iter().map(String::as_str))
+        }
+        RecallStage::Recombined => candidate_rank(
+            &item.surface,
+            recombined
+                .iter()
+                .map(|candidate| candidate.surface.as_str()),
+        ),
+        RecallStage::KnownComponents | RecallStage::Missing => None,
+    };
+    ItemResult {
+        reading: item.reading.clone(),
+        surface: item.surface.clone(),
+        stage,
+        stage_rank,
+        top1_surface,
+        top1_correct,
+        initial_latency_ms,
+        fixed_segment_latency_ms,
+        recombined_latency_ms,
+        oracle_at_32_rank,
+        oracle_at_64_rank,
+        oracle_at_32_latency_ms,
+        oracle_at_64_latency_ms,
+    }
+}
+
+fn oracle_rank_and_latency(
+    dictionary: &Dictionary,
+    item: &RecallItem,
+    limit: usize,
+    enabled: bool,
+) -> (Option<usize>, Option<f64>) {
+    if !enabled {
+        return (None, None);
+    }
+    let started = Instant::now();
+    let candidates = dictionary.candidates_with_limit(&item.reading, limit);
+    let rank = candidate_rank(
+        &item.surface,
+        candidates
+            .iter()
+            .map(|candidate| candidate.surface.as_str()),
+    );
+    (rank, Some(started.elapsed().as_secs_f64() * 1_000.0))
+}
+
+fn candidate_rank<'a>(expected: &str, candidates: impl Iterator<Item = &'a str>) -> Option<usize> {
+    candidates
+        .enumerate()
+        .find_map(|(index, surface)| (surface == expected).then_some(index + 1))
 }
 
 fn latency_report(mut milliseconds: Vec<f64>) -> LatencyReport {
@@ -629,6 +806,7 @@ fn classify<'a>(
     expanded: impl Iterator<Item = &'a str>,
     compound: impl Iterator<Item = &'a str>,
     fixed_segment: impl Iterator<Item = &'a str>,
+    recombined: impl Iterator<Item = &'a str>,
 ) -> RecallStage {
     if initial.into_iter().any(|surface| surface == expected) {
         RecallStage::Initial
@@ -638,6 +816,8 @@ fn classify<'a>(
         RecallStage::Compound
     } else if fixed_segment.into_iter().any(|surface| surface == expected) {
         RecallStage::FixedSegment
+    } else if recombined.into_iter().any(|surface| surface == expected) {
+        RecallStage::Recombined
     } else {
         RecallStage::Missing
     }
@@ -661,6 +841,7 @@ fn print_report(report: &RecallReport, details: usize) {
     println!("  expanded: {}", report.expanded);
     println!("  compound: {}", report.compound);
     println!("  fixed segment: {}", report.fixed_segment);
+    println!("  recombined: {}", report.recombined);
     println!("  known components: {}", report.known_components);
     println!("  unknown components: {}", report.unknown_components);
     println!("  missing: {}", report.missing);
@@ -696,6 +877,12 @@ fn print_report(report: &RecallReport, details: usize) {
         report.baseline_initial_latency_ms.p50,
         report.baseline_initial_latency_ms.p95,
         report.baseline_initial_latency_ms.max
+    );
+    println!(
+        "  recombined latency ms: p50={:.3} p95={:.3} max={:.3}",
+        report.recombined_latency_ms.p50,
+        report.recombined_latency_ms.p95,
+        report.recombined_latency_ms.max
     );
     println!("  external dictionary bytes: {}", report.dictionary_bytes);
     for result in report
@@ -767,6 +954,7 @@ mod tests {
                 ["正解"].into_iter(),
                 [].into_iter(),
                 [].into_iter(),
+                [].into_iter(),
                 [].into_iter()
             ),
             RecallStage::Initial
@@ -776,6 +964,7 @@ mod tests {
                 "正解",
                 ["別候補"].into_iter(),
                 ["正解"].into_iter(),
+                [].into_iter(),
                 [].into_iter(),
                 [].into_iter()
             ),
@@ -787,6 +976,7 @@ mod tests {
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["正解"].into_iter(),
+                [].into_iter(),
                 [].into_iter()
             ),
             RecallStage::Compound
@@ -797,13 +987,26 @@ mod tests {
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
-                ["正解"].into_iter()
+                ["正解"].into_iter(),
+                [].into_iter()
             ),
             RecallStage::FixedSegment
         );
         assert_eq!(
             classify(
                 "正解",
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["別候補"].into_iter(),
+                ["正解"].into_iter()
+            ),
+            RecallStage::Recombined
+        );
+        assert_eq!(
+            classify(
+                "正解",
+                ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),
                 ["別候補"].into_iter(),

@@ -1,0 +1,6 @@
+# Public-domain language correction.
+#
+# The reading/surface pair is independently evidenced in public-domain Anthy
+# corpus.1. The supplemental noun POS keeps it productive in compounds; cost
+# 7000 fixes the observed ranking without changing top-1 on 901 held-out items.
+へんかんせいど	変換精度	1851	1851	7000

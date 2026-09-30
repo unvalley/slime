@@ -11,9 +11,28 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 slime-core = { path = "../slime-core" }
+slime-tools = { path = "../slime-tools", optional = true, features = ["neural"] }
+
+[features]
+# Optional local neural reranking for explicit Space conversion and delayed
+# LIVE ranking after a typing pause. The per-keystroke path stays free of
+# candidate expansion and llama.cpp inference.
+neural = ["dep:slime-tools"]
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
 
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [lints]
 workspace = true
+
+[[example]]
+name = "live_neural_evaluate"
+required-features = ["neural"]
+
+[[example]]
+name = "live_neural_trace"
+required-features = ["neural"]

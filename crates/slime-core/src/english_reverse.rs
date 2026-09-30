@@ -37,20 +37,36 @@ pub fn surface_key(surface: &str) -> Option<String> {
 /// Reports whether `reading` retypes `key` exactly or as a strict prefix.
 #[must_use]
 pub fn reverse_match(reading: &str, key: &str) -> Option<ReverseMatch> {
-    if key.len() < MIN_KEY_LENGTH || reading.is_empty() {
-        return None;
+    ReverseReading::new(reading).reverse_match(key)
+}
+
+/// A reading decoded once for matching against many ASCII keys.
+pub struct ReverseReading(Vec<char>);
+
+impl ReverseReading {
+    #[must_use]
+    pub fn new(reading: &str) -> Self {
+        Self(reading.chars().collect())
     }
-    let reading: Vec<char> = reading.chars().collect();
-    // Require most of the key before a prefix counts, so short fragments do
-    // not pull in every surface that shares a first syllable.
-    let minimum_matched = MIN_KEY_LENGTH.max(key.len().saturating_sub(4));
-    matches(&reading, key.as_bytes()).and_then(|matched| {
-        if matched == key.len() {
-            Some(ReverseMatch::Exact)
-        } else {
-            (matched >= minimum_matched).then_some(ReverseMatch::Prefix)
+
+    /// Reports whether this reading retypes `key` exactly or as a strict
+    /// prefix.
+    #[must_use]
+    pub fn reverse_match(&self, key: &str) -> Option<ReverseMatch> {
+        if key.len() < MIN_KEY_LENGTH || self.0.is_empty() {
+            return None;
         }
-    })
+        // Require most of the key before a prefix counts, so short fragments
+        // do not pull in every surface that shares a first syllable.
+        let minimum_matched = MIN_KEY_LENGTH.max(key.len().saturating_sub(4));
+        matches(&self.0, key.as_bytes()).and_then(|matched| {
+            if matched == key.len() {
+                Some(ReverseMatch::Exact)
+            } else {
+                (matched >= minimum_matched).then_some(ReverseMatch::Prefix)
+            }
+        })
+    }
 }
 
 /// Returns how many bytes of `key` the whole reading can spell, if any.
@@ -79,7 +95,7 @@ fn matches(reading: &[char], key: &[u8]) -> Option<usize> {
         return None;
     }
 
-    for (kana, spelling) in spellings() {
+    for (kana, spelling) in spellings().get(&character)? {
         let kana_characters: &[char] = kana;
         if reading.starts_with(kana_characters)
             && key.starts_with(spelling.as_bytes())
@@ -92,8 +108,12 @@ fn matches(reading: &[char], key: &[u8]) -> Option<usize> {
     None
 }
 
-fn spellings() -> &'static [(Vec<char>, &'static str)] {
-    static SPELLINGS: OnceLock<Vec<(Vec<char>, &'static str)>> = OnceLock::new();
+type Spellings = HashMap<char, Vec<(Vec<char>, &'static str)>>;
+
+/// Kana spellings bucketed by their first kana, so each step scans only the
+/// spellings that can start at the current character.
+fn spellings() -> &'static Spellings {
+    static SPELLINGS: OnceLock<Spellings> = OnceLock::new();
     SPELLINGS.get_or_init(|| {
         let mut by_kana: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         for (kana, romaji) in slime_romaji::kana_spellings() {
@@ -122,7 +142,16 @@ fn spellings() -> &'static [(Vec<char>, &'static str)] {
                 .cmp(&left.0.len())
                 .then_with(|| right.1.len().cmp(&left.1.len()))
         });
-        spellings
+        let mut by_first_kana = Spellings::new();
+        for (kana, spelling) in spellings {
+            if let Some(&first) = kana.first() {
+                by_first_kana
+                    .entry(first)
+                    .or_default()
+                    .push((kana, spelling));
+            }
+        }
+        by_first_kana
     })
 }
 

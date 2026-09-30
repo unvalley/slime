@@ -253,8 +253,17 @@ pub fn validate_dictionary_pack(source: &str) -> Result<DictionaryPackInfo, Stri
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DictionaryPackStore {
     packs: Vec<DictionaryPack>,
-    context_rules: Vec<PackContextRule>,
+    context_rules: ContextRuleIndex,
     errors: Vec<DictionaryPackLoadError>,
+}
+
+/// Rules from every pack, sorted by reading, previous surface, priority, and
+/// surface. The longest previous surface bounds which suffixes of a left
+/// context can match at all, so lookups skip the rest of a long context.
+#[derive(Clone, Debug, Default)]
+struct ContextRuleIndex {
+    rules: Vec<PackContextRule>,
+    max_previous_surface_characters: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +334,7 @@ impl DictionaryPackStore {
             Err(message) => {
                 return Self {
                     packs: Vec::new(),
-                    context_rules: Vec::new(),
+                    context_rules: ContextRuleIndex::default(),
                     errors: vec![DictionaryPackLoadError {
                         file: directory.display().to_string(),
                         message,
@@ -387,27 +396,66 @@ impl DictionaryPackStore {
         })
     }
 
+    pub(crate) fn has_contextual_rules(&self) -> bool {
+        !self.context_rules.rules.is_empty()
+    }
+
+    /// Whether some rule's reading occurs inside `reading` as a proper
+    /// substring, so that it could match one lattice segment. Rules are
+    /// sorted by reading first: each start position narrows one prefix range
+    /// and stops as soon as no rule reading can extend it, which keeps this
+    /// far cheaper than the N-best search it guards.
+    pub(crate) fn has_contextual_rules_inside(&self, reading: &str) -> bool {
+        for (start, _) in reading.char_indices() {
+            let tail = &reading[start..];
+            let mut rules = self.context_rules.rules.as_slice();
+            let ends = tail
+                .char_indices()
+                .skip(1)
+                .map(|(end, _)| end)
+                .chain(std::iter::once(tail.len()));
+            for end in ends {
+                if start == 0 && end == tail.len() {
+                    break;
+                }
+                let prefix = &tail[..end];
+                let lower = rules.partition_point(|rule| rule.reading.as_str() < prefix);
+                rules = &rules[lower..];
+                let upper = rules.partition_point(|rule| rule.reading.starts_with(prefix));
+                rules = &rules[..upper];
+                match rules.first() {
+                    None => break,
+                    Some(rule) if rule.reading == prefix => return true,
+                    Some(_) => {}
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn visit_contextual_surfaces(
         &self,
         previous_surface: &str,
         reading: &str,
         mut visitor: impl FnMut(&str) -> bool,
     ) {
-        let reading_start = self
-            .context_rules
-            .partition_point(|rule| rule.reading.as_str() < reading);
-        let reading_end = self
-            .context_rules
-            .partition_point(|rule| rule.reading.as_str() <= reading);
-        let rules = &self.context_rules[reading_start..reading_end];
+        let all_rules = &self.context_rules.rules;
+        let reading_start = all_rules.partition_point(|rule| rule.reading.as_str() < reading);
+        let reading_end = all_rules.partition_point(|rule| rule.reading.as_str() <= reading);
+        let rules = &all_rules[reading_start..reading_end];
         if rules.is_empty() {
             return;
         }
-        let character_count = previous_surface.chars().count();
-        for (character_index, (byte_index, _)) in previous_surface.char_indices().enumerate() {
-            if character_count - character_index > MAX_CONTEXT_SURFACE_CHARACTERS {
-                continue;
-            }
+        // Longest suffix first, so more specific contexts are visited first.
+        let searchable_characters = self
+            .context_rules
+            .max_previous_surface_characters
+            .min(MAX_CONTEXT_SURFACE_CHARACTERS);
+        let skipped_characters = previous_surface
+            .chars()
+            .count()
+            .saturating_sub(searchable_characters);
+        for (byte_index, _) in previous_surface.char_indices().skip(skipped_characters) {
             let suffix = &previous_surface[byte_index..];
             let start = rules.partition_point(|rule| rule.previous_surface.as_str() < suffix);
             let end = rules.partition_point(|rule| rule.previous_surface.as_str() <= suffix);
@@ -441,7 +489,7 @@ impl DictionaryPackStore {
     }
 }
 
-fn merge_context_rules(packs: &[DictionaryPack]) -> Vec<PackContextRule> {
+fn merge_context_rules(packs: &[DictionaryPack]) -> ContextRuleIndex {
     let mut rules: Vec<_> = packs
         .iter()
         .flat_map(|pack| pack.context_rules.iter().cloned())
@@ -479,7 +527,15 @@ fn merge_context_rules(packs: &[DictionaryPack]) -> Vec<PackContextRule> {
                 &right.surface,
             ))
     });
-    rules
+    let max_previous_surface_characters = rules
+        .iter()
+        .map(|rule| rule.previous_surface.chars().count())
+        .max()
+        .unwrap_or(0);
+    ContextRuleIndex {
+        rules,
+        max_previous_surface_characters,
+    }
 }
 
 fn pack_paths(directory: &Path) -> Result<Vec<PathBuf>, String> {
@@ -598,10 +654,9 @@ fn decode_lower_hex<const N: usize>(source: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in source.as_bytes().chunks_exact(2).enumerate() {
-        let high = decode_lower_hex_digit(pair[0])?;
-        let low = decode_lower_hex_digit(pair[1])?;
-        decoded[index] = high << 4 | low;
+    let (pairs, _) = source.as_bytes().as_chunks::<2>();
+    for (slot, &[high, low]) in decoded.iter_mut().zip(pairs) {
+        *slot = decode_lower_hex_digit(high)? << 4 | decode_lower_hex_digit(low)?;
     }
     Some(decoded)
 }
@@ -1234,6 +1289,15 @@ mod tests {
             true
         });
         assert_eq!(surfaces, ["器官", "機関", "期間"]);
+
+        // Only proper substrings count; the whole reading is looked up directly.
+        assert!(!store.has_contextual_rules_inside("きかん"));
+        assert!(!store.has_contextual_rules_inside("き"));
+        assert!(!store.has_contextual_rules_inside("きか"));
+        assert!(!store.has_contextual_rules_inside("ききか"));
+        assert!(store.has_contextual_rules_inside("きかんしゃ"));
+        assert!(store.has_contextual_rules_inside("このきかん"));
+        assert!(store.has_contextual_rules_inside("このきかんに"));
 
         assert!(validate_dictionary_pack(&source.replace("機関", "器官")).is_err());
         assert!(

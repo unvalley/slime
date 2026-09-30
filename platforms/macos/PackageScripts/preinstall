@@ -1,0 +1,45 @@
+#!/bin/bash
+set -eu
+
+bundle_identifier="com.unvalley.inputmethod.Slime"
+target_volume="${3:-/}"
+
+case "$target_volume" in
+  /|/Volumes/*) ;;
+  *)
+    echo "Refusing unexpected target volume: $target_volume" >&2
+    exit 64
+    ;;
+esac
+
+target="${target_volume%/}/Library/Input Methods/Slime.app"
+expected_target="${target_volume%/}/Library/Input Methods/Slime.app"
+if [[ "$target" != "$expected_target" ]]; then
+  echo "Refusing unexpected input method path: $target" >&2
+  exit 64
+fi
+
+if [[ ! -e "$target" ]]; then
+  exit 0
+fi
+if [[ -L "$target" || ! -d "$target" ]]; then
+  echo "Refusing to replace a non-bundle path: $target" >&2
+  exit 65
+fi
+
+installed_identifier="$(
+  /usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+    "$target/Contents/Info.plist" 2>/dev/null || true
+)"
+if [[ "$installed_identifier" != "$bundle_identifier" ]]; then
+  echo "Refusing to replace a bundle with identifier: $installed_identifier" >&2
+  exit 65
+fi
+
+if [[ "$target_volume" == "/" ]]; then
+  /usr/bin/pkill -x Slime >/dev/null 2>&1 || true
+fi
+
+# Remove the validated previous bundle before extraction so files deleted by a
+# newer release cannot survive an update.
+/bin/rm -rf "$target"

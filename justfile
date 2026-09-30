@@ -31,13 +31,65 @@ test:
 test-ffi:
     scripts/test-c-ffi.sh
 
-# format、lint、Rustテスト、C ABIテストをまとめて実行する
-check: fmt-check lint test test-ffi
+# 公開入力経路へ商用認証・ネットワーク依存が戻っていないことを確認する
+test-commercial-boundary:
+    scripts/test-commercial-boundary.sh
+
+# 辞書パック公開鍵のbuild-time形式・重複・上限を検証する
+test-dictionary-pack-verification-keys:
+    scripts/test-dictionary-pack-verification-keys.sh
+
+# 署名済み辞書パックのrollback下限形式・重複・上限を検証する
+test-dictionary-pack-version-floors:
+    scripts/test-dictionary-pack-version-floors.sh
+
+# private辞書候補の生成・評価・no-clobberを架空データで検証する
+test-private-dictionary-candidate:
+    scripts/test-private-dictionary-candidate.sh
+
+# macOS release buildがcleanなGit revisionだけを受け入れることを検証する
+test-macos-release-source-policy:
+    scripts/test-macos-release-source-policy.sh
+
+# macOS release evidenceのcanonical artifact bindingを検証する
+test-macos-package-binding-policy:
+    scripts/test-macos-package-binding-policy.sh
+
+# macOS consumer sessionの全証拠が同一releaseへbindされることを検証する
+test-macos-consumer-evidence-policy:
+    scripts/test-macos-consumer-evidence-policy.sh
+
+# format、lint、Rustテスト、C ABI、商用境界テストをまとめて実行する
+check: fmt-check lint test test-ffi test-commercial-boundary test-dictionary-pack-verification-keys test-dictionary-pack-version-floors test-private-dictionary-candidate test-macos-release-source-policy test-macos-package-binding-policy test-macos-consumer-evidence-policy
     @echo "All checks passed."
+
+# 端末内文脈学習と入力ミス訂正の改善・副作用を固定データで評価する
+evaluate-adaptation:
+    scripts/evaluate-adaptation.sh
+
+# 外部TSVの候補recallと、追加辞書による回収・回帰件数を分類する
+evaluate-recall input *args:
+    cargo run --release --quiet -p slime-tools --bin slime-recall -- --input "{{input}}" {{args}}
 
 # 外部fixtureで入力ミス訂正の回収・誤訂正・遅延を集計する
 evaluate-typos positive negative *args:
     cargo run --release --quiet -p slime-tools --bin slime-typo-evaluate -- --positive "{{positive}}" --negative "{{negative}}" {{args}}
+
+# 非公開fixtureを出力せず、追加辞書・文脈ルールの品質差を集計する
+evaluate-context-pack data_dir input *args:
+    cargo run --release --quiet -p slime-tools --bin slime-context-pack-evaluate -- --data-dir "{{data_dir}}" --input "{{input}}" {{args}}
+
+# 辞書packを独立processで反復読込し、起動時間と最大RSSを集計する
+evaluate-pack-startup data_dir *args:
+    cargo run --release --quiet -p slime-tools --bin slime-pack-startup-evaluate -- --data-dir "{{data_dir}}" {{args}}
+
+# かなprefixを逐次再生し、LIVE表示の巻き戻し・かな戻り・数字混入を集計する
+evaluate-live-transitions input *args:
+    cargo run --release --quiet -p slime-tools --bin slime-live-transition-evaluate -- --input "{{input}}" {{args}}
+
+# 実際の非同期LIVE neural taskをかな入力の最終停止点で評価する
+evaluate-live-neural model input *args:
+    cargo run --release --quiet -p slime-ffi --features neural --example live_neural_evaluate -- "{{model}}" --input "{{input}}" {{args}}
 
 # debugビルドする
 build:
@@ -115,10 +167,51 @@ build-macos:
 verify-macos: build-macos
     scripts/verify-macos-bundle.sh
 
-# macOS版をまとめて検証する
-check-macos: check test-macos verify-macos
+# 未署名PKGでもpayload・version・lifecycle scriptの構造policyを回帰検証する
+test-macos-package-policy: build-macos
+    scripts/test-macos-package-policy.sh
 
-# Windows TSFアダプターをx64/x86向けに型検査する
+# TextEditの物理キーがInputMethodKitへ届いたことを内容非記録で確認する
+macos-textedit-input-gate command:
+    scripts/macos-textedit-input-gate.sh "{{command}}"
+
+# private/secure input中の履歴不変と解除後の学習再開を内容非記録で確認する
+macos-input-privacy-gate command:
+    scripts/macos-input-privacy-gate.sh "{{command}}"
+
+# 物理入力gateのshell構文を対話sessionなしで検証する
+test-macos-input-gate-syntax:
+    bash -n scripts/dictionary-pack-verification-keys.sh scripts/dictionary-pack-version-floors.sh scripts/macos-package-binding.sh scripts/macos-release-source.sh scripts/build-macos.sh scripts/verify-macos-bundle.sh scripts/verify-macos-release.sh scripts/test-macos-package-lifecycle.sh scripts/verify-macos-consumer-evidence.sh scripts/macos-console-state.sh scripts/macos-textedit-input-gate.sh scripts/macos-input-privacy-gate.sh scripts/test-macos-input-privacy-gate-policy.sh scripts/test-macos-textedit-input-gate-policy.sh scripts/test-macos-console-state-policy.sh scripts/test-macos-package-binding-policy.sh scripts/test-macos-consumer-evidence-policy.sh scripts/test-dictionary-pack-verification-keys.sh scripts/test-dictionary-pack-version-floors.sh scripts/test-macos-release-build-policy.sh scripts/test-macos-release-source-policy.sh
+    scripts/test-macos-console-state-policy.sh
+    scripts/test-macos-release-build-policy.sh
+    scripts/test-macos-input-privacy-gate-policy.sh
+    scripts/test-macos-textedit-input-gate-policy.sh
+
+# 署名状態に依存しないmacOS PKGの構造policyを検証する
+verify-macos-package package:
+    scripts/verify-macos-package-structure.sh "{{package}}"
+
+# Developer ID署名済みbundleからInstaller署名済みpkgを作る
+build-macos-release-pkg build:
+    SLIME_RELEASE_BUILD=1 SLIME_BUILD_NUMBER="{{build}}" scripts/build-macos.sh
+    scripts/build-macos-pkg.sh
+
+# 公証・staple済みpkgの商用配布gateを検証する
+verify-macos-release package:
+    scripts/verify-macos-release.sh "{{package}}"
+
+# 使い捨てmacOS VMで署名済みPKGのinstall/update/uninstallを検証する
+test-macos-package-lifecycle current previous="":
+    sudo -E scripts/test-macos-package-lifecycle.sh --current "{{current}}" {{ if previous != "" { "--previous '" + previous + "'" } else { "" } }}
+
+# システム領域のmacOS版を削除し、ユーザーデータは保持する
+uninstall-macos-system:
+    scripts/uninstall-macos-system.sh
+
+# macOS版をまとめて検証する
+check-macos: check test-macos verify-macos test-macos-package-policy test-macos-input-gate-syntax
+
+# Windows TSFアダプターをx64/x86/ARM64向けに型検査する
 check-windows:
     scripts/check-windows.sh
 
@@ -126,7 +219,7 @@ check-windows:
 check-landing:
     cd landing && pnpm build && pnpm check
 
-# slime.unvalley.meへ静的Landingをdeployする（実Checkout URLが必須）
+# slime.unvalley.meへ静的Landingをdeployする
 deploy-landing:
     cd landing && pnpm run deploy
 
@@ -137,6 +230,22 @@ install-local-dictionary-packs:
 # Git管理外の開発用追加辞書を形式検証する
 validate-local-dictionary-packs:
     cargo run -q -p slime-tools --bin slime-dictionary-pack -- validate .slime-private/dictionary-packs/*.slime-dict
+
+# 署名・rollback下限・期待件数を語彙非出力で最終検証する
+verify-signed-dictionary-packs data_dir keys floors expected *args:
+    cargo run -q -p slime-tools --bin slime-dictionary-pack -- verify-signed --data-dir "{{data_dir}}" --verification-keys "{{keys}}" --version-floors "{{floors}}" --expected-packs "{{expected}}" {{args}}
+
+# 非公開の注釈corpusから保守的な左文脈ルールTSVを生成する
+generate-context-rules input output *args:
+    cargo run -q -p slime-tools --bin slime-context-rules -- --input "{{input}}" --output "{{output}}" {{args}}
+
+# 非公開の注釈corpusから生成欠落している固有語・複合語TSVを作る
+generate-term-dictionary input output *args:
+    cargo run -q -p slime-tools --bin slime-term-dictionary -- --input "{{input}}" --output "{{output}}" {{args}}
+
+# private語彙・文脈を生成し、複数splitのgateを通ったunsigned候補だけを公開する
+prepare-private-dictionary-candidate *args:
+    scripts/prepare-private-dictionary-candidate.sh {{args}}
 
 # macOS版をユーザー領域へインストールして選択する
 install-macos: check-macos

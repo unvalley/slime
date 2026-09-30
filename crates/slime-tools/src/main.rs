@@ -3,7 +3,7 @@
 mod corpus_bigram;
 mod discriminative;
 #[cfg(feature = "neural")]
-mod neural;
+use slime_tools::neural;
 
 use std::collections::HashSet;
 use std::env;
@@ -17,11 +17,15 @@ use corpus_bigram::{
     parse_annotated_corpus_line,
 };
 use serde::{Deserialize, Serialize};
-use slime_converter::{Candidate, CandidateRanker, Dictionary};
+use slime_converter::{Candidate, CandidateRanker, Dictionary, DictionaryEntry, DictionaryLayer};
 
 /// Mozc-style costs approximate `-scale * ln(probability)`. Used to map
 /// lattice costs onto the neural log-likelihood axis for interpolation.
 const COST_LOG_SCALE: f64 = 500.0;
+const LIVE_LONG_READING_MIN_CHARACTERS: usize = 4;
+const MAX_EVALUATION_DICTIONARY_ENTRIES: usize = 100_000;
+const MAX_EVALUATION_DICTIONARY_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_EVALUATION_DICTIONARY_LINE_BYTES: usize = 4_096;
 
 fn main() -> ExitCode {
     match run() {
@@ -36,7 +40,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let options = Options::parse(env::args().skip(1))?;
     let items = load_items(&options)?;
-    let dictionary = Dictionary::bundled();
+    let dictionary = load_evaluation_dictionary(&options.dictionaries)?;
     let word_bigram_ranker = options
         .uses_corpus_ranker()
         .then(|| {
@@ -180,6 +184,7 @@ impl DatasetFormat {
 struct Options {
     format: DatasetFormat,
     inputs: Vec<PathBuf>,
+    dictionaries: Vec<PathBuf>,
     dataset_name: Option<String>,
     dataset_revision: Option<String>,
     dataset_sha256: Option<String>,
@@ -191,7 +196,10 @@ struct Options {
     json: bool,
     neural_model: Option<PathBuf>,
     neural_max_cost_gap: Option<i32>,
-    neural_max_candidates: Option<usize>,
+    neural_min_switch_margin: Option<f64>,
+    neural_numeric_base_switch_margin: Option<f64>,
+    neural_preserve_surface_length: bool,
+    neural_long_reading_lambda: Option<f64>,
     lambdas: Vec<f64>,
     discriminative_train: Option<PathBuf>,
     discriminative_teacher_model: Option<PathBuf>,
@@ -221,6 +229,7 @@ impl Options {
         let mut options = Self {
             format,
             inputs: Vec::new(),
+            dictionaries: Vec::new(),
             dataset_name: None,
             dataset_revision: format.revision(),
             dataset_sha256: format.sha256(),
@@ -232,7 +241,10 @@ impl Options {
             json: false,
             neural_model: None,
             neural_max_cost_gap: None,
-            neural_max_candidates: None,
+            neural_min_switch_margin: None,
+            neural_numeric_base_switch_margin: None,
+            neural_preserve_surface_length: false,
+            neural_long_reading_lambda: None,
             lambdas: Vec::new(),
             discriminative_train: None,
             discriminative_teacher_model: None,
@@ -258,6 +270,12 @@ impl Options {
                         .next()
                         .ok_or_else(|| "--input requires a path".to_owned())?;
                     options.inputs.push(PathBuf::from(value));
+                }
+                "--dictionary" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--dictionary requires a path".to_owned())?;
+                    options.dictionaries.push(PathBuf::from(value));
                 }
                 "--dataset-name" => {
                     options.dataset_name = Some(
@@ -305,12 +323,23 @@ impl Options {
                         arguments.next(),
                     )?);
                 }
-                "--neural-max-candidates" => {
-                    let maximum = parse_positive("--neural-max-candidates", arguments.next())?;
-                    if maximum < 2 {
-                        return Err("--neural-max-candidates must be at least 2".to_owned());
-                    }
-                    options.neural_max_candidates = Some(maximum);
+                "--neural-min-switch-margin" => {
+                    options.neural_min_switch_margin = Some(parse_non_negative_f64(
+                        "--neural-min-switch-margin",
+                        arguments.next(),
+                    )?);
+                }
+                "--neural-numeric-base-switch-margin" => {
+                    options.neural_numeric_base_switch_margin = Some(parse_non_negative_f64(
+                        "--neural-numeric-base-switch-margin",
+                        arguments.next(),
+                    )?);
+                }
+                "--neural-preserve-surface-length" => {
+                    options.neural_preserve_surface_length = true;
+                }
+                "--neural-long-reading-lambda" => {
+                    options.neural_long_reading_lambda = Some(parse_lambda(arguments.next())?);
                 }
                 "--lambda" => options.lambdas.push(parse_lambda(arguments.next())?),
                 "--discriminative-train" => {
@@ -403,10 +432,20 @@ impl Options {
         if options.uses_corpus_ranker() && options.word_bigram_corpora.is_empty() {
             return Err("n-gram weights require --word-bigram-corpus".to_owned());
         }
-        if (options.neural_max_cost_gap.is_some() || options.neural_max_candidates.is_some())
-            && options.neural_model.is_none()
-        {
-            return Err("neural limits require --neural-model".to_owned());
+        if options.neural_max_cost_gap.is_some() && options.neural_model.is_none() {
+            return Err("--neural-max-cost-gap requires --neural-model".to_owned());
+        }
+        if options.neural_min_switch_margin.is_some() && options.neural_model.is_none() {
+            return Err("--neural-min-switch-margin requires --neural-model".to_owned());
+        }
+        if options.neural_numeric_base_switch_margin.is_some() && options.neural_model.is_none() {
+            return Err("--neural-numeric-base-switch-margin requires --neural-model".to_owned());
+        }
+        if options.neural_preserve_surface_length && options.neural_model.is_none() {
+            return Err("--neural-preserve-surface-length requires --neural-model".to_owned());
+        }
+        if options.neural_long_reading_lambda.is_some() && options.neural_model.is_none() {
+            return Err("--neural-long-reading-lambda requires --neural-model".to_owned());
         }
         if options.neural_model.is_some() && options.discriminative_train.is_some() {
             return Err(
@@ -460,11 +499,14 @@ impl Options {
 
 fn usage() -> String {
     "usage: slime-evaluate <ajimee|anthy|annotated> --input <path> [--input <path> ...] \
+     [--dictionary reading-surface-cost.tsv] \
      [--dataset-name NAME] [--dataset-revision REV] [--dataset-sha256 HEX] [--top-k N] \
      [--search-k N] \
      [--context all|none|present] [--limit N] [--failures N] [--json] \
      [--neural-model model.gguf] [--neural-max-cost-gap N] \
-     [--neural-max-candidates N] [--lambda X]... \
+     [--neural-min-switch-margin X] [--neural-preserve-surface-length] \
+     [--neural-numeric-base-switch-margin X] \
+     [--neural-long-reading-lambda X] [--lambda X]... \
      [--export-nbest path] \
      [--discriminative-train items.json] [--discriminative-train-limit N] \
      [--discriminative-teacher-model model.gguf] [--discriminative-teacher-lambda X] \
@@ -476,15 +518,98 @@ fn usage() -> String {
      [--corpus-bigram-min-count N]\n\
      --neural-model rescores the N-best with a zenz GGUF model (requires \
      building with --features neural). --neural-max-cost-gap skips neural \
-     scoring when the base top-two cost gap exceeds N. --neural-max-candidates \
-     restricts neural reordering to the first N lattice candidates while \
-     preserving the remaining base order. --lambda selects \
+     scoring when the base top-two cost gap exceeds N. \
+     --neural-min-switch-margin keeps the base top candidate unless the \
+     interpolated neural winner exceeds it by X. --lambda selects \
      interpolation weights; without it a default sweep runs. The discriminative \
      options train an evaluation-only hashed averaged perceptron on a disjoint \
      AJIMEE-format training file. The optional annotated corpus \
      uses whitespace-separated surface/reading tokens and only affects offline \
-     N-best ranking."
+     N-best ranking. --dictionary adds an evaluation-only TSV overlay with \
+     reading<TAB>surface<TAB>cost rows."
         .to_owned()
+}
+
+fn load_evaluation_dictionary(paths: &[PathBuf]) -> Result<Dictionary, String> {
+    if paths.is_empty() {
+        return Ok(Dictionary::bundled());
+    }
+    let mut layers = Vec::with_capacity(paths.len());
+    let mut total_entries = 0_usize;
+    for (index, path) in paths.iter().enumerate() {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "evaluation dictionary must be a regular file: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_EVALUATION_DICTIONARY_BYTES {
+            return Err(format!(
+                "evaluation dictionary exceeds {MAX_EVALUATION_DICTIONARY_BYTES} bytes: {}",
+                path.display()
+            ));
+        }
+        let source = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let entries = parse_evaluation_dictionary(&source)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        total_entries = total_entries
+            .checked_add(entries.len())
+            .ok_or_else(|| "evaluation dictionary entry total overflowed".to_owned())?;
+        if total_entries > MAX_EVALUATION_DICTIONARY_ENTRIES {
+            return Err(format!(
+                "evaluation dictionaries exceed the {MAX_EVALUATION_DICTIONARY_ENTRIES} entry limit"
+            ));
+        }
+        layers.push(DictionaryLayer::new(
+            format!("evaluation-overlay-{index}"),
+            "Evaluation dictionary overlay",
+            entries,
+        ));
+    }
+    Ok(Dictionary::bundled_with_layers(layers))
+}
+
+fn parse_evaluation_dictionary(source: &str) -> Result<Vec<DictionaryEntry>, String> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, line) in source.lines().enumerate() {
+        let line_number = index + 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.len() > MAX_EVALUATION_DICTIONARY_LINE_BYTES {
+            return Err(format!("line {line_number} exceeds the byte limit"));
+        }
+        let mut columns = line.split('\t');
+        let reading = columns.next().unwrap_or_default();
+        let surface = columns.next().unwrap_or_default();
+        let cost = columns
+            .next()
+            .ok_or_else(|| format!("line {line_number} is missing cost"))?
+            .parse::<i32>()
+            .map_err(|_| format!("line {line_number} has an invalid cost"))?;
+        if columns.next().is_some()
+            || reading.is_empty()
+            || surface.is_empty()
+            || !reading
+                .chars()
+                .all(|character| matches!(character, 'ぁ'..='ゖ' | 'ー'))
+            || !(0..=100_000).contains(&cost)
+        {
+            return Err(format!("line {line_number} is invalid"));
+        }
+        if !seen.insert((reading.to_owned(), surface.to_owned())) {
+            return Err(format!("line {line_number} duplicates an earlier entry"));
+        }
+        entries.push(DictionaryEntry::new(reading, surface, cost));
+    }
+    if entries.is_empty() {
+        return Err("dictionary contains no entries".to_owned());
+    }
+    Ok(entries)
 }
 
 fn parse_non_negative_i32(name: &str, value: Option<String>) -> Result<i32, String> {
@@ -609,6 +734,17 @@ fn parse_lambda(value: Option<String>) -> Result<f64, String> {
     Ok(parsed)
 }
 
+fn parse_non_negative_f64(name: &str, value: Option<String>) -> Result<f64, String> {
+    let parsed: f64 = value
+        .ok_or_else(|| format!("{name} requires a value"))?
+        .parse()
+        .map_err(|_| format!("{name} requires a number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{name} must be a finite non-negative number"));
+    }
+    Ok(parsed)
+}
+
 fn parse_positive(name: &str, value: Option<String>) -> Result<usize, String> {
     let parsed = parse_usize(name, value)?;
     if parsed == 0 {
@@ -646,13 +782,26 @@ struct EvaluationReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_max_cost_gap: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    neural_max_candidates: Option<usize>,
+    neural_min_switch_margin: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_numeric_base_switch_margin: Option<f64>,
+    neural_preserve_surface_length: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neural_long_reading_lambda: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_scored_items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neural_skipped_items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lambda: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reranked_top1_changed_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reranked_top1_improved_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reranked_top1_regressed_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reranked_top1_changes: Option<Vec<Top1Change>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     discriminative: Option<DiscriminativeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,6 +866,41 @@ struct NgramReport {
     transitions_scored: u64,
     matched_transitions: u64,
     match_rate: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Top1Churn {
+    changed: usize,
+    improved: usize,
+    regressed: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Top1Change {
+    index: String,
+    context_text: String,
+    input: String,
+    expected_output: Vec<String>,
+    baseline: String,
+    reranked: String,
+    improved: bool,
+    regressed: bool,
+}
+
+fn classify_top1_churn(
+    baseline: Option<&str>,
+    reranked: Option<&str>,
+    expected: &[String],
+) -> Top1Churn {
+    let baseline_correct =
+        baseline.is_some_and(|candidate| expected.iter().any(|expected| expected == candidate));
+    let reranked_correct =
+        reranked.is_some_and(|candidate| expected.iter().any(|expected| expected == candidate));
+    Top1Churn {
+        changed: usize::from(baseline != reranked),
+        improved: usize::from(!baseline_correct && reranked_correct),
+        regressed: usize::from(baseline_correct && !reranked_correct),
+    }
 }
 
 impl NgramReport {
@@ -879,12 +1063,7 @@ fn evaluate(
     #[cfg(feature = "neural")]
     {
         let rescorer = neural::Rescorer::load(model_path)?;
-        let neural = score_neural_outcomes(
-            &rescorer,
-            &outcomes,
-            options.neural_max_cost_gap,
-            options.neural_max_candidates,
-        )?;
+        let neural = score_neural_outcomes(&rescorer, &outcomes, options.neural_max_cost_gap)?;
         Ok(options
             .lambdas
             .iter()
@@ -1132,16 +1311,23 @@ fn discriminative_teacher_expected(
             model_path.display()
         );
         let rescorer = neural::Rescorer::load(model_path)?;
-        let neural = score_neural_outcomes(&rescorer, outcomes, None, None)?;
+        let neural = score_neural_outcomes(&rescorer, outcomes, None)?;
         Ok(outcomes
             .iter()
             .enumerate()
             .map(|(index, outcome)| {
-                let surface =
-                    rescored_surfaces(&outcome.candidates, &neural.logliks[index], lambda)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default();
+                let surface = rescored_surfaces(
+                    &outcome.item.input,
+                    &outcome.candidates,
+                    &neural.logliks[index],
+                    lambda,
+                    0.0,
+                    false,
+                    None,
+                )
+                .into_iter()
+                .next()
+                .unwrap_or_default();
                 vec![surface]
             })
             .collect())
@@ -1159,7 +1345,6 @@ fn score_neural_outcomes(
     rescorer: &neural::Rescorer,
     outcomes: &[ItemOutcome<'_>],
     max_cost_gap: Option<i32>,
-    max_candidates: Option<usize>,
 ) -> Result<NeuralOutcome, String> {
     let score_item: Vec<_> = outcomes
         .iter()
@@ -1175,7 +1360,6 @@ fn score_neural_outcomes(
             candidates: outcome
                 .candidates
                 .iter()
-                .take(max_candidates.unwrap_or(usize::MAX))
                 .map(|candidate| candidate.surface.clone())
                 .collect(),
         })
@@ -1184,13 +1368,13 @@ fn score_neural_outcomes(
     let mut scored = scored.into_iter();
     let mut logliks = Vec::with_capacity(outcomes.len());
     let mut latencies = Vec::with_capacity(outcomes.len());
-    for score in &score_item {
+    for (outcome, score) in outcomes.iter().zip(&score_item) {
         if *score {
             let item = scored.next().expect("one score per selected request");
             logliks.push(item.logliks);
             latencies.push(item.latency);
         } else {
-            logliks.push(Vec::new());
+            logliks.push(vec![0.0; outcome.candidates.len()]);
             latencies.push(Duration::ZERO);
         }
     }
@@ -1221,23 +1405,58 @@ fn should_score_neurally(candidates: &[Candidate], max_cost_gap: Option<i32>) ->
 /// Reorders candidate surfaces by interpolating the lattice cost with the
 /// neural log-likelihood: `(1-lambda) * (-cost/scale) + lambda * loglik`.
 /// The stable sort keeps the lattice order for ties.
-fn rescored_surfaces(candidates: &[Candidate], logliks: &[f64], lambda: f64) -> Vec<String> {
-    let scored_candidates = candidates.len().min(logliks.len());
-    let mut indexed: Vec<usize> = (0..scored_candidates).collect();
+fn rescored_surfaces(
+    reading: &str,
+    candidates: &[Candidate],
+    logliks: &[f64],
+    lambda: f64,
+    minimum_switch_margin: f64,
+    preserve_surface_length: bool,
+    numeric_base_switch_margin: Option<f64>,
+) -> Vec<String> {
+    let mut indexed: Vec<usize> = (0..candidates.len()).collect();
     let combined: Vec<f64> = candidates
         .iter()
-        .take(scored_candidates)
         .zip(logliks)
         .map(|(candidate, loglik)| {
             (1.0 - lambda) * (-f64::from(candidate.cost) / COST_LOG_SCALE) + lambda * loglik
         })
         .collect();
     indexed.sort_by(|&a, &b| combined[b].total_cmp(&combined[a]));
-    indexed.extend(scored_candidates..candidates.len());
+    let should_keep_base = indexed.first().is_some_and(|index| {
+        if *index == 0 {
+            return false;
+        }
+        let base = &candidates[0].surface;
+        let winner = &candidates[*index].surface;
+        let numeric_base_repair = numeric_base_switch_margin.is_some()
+            && !contains_numeric_character(reading)
+            && contains_numeric_character(base)
+            && !contains_numeric_character(winner);
+        let required_margin = if numeric_base_repair {
+            minimum_switch_margin.min(numeric_base_switch_margin.unwrap_or(f64::INFINITY))
+        } else {
+            minimum_switch_margin
+        };
+        combined[*index] - combined[0] < required_margin
+            || (preserve_surface_length
+                && !numeric_base_repair
+                && winner.chars().count() != base.chars().count())
+    });
+    if should_keep_base {
+        indexed.retain(|index| *index != 0);
+        indexed.insert(0, 0);
+    }
     indexed
         .into_iter()
         .map(|index| candidates[index].surface.clone())
         .collect()
+}
+
+fn contains_numeric_character(surface: &str) -> bool {
+    surface
+        .chars()
+        .any(|character| character.is_ascii_digit() || matches!(character, '０'..='９'))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1257,13 +1476,30 @@ fn compute_report(
     let mut min_cer_at_k = 0.0;
     let mut latencies = Vec::with_capacity(outcomes.len());
     let mut failures = Vec::new();
+    let has_post_ranker = neural.is_some() || discriminative.is_some();
+    let mut top1_churn = Top1Churn::default();
+    let mut top1_changes = Vec::new();
 
     for (outcome_index, outcome) in outcomes.iter().enumerate() {
         let item = outcome.item;
         let candidates: Vec<String> = match (neural, lambda, discriminative, discriminative_weight)
         {
             (Some(neural), Some(lambda), None, None) => {
-                rescored_surfaces(&outcome.candidates, &neural.logliks[outcome_index], lambda)
+                let effective_lambda =
+                    if outcome.item.input.chars().count() >= LIVE_LONG_READING_MIN_CHARACTERS {
+                        options.neural_long_reading_lambda.unwrap_or(lambda)
+                    } else {
+                        lambda
+                    };
+                rescored_surfaces(
+                    &outcome.item.input,
+                    &outcome.candidates,
+                    &neural.logliks[outcome_index],
+                    effective_lambda,
+                    options.neural_min_switch_margin.unwrap_or(0.0),
+                    options.neural_preserve_surface_length,
+                    options.neural_numeric_base_switch_margin,
+                )
             }
             (None, None, Some(discriminative), Some(weight)) => discriminative::rescored_surfaces(
                 &outcome.candidates,
@@ -1294,6 +1530,36 @@ fn compute_report(
             .iter()
             .map(|expected| normalize_for_evaluation(expected, options.format))
             .collect();
+        if has_post_ranker {
+            let baseline_top1 = outcome
+                .candidates
+                .first()
+                .map(|candidate| normalize_for_evaluation(&candidate.surface, options.format));
+            let churn = classify_top1_churn(
+                baseline_top1.as_deref(),
+                normalized_candidates.first().map(String::as_str),
+                &normalized_expected,
+            );
+            top1_churn.changed += churn.changed;
+            top1_churn.improved += churn.improved;
+            top1_churn.regressed += churn.regressed;
+            if churn.changed > 0
+                && top1_changes.len() < options.failures
+                && let (Some(baseline), Some(reranked)) =
+                    (baseline_top1, normalized_candidates.first())
+            {
+                top1_changes.push(Top1Change {
+                    index: item.index.clone(),
+                    context_text: item.context_text.clone(),
+                    input: item.input.clone(),
+                    expected_output: item.expected_output.clone(),
+                    baseline,
+                    reranked: reranked.clone(),
+                    improved: churn.improved > 0,
+                    regressed: churn.regressed > 0,
+                });
+            }
+        }
         let rank = normalized_candidates.iter().position(|candidate| {
             normalized_expected
                 .iter()
@@ -1351,10 +1617,17 @@ fn compute_report(
             .as_ref()
             .map(|path| path.display().to_string()),
         neural_max_cost_gap: options.neural_max_cost_gap,
-        neural_max_candidates: options.neural_max_candidates,
+        neural_min_switch_margin: options.neural_min_switch_margin,
+        neural_numeric_base_switch_margin: options.neural_numeric_base_switch_margin,
+        neural_preserve_surface_length: options.neural_preserve_surface_length,
+        neural_long_reading_lambda: options.neural_long_reading_lambda,
         neural_scored_items: neural.map(|neural| neural.scored_items),
         neural_skipped_items: neural.map(|neural| outcomes.len() - neural.scored_items),
         lambda,
+        reranked_top1_changed_items: has_post_ranker.then_some(top1_churn.changed),
+        reranked_top1_improved_items: has_post_ranker.then_some(top1_churn.improved),
+        reranked_top1_regressed_items: has_post_ranker.then_some(top1_churn.regressed),
+        reranked_top1_changes: has_post_ranker.then_some(top1_changes),
         discriminative: discriminative.map(DiscriminativeReport::new),
         discriminative_weight,
         word_bigram: word_bigram_report(word_bigram_diagnostics),
@@ -1404,8 +1677,8 @@ fn print_report(report: &EvaluationReport) {
     if let Some(maximum) = report.neural_max_cost_gap {
         println!("neural max base cost gap: {maximum}");
     }
-    if let Some(maximum) = report.neural_max_candidates {
-        println!("neural max candidates: {maximum}");
+    if let Some(minimum) = report.neural_min_switch_margin {
+        println!("neural minimum switch margin: {minimum:.3}");
     }
     if let Some(scored) = report.neural_scored_items {
         println!("neural scored items: {scored}");
@@ -1417,6 +1690,7 @@ fn print_report(report: &EvaluationReport) {
     if let Some(lambda) = report.lambda {
         println!("lambda: {lambda:.2}");
     }
+    print_top1_churn(report);
     if let Some(discriminative) = &report.discriminative {
         print_discriminative_report(discriminative);
     }
@@ -1480,6 +1754,21 @@ fn print_report(report: &EvaluationReport) {
             );
         }
     }
+}
+
+fn print_top1_churn(report: &EvaluationReport) {
+    let Some(changed) = report.reranked_top1_changed_items else {
+        return;
+    };
+    println!("reranked top-1 changed items: {changed}");
+    println!(
+        "reranked top-1 improved items: {}",
+        report.reranked_top1_improved_items.unwrap_or(0)
+    );
+    println!(
+        "reranked top-1 regressed items: {}",
+        report.reranked_top1_regressed_items.unwrap_or(0)
+    );
 }
 
 fn print_context_report(label: &str, report: &NgramReport) {
@@ -1602,9 +1891,10 @@ fn u64_to_f64(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextFilter, DatasetFormat, Options, base_cost_gap, character_error_rate,
-        katakana_to_hiragana, load_annotated_items, normalize_for_evaluation, parse_anthy_line,
-        percentile, rescored_surfaces, should_score_neurally,
+        ContextFilter, DatasetFormat, Options, Top1Churn, base_cost_gap, character_error_rate,
+        classify_top1_churn, katakana_to_hiragana, load_annotated_items, normalize_for_evaluation,
+        parse_anthy_line, parse_evaluation_dictionary, percentile, rescored_surfaces,
+        should_score_neurally,
     };
     use slime_converter::Candidate;
     use std::fs;
@@ -1630,6 +1920,39 @@ mod tests {
     }
 
     #[test]
+    fn top1_churn_separates_improvements_regressions_and_wrong_changes() {
+        let expected = vec!["正解".to_owned()];
+        assert_eq!(
+            classify_top1_churn(Some("誤り"), Some("正解"), &expected),
+            Top1Churn {
+                changed: 1,
+                improved: 1,
+                regressed: 0,
+            }
+        );
+        assert_eq!(
+            classify_top1_churn(Some("正解"), Some("誤り"), &expected),
+            Top1Churn {
+                changed: 1,
+                improved: 0,
+                regressed: 1,
+            }
+        );
+        assert_eq!(
+            classify_top1_churn(Some("誤り一"), Some("誤り二"), &expected),
+            Top1Churn {
+                changed: 1,
+                improved: 0,
+                regressed: 0,
+            }
+        );
+        assert_eq!(
+            classify_top1_churn(Some("誤り"), Some("誤り"), &expected),
+            Top1Churn::default()
+        );
+    }
+
+    #[test]
     fn percentile_uses_nearest_rank() {
         let values: Vec<_> = (1..=100).map(Duration::from_nanos).collect();
         assert_close(percentile(&values, 50), 50.0 / 1_000_000.0);
@@ -1644,6 +1967,8 @@ mod tests {
                 "ajimee",
                 "--input",
                 "items.json",
+                "--dictionary",
+                "phrases.tsv",
                 "--dataset-name",
                 "custom",
                 "--dataset-revision",
@@ -1665,8 +1990,13 @@ mod tests {
                 "model.gguf",
                 "--neural-max-cost-gap",
                 "750",
-                "--neural-max-candidates",
-                "5",
+                "--neural-min-switch-margin",
+                "0.25",
+                "--neural-numeric-base-switch-margin",
+                "0.1",
+                "--neural-preserve-surface-length",
+                "--neural-long-reading-lambda",
+                "0.3",
                 "--export-nbest",
                 "nbest.json",
                 "--word-bigram-corpus",
@@ -1689,6 +2019,10 @@ mod tests {
         assert_eq!(options.search_k, Some(20));
         assert_eq!(options.format, DatasetFormat::Ajimee);
         assert_eq!(options.inputs, [std::path::PathBuf::from("items.json")]);
+        assert_eq!(
+            options.dictionaries,
+            [std::path::PathBuf::from("phrases.tsv")]
+        );
         assert_eq!(options.dataset_name.as_deref(), Some("custom"));
         assert_eq!(options.dataset_revision.as_deref(), Some("revision"));
         assert_eq!(options.dataset_sha256.as_deref(), Some("digest"));
@@ -1697,7 +2031,10 @@ mod tests {
         assert_eq!(options.failures, 0);
         assert!(options.json);
         assert_eq!(options.neural_max_cost_gap, Some(750));
-        assert_eq!(options.neural_max_candidates, Some(5));
+        assert_eq!(options.neural_min_switch_margin, Some(0.25));
+        assert_eq!(options.neural_numeric_base_switch_margin, Some(0.1));
+        assert!(options.neural_preserve_surface_length);
+        assert_eq!(options.neural_long_reading_lambda, Some(0.3));
         assert_eq!(
             options.export_nbest,
             Some(std::path::PathBuf::from("nbest.json"))
@@ -1710,6 +2047,21 @@ mod tests {
         assert_eq!(options.skip_bigram_weight, 250);
         assert_eq!(options.context_bigram_weight, 125);
         assert_eq!(options.corpus_bigram_min_count, 3);
+    }
+
+    #[test]
+    fn parses_bounded_evaluation_dictionary_rows() {
+        let entries = parse_evaluation_dictionary(
+            "# generated\nへんかんせいど\t変換精度\t5000\nさいかい\t再会\t4200\n",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(&*entries[0].reading, "へんかんせいど");
+        assert_eq!(&*entries[0].surface, "変換精度");
+        assert_eq!(entries[0].word_cost, 5_000);
+        assert!(parse_evaluation_dictionary("漢字\t漢字\t1\n").is_err());
+        assert!(parse_evaluation_dictionary("かんじ\t漢字\t-1\n").is_err());
+        assert!(parse_evaluation_dictionary("かんじ\t漢字\t1\nかんじ\t漢字\t2\n").is_err());
     }
 
     #[test]
@@ -1736,30 +2088,86 @@ mod tests {
     }
 
     #[test]
-    fn neural_rescoring_reorders_only_the_scored_prefix() {
+    fn neural_switch_margin_requires_a_material_advantage_over_base_top1() {
         let candidates = vec![
             Candidate {
-                surface: "第一".to_owned(),
-                cost: 1_000,
+                surface: "辞書一位".to_owned(),
+                cost: 0,
             },
             Candidate {
-                surface: "第二".to_owned(),
-                cost: 1_100,
-            },
-            Candidate {
-                surface: "第三".to_owned(),
-                cost: 1_200,
-            },
-            Candidate {
-                surface: "第四".to_owned(),
-                cost: 1_300,
+                surface: "モデル一位".to_owned(),
+                cost: 100,
             },
         ];
-        let surfaces = rescored_surfaces(&candidates, &[-10.0, -1.0], 0.8);
-        assert_eq!(surfaces, ["第二", "第一", "第三", "第四"]);
+        let logliks = [0.0, 2.0];
+
         assert_eq!(
-            rescored_surfaces(&candidates, &[], 0.8),
-            ["第一", "第二", "第三", "第四"]
+            rescored_surfaces("てすと", &candidates, &logliks, 0.2, 0.0, false, None)[0],
+            "モデル一位"
+        );
+        assert_eq!(
+            rescored_surfaces("てすと", &candidates, &logliks, 0.2, 0.3, false, None)[0],
+            "辞書一位"
+        );
+    }
+
+    #[test]
+    fn neural_live_gate_rejects_a_surface_length_change() {
+        let candidates = vec![
+            Candidate {
+                surface: "辺り".to_owned(),
+                cost: 0,
+            },
+            Candidate {
+                surface: "辺".to_owned(),
+                cost: 100,
+            },
+        ];
+        let logliks = [0.0, 10.0];
+
+        assert_eq!(
+            rescored_surfaces("あたり", &candidates, &logliks, 1.0, 0.0, true, None)[0],
+            "辺り"
+        );
+        assert_eq!(
+            rescored_surfaces("あたり", &candidates, &logliks, 1.0, 0.0, false, None)[0],
+            "辺"
+        );
+    }
+
+    #[test]
+    fn neural_live_gate_can_repair_an_implicit_numeric_base_candidate() {
+        let candidates = vec![
+            Candidate {
+                surface: "1固定".to_owned(),
+                cost: 8_502,
+            },
+            Candidate {
+                surface: "位置固定".to_owned(),
+                cost: 9_386,
+            },
+        ];
+        let logliks = [-28.327_862, -23.697_815];
+
+        assert_eq!(
+            rescored_surfaces(
+                "いちこてい",
+                &candidates,
+                &logliks,
+                0.3,
+                0.3,
+                true,
+                Some(0.1),
+            )[0],
+            "位置固定"
+        );
+        assert_eq!(
+            rescored_surfaces("いちこてい", &candidates, &logliks, 0.3, 0.3, true, None,)[0],
+            "1固定"
+        );
+        assert_eq!(
+            rescored_surfaces("1こてい", &candidates, &logliks, 0.3, 0.3, true, Some(0.1),)[0],
+            "1固定"
         );
     }
 

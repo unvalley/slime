@@ -1,0 +1,7 @@
+# Targeted recombination cost profile — 2026-09-12
+
+The motivating reading was measured with a single loaded model and dictionary, in the actual initial-score → dictionary-recombination → incremental-score order. Each result was checked against a full combined candidate score on the same model. Ten measured sequences after two warmups gave median dictionary reconstruction12.743ms and incremental model call29.285ms. The latter's internal scoring duration was18.447ms; paired outer-minus-inner overhead had median11.326ms. This overhead includes context/batch construction and destruction plus other wrapper work; it is not an isolated allocator measurement. All raw likelihoods matched exactly. These component measurements do not include the whole engine event or user-visible latency.
+
+A temporary driver was compiled and run successfully, then moved out of examples into `target/evaluation/targeted-cost-profile-20260912/`, along with its binary, hashes, measurements, and summary. Initial build attempts omitted the neural feature and incorrectly assumed ScoreRequest implemented Clone; the final driver/build fixes both. No product behavior changed in that profiling phase.
+
+The evidence supports testing reuse of the transient inference context/batch within one synchronous two-stage ranking transaction. Dictionary reconstruction is also material; optimizing it alone cannot remove all added latency.

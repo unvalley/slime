@@ -34,3 +34,11 @@ scripts/update-mozc-basic-dictionary.sh
 
 The source dictionary, connection matrix, and these derived extracts are covered by the notices in
 [`MOZC_DICTIONARY_LICENSE.txt`](./MOZC_DICTIONARY_LICENSE.txt).
+
+`public-language.tsv` is a deliberately small correction layer kept separate
+from the Mozc extract. Its reading/surface evidence comes from Anthy's
+`calctrans/corpus.1.txt`, whose file header designates the corpus as public
+domain. Each correction must also pass held-out top-1 regression checks before
+being bundled. The layer stays textual and is parsed once per process through a
+`OnceLock`; an identical external dictionary-pack entry takes precedence so an
+existing installation does not gain a duplicate conversion path.

@@ -5,23 +5,105 @@ on:
   pull_request:
 
 jobs:
-  tsf:
+  release-scripts:
     runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse release PowerShell
+        shell: pwsh
+        run: |
+          foreach ($path in @(
+            "scripts/windows-signature.ps1",
+            "scripts/windows-install-layout.ps1",
+            "scripts/windows-release-source.ps1",
+            "scripts/windows-consumer-evidence.ps1",
+            "scripts/verify-windows-consumer-evidence.ps1",
+            "scripts/test-windows-install-layout-policy.ps1",
+            "scripts/test-windows-signature-policy.ps1",
+            "scripts/test-windows-consumer-evidence-policy.ps1",
+            "scripts/test-windows-consumer-evidence-aggregate-policy.ps1",
+            "scripts/test-windows-release-architecture-policy.ps1",
+            "scripts/test-windows-arm64x-policy.ps1",
+            "scripts/test-windows-arm64x-artifact-policy.ps1",
+            "scripts/build-windows-installer.ps1",
+            "scripts/build-windows-arm64x.ps1",
+            "scripts/verify-windows-arm64x-artifact.ps1",
+            "scripts/verify-windows-release.ps1",
+            "scripts/test-windows-development-lifecycle.ps1",
+            "scripts/test-windows-install-lifecycle.ps1",
+            "scripts/windows-consumer-input-gate.ps1",
+            "scripts/test-windows-release-source-policy.ps1"
+          )) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path).Path,
+              [ref]$tokens,
+              [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -ne 0) {
+              $messages = $parseErrors | ForEach-Object { $_.Message }
+              throw "$path failed to parse: $($messages -join '; ')"
+            }
+          }
+      - name: Test signature certificate policy
+        shell: pwsh
+        run: scripts/test-windows-signature-policy.ps1
+      - name: Test installed-layout policy
+        shell: pwsh
+        run: scripts/test-windows-install-layout-policy.ps1
+      - name: Test consumer evidence policy
+        shell: pwsh
+        run: scripts/test-windows-consumer-evidence-policy.ps1
+      - name: Test consumer evidence aggregation policy
+        shell: pwsh
+        run: scripts/test-windows-consumer-evidence-aggregate-policy.ps1
+      - name: Test release architecture selection policy
+        shell: pwsh
+        run: scripts/test-windows-release-architecture-policy.ps1
+      - name: Test clean release source policy
+        shell: pwsh
+        run: scripts/test-windows-release-source-policy.ps1
+      - name: Test ARM64X export policy
+        shell: pwsh
+        run: scripts/test-windows-arm64x-policy.ps1
+      - name: Test portable Windows export contract
+        shell: bash
+        run: scripts/test-windows-export-contracts.sh
+
+  tsf:
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - rust-target: x86_64-pc-windows-msvc
+            runner: windows-latest
             cmake-platform: x64
             architecture: x64
           - rust-target: i686-pc-windows-msvc
+            runner: windows-latest
             cmake-platform: Win32
             architecture: x86
+          - rust-target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            cmake-platform: ARM64
+            architecture: arm64-native
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-target }}
+      - name: Bind payload build to source revision
+        shell: pwsh
+        run: |
+          $revision = (& git rev-parse --verify 'HEAD^{commit}').Trim()
+          if ($revision -notmatch '^[0-9a-f]{40}$') { throw "invalid source revision" }
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq "slime-ffi").version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "unsupported version: $version" }
+          "SLIME_SOURCE_REVISION=$revision" >> $env:GITHUB_ENV
+          "SLIME_PRODUCT_VERSION=$version" >> $env:GITHUB_ENV
       - name: Build Rust C ABI
         run: cargo build --release -p slime-ffi --target ${{ matrix.rust-target }}
       - name: Configure TSF COM DLL
@@ -33,9 +115,30 @@ jobs:
           cmake -S platforms/windows/native `
             -B "target/windows-${{ matrix.architecture }}" `
             -A "${{ matrix.cmake-platform }}" `
-            -DSLIME_FFI_LIBRARY="$($importLibrary.FullName)"
+            -DSLIME_FFI_LIBRARY="$($importLibrary.FullName)" `
+            -DSLIME_SOURCE_REVISION="$env:SLIME_SOURCE_REVISION" `
+            -DSLIME_VERSION="$env:SLIME_PRODUCT_VERSION"
       - name: Build TSF COM DLL
         run: cmake --build "target/windows-${{ matrix.architecture }}" --config Release
+      - name: Verify payload source revision metadata
+        shell: pwsh
+        run: |
+          foreach ($name in @(
+            "SlimeIME.dll",
+            "slime_ffi.dll",
+            "SlimeIMERegister.exe",
+            "SlimeSettings.exe"
+          )) {
+            $path = "target/windows-${{ matrix.architecture }}/Release/$name"
+            $comments = (Get-Item -LiteralPath $path).VersionInfo.Comments
+            if ($comments -ne "Source revision: $env:SLIME_SOURCE_REVISION") {
+              throw "$name source revision metadata does not match the build"
+            }
+            $version = (Get-Item -LiteralPath $path).VersionInfo.ProductVersion
+            if (-not $version -or $version.Trim() -ne $env:SLIME_PRODUCT_VERSION) {
+              throw "$name product version metadata does not match the build"
+            }
+          }
       - name: Run native tests
         run: ctest --test-dir "target/windows-${{ matrix.architecture }}" -C Release --output-on-failure
       - name: Verify DLL exports
@@ -63,8 +166,100 @@ jobs:
             target/windows-${{ matrix.architecture }}/Release/SlimeSettings.exe
             target/windows-${{ matrix.architecture }}/Release/slime_ffi.dll
 
+  arm64x:
+    needs: [release-scripts, tsf]
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SlimeIME-x64-unsigned
+          path: target/arm64x-input/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: SlimeIME-arm64-native-unsigned
+          path: target/arm64x-input/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: SlimeIME-x86-unsigned
+          path: target/arm64x-input/x86
+      - name: Build ARM64X development artifact
+        shell: pwsh
+        run: |
+          $revision = (& git rev-parse --verify 'HEAD^{commit}').Trim()
+          scripts/build-windows-arm64x.ps1 `
+            -PayloadX64 target/arm64x-input/x64 `
+            -PayloadARM64 target/arm64x-input/arm64 `
+            -SourceRevision $revision `
+            -Output target/windows-arm64x
+      - name: Test ARM64X artifact policy
+        shell: pwsh
+        run: scripts/test-windows-arm64x-artifact-policy.ps1 -Artifact target/windows-arm64x
+      - name: Probe native and emulated dependency loading
+        shell: pwsh
+        run: |
+          & target/arm64x-input/arm64/SlimeIMERegister.exe `
+            probe `
+            (Resolve-Path target/windows-arm64x/SlimeIME.dll).Path
+          if ($LASTEXITCODE -ne 0) { throw "ARM64 load probe failed" }
+          & target/arm64x-input/x64/SlimeIMERegister.exe `
+            probe `
+            (Resolve-Path target/windows-arm64x/SlimeIME.dll).Path
+          if ($LASTEXITCODE -ne 0) { throw "x64 load probe failed" }
+      - name: Install pinned NSIS
+        shell: pwsh
+        run: choco install nsis --version=3.12.0 --yes --no-progress
+      - name: Resolve package version
+        id: version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq "slime-core").version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "unsupported version: $version" }
+          "value=$version" >> $env:GITHUB_OUTPUT
+      - name: Build ARM64 development installers
+        shell: pwsh
+        run: |
+          scripts/build-windows-installer.ps1 `
+            -Version "0.0.0" `
+            -PayloadARM64X target/windows-arm64x `
+            -PayloadX86 target/arm64x-input/x86 `
+            -Output "target/Slime-0.0.0-windows-arm64-unsigned.exe"
+          scripts/build-windows-installer.ps1 `
+            -Version "${{ steps.version.outputs.value }}" `
+            -PayloadARM64X target/windows-arm64x `
+            -PayloadX86 target/arm64x-input/x86 `
+            -Output "target/Slime-${{ steps.version.outputs.value }}-windows-arm64-unsigned.exe"
+          Copy-Item target/arm64x-input/x86 target/arm64x-input/x86-failing -Recurse
+          Copy-Item `
+            target/arm64x-input/x86-failing/SlimeSettings.exe `
+            target/arm64x-input/x86-failing/SlimeIME.dll `
+            -Force
+          scripts/build-windows-installer.ps1 `
+            -Version "0.0.1" `
+            -PayloadARM64X target/windows-arm64x `
+            -PayloadX86 target/arm64x-input/x86-failing `
+            -Output "target/Slime-0.0.1-windows-arm64-invalid.exe"
+      - name: Exercise ARM64 unsigned install, update, and uninstall
+        shell: pwsh
+        run: |
+          $env:SLIME_DEVELOPMENT_TEST_VM = "1"
+          scripts/test-windows-development-lifecycle.ps1 `
+            -Version "${{ steps.version.outputs.value }}" `
+            -PayloadARM64X target/windows-arm64x `
+            -PayloadX86 target/arm64x-input/x86 `
+            -PreviousInstaller "target/Slime-0.0.0-windows-arm64-unsigned.exe" `
+            -FailingInstaller "target/Slime-0.0.1-windows-arm64-invalid.exe" `
+            -CurrentInstaller "target/Slime-${{ steps.version.outputs.value }}-windows-arm64-unsigned.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SlimeIME-arm64x-unsigned
+          path: |
+            target/windows-arm64x
+            target/Slime-${{ steps.version.outputs.value }}-windows-arm64-unsigned.exe
+
   package:
-    needs: tsf
+    needs: [release-scripts, tsf]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,10 +286,36 @@ jobs:
         shell: pwsh
         run: |
           scripts/build-windows-installer.ps1 `
+            -Version "0.0.0" `
+            -PayloadX64 target/package/x64 `
+            -PayloadX86 target/package/x86 `
+            -Output "target/package/Slime-0.0.0-windows-unsigned.exe"
+          scripts/build-windows-installer.ps1 `
             -Version "${{ steps.version.outputs.value }}" `
             -PayloadX64 target/package/x64 `
             -PayloadX86 target/package/x86 `
             -Output "target/package/Slime-${{ steps.version.outputs.value }}-windows-unsigned.exe"
+          Copy-Item target/package/x86 target/package/x86-failing -Recurse
+          Copy-Item `
+            target/package/x86-failing/SlimeSettings.exe `
+            target/package/x86-failing/SlimeIME.dll `
+            -Force
+          scripts/build-windows-installer.ps1 `
+            -Version "0.0.1" `
+            -PayloadX64 target/package/x64 `
+            -PayloadX86 target/package/x86-failing `
+            -Output "target/package/Slime-0.0.1-windows-invalid.exe"
+      - name: Exercise unsigned install, update, and uninstall
+        shell: pwsh
+        run: |
+          $env:SLIME_DEVELOPMENT_TEST_VM = "1"
+          scripts/test-windows-development-lifecycle.ps1 `
+            -Version "${{ steps.version.outputs.value }}" `
+            -PayloadX64 target/package/x64 `
+            -PayloadX86 target/package/x86 `
+            -PreviousInstaller "target/package/Slime-0.0.0-windows-unsigned.exe" `
+            -FailingInstaller "target/package/Slime-0.0.1-windows-invalid.exe" `
+            -CurrentInstaller "target/package/Slime-${{ steps.version.outputs.value }}-windows-unsigned.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: Slime-${{ steps.version.outputs.value }}-windows-unsigned

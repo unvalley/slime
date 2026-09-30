@@ -17,6 +17,14 @@ jobs:
       - run: cargo test --workspace
       - run: cargo bench --workspace --no-run
       - run: scripts/test-c-ffi.sh
+      - run: scripts/test-commercial-boundary.sh
       - run: scripts/test-macos-adapter.sh
+      - run: bash -n scripts/macos-console-state.sh scripts/macos-package-binding.sh scripts/macos-textedit-input-gate.sh scripts/macos-input-privacy-gate.sh scripts/verify-macos-consumer-evidence.sh scripts/test-macos-console-state-policy.sh scripts/test-macos-package-binding-policy.sh scripts/test-macos-consumer-evidence-policy.sh scripts/test-macos-textedit-input-gate-policy.sh scripts/test-macos-input-privacy-gate-policy.sh
+      - run: scripts/test-macos-console-state-policy.sh
+      - run: scripts/test-macos-package-binding-policy.sh
+      - run: scripts/test-macos-consumer-evidence-policy.sh
+      - run: scripts/test-macos-textedit-input-gate-policy.sh
+      - run: scripts/test-macos-input-privacy-gate-policy.sh
       - run: scripts/build-macos.sh
       - run: scripts/verify-macos-bundle.sh
+      - run: scripts/test-macos-package-policy.sh

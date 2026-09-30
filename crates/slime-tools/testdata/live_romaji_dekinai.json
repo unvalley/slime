@@ -1,0 +1,237 @@
+[
+  {
+    "index": "0",
+    "input": "sonotamenidokonimoshikandekinai",
+    "context_text": "",
+    "expected_output": [
+      "そのためにどこにも仕官できない",
+      "そのためにどこにも仕官出来ない"
+    ],
+    "kana_input": "そのためにどこにもしかんできない"
+  },
+  {
+    "index": "1",
+    "input": "yoyakudekinai",
+    "context_text": "",
+    "expected_output": [
+      "予約できない",
+      "予約出来ない"
+    ],
+    "kana_input": "よやくできない"
+  },
+  {
+    "index": "2",
+    "input": "shussekidekinai",
+    "context_text": "",
+    "expected_output": [
+      "出席できない",
+      "出席出来ない"
+    ],
+    "kana_input": "しゅっせきできない"
+  },
+  {
+    "index": "3",
+    "input": "henkoudekinai",
+    "context_text": "",
+    "expected_output": [
+      "変更できない",
+      "変更出来ない"
+    ],
+    "kana_input": "へんこうできない"
+  },
+  {
+    "index": "4",
+    "input": "nyuuryokudekinai",
+    "context_text": "",
+    "expected_output": [
+      "入力できない",
+      "入力出来ない"
+    ],
+    "kana_input": "にゅうりょくできない"
+  },
+  {
+    "index": "5",
+    "input": "henkandekinai",
+    "context_text": "",
+    "expected_output": [
+      "変換できない",
+      "変換出来ない"
+    ],
+    "kana_input": "へんかんできない"
+  },
+  {
+    "index": "6",
+    "input": "hozondekinai",
+    "context_text": "",
+    "expected_output": [
+      "保存できない",
+      "保存出来ない"
+    ],
+    "kana_input": "ほぞんできない"
+  },
+  {
+    "index": "7",
+    "input": "kakunindekinai",
+    "context_text": "",
+    "expected_output": [
+      "確認できない",
+      "確認出来ない"
+    ],
+    "kana_input": "かくにんできない"
+  },
+  {
+    "index": "8",
+    "input": "rikaidekinai",
+    "context_text": "",
+    "expected_output": [
+      "理解できない",
+      "理解出来ない"
+    ],
+    "kana_input": "りかいできない"
+  },
+  {
+    "index": "9",
+    "input": "sankadekiru",
+    "context_text": "",
+    "expected_output": [
+      "参加できる",
+      "参加出来る"
+    ],
+    "kana_input": "さんかできる"
+  },
+  {
+    "index": "10",
+    "input": "riyoudekimasu",
+    "context_text": "",
+    "expected_output": [
+      "利用できます",
+      "利用出来ます"
+    ],
+    "kana_input": "りようできます"
+  },
+  {
+    "index": "11",
+    "input": "yoyakudekimashita",
+    "context_text": "",
+    "expected_output": [
+      "予約できました",
+      "予約出来ました"
+    ],
+    "kana_input": "よやくできました"
+  },
+  {
+    "index": "12",
+    "input": "hozondekinakatta",
+    "context_text": "",
+    "expected_output": [
+      "保存できなかった",
+      "保存出来なかった"
+    ],
+    "kana_input": "ほぞんできなかった"
+  },
+  {
+    "index": "13",
+    "input": "henkoudekireba",
+    "context_text": "",
+    "expected_output": [
+      "変更できれば",
+      "変更出来れば"
+    ],
+    "kana_input": "へんこうできれば"
+  },
+  {
+    "index": "14",
+    "input": "niwadekigaoishigeru",
+    "context_text": "",
+    "expected_output": [
+      "庭で木が生い茂る"
+    ],
+    "kana_input": "にわできがおいしげる"
+  },
+  {
+    "index": "15",
+    "input": "yamadekinokowotoru",
+    "context_text": "",
+    "expected_output": [
+      "山でキノコを採る",
+      "山できのこを採る",
+      "山で茸を採る"
+    ],
+    "kana_input": "やまできのこをとる"
+  },
+  {
+    "index": "16",
+    "input": "uchidekyuukeisuru",
+    "context_text": "",
+    "expected_output": [
+      "家で休憩する",
+      "うちで休憩する"
+    ],
+    "kana_input": "うちできゅうけいする"
+  },
+  {
+    "index": "17",
+    "input": "gakkoudekyoukashowoyomu",
+    "context_text": "",
+    "expected_output": [
+      "学校で教科書を読む"
+    ],
+    "kana_input": "がっこうできょうかしょをよむ"
+  },
+  {
+    "index": "18",
+    "input": "ekidekippuwokau",
+    "context_text": "",
+    "expected_output": [
+      "駅で切符を買う"
+    ],
+    "kana_input": "えきできっぷをかう"
+  },
+  {
+    "index": "19",
+    "input": "kokodekimeru",
+    "context_text": "",
+    "expected_output": [
+      "ここで決める"
+    ],
+    "kana_input": "ここできめる"
+  },
+  {
+    "index": "20",
+    "input": "misedekimonowokau",
+    "context_text": "",
+    "expected_output": [
+      "店で着物を買う"
+    ],
+    "kana_input": "みせできものをかう"
+  },
+  {
+    "index": "21",
+    "input": "heyadekigaeru",
+    "context_text": "",
+    "expected_output": [
+      "部屋で着替える"
+    ],
+    "kana_input": "へやできがえる"
+  },
+  {
+    "index": "22",
+    "input": "hitoridekimenai",
+    "context_text": "",
+    "expected_output": [
+      "一人で決めない",
+      "ひとりで決めない"
+    ],
+    "kana_input": "ひとりできめない"
+  },
+  {
+    "index": "23",
+    "input": "minnnadekyouryokusuru",
+    "context_text": "",
+    "expected_output": [
+      "みんなで協力する",
+      "皆で協力する"
+    ],
+    "kana_input": "みんなできょうりょくする"
+  }
+]

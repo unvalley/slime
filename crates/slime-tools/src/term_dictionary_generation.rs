@@ -382,6 +382,7 @@ fn standalone_term(token: &Token) -> Option<TermKey> {
         || !(2..=MAX_SINGLE_SURFACE_CHARACTERS).contains(&surface_characters)
         || !token.surface.chars().all(is_lexical_character)
         || !token.surface.chars().any(is_kanji_or_katakana)
+        || !katakana_surface_matches_reading(&token.surface, &reading)
     {
         return None;
     }
@@ -416,7 +417,29 @@ fn compound_term(tokens: &[Token]) -> Option<TermKey> {
         return None;
     }
     let surface: String = tokens.iter().map(|token| token.surface.as_str()).collect();
-    (surface.chars().count() <= MAX_TOKEN_CHARACTERS).then_some((reading, surface))
+    (surface.chars().count() <= MAX_TOKEN_CHARACTERS
+        && katakana_surface_matches_reading(&surface, &reading))
+    .then_some((reading, surface))
+}
+
+fn katakana_surface_matches_reading(surface: &str, reading: &str) -> bool {
+    if !surface
+        .chars()
+        .all(|character| is_katakana(character) || matches!(character, 'ー' | '・'))
+    {
+        return true;
+    }
+    let normalized_surface: String = surface
+        .chars()
+        .filter(|character| *character != '・')
+        .map(|character| match character {
+            'ァ'..='ヶ' | 'ヽ' | 'ヾ' => {
+                char::from_u32(u32::from(character) - 0x60).expect("valid hiragana scalar")
+            }
+            _ => character,
+        })
+        .collect();
+    normalized_surface == reading
 }
 
 fn is_compound_element(token: &Token) -> bool {
@@ -771,6 +794,20 @@ mod tests {
             2
         );
         assert!(!terms.keys().any(|(_, surface)| surface.contains('を')));
+    }
+
+    #[test]
+    fn rejects_phonetic_katakana_spellings_that_can_pollute_longer_readings() {
+        let tokens =
+            parse_annotated_line("イイ/イー イーグル/イーグル ジャン・ポール/ジャンポール", 1)
+                .unwrap();
+        let mut terms = HashMap::new();
+        let mut report = Report::default();
+        collect_line_terms(&tokens, &mut terms, &mut report);
+
+        assert!(!terms.contains_key(&("いー".to_owned(), "イイ".to_owned())));
+        assert!(terms.contains_key(&("いーぐる".to_owned(), "イーグル".to_owned())));
+        assert!(terms.contains_key(&("じゃんぽーる".to_owned(), "ジャン・ポール".to_owned())));
     }
 
     #[test]

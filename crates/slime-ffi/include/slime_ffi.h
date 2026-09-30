@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 typedef struct SlimeHandle SlimeHandle;
+typedef struct SlimeLiveNeuralTask SlimeLiveNeuralTask;
 
 typedef struct SlimeBuffer {
   uint8_t *data;
@@ -21,6 +22,11 @@ typedef struct SlimeStringView {
   const uint8_t *data;
   size_t len;
 } SlimeStringView;
+
+/* `selected` and `selection_start` hold SLIME_NO_SELECTION when an action has
+ * no candidate or segment selection. Swift imports size_t as Int, where the
+ * value reads as -1; compare it as UInt(bitPattern:) instead of Int.max. */
+#define SLIME_NO_SELECTION SIZE_MAX
 
 typedef struct SlimeActionView {
   uint32_t kind;
@@ -104,6 +110,10 @@ enum SlimeStatus {
   SLIME_STATUS_PANIC = 4,
   SLIME_STATUS_INVALID_UTF8 = 5,
   SLIME_STATUS_INVALID_CANDIDATE = 6,
+  SLIME_STATUS_NEURAL_UNAVAILABLE = 7,
+  SLIME_STATUS_NEURAL_LOAD_FAILED = 8,
+  SLIME_STATUS_INVALID_WEIGHT = 9,
+  SLIME_STATUS_INVALID_COST_GAP = 10,
 };
 
 SlimeHandle *slime_create(void);
@@ -122,6 +132,76 @@ SlimeHandle *slime_create_with_signed_data_dir_and_version_floors(
     const uint8_t *verification_keys, size_t verification_keys_len,
     const uint8_t *version_floors, size_t version_floors_len);
 void slime_destroy(SlimeHandle *handle);
+/* Loads an optional local model for first-Space conversion reranking. Default
+   builds return SLIME_STATUS_NEURAL_UNAVAILABLE and keep base conversion. */
+uint32_t slime_enable_neural_reranker(SlimeHandle *handle,
+                                      const uint8_t *model_path,
+                                      size_t model_path_len, double lambda);
+/* ABI-compatible opt-in gate: base candidates with a top-two cost gap greater
+   than max_cost_gap bypass neural scoring and retain their original order. */
+uint32_t slime_enable_neural_reranker_with_cost_gap(
+    SlimeHandle *handle, const uint8_t *model_path, size_t model_path_len,
+    double lambda, int32_t max_cost_gap);
+/* Overrides only the explicit Space cost-gap gate. Nonnegative values required.
+   Newly admitted switches retain the base hiragana subsequence. LIVE is unchanged.
+   Loading a model resets the override. Requires a loaded model. */
+uint32_t slime_set_explicit_neural_cost_gap(SlimeHandle *handle, int32_t max_cost_gap);
+
+/* Optional confidence-gated long explicit ranking. Defaults off; model reload resets it. */
+uint32_t slime_set_explicit_neural_confidence(SlimeHandle *handle, bool enabled);
+/* Retains a close model-approved LIVE alternative for short explicit conversion,
+   preserving non-Han text. Defaults off; model reload resets it. */
+uint32_t slime_set_explicit_live_agreement(SlimeHandle *handle, bool enabled);
+/* Overrides only explicit conversion weight for readings of at least the
+   specified Unicode character count. Zero disables the override; reloading a
+   model resets it. LIVE weights remain unchanged. Requires a loaded model. */
+uint32_t slime_set_explicit_neural_long_reading_weight(
+    SlimeHandle *handle, size_t minimum_reading_characters, double lambda);
+/* Overrides explicit conversion weight for 3 through 19 Unicode characters.
+   A matching long-reading override takes precedence. Reloading a model resets
+   the override. LIVE weights remain unchanged. Requires a loaded model. */
+uint32_t slime_set_explicit_neural_medium_reading_weight(
+    SlimeHandle *handle, double lambda);
+/* Enables the synchronous-to-delayed LIVE handoff only when an adapter will
+   actually schedule LIVE neural tasks. Returns NEURAL_UNAVAILABLE when true is
+   requested without a loaded model. */
+uint32_t slime_set_live_neural_ranking_enabled(SlimeHandle *handle,
+                                               bool enabled);
+/* Captures a cheap immutable LIVE snapshot. Candidate generation and scoring
+   happen only when slime_live_neural_task_run is called on a worker. Readings
+   of four or more characters use long_reading_lambda; shorter readings keep
+   the lambda configured by slime_enable_neural_reranker*. A base candidate
+   containing digits may switch to a nonnumeric winner with the narrower
+   numeric_base_switch_margin. A null result means the current composition is
+   ineligible or neural is disabled. */
+SlimeLiveNeuralTask *slime_live_neural_task_create(
+    const SlimeHandle *handle, double minimum_switch_margin,
+    double numeric_base_switch_margin,
+    double long_reading_lambda);
+/* Versioned LIVE snapshot API with an independent confidence margin for
+   readings of four or more characters. The original entry point applies
+   minimum_switch_margin to both reading lengths. */
+SlimeLiveNeuralTask *slime_live_neural_task_create_v2(
+    const SlimeHandle *handle, double minimum_switch_margin,
+    double long_reading_minimum_switch_margin,
+    double numeric_base_switch_margin,
+    double long_reading_lambda);
+/* Returns the complete reading length captured by a LIVE snapshot. A null task
+   returns zero. Adapters can use this cheap metadata to choose a debounce
+   without generating candidates or running the model. Call it before handing
+   the task to a worker: slime_live_neural_task_run mutates the snapshot. */
+size_t slime_live_neural_task_reading_character_count(
+    const SlimeLiveNeuralTask *task);
+/* Worker-only expensive operation. The task owns all data it reads and never
+   accesses its originating SlimeHandle. */
+uint32_t slime_live_neural_task_run(SlimeLiveNeuralTask *task);
+/* Main/input-thread application. Stale results are successful no-ops after
+   revalidating reading, context, stable prefix, candidate identity, and
+   private mode. */
+uint32_t slime_live_neural_task_apply_actions_v2(
+    SlimeHandle *handle, const SlimeLiveNeuralTask *task, void *context,
+    SlimeActionCallbackV2 callback);
+void slime_live_neural_task_destroy(SlimeLiveNeuralTask *task);
 SlimeBuffer slime_process(SlimeHandle *handle, uint32_t event_kind, uint32_t value);
 /* Calls callback synchronously for each action. All views are borrowed only
    for that callback; the callback must not retain them, unwind, or re-enter

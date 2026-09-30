@@ -13,7 +13,8 @@ typedef struct TypedActions {
 
 typedef struct CandidateCapture {
   size_t count;
-  bool found_nihon;
+  const char *expected;
+  bool found_expected;
 } CandidateCapture;
 
 typedef struct TypedActionsV2 {
@@ -32,12 +33,16 @@ static void collect_action(void *context, const SlimeActionView *action) {
     assert(action->text.len < sizeof(collected->last_preedit));
     memcpy(collected->last_preedit, action->text.data, action->text.len);
     collected->last_preedit[action->text.len] = '\0';
+    /* This test never enters segmented conversion. */
+    assert(action->selected == SLIME_NO_SELECTION);
+    assert(action->selection_start == SLIME_NO_SELECTION);
     collected->preedit_count += 1;
     break;
   case SLIME_ACTION_SHOW_CANDIDATES:
     assert(action->candidates != NULL);
     assert(action->candidate_count > 0);
     assert(action->selected < action->candidate_count);
+    assert(action->selection_start == SLIME_NO_SELECTION);
     collected->candidate_count = action->candidate_count;
     collected->saw_show_candidates = true;
     break;
@@ -48,11 +53,11 @@ static void collect_action(void *context, const SlimeActionView *action) {
 
 static void collect_candidate(void *context, SlimeStringView value) {
   CandidateCapture *capture = context;
-  const char nihon[] = "日本";
   capture->count += 1;
-  if (value.len == sizeof(nihon) - 1 &&
-      memcmp(value.data, nihon, sizeof(nihon) - 1) == 0) {
-    capture->found_nihon = true;
+  size_t expected_len = strlen(capture->expected);
+  if (value.len == expected_len &&
+      memcmp(value.data, capture->expected, expected_len) == 0) {
+    capture->found_expected = true;
   }
 }
 
@@ -103,6 +108,12 @@ int main(void) {
              NULL, 0) == NULL);
 
   SlimeHandle *handle = slime_create();
+  assert(slime_set_explicit_neural_long_reading_weight(NULL, 20, 0.4) ==
+         SLIME_STATUS_NULL_HANDLE);
+  assert(slime_set_explicit_neural_long_reading_weight(handle, 20, -1.0) ==
+         SLIME_STATUS_INVALID_WEIGHT);
+  assert(slime_set_explicit_neural_long_reading_weight(handle, 20, 0.4) ==
+         SLIME_STATUS_NEURAL_UNAVAILABLE);
   assert(handle != NULL);
 
   const char *input = "nihon";
@@ -177,11 +188,12 @@ int main(void) {
   const char *reading = "にほん";
   const char *surface = "日本";
   CandidateCapture candidate_capture = {0};
+  candidate_capture.expected = surface;
   assert(slime_conversion_candidates(
              handle, (const uint8_t *)reading, strlen(reading),
              &candidate_capture, collect_candidate) == SLIME_STATUS_OK);
   assert(candidate_capture.count > 0);
-  assert(candidate_capture.found_nihon);
+  assert(candidate_capture.found_expected);
   assert(slime_record_external_selection(
              handle, (const uint8_t *)reading, strlen(reading),
              (const uint8_t *)surface, strlen(surface)) == SLIME_STATUS_OK);
@@ -190,6 +202,19 @@ int main(void) {
              handle, (const uint8_t *)reading, strlen(reading),
              (const uint8_t *)invalid_surface, strlen(invalid_surface)) ==
          SLIME_STATUS_INVALID_CANDIDATE);
+  slime_destroy(handle);
+
+  handle = slime_create();
+  assert(handle != NULL);
+  const char *recall_reading =
+      "きこうはねんかんをつうじてひじょうにかんれいであり、なつでもひょうてんをこえることはなく";
+  CandidateCapture recall_capture = {0};
+  recall_capture.expected =
+      "気候は年間を通じて非常に寒冷であり、夏でも氷点を超えることはなく";
+  assert(slime_conversion_candidates(
+             handle, (const uint8_t *)recall_reading, strlen(recall_reading),
+             &recall_capture, collect_candidate) == SLIME_STATUS_OK);
+  assert(recall_capture.found_expected);
   slime_destroy(handle);
 
   handle = slime_create();

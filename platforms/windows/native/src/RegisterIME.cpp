@@ -12,6 +12,7 @@
 namespace {
 
 using DllRegistrationFunction = HRESULT(__stdcall *)();
+using DllRegistrationAtPathFunction = HRESULT(__stdcall *)(LPCWSTR);
 using InstallLayoutOrTipFunction = BOOL(WINAPI *)(LPCWSTR, DWORD);
 
 constexpr DWORD kInstallLayoutOrTipUninstall = 0x00000001;
@@ -70,12 +71,15 @@ bool EnableProfile(const bool uninstall) {
 int wmain(const int argumentCount, wchar_t **arguments) {
   if (argumentCount != 3 ||
       (std::wstring(arguments[1]) != L"install" &&
-       std::wstring(arguments[1]) != L"uninstall")) {
-    std::wcerr << L"usage: SlimeIMERegister <install|uninstall> <absolute SlimeIME.dll path>\n";
+       std::wstring(arguments[1]) != L"uninstall" &&
+       std::wstring(arguments[1]) != L"probe")) {
+    std::wcerr
+        << L"usage: SlimeIMERegister <install|uninstall|probe> <absolute SlimeIME.dll path>\n";
     return 2;
   }
 
   const bool uninstall = std::wstring(arguments[1]) == L"uninstall";
+  const bool probe = std::wstring(arguments[1]) == L"probe";
   std::wstring dllPath;
   if (!ResolveAbsolutePath(arguments[2], dllPath)) {
     return PrintWindowsError(L"GetFullPathNameW");
@@ -83,6 +87,20 @@ int wmain(const int argumentCount, wchar_t **arguments) {
   HMODULE ime = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
   if (ime == nullptr) {
     return PrintWindowsError(L"LoadLibraryExW(SlimeIME.dll)");
+  }
+
+  if (probe) {
+    constexpr const char *requiredExports[] = {
+        "DllCanUnloadNow", "DllGetClassObject", "DllRegisterServer",
+        "DllUnregisterServer", "SlimeRegisterServerAtPath"};
+    for (const char *requiredExport : requiredExports) {
+      if (GetProcAddress(ime, requiredExport) == nullptr) {
+        FreeLibrary(ime);
+        return PrintWindowsError(L"GetProcAddress(probe)");
+      }
+    }
+    FreeLibrary(ime);
+    return 0;
   }
 
   const char *entryPoint = uninstall ? "DllUnregisterServer" : "DllRegisterServer";
@@ -97,7 +115,9 @@ int wmain(const int argumentCount, wchar_t **arguments) {
     EnableProfile(true);
     result = registration();
   } else {
-    result = registration();
+    const auto registrationAtPath =
+        LoadFunction<DllRegistrationAtPathFunction>(ime, "SlimeRegisterServerAtPath");
+    result = registrationAtPath == nullptr ? registration() : registrationAtPath(dllPath.c_str());
     if (SUCCEEDED(result) && !EnableProfile(false)) {
       const DWORD error = GetLastError();
       result = error == ERROR_SUCCESS ? E_FAIL : HRESULT_FROM_WIN32(error);

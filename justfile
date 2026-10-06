@@ -191,7 +191,7 @@ uninstall-macos-system:
 # macOS版をまとめて検証する
 check-macos: check test-macos verify-macos test-macos-package-policy test-macos-input-gate-syntax
 
-# Windows TSFアダプターをx64/x86向けに型検査する
+# Windows TSFアダプターをx64/x86/ARM64向けに型検査する
 check-windows:
     scripts/check-windows.sh
 

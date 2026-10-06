@@ -4,7 +4,6 @@
 #include <wrl/client.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iterator>
@@ -1914,12 +1913,8 @@ HRESULT SetRegistryString(HKEY root, const std::wstring &subkey, const wchar_t *
   return HRESULT_FROM_WIN32(setResult);
 }
 
-HRESULT RegisterComServer() {
-  std::wstring modulePath;
-  HRESULT result = ModulePath(modulePath);
-  if (FAILED(result)) {
-    return result;
-  }
+HRESULT RegisterComServer(const std::wstring &modulePath) {
+  HRESULT result = S_OK;
   const std::wstring classKey = L"CLSID\\" + GuidString(kTextServiceClsid);
   result = SetRegistryString(HKEY_CLASSES_ROOT, classKey, nullptr, kDescription);
   if (FAILED(result)) {
@@ -1939,7 +1934,7 @@ void UnregisterComServer() noexcept {
   RegDeleteTreeW(HKEY_CLASSES_ROOT, classKey.c_str());
 }
 
-HRESULT RegisterTsfProfile() {
+HRESULT RegisterTsfProfile(const std::wstring &modulePath) {
   ComPtr<ITfInputProcessorProfiles> profiles;
   HRESULT result = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
                                     IID_PPV_ARGS(&profiles));
@@ -1947,11 +1942,6 @@ HRESULT RegisterTsfProfile() {
     return result;
   }
   result = profiles->Register(kTextServiceClsid);
-  if (FAILED(result)) {
-    return result;
-  }
-  std::wstring modulePath;
-  result = ModulePath(modulePath);
   if (FAILED(result)) {
     return result;
   }
@@ -1998,6 +1988,26 @@ void UnregisterTsfProfile() noexcept {
   }
 }
 
+HRESULT RegisterServerAtPath(const std::wstring &modulePath) {
+  const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
+    return initializeResult;
+  }
+  const bool uninitialize = SUCCEEDED(initializeResult);
+  HRESULT result = RegisterComServer(modulePath);
+  if (SUCCEEDED(result)) {
+    result = RegisterTsfProfile(modulePath);
+  }
+  if (FAILED(result)) {
+    UnregisterTsfProfile();
+    UnregisterComServer();
+  }
+  if (uninitialize) {
+    CoUninitialize();
+  }
+  return result;
+}
+
 } // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, const DWORD reason, LPVOID) {
@@ -2035,23 +2045,23 @@ extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID classId, REFIID interfac
 }
 
 extern "C" HRESULT __stdcall DllRegisterServer() {
-  const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE) {
-    return initializeResult;
-  }
-  const bool uninitialize = SUCCEEDED(initializeResult);
-  HRESULT result = RegisterComServer();
-  if (SUCCEEDED(result)) {
-    result = RegisterTsfProfile();
-  }
+  std::wstring modulePath;
+  const HRESULT result = ModulePath(modulePath);
   if (FAILED(result)) {
-    UnregisterTsfProfile();
-    UnregisterComServer();
+    return result;
   }
-  if (uninitialize) {
-    CoUninitialize();
+  return RegisterServerAtPath(modulePath);
+}
+
+extern "C" HRESULT __stdcall SlimeRegisterServerAtPath(const wchar_t *modulePath) {
+  if (modulePath == nullptr || modulePath[0] == L'\0') {
+    return E_INVALIDARG;
   }
-  return result;
+  try {
+    return RegisterServerAtPath(modulePath);
+  } catch (...) {
+    return E_OUTOFMEMORY;
+  }
 }
 
 extern "C" HRESULT __stdcall DllUnregisterServer() {

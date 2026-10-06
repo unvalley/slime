@@ -205,6 +205,35 @@ void TestCandidatePresentationLabels() {
             .annotation == L"日付・時刻");
 }
 
+void TestTypedExpandedRecallSelectionAndAcceptance() {
+  SlimeHandle *handle = slime_create();
+  CHECK(handle != nullptr);
+  TypedActionCapture capture;
+  TypeAscii(handle, capture, "asairi");
+  ProcessTyped(handle, capture, SLIME_EVENT_SPACE);
+
+  const std::string expected = Utf8(u8"浅煎り");
+  CHECK(std::find(capture.candidates.begin(), capture.candidates.end(),
+                  expected) == capture.candidates.end());
+  const std::size_t initialCount = capture.candidates.size();
+  CHECK(initialCount > 0);
+  for (std::size_t index = 0; index < initialCount; ++index) {
+    ProcessTyped(handle, capture, SLIME_EVENT_NEXT_CANDIDATE);
+  }
+
+  CHECK(capture.candidates.size() > initialCount);
+  const std::size_t index = CandidateIndex(capture, expected);
+  CHECK(index <= std::numeric_limits<std::uint32_t>::max());
+  ProcessTyped(handle, capture, SLIME_EVENT_SELECT_CANDIDATE,
+               static_cast<std::uint32_t>(index));
+  CHECK(capture.selected == index);
+  CHECK(capture.preedit == expected);
+
+  ProcessTyped(handle, capture, SLIME_EVENT_ACCEPT_CANDIDATE);
+  CHECK(capture.commit == expected);
+  slime_destroy(handle);
+}
+
 std::wstring CandidateValue(ITfCandidateString *candidate) {
   CHECK(candidate != nullptr);
   BSTR value = nullptr;
@@ -407,6 +436,7 @@ void TestTextServiceFunctionProvider() {
 int wmain() {
   TestTypedCorrectionSelectionAndAcceptance();
   TestTypedCorrectionPresentationV2();
+  TestTypedExpandedRecallSelectionAndAcceptance();
   TestCandidatePresentationLabels();
   TestSearchFiltering();
   TestCandidateList();

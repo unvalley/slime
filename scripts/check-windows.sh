@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for target in x86_64-pc-windows-msvc i686-pc-windows-msvc; do
+for target in x86_64-pc-windows-msvc i686-pc-windows-msvc aarch64-pc-windows-msvc; do
   if ! rustup target list --installed | grep -Fxq "$target"; then
     echo "missing Rust target: $target" >&2
     echo "install it with: rustup target add $target" >&2
@@ -10,7 +10,9 @@ for target in x86_64-pc-windows-msvc i686-pc-windows-msvc; do
   cargo check -p slime-ffi --target "$target"
 done
 
-for compiler in x86_64-w64-mingw32-g++ i686-w64-mingw32-g++; do
+scripts/test-windows-export-contracts.sh
+
+for compiler in x86_64-w64-mingw32-g++ i686-w64-mingw32-g++ aarch64-w64-mingw32-g++; do
   if ! command -v "$compiler" >/dev/null 2>&1; then
     continue
   fi

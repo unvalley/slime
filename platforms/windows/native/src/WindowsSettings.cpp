@@ -1,5 +1,6 @@
 #include "WindowsPreferences.h"
 
+#include <shellapi.h>
 #include <windows.h>
 
 #include <array>
@@ -36,6 +37,83 @@ struct SettingsWindowState {
   HFONT font = nullptr;
   HWND status = nullptr;
 };
+
+bool IsSettingsSelfTestCommand() noexcept {
+  int argumentCount = 0;
+  wchar_t **arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+  if (arguments == nullptr) {
+    return false;
+  }
+  const bool matches =
+      argumentCount == 2 && lstrcmpW(arguments[1], L"--self-test") == 0;
+  LocalFree(arguments);
+  return matches;
+}
+
+int RunSettingsSelfTest() noexcept {
+  try {
+    const std::wstring path = WindowsPreferencesPath();
+    const std::size_t separator = path.find_last_of(L"\\/");
+    if (path.empty() || separator == std::wstring::npos || separator == 0) {
+      return 1;
+    }
+    const std::wstring directory = path.substr(0, separator);
+    if (GetFileAttributesW(directory.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      // Never exercise the write path against an existing user-data folder.
+      return 2;
+    }
+    if (CreateDirectoryW(directory.c_str(), nullptr) == FALSE) {
+      return 1;
+    }
+
+    const auto cleanup = [&]() noexcept {
+      DeleteFileW(path.c_str());
+      RemoveDirectoryW(directory.c_str());
+    };
+    const WindowsPreferences initial{.liveConversion = true,
+                                     .typoCorrectionEnabled = false,
+                                     .historyCompletion = false,
+                                     .historyLearning = true,
+                                     .dictionaryPacks = 0,
+                                     .dateFormatMask = 1};
+    if (SaveWindowsPreferences(path, initial) != ERROR_SUCCESS) {
+      cleanup();
+      return 1;
+    }
+
+    bool passed = false;
+    {
+      WindowsPreferencesMonitor monitor;
+      if (monitor.Start(path)) {
+        const WindowsPreferences expected{.liveConversion = false,
+                                          .typoCorrectionEnabled = true,
+                                          .historyCompletion = true,
+                                          .historyLearning = false,
+                                          .dictionaryPacks = 5,
+                                          .dateFormatMask = 73};
+        if (SaveWindowsPreferences(path, expected) == ERROR_SUCCESS) {
+          WindowsPreferences loaded;
+          const bool loadedExpected =
+              LoadWindowsPreferences(path, loaded) ==
+                  WindowsPreferencesLoadStatus::loaded &&
+              loaded == expected;
+          bool observedChange = false;
+          for (int attempt = 0; attempt < 100 && !observedChange; ++attempt) {
+            observedChange = monitor.HasChanged();
+            if (!observedChange) {
+              Sleep(10);
+            }
+          }
+          passed = loadedExpected && observedChange;
+        }
+      }
+    }
+    cleanup();
+    return passed ? 0 : 1;
+  } catch (...) {
+    return 1;
+  }
+}
 
 int Scale(const int value, const UINT dpi) noexcept {
   return MulDiv(value, static_cast<int>(dpi), 96);
@@ -276,6 +354,9 @@ LRESULT CALLBACK SettingsWindowProcedure(const HWND window, const UINT message,
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+  if (IsSettingsSelfTestCommand()) {
+    return RunSettingsSelfTest();
+  }
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
 
   if (HWND existing = FindWindowW(kSettingsWindowClass, nullptr);

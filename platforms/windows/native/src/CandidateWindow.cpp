@@ -1,7 +1,8 @@
 #include "CandidateWindow.h"
 #include "slime_ffi.h"
 
-// Declare COM base interfaces before the generated accessibility providers.
+// Current platform SDKs require the COM and Automation base declarations
+// before the generated accessibility provider interfaces.
 #include <unknwn.h>
 #include <oaidl.h>
 #include <UIAutomation.h>

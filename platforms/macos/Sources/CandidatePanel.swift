@@ -6,10 +6,24 @@ struct CandidatePanelItem: Equatable {
 }
 
 func candidateAnnotationText(_ detail: RustEngine.CandidateDetail) -> String? {
-    guard detail.annotation == UInt32(SLIME_CANDIDATE_ANNOTATION_CORRECTION.rawValue) else {
+    switch detail.annotation {
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_USER_DICTIONARY.rawValue):
+        return "ユーザー辞書"
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_HISTORY.rawValue):
+        return "履歴"
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_CORRECTION.rawValue):
+        return detail.detail.map { "\($0)に訂正" } ?? "訂正"
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_COMPLETION.rawValue):
+        return "補完"
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_DATE_TIME.rawValue):
+        return "日付・時刻"
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_NUMBER.rawValue):
+        return "数値"
+    case UInt32(SLIME_CANDIDATE_ANNOTATION_CONTEXT.rawValue):
+        return "文脈"
+    default:
         return nil
     }
-    return detail.detail.map { "\($0)に訂正" } ?? "訂正"
 }
 
 func candidatePanelFrame(

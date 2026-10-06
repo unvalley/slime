@@ -28,17 +28,16 @@ enum DictionaryImportError: LocalizedError {
 
 enum DictionaryImporter {
     private enum TextFormat {
-        case google
-        case microsoft
-        case atok
-        case kotoeri
+        case plainTabSeparated
+        case singleBangHeader
+        case doubleBangHeader
+        case quotedCSV
 
         var name: String {
             switch self {
-            case .google: "Google日本語入力辞書"
-            case .microsoft: "Microsoft IME辞書"
-            case .atok: "ATOK辞書"
-            case .kotoeri: "旧Mac日本語入力辞書"
+            case .plainTabSeparated: "タブ区切り辞書"
+            case .singleBangHeader, .doubleBangHeader: "ヘッダー付きタブ区切り辞書"
+            case .quotedCSV: "CSV辞書"
             }
         }
     }
@@ -128,15 +127,15 @@ enum DictionaryImporter {
             let line = rawLine.trimmingCharacters(in: trimCharacters)
             if line.isEmpty
                 || line.hasPrefix("#")
-                || (format == .kotoeri && line.hasPrefix("//"))
+                || (format == .quotedCSV && line.hasPrefix("//"))
             {
                 continue
             }
-            if line.hasPrefix("!") && format != .google {
+            if line.hasPrefix("!") && format != .plainTabSeparated {
                 continue
             }
 
-            let columns: [String] = if format == .kotoeri {
+            let columns: [String] = if format == .quotedCSV {
                 parseCSVLine(rawLine) ?? []
             } else {
                 rawLine.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
@@ -170,21 +169,21 @@ enum DictionaryImporter {
         let firstLine = lines.first ?? ""
         let lowercased = firstLine.lowercased()
         if lowercased.hasPrefix("!microsoft ime") {
-            return .microsoft
+            return .singleBangHeader
         }
         if lowercased.hasPrefix("!!atok_tango_text_header")
             || lowercased.hasPrefix("!!dicut")
         {
-            return .atok
+            return .doubleBangHeader
         }
         let firstDataLine = lines.first { !$0.hasPrefix("//") } ?? firstLine
         if firstDataLine.hasPrefix("\"")
             && firstDataLine.hasSuffix("\"")
             && !firstDataLine.contains("\t")
         {
-            return .kotoeri
+            return .quotedCSV
         }
-        return .google
+        return .plainTabSeparated
     }
 
     private static func parseCSVLine(_ line: String) -> [String]? {

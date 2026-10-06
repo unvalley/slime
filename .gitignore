@@ -4,3 +4,4 @@
 .slime-private/
 *.profraw
 *.profdata
+__pycache__/

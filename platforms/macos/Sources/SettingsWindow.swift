@@ -223,7 +223,7 @@ final class SettingsModel: ObservableObject {
     func importDictionary() {
         let panel = NSOpenPanel()
         panel.title = "辞書を読み込む"
-        panel.message = "Google日本語入力、Microsoft IME、またはMacのユーザ辞書を選択してください。"
+        panel.message = "タブ区切りテキスト、CSV、またはMacのユーザ辞書を選択してください。"
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }

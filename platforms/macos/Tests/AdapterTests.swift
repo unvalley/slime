@@ -241,6 +241,10 @@ enum AdapterTests {
             dateActions.first(where: { $0.type == "show_candidates" })?.candidates,
             "configured date candidates should cross the Swift bridge"
         )
+        let configuredDateDetails = try expectValue(
+            dateActions.first(where: { $0.type == "show_candidates" })?.candidateDetails,
+            "date candidate metadata should cross the Swift bridge"
+        )
         try expect(
             configuredDateCandidates.contains(where: {
                 $0.hasPrefix("R") && $0.filter { $0 == "/" }.count == 2
@@ -252,6 +256,13 @@ enum AdapterTests {
                 $0.count == 10 && $0.dropFirst(4).first == "/"
             }),
             "disabled Gregorian numeric formats should not be offered"
+        )
+        try expect(
+            configuredDateDetails.contains(where: {
+                $0.annotation == UInt32(SLIME_CANDIDATE_ANNOTATION_DATE_TIME.rawValue)
+                    && candidateAnnotationText($0) == "日付・時刻"
+            }),
+            "date candidates should carry a localized semantic annotation"
         )
 
         let reconversionEngine = try RustEngine(dataDirectory: testDirectory)
@@ -783,30 +794,33 @@ enum AdapterTests {
     }
 
     private static func testDictionaryImports() throws {
-        let google = Data(
+        let plainTabSeparated = Data(
             "\u{FEFF}# exported dictionary\nパフォーマンス\tPerformance\t名詞\nぱふぇ\tパフェ\t名詞\nぱふぇ\tパフェ\t名詞\ninvalid\n".utf8
         )
-        let googleResult = try DictionaryImporter.parse(data: google, fileExtension: "txt")
-        try expect(googleResult.formatName == "Google日本語入力辞書", "Google format name")
+        let plainTabResult = try DictionaryImporter.parse(
+            data: plainTabSeparated,
+            fileExtension: "txt"
+        )
+        try expect(plainTabResult.formatName == "タブ区切り辞書", "plain tab format name")
         try expect(
-            googleResult.entries.map(\.reading) == ["ぱふぉーまんす", "ぱふぇ"],
-            "Google readings should normalize and preserve order"
+            plainTabResult.entries.map(\.reading) == ["ぱふぉーまんす", "ぱふぇ"],
+            "tab-separated readings should normalize and preserve order"
         )
         try expect(
-            googleResult.skippedCount == 2,
-            "invalid and duplicate Google rows should be reported"
+            plainTabResult.skippedCount == 2,
+            "invalid and duplicate tab-separated rows should be reported"
         )
 
-        let microsoft = Data(
+        let singleBangHeader = Data(
             "!Microsoft IME Dictionary Tool\nにほん\t日本\t名詞\n".utf8
         )
-        let microsoftResult = try DictionaryImporter.parse(
-            data: microsoft,
+        let singleBangResult = try DictionaryImporter.parse(
+            data: singleBangHeader,
             fileExtension: "txt"
         )
         try expect(
-            microsoftResult.formatName == "Microsoft IME辞書",
-            "Microsoft header should be detected"
+            singleBangResult.formatName == "ヘッダー付きタブ区切り辞書",
+            "single-bang header should be detected"
         )
 
         let shiftJISText = "!Microsoft IME Dictionary Tool\nとうきょう\t東京\t地名\n"
@@ -823,27 +837,36 @@ enum AdapterTests {
             "Shift JIS dictionaries should import"
         )
 
-        let atok = Data(
+        let doubleBangHeader = Data(
             "!!ATOK_TANGO_TEXT_HEADER 1\nりんぎしょ\t稟議書\t固有人一般\n".utf8
         )
-        let atokResult = try DictionaryImporter.parse(data: atok, fileExtension: "txt")
-        try expect(atokResult.formatName == "ATOK辞書", "ATOK header should be detected")
-        try expect(atokResult.entries.first?.surface == "稟議書", "ATOK rows should import")
-
-        let kotoeri = Data(
-            "// Kotoeri dictionary\n\"いんよう\",\"「引用」\",\"普通名詞\"\n\"だぶる\",\"二重\"\"引用\",\"普通名詞\"\n".utf8
-        )
-        let kotoeriResult = try DictionaryImporter.parse(
-            data: kotoeri,
+        let doubleBangResult = try DictionaryImporter.parse(
+            data: doubleBangHeader,
             fileExtension: "txt"
         )
         try expect(
-            kotoeriResult.formatName == "旧Mac日本語入力辞書",
-            "quoted CSV should be detected as Kotoeri"
+            doubleBangResult.formatName == "ヘッダー付きタブ区切り辞書",
+            "double-bang header should be detected"
         )
         try expect(
-            kotoeriResult.entries.map(\.surface) == ["「引用」", "二重\"引用"],
-            "Kotoeri CSV quoting should be decoded"
+            doubleBangResult.entries.first?.surface == "稟議書",
+            "double-bang rows should import"
+        )
+
+        let quotedCSV = Data(
+            "// exported dictionary\n\"いんよう\",\"「引用」\",\"普通名詞\"\n\"だぶる\",\"二重\"\"引用\",\"普通名詞\"\n".utf8
+        )
+        let quotedCSVResult = try DictionaryImporter.parse(
+            data: quotedCSV,
+            fileExtension: "txt"
+        )
+        try expect(
+            quotedCSVResult.formatName == "CSV辞書",
+            "quoted CSV should be detected"
+        )
+        try expect(
+            quotedCSVResult.entries.map(\.surface) == ["「引用」", "二重\"引用"],
+            "CSV quoting should be decoded"
         )
 
         let appleObject: [[String: String]] = [

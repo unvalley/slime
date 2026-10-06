@@ -1,0 +1,73 @@
+name: Debug version resource
+
+on:
+  push:
+    branches: [ci-windows-version-debug]
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - name: Probe version resource variants
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          $link = Get-ChildItem "$vs/VC/Tools/MSVC/*/bin/Hostx64/x64/link.exe" | Select-Object -Last 1
+          $kits = "${env:ProgramFiles(x86)}/Windows Kits/10"
+          $rc = Get-ChildItem "$kits/bin/*/x64/rc.exe" | Sort-Object FullName | Select-Object -Last 1
+          $sdkVersion = Split-Path (Split-Path $rc.DirectoryName -Parent) -Leaf
+          $include = "$kits/Include/$sdkVersion"
+          Write-Host "rc=$($rc.FullName) link=$($link.FullName)"
+          New-Item -ItemType Directory -Force probe | Out-Null
+          Set-Location probe
+          $base = @'
+          #include <winver.h>
+          1 VERSIONINFO
+          FILEVERSION 0,1,0,0
+          PRODUCTVERSION 0,1,0,0
+          FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+          FILEFLAGS 0
+          FILEOS VOS_NT_WINDOWS32
+          FILETYPE __FILETYPE__
+          FILESUBTYPE VFT2_UNKNOWN
+          BEGIN
+            BLOCK "StringFileInfo"
+            BEGIN
+              BLOCK "040904b0"
+              BEGIN
+                VALUE "Comments", "Source revision: abc\0"
+                VALUE "CompanyName", "unvalley\0"
+                VALUE "ProductName", "Slime\0"
+                VALUE "ProductVersion", "0.1.0\0"
+          __EXTRA__
+              END
+            END
+            BLOCK "VarFileInfo"
+            BEGIN
+              VALUE "Translation", 0x0409, 1200
+            END
+          END
+          '@
+          $variants = [ordered]@{
+            "asis"            = @{ filetype = "VFT_UNKNOWN"; extra = ""; rcflags = @() }
+            "msbuild-flags"   = @{ filetype = "VFT_UNKNOWN"; extra = ""; rcflags = @("/l", "0x0409", "/nologo") }
+            "filetype-dll"    = @{ filetype = "VFT_DLL"; extra = ""; rcflags = @() }
+            "with-fileversion" = @{ filetype = "VFT_UNKNOWN"; extra = '      VALUE "FileVersion", "0.1.0\0"' ; rcflags = @() }
+            "with-description" = @{ filetype = "VFT_UNKNOWN"; extra = "      VALUE `"FileDescription`", `"Slime`"`n      VALUE `"FileVersion`", `"0.1.0`"`n      VALUE `"OriginalFilename`", `"x.dll`"" ; rcflags = @() }
+          }
+          foreach ($name in $variants.Keys) {
+            $v = $variants[$name]
+            $text = ($base -replace "(?m)^          ", "").Replace("__FILETYPE__", $v.filetype).Replace("__EXTRA__", $v.extra)
+            Set-Content -Path "$name.rc" -Value $text -Encoding ascii
+            $flags = @($v.rcflags) + @("/I", "$include/um", "/I", "$include/shared", "/fo", "$name.res", "$name.rc")
+            & $rc.FullName @flags | Out-Null
+            foreach ($kind in @("dll", "manifest")) {
+              $out = "$name-$kind.dll"
+              $linkFlags = @("/NOLOGO", "/DLL", "/NOENTRY", "/MACHINE:X64", "/OUT:$out", "$name.res")
+              if ($kind -eq "manifest") { $linkFlags += @("/MANIFEST:EMBED") }
+              & $link.FullName @linkFlags | Out-Null
+              $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $out))
+              Write-Host "RESULT $out size=$((Get-Item $out).Length) ProductName='$($info.ProductName)' Comments='$($info.Comments)' ProductVersion='$($info.ProductVersion)' FileVersion='$($info.FileVersion)' lang='$($info.Language)'"
+            }
+          }

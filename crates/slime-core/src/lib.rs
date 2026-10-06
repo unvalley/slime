@@ -14,7 +14,7 @@ mod typo_correction;
 mod user_data;
 
 use dictionary_packs::DictionaryPackStore;
-use english_reverse::ReverseMatch;
+use english_reverse::{ReverseMatch, ReverseReading};
 use live_conversion::Decision as LiveConversionDecision;
 use session_history::SessionHistory;
 
@@ -1902,6 +1902,21 @@ impl SlimeEngine {
         self.installed_packs.errors()
     }
 
+    fn exact_english_reverse_surfaces<'a>(
+        &'a self,
+        reading: &str,
+    ) -> impl Iterator<Item = &'a String> + 'a {
+        let reading = (!self.ascii_surfaces.is_empty()).then(|| ReverseReading::new(reading));
+        self.ascii_surfaces
+            .iter()
+            .filter(move |(key, _)| {
+                reading
+                    .as_ref()
+                    .is_some_and(|reading| reading.reverse_match(key) == Some(ReverseMatch::Exact))
+            })
+            .map(|(_, surface)| surface)
+    }
+
     /// Returns ASCII surfaces whose spelling the current reading retypes,
     /// exact matches first.
     fn english_reverse_surfaces(&self, target: &str) -> Vec<String> {
@@ -1910,8 +1925,9 @@ impl SlimeEngine {
         }
         let mut exact = Vec::new();
         let mut prefix = Vec::new();
+        let target = ReverseReading::new(target);
         for (key, surface) in &self.ascii_surfaces {
-            match english_reverse::reverse_match(target, key) {
+            match target.reverse_match(key) {
                 Some(ReverseMatch::Exact) => exact.push(surface.clone()),
                 Some(ReverseMatch::Prefix) => prefix.push(surface.clone()),
                 None => {}
@@ -2220,11 +2236,9 @@ impl SlimeEngine {
                 push_unique(&mut candidates, (*surface).to_owned());
             }
         }
-        for (key, surface) in &self.ascii_surfaces {
-            if english_reverse::reverse_match(reading, key) == Some(ReverseMatch::Exact) {
-                push_unique(&mut candidates, surface.clone());
-                has_protected_candidates = true;
-            }
+        for surface in self.exact_english_reverse_surfaces(reading) {
+            push_unique(&mut candidates, surface.clone());
+            has_protected_candidates = true;
         }
         if let Some(surface) = contextual_dictionary_winner {
             push_unique(&mut candidates, surface.to_owned());
@@ -2314,9 +2328,10 @@ impl SlimeEngine {
                 .is_some()
             || (self.history_is_available()
                 && !self.user_data.exact_history_surfaces(reading).is_empty())
-            || self.ascii_surfaces.iter().any(|(key, _)| {
-                english_reverse::reverse_match(reading, key) == Some(ReverseMatch::Exact)
-            })
+            || self
+                .exact_english_reverse_surfaces(reading)
+                .next()
+                .is_some()
         {
             return (ordinary.surfaces, Vec::new(), ordinary.rescore);
         }

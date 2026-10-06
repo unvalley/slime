@@ -809,15 +809,15 @@ mod tests {
             },
         );
         let mut bundled_report = Report::default();
-        assert!(
+        assert_eq!(
             select_missing_terms(
                 &Dictionary::bundled(),
                 bundled_counts,
                 &options(),
                 &mut bundled_report,
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [GeneratedEntry; 0]
         );
         assert_eq!(bundled_report.already_reachable, 1);
     }

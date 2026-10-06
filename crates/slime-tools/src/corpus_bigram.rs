@@ -400,10 +400,9 @@ mod tests {
 
     #[test]
     fn parses_surface_reading_tokens_and_comments() {
-        assert!(
-            parse_annotated_corpus_line(";; comment")
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            parse_annotated_corpus_line(";; comment").unwrap(),
+            [] as [(String, String); 0]
         );
         assert_eq!(
             parse_annotated_corpus_line("夏/なつ は/は 暑い/あつい").unwrap(),

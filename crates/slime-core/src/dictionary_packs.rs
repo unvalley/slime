@@ -1722,7 +1722,7 @@ mod tests {
 
         let verified = DictionaryPackStore::load_with_trust(Some(&directory), &trust);
         assert_eq!(verified.infos().count(), 1);
-        assert!(verified.errors().is_empty());
+        assert_eq!(verified.errors(), []);
 
         fs::write(&pack_path, format!("{VALID_PACK}\n")).unwrap();
         let tampered = DictionaryPackStore::load_with_trust(Some(&directory), &trust);
@@ -1757,7 +1757,7 @@ mod tests {
         let compatible =
             DictionaryPackStore::load_with_trust(Some(&directory), &DictionaryPackTrust::default());
         assert_eq!(compatible.infos().count(), 1);
-        assert!(compatible.errors().is_empty());
+        assert_eq!(compatible.errors(), []);
 
         assert!(DictionaryPackVerificationKey::new("invalid key", [7_u8; 32]).is_err());
         assert!(DictionaryPackVerificationKey::new("fixture-weak", [0_u8; 32]).is_err());
@@ -1838,7 +1838,7 @@ mod tests {
         write_signed(&current);
         let accepted = DictionaryPackStore::load_with_trust(Some(&directory), &trust);
         assert_eq!(accepted.infos().count(), 1);
-        assert!(accepted.errors().is_empty());
+        assert_eq!(accepted.errors(), []);
 
         let unknown_id_trust = DictionaryPackTrust::signed_only_with_version_floors(
             vec![verification_key.clone()],

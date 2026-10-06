@@ -5431,7 +5431,7 @@ mod tests {
                 },
             ]
         );
-        assert!(engine.dictionary_pack_load_errors().is_empty());
+        assert_eq!(engine.dictionary_pack_load_errors(), []);
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5912,7 +5912,7 @@ mod tests {
             engine.conversion_candidates_with_left_context("文章", "かんじ")[0],
             "漢字"
         );
-        assert!(engine.dictionary_pack_load_errors().is_empty());
+        assert_eq!(engine.dictionary_pack_load_errors(), []);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -6209,7 +6209,7 @@ mod tests {
 
         let actions = engine.handle(InputEvent::Character('u'));
         assert!(actions.contains(&SlimeAction::HideCandidates));
-        assert!(engine.snapshot().candidates.is_empty());
+        assert_eq!(engine.snapshot().candidates, [] as [String; 0]);
         assert_eq!(engine.snapshot().preedit, "どうぐ");
         fs::remove_dir_all(directory).unwrap();
     }
@@ -10583,10 +10583,9 @@ mod tests {
 
         let snapshot = engine.snapshot();
 
-        assert!(
-            engine
-                .handle(InputEvent::SelectCandidate(u32::MAX))
-                .is_empty()
+        assert_eq!(
+            engine.handle(InputEvent::SelectCandidate(u32::MAX)),
+            [] as [SlimeAction; 0]
         );
         assert_eq!(engine.snapshot(), snapshot);
     }
@@ -11136,7 +11135,7 @@ mod tests {
         )));
 
         let snapshot = engine.snapshot();
-        assert!(engine.begin_reconversion("🫠").is_empty());
+        assert_eq!(engine.begin_reconversion("🫠"), [] as [SlimeAction; 0]);
         assert_eq!(engine.snapshot(), snapshot);
     }
 
@@ -11175,7 +11174,7 @@ mod tests {
         });
 
         convert_and_commit(&mut engine, "bunshou", "文章");
-        assert!(!engine.begin_reconversion("漢字").is_empty());
+        assert_ne!(engine.begin_reconversion("漢字"), [] as [SlimeAction; 0]);
         engine.handle(InputEvent::Enter);
 
         assert!(!directory.join("context_history.tsv").exists());
@@ -11196,7 +11195,7 @@ mod tests {
         });
 
         convert_and_commit(&mut engine, "bunshou", "文章");
-        assert!(engine.begin_reconversion("🫠").is_empty());
+        assert_eq!(engine.begin_reconversion("🫠"), [] as [SlimeAction; 0]);
         convert_and_commit(&mut engine, "kanji", "漢字");
 
         assert!(!directory.join("context_history.tsv").exists());

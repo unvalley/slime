@@ -293,7 +293,7 @@ const fn maximum_variant_count(raw_length: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::corrected_readings;
+    use super::{CorrectedReading, corrected_readings};
 
     #[test]
     fn generates_supported_single_key_edits() {
@@ -354,8 +354,14 @@ mod tests {
 
     #[test]
     fn skips_short_non_ascii_and_already_equivalent_inputs() {
-        assert!(corrected_readings("kan", "かん").is_empty());
-        assert!(corrected_readings("かんじ", "かんじ").is_empty());
+        assert_eq!(
+            corrected_readings("kan", "かん"),
+            [] as [CorrectedReading; 0]
+        );
+        assert_eq!(
+            corrected_readings("かんじ", "かんじ"),
+            [] as [CorrectedReading; 0]
+        );
         assert!(
             corrected_readings("kannji", "かんじ")
                 .iter()

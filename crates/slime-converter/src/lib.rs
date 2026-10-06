@@ -8657,20 +8657,17 @@ mod tests {
                 .len(),
             3
         );
-        assert!(
-            dictionary
-                .fixed_segment_variants("あいうえ", 0, 8)
-                .is_empty()
+        assert_eq!(
+            dictionary.fixed_segment_variants("あいうえ", 0, 8),
+            [] as [String; 0]
         );
-        assert!(
-            dictionary
-                .fixed_segment_variants("あいうえ", 8, 0)
-                .is_empty()
+        assert_eq!(
+            dictionary.fixed_segment_variants("あいうえ", 8, 0),
+            [] as [String; 0]
         );
-        assert!(
-            dictionary
-                .fixed_segment_variants(&"あ".repeat(129), 8, 8)
-                .is_empty()
+        assert_eq!(
+            dictionary.fixed_segment_variants(&"あ".repeat(129), 8, 8),
+            [] as [String; 0]
         );
     }
 
@@ -8732,10 +8729,9 @@ mod tests {
             DictionaryEntry::new("あい", "あい", 1),
             DictionaryEntry::new("うえ", "うえ", 1),
         ]);
-        assert!(
-            literal_only
-                .compound_candidates("あいうえ", 4, 16)
-                .is_empty()
+        assert_eq!(
+            literal_only.compound_candidates("あいうえ", 4, 16),
+            [] as [Candidate; 0]
         );
     }
 
@@ -8743,12 +8739,17 @@ mod tests {
     fn bounded_compound_recall_rejects_unbounded_inputs() {
         let dictionary = Dictionary::new(vec![DictionaryEntry::new("あい", "第一", 10)]);
 
-        assert!(dictionary.compound_candidates("あいうえ", 0, 16).is_empty());
-        assert!(dictionary.compound_candidates("あいうえ", 4, 0).is_empty());
-        assert!(
-            dictionary
-                .compound_candidates("あいうえおかきくけこさしすせそたち", 4, 16)
-                .is_empty()
+        assert_eq!(
+            dictionary.compound_candidates("あいうえ", 0, 16),
+            [] as [Candidate; 0]
+        );
+        assert_eq!(
+            dictionary.compound_candidates("あいうえ", 4, 0),
+            [] as [Candidate; 0]
+        );
+        assert_eq!(
+            dictionary.compound_candidates("あいうえおかきくけこさしすせそたち", 4, 16),
+            [] as [Candidate; 0]
         );
     }
 
@@ -8987,10 +8988,9 @@ mod tests {
         let conversions = dictionary.convert_n_best_with_surface_prefix("あい", "愛", 5);
 
         assert_eq!(conversions[0].surface, "愛情");
-        assert!(
-            dictionary
-                .convert_n_best_with_surface_prefix("あい", "不一致", 5)
-                .is_empty()
+        assert_eq!(
+            dictionary.convert_n_best_with_surface_prefix("あい", "不一致", 5),
+            [] as [Conversion; 0]
         );
     }
 
@@ -11132,7 +11132,10 @@ mod tests {
             ["１９９１", "千九百九十一", "1991"]
         );
         assert_eq!(dictionary.generated_number_surfaces("１２３"), ["１２３"]);
-        assert!(dictionary.generated_number_surfaces("にほん").is_empty());
+        assert_eq!(
+            dictionary.generated_number_surfaces("にほん"),
+            [] as [String; 0]
+        );
     }
 
     #[test]

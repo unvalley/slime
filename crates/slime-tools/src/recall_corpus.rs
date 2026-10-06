@@ -350,7 +350,7 @@ mod tests {
             &mut phrases,
             &mut stats,
         );
-        assert!(phrases.is_empty());
+        assert_eq!(phrases, [] as [Phrase; 0]);
         assert!(stats.non_compound_elements > 0);
     }
 

@@ -35,6 +35,6 @@ mod tests {
     fn unrelated_readings_do_not_gain_symbol_candidates() {
         let mut candidates = Vec::new();
         append_for_reading("にほん", &mut candidates);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [crate::Candidate; 0]);
     }
 }

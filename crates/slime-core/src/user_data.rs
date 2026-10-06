@@ -1210,9 +1210,9 @@ mod tests {
         let mut data = UserData::load(&directory);
 
         data.record_context("ぶんしょう", "文章", "かんじ", "漢字");
-        assert!(
-            data.contextual_history_surfaces("ぶんしょう", "文章", "かんじ")
-                .is_empty()
+        assert_eq!(
+            data.contextual_history_surfaces("ぶんしょう", "文章", "かんじ"),
+            [] as [&str; 0]
         );
 
         data.record_context("ぶんしょう", "文章", "かんじ", "漢字");
@@ -1289,7 +1289,7 @@ mod tests {
         let mut data = UserData::load(&directory);
 
         data.record("へや", "部屋");
-        assert!(data.exact_history_surfaces("へや").is_empty());
+        assert_eq!(data.exact_history_surfaces("へや"), [] as [&str; 0]);
 
         for _ in 0..2 {
             data.record_context("へや", "部屋", "しょうめい", "照明");
@@ -1361,10 +1361,9 @@ mod tests {
             reloaded.contextual_completion_surfaces("ぶんしょう", "文章", "かんじ", 9),
             ["漢字変換"]
         );
-        assert!(
-            reloaded
-                .contextual_completion_surfaces("ぶんしょう", "文章", "かんじへんか", 9)
-                .is_empty()
+        assert_eq!(
+            reloaded.contextual_completion_surfaces("ぶんしょう", "文章", "かんじへんか", 9),
+            [] as [&str; 0]
         );
 
         fs::remove_dir_all(directory).unwrap();
@@ -1555,7 +1554,7 @@ mod tests {
             reloaded.completion_surfaces("ぱ", 5),
             ["パソコン", "パフォーマンス"]
         );
-        assert!(reloaded.exact_history_surfaces("ぱ").is_empty());
+        assert_eq!(reloaded.exact_history_surfaces("ぱ"), [] as [&str; 0]);
         let history = fs::read_to_string(directory.join("history.tsv")).unwrap();
         assert!(history.contains("ぱそこん\tパソコン\t6\t"));
 
@@ -1613,9 +1612,9 @@ mod tests {
         .unwrap();
 
         let data = UserData::load(&directory);
-        assert!(data.exact_history_surfaces("に").is_empty());
-        assert!(data.exact_history_surfaces("かな").is_empty());
-        assert!(data.exact_history_surfaces("nihon").is_empty());
+        assert_eq!(data.exact_history_surfaces("に"), [] as [&str; 0]);
+        assert_eq!(data.exact_history_surfaces("かな"), [] as [&str; 0]);
+        assert_eq!(data.exact_history_surfaces("nihon"), [] as [&str; 0]);
         assert_eq!(data.exact_history_surfaces("にほん"), ["日本"]);
         assert_eq!(data.completion_surfaces("に", 5), ["日本"]);
 
@@ -1633,8 +1632,11 @@ mod tests {
         data.record("ながすぎるひょうき", &long_surface);
 
         assert!(!directory.join("history.tsv").exists());
-        assert!(data.completion_surfaces("ああ", 5).is_empty());
-        assert!(data.exact_history_surfaces("ながすぎるひょうき").is_empty());
+        assert_eq!(data.completion_surfaces("ああ", 5), [] as [String; 0]);
+        assert_eq!(
+            data.exact_history_surfaces("ながすぎるひょうき"),
+            [] as [&str; 0]
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

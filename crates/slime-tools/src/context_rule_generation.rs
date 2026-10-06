@@ -592,41 +592,41 @@ mod tests {
     fn rejects_ties_unreachable_surfaces_and_existing_top1() {
         let dictionary = Dictionary::bundled();
         let mut tied_report = Report::default();
-        assert!(
+        assert_eq!(
             select_rules(
                 &dictionary,
                 counts("文章", "かんじ", &[("漢字", 3), ("感じ", 3)]),
                 &options(),
                 &mut tied_report,
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [super::Rule; 0]
         );
         assert_eq!(tied_report.tied, 1);
 
         let mut unreachable_report = Report::default();
-        assert!(
+        assert_eq!(
             select_rules(
                 &dictionary,
                 counts("文章", "かんじ", &[("未収録表記", 5)]),
                 &options(),
                 &mut unreachable_report,
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [super::Rule; 0]
         );
         assert_eq!(unreachable_report.unreachable_winner, 1);
 
         let mut top1_report = Report::default();
-        assert!(
+        assert_eq!(
             select_rules(
                 &dictionary,
                 counts("文章", "かんじ", &[("感じ", 5)]),
                 &options(),
                 &mut top1_report,
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [super::Rule; 0]
         );
         assert_eq!(top1_report.already_top1, 1);
     }
@@ -634,15 +634,15 @@ mod tests {
     #[test]
     fn rejects_a_phonetic_winner_that_only_changes_script_preference() {
         let mut report = Report::default();
-        assert!(
+        assert_eq!(
             select_rules(
                 &Dictionary::bundled(),
                 counts("ホームページが", "でき", &[("でき", 8)]),
                 &options(),
                 &mut report,
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [super::Rule; 0]
         );
         assert_eq!(report.phonetic_winner, 1);
     }

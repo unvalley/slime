@@ -171,7 +171,7 @@ mod tests {
             .map(slime_converter::DictionaryLayer::entry_count)
             .sum();
         assert_eq!(words(ALL_DOMAIN_DICTIONARIES).len(), total);
-        assert!(words(0).is_empty());
+        assert_eq!(words(0), [] as [(&str, &str); 0]);
     }
 
     #[test]

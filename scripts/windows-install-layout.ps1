@@ -178,13 +178,18 @@ function Assert-SlimeStartMenu(
         throw "Start Menu entries are unexpected: $($nameDifference | Out-String)"
     }
 
-    $shell = New-Object -ComObject WScript.Shell
+    # WScript.Shell opens shortcuts through the ANSI code page, so a Japanese
+    # name yields an empty target on a system with another code page.
+    $shell = New-Object -ComObject Shell.Application
     try {
+        $folder = $shell.Namespace($directory)
         foreach ($name in $expected.Keys) {
-            $shortcut = $shell.CreateShortcut((Join-Path $directory $name))
-            if ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ne
+            $item = if ($folder) { $folder.ParseName($name) }
+            $target = if ($item -and $item.IsLink) { $item.GetLink.Path }
+            if (-not $target -or
+                [System.IO.Path]::GetFullPath($target) -ne
                 [System.IO.Path]::GetFullPath($expected[$name])) {
-                throw "Start Menu shortcut points to an unexpected target: $name"
+                throw "Start Menu shortcut '$name' points to an unexpected target: '$target'"
             }
         }
     } finally {

@@ -15,6 +15,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows-signature.ps1")
+if (-not (Get-Command $Dumpbin -ErrorAction SilentlyContinue)) {
+    # The build script imports the MSVC tools only into its own process, so a
+    # fresh shell has to find dumpbin in the Visual Studio installation.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+        "Microsoft Visual Studio\Installer\vswhere.exe"
+    $located = if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+        & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Host*\*\dumpbin.exe" |
+            Select-Object -First 1
+    }
+    if (-not $located) {
+        throw "dumpbin was not found: $Dumpbin"
+    }
+    $Dumpbin = $located
+}
 $repository = Split-Path -Parent $PSScriptRoot
 $artifactPath = (Resolve-Path $Artifact).Path
 $manifestDirectory = Join-Path $repository "platforms/windows/arm64x"

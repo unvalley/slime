@@ -18,8 +18,14 @@ endif()
 
 if(NOT DEFINED SLIME_SOURCE_REVISION)
   set(SLIME_SOURCE_REVISION "development")
-elseif(NOT SLIME_SOURCE_REVISION MATCHES "^[0-9a-f]{40}$")
-  message(FATAL_ERROR "SLIME_SOURCE_REVISION must be a lowercase 40-character Git revision")
+else()
+  # CMake regular expressions have no {n} quantifier, so check the length
+  # separately.
+  string(LENGTH "${SLIME_SOURCE_REVISION}" SLIME_SOURCE_REVISION_LENGTH)
+  if(NOT SLIME_SOURCE_REVISION_LENGTH EQUAL 40
+     OR NOT SLIME_SOURCE_REVISION MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "SLIME_SOURCE_REVISION must be a lowercase 40-character Git revision")
+  endif()
 endif()
 configure_file(
   src/SlimeVersion.rc.in

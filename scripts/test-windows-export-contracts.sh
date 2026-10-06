@@ -37,7 +37,9 @@ validate_manifest "$ffi_manifest"
 validate_manifest "$ime_manifest"
 
 ffi_expected="$(sed '/^[[:space:]]*$/d' "$ffi_manifest" | LC_ALL=C sort -u)"
-ffi_actual="$(rg -o --pcre2 '\bslime_[a-z0-9_]+(?=\s*\()' "$ffi_header" \
+# POSIX grep and sed only: the Windows runner's Git Bash has no ripgrep.
+ffi_actual="$(grep -oE '(^|[^A-Za-z0-9_])slime_[a-z0-9_]+[[:space:]]*\(' "$ffi_header" \
+  | sed -E 's/^[^A-Za-z0-9_]//; s/[[:space:]]*\($//' \
   | LC_ALL=C sort -u)"
 compare_exports "Rust C ABI" "$ffi_expected" "$ffi_actual"
 
@@ -54,7 +56,7 @@ if [[ -z "$probe_block" ]]; then
   exit 1
 fi
 probe_actual="$(printf '%s\n' "$probe_block" \
-  | rg -o '"[A-Za-z_][A-Za-z0-9_]*"' \
+  | grep -oE '"[A-Za-z_][A-Za-z0-9_]*"' \
   | tr -d '"' \
   | LC_ALL=C sort -u)"
 compare_exports "TSF load probe" "$ime_expected" "$probe_actual"

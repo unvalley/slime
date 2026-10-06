@@ -20,6 +20,7 @@ const MIN_COMPLETION_REMAINING_CHARS: usize = 2;
 const MIN_ESTABLISHED_HISTORY_COUNT: u32 = 5;
 const MIN_ESTABLISHED_CONTEXT_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
 const MIN_CONTEXT_USE_COUNT: u32 = 2;
+const MIN_LIVE_PHRASE_USE_COUNT: u32 = 2;
 const MIN_COMPLETION_USE_COUNT: u32 = MIN_ESTABLISHED_HISTORY_COUNT;
 const MAX_HISTORY_READING_CHARS: usize = 64;
 const MAX_HISTORY_SURFACE_CHARS: usize = 128;
@@ -141,6 +142,24 @@ impl UserData {
         self.directory.as_deref()
     }
 
+    /// Conservative guard for a worker scope crossing a previously fixed edge.
+    /// A registered or learned reading anywhere in that scope must retain the
+    /// existing personalization path. This query allocates nothing and does no I/O.
+    pub(crate) fn has_personalization_in_reading(
+        &self,
+        reading: &str,
+        include_history: bool,
+    ) -> bool {
+        let overlaps = |key: &str| !key.is_empty() && reading.contains(key);
+        self.dictionary.iter().any(|entry| overlaps(&entry.reading))
+            || (include_history
+                && (self.history.iter().any(|entry| {
+                    overlaps(&entry.reading) && is_useful_history(&entry.reading, &entry.surface)
+                }) || self.context_history.iter().any(|entry| {
+                    entry.count >= MIN_LIVE_PHRASE_USE_COUNT && overlaps(&entry.reading)
+                })))
+    }
+
     pub fn exact_dictionary_surfaces(&self, reading: &str) -> impl Iterator<Item = &str> {
         self.dictionary
             .iter()
@@ -163,7 +182,7 @@ impl UserData {
                     && entry.previous_surface == previous_surface
                     && entry.reading == reading
                     && entry.count >= MIN_CONTEXT_USE_COUNT
-                    && is_useful_history(&entry.reading, &entry.surface)
+                    && is_useful_context_anchor(&entry.reading, &entry.surface)
             })
             .collect();
         sort_context_history(&mut entries);
@@ -192,7 +211,7 @@ impl UserData {
                     && external_surface.ends_with(&entry.previous_surface)
                     && entry.previous_surface.chars().count() >= 2
                     && is_useful_context_anchor(&entry.previous_reading, &entry.previous_surface)
-                    && is_useful_history(&entry.reading, &entry.surface)
+                    && is_useful_context_anchor(&entry.reading, &entry.surface)
             })
             .collect();
         sort_context_history(&mut entries);
@@ -298,6 +317,28 @@ impl UserData {
     pub fn exact_history_surfaces(&self, reading: &str) -> Vec<&str> {
         let (established, transient) = self.exact_history_surfaces_by_strength(reading);
         established.into_iter().chain(transient).collect()
+    }
+
+    /// Returns repeatedly selected exact phrases that are safe to consider for
+    /// personalized live conversion.
+    ///
+    /// A single selection is deliberately insufficient: explicit conversion
+    /// history can be context-specific, while live conversion changes marked
+    /// text without asking. The live-conversion layer applies additional
+    /// reading-length, candidate-recall, and cost-gap gates before using these
+    /// surfaces.
+    #[must_use]
+    pub(crate) fn repeated_live_phrase_surface(&self, reading: &str) -> Option<&str> {
+        let preferred_surface = self.preferred_history_surface(reading);
+        self.history
+            .iter()
+            .filter(|entry| {
+                entry.reading == reading
+                    && entry.count >= MIN_LIVE_PHRASE_USE_COUNT
+                    && is_useful_history(&entry.reading, &entry.surface)
+            })
+            .min_by(|left, right| compare_history(left, right, preferred_surface))
+            .map(|entry| entry.surface.as_str())
     }
 
     #[must_use]
@@ -533,7 +574,7 @@ impl UserData {
             .into_iter()
             .filter(|(previous_reading, previous_surface, reading, surface)| {
                 is_useful_context_anchor(previous_reading, previous_surface)
-                    && is_useful_history(reading, surface)
+                    && is_useful_context_anchor(reading, surface)
             })
             .map(|(previous_reading, previous_surface, reading, surface)| {
                 (
@@ -596,14 +637,22 @@ fn sort_completions(entries: &mut Vec<&HistoryEntry>) {
 }
 
 fn sort_history(entries: &mut Vec<&HistoryEntry>, preferred_surface: Option<&str>) {
-    entries.sort_unstable_by(|left, right| {
-        (preferred_surface == Some(right.surface.as_str()))
-            .cmp(&(preferred_surface == Some(left.surface.as_str())))
-            .then_with(|| history_strength(right).cmp(&history_strength(left)))
-            .then_with(|| right.last_used.cmp(&left.last_used))
-            .then_with(|| right.count.cmp(&left.count))
-            .then_with(|| left.surface.cmp(&right.surface))
-    });
+    entries.sort_unstable_by(|left, right| compare_history(left, right, preferred_surface));
+}
+
+/// Orders a confirmed preference first, then established, recent, and
+/// frequent entries.
+fn compare_history(
+    left: &HistoryEntry,
+    right: &HistoryEntry,
+    preferred_surface: Option<&str>,
+) -> std::cmp::Ordering {
+    (preferred_surface == Some(right.surface.as_str()))
+        .cmp(&(preferred_surface == Some(left.surface.as_str())))
+        .then_with(|| history_strength(right).cmp(&history_strength(left)))
+        .then_with(|| right.last_used.cmp(&left.last_used))
+        .then_with(|| right.count.cmp(&left.count))
+        .then_with(|| left.surface.cmp(&right.surface))
 }
 
 fn sort_context_history(entries: &mut Vec<&ContextHistoryEntry>) {
@@ -800,7 +849,7 @@ fn trim_context_history(history: &mut Vec<ContextHistoryEntry>) {
                 &entry.previous_reading,
                 &entry.previous_surface,
             )),
-            Reverse(is_useful_history(&entry.reading, &entry.surface)),
+            Reverse(is_useful_context_anchor(&entry.reading, &entry.surface)),
             Reverse(entry.last_used),
             Reverse(entry.count),
         )
@@ -819,10 +868,10 @@ pub(crate) fn is_useful_history(reading: &str, surface: &str) -> bool {
             .any(|character| matches!(character, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}'))
 }
 
-/// A committed word may be valuable as the left side of a context edge even
-/// when it is too short to retain as a global conversion preference. The
-/// selected surface disambiguates the anchor, while equality and script checks
-/// continue to reject literal kana, punctuation, and raw ASCII input.
+/// A committed word can be either end of a repeated context edge even when
+/// it is too short to retain as a global conversion preference. Contextual
+/// lookup still requires a matching anchor and repeated observations; equality
+/// and script checks reject literal kana, punctuation, and raw ASCII input.
 pub(crate) fn is_useful_context_anchor(reading: &str, surface: &str) -> bool {
     let reading_length = reading.chars().count();
     let surface_length = surface.chars().count();
@@ -1145,6 +1194,74 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn boundary_scope_protection_respects_registration_and_history_settings() {
+        let mut data = UserData::default();
+        data.dictionary.push(super::UserDictionaryEntry {
+            reading: "もうけ".to_owned(),
+            surface: "儲け".to_owned(),
+        });
+        assert!(data.has_personalization_in_reading("もうける", false));
+        assert!(!data.has_personalization_in_reading("とおす", true));
+        data.record("とおす", "通す");
+        assert!(!data.has_personalization_in_reading("とおす", false));
+        assert!(data.has_personalization_in_reading("みずをとおす", true));
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        assert!(data.has_personalization_in_reading("はしをつかう", true));
+        assert!(!data.has_personalization_in_reading("はしをつかう", false));
+    }
+
+    #[test]
+    fn short_context_targets_still_reject_literal_and_non_japanese_readings() {
+        let directory = test_directory("invalid-short-context-target");
+        let mut data = UserData::load(&directory);
+        for (reading, surface) in [
+            ("", "箸"),
+            ("は", ""),
+            ("はし", "はし"),
+            ("1", "一"),
+            ("x", "X"),
+        ] {
+            data.record_context("しょくじ", "食事", reading, surface);
+        }
+        assert!(!directory.join("context_history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn short_target_requires_repeated_matching_context_and_survives_reload() {
+        let directory = test_directory("short-context-target");
+        let mut data = UserData::load(&directory);
+        data.record("はし", "箸");
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        assert_eq!(
+            data.contextual_history_surfaces("しょくじ", "食事", "はし"),
+            [] as [&str; 0]
+        );
+        data.record_context("しょくじ", "食事", "はし", "箸");
+        let reloaded = UserData::load(&directory);
+        assert_eq!(
+            reloaded.contextual_history_surfaces("しょくじ", "食事", "はし"),
+            ["箸"]
+        );
+        assert_eq!(
+            reloaded.contextual_history_surfaces_for_external_surface("今日の食事", "はし"),
+            ["箸"]
+        );
+        assert_eq!(
+            reloaded.contextual_history_surfaces("どうろ", "道路", "はし"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            reloaded.contextual_history_surfaces_for_external_surface("道路", "はし"),
+            [] as [&str; 0]
+        );
+        assert_eq!(reloaded.exact_history_surfaces("はし"), [] as [&str; 0]);
+        assert!(!directory.join("history.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 

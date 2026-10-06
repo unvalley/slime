@@ -1,0 +1,130 @@
+[
+  {
+    "index": "joint-0",
+    "input": "とうししんたくこうざをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "投資信託口座を開設"
+    ]
+  },
+  {
+    "index": "joint-1",
+    "input": "ぎんこうこうざをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "銀行口座を開設"
+    ]
+  },
+  {
+    "index": "joint-2",
+    "input": "しょうけんこうざをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "証券口座を開設"
+    ]
+  },
+  {
+    "index": "joint-3",
+    "input": "しんきこうざをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "新規口座を開設"
+    ]
+  },
+  {
+    "index": "joint-4",
+    "input": "とうししんたくのこうざでかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "投資信託の講座で解説"
+    ]
+  },
+  {
+    "index": "joint-5",
+    "input": "こうざのないようをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "講座の内容を解説"
+    ]
+  },
+  {
+    "index": "joint-6",
+    "input": "すうがくのもんだいをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "数学の問題を解説"
+    ]
+  },
+  {
+    "index": "joint-7",
+    "input": "こうざをじゅこうする",
+    "context_text": "",
+    "expected_output": [
+      "講座を受講する"
+    ]
+  },
+  {
+    "index": "joint-8",
+    "input": "こうざににゅうきんする",
+    "context_text": "",
+    "expected_output": [
+      "口座に入金する"
+    ]
+  },
+  {
+    "index": "joint-9",
+    "input": "こうざのざんだかをかくにんする",
+    "context_text": "",
+    "expected_output": [
+      "口座の残高を確認する"
+    ]
+  },
+  {
+    "index": "joint-10",
+    "input": "しょうひんのきのうをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "商品の機能を解説"
+    ]
+  },
+  {
+    "index": "joint-11",
+    "input": "あたらしいしてんをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "新しい支店を開設"
+    ]
+  },
+  {
+    "index": "joint-12",
+    "input": "じけんのはいけいをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "事件の背景を解説"
+    ]
+  },
+  {
+    "index": "joint-13",
+    "input": "ほーむぺーじをかいせつ",
+    "context_text": "",
+    "expected_output": [
+      "ホームページを開設"
+    ]
+  },
+  {
+    "index": "joint-14",
+    "input": "toushishintakukouzawokaisetsu",
+    "context_text": "",
+    "expected_output": [
+      "投資信託口座を開設"
+    ]
+  },
+  {
+    "index": "joint-15",
+    "input": "ginkoukouzawokaisetsu",
+    "context_text": "",
+    "expected_output": [
+      "銀行口座を開設"
+    ]
+  }
+]

@@ -111,6 +111,81 @@ fn main() {
             },
         );
     }
+    run_personalized_live_benchmark(live_iterations);
+}
+
+fn run_personalized_live_benchmark(iterations: u64) {
+    let directory = std::env::temp_dir().join(format!(
+        "slime-personalized-live-benchmark-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).expect("create personalized live benchmark directory");
+    fs::write(
+        directory.join("history.tsv"),
+        "# slime-history-v1\nへんかんせいど\t変換精度\t2\t20\n",
+    )
+    .expect("write personalized live benchmark history");
+    let mut personalized = SlimeEngine::bundled_with_user_data(UserData::load(&directory));
+    black_box(personalized.set_preferences(EnginePreferences {
+        live_conversion: true,
+        history_completion: true,
+        history_learning: true,
+        dictionary_packs: 0,
+        private_mode: false,
+        date_format_mask: ALL_DATE_FORMATS,
+    }));
+
+    run(
+        "engine/live_conversion_personalized_phrase",
+        iterations,
+        || {
+            let mut engine = personalized.clone();
+            for character in black_box("henkanseido").chars() {
+                black_box(engine.handle(InputEvent::Character(character)));
+            }
+            assert_eq!(engine.snapshot().preedit, "変換精度");
+            black_box(engine.handle(InputEvent::Enter));
+        },
+    );
+
+    let mut recent = SlimeEngine::bundled();
+    black_box(recent.set_preferences(EnginePreferences {
+        live_conversion: true,
+        history_completion: true,
+        history_learning: true,
+        dictionary_packs: 0,
+        private_mode: false,
+        date_format_mask: ALL_DATE_FORMATS,
+    }));
+    for character in "henkanseido".chars() {
+        black_box(recent.handle(InputEvent::Character(character)));
+    }
+    black_box(recent.handle(InputEvent::Space));
+    let corrected_index = recent
+        .snapshot()
+        .candidates
+        .iter()
+        .position(|candidate| candidate == "変換精度")
+        .expect("benchmark correction remains a dictionary candidate");
+    black_box(recent.handle(InputEvent::SelectCandidate(
+        u32::try_from(corrected_index).expect("candidate index fits u32"),
+    )));
+    black_box(recent.handle(InputEvent::Enter));
+
+    run(
+        "engine/live_conversion_recent_selection",
+        iterations,
+        || {
+            let mut engine = recent.clone();
+            for character in black_box("henkanseido").chars() {
+                black_box(engine.handle(InputEvent::Character(character)));
+            }
+            assert_eq!(engine.snapshot().preedit, "変換精度");
+            black_box(engine.handle(InputEvent::Enter));
+        },
+    );
+
+    fs::remove_dir_all(directory).expect("remove personalized live benchmark directory");
 }
 
 fn run_confirmed_context_commit_benchmark(iterations: u64) {
@@ -185,6 +260,27 @@ fn run_static_context_pack_benchmarks(iterations: u64) {
         },
     );
 
+    // Candidate-window navigation rebuilds annotations on every key, so pack
+    // rules must not add a dictionary search per NextCandidate.
+    let mut baseline_navigation = converting_after_commit(SlimeEngine::bundled());
+    run(
+        "engine/static_context_next_candidate_baseline_no_pack",
+        iterations,
+        || {
+            black_box(baseline_navigation.handle(InputEvent::NextCandidate));
+        },
+    );
+    let mut navigation = converting_after_commit(SlimeEngine::bundled_with_user_data(
+        UserData::load(&directory),
+    ));
+    run(
+        "engine/static_context_next_candidate_10001_rules",
+        iterations,
+        || {
+            black_box(navigation.handle(InputEvent::NextCandidate));
+        },
+    );
+
     let trust = sign_static_context_benchmark_pack(&pack_path);
     let load_iterations = (iterations / 10).clamp(100, 500);
     run(
@@ -208,6 +304,20 @@ fn run_static_context_pack_benchmarks(iterations: u64) {
     );
 
     fs::remove_dir_all(directory).expect("remove static context benchmark directory");
+}
+
+/// Commits 文章 as left context, then opens the candidate window for かんじ.
+fn converting_after_commit(mut engine: SlimeEngine) -> SlimeEngine {
+    for character in "bunshou".chars() {
+        engine.handle(InputEvent::Character(character));
+    }
+    engine.handle(InputEvent::Space);
+    engine.handle(InputEvent::Enter);
+    for character in "kanji".chars() {
+        engine.handle(InputEvent::Character(character));
+    }
+    engine.handle(InputEvent::Space);
+    engine
 }
 
 fn write_static_context_benchmark_pack(directory: &Path) -> PathBuf {

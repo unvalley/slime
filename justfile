@@ -83,6 +83,10 @@ evaluate-context-pack data_dir input *args:
 evaluate-pack-startup data_dir *args:
     cargo run --release --quiet -p slime-tools --bin slime-pack-startup-evaluate -- --data-dir "{{data_dir}}" {{args}}
 
+# かなprefixを逐次再生し、LIVE表示の巻き戻し・かな戻り・数字混入を集計する
+evaluate-live-transitions input *args:
+    cargo run --release --quiet -p slime-tools --bin slime-live-transition-evaluate -- --input "{{input}}" {{args}}
+
 # debugビルドする
 build:
     cargo build --workspace

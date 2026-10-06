@@ -1,0 +1,404 @@
+[
+  {
+    "index": "contrast-0",
+    "input": "tititoko",
+    "kana_input": "ちちとこ",
+    "context_text": "",
+    "expected_output": [
+      "父と子"
+    ]
+  },
+  {
+    "index": "contrast-1",
+    "input": "hahatokodomo",
+    "kana_input": "ははとこども",
+    "context_text": "",
+    "expected_output": [
+      "母と子供",
+      "母と子ども"
+    ]
+  },
+  {
+    "index": "contrast-2",
+    "input": "hon'tokonopen'",
+    "kana_input": "ほんとこのぺん",
+    "context_text": "",
+    "expected_output": [
+      "本とこのペン"
+    ]
+  },
+  {
+    "index": "contrast-3",
+    "input": "kyoutotokoube",
+    "kana_input": "きょうととこうべ",
+    "context_text": "",
+    "expected_output": [
+      "京都と神戸"
+    ]
+  },
+  {
+    "index": "contrast-4",
+    "input": "yamatomizuumi",
+    "kana_input": "やまとみずうみ",
+    "context_text": "",
+    "expected_output": [
+      "山と湖"
+    ]
+  },
+  {
+    "index": "contrast-5",
+    "input": "inutokotori",
+    "kana_input": "いぬとことり",
+    "context_text": "",
+    "expected_output": [
+      "犬と小鳥"
+    ]
+  },
+  {
+    "index": "contrast-6",
+    "input": "yuuzin'tokoーhiー",
+    "kana_input": "ゆうじんとこーひー",
+    "context_text": "",
+    "expected_output": [
+      "友人とコーヒー"
+    ]
+  },
+  {
+    "index": "contrast-7",
+    "input": "sigototoren'ai",
+    "kana_input": "しごととれんあい",
+    "context_text": "",
+    "expected_output": [
+      "仕事と恋愛"
+    ]
+  },
+  {
+    "index": "contrast-8",
+    "input": "hahatokonokaiwa",
+    "kana_input": "ははとこのかいわ",
+    "context_text": "",
+    "expected_output": [
+      "母と子の会話"
+    ]
+  },
+  {
+    "index": "contrast-9",
+    "input": "yuuzin'tokoyawotateru",
+    "kana_input": "ゆうじんとこやをたてる",
+    "context_text": "",
+    "expected_output": [
+      "友人と小屋を建てる"
+    ]
+  },
+  {
+    "index": "contrast-10",
+    "input": "iitokorowomituketa",
+    "kana_input": "いいところをみつけた",
+    "context_text": "",
+    "expected_output": [
+      "いいところを見つけた"
+    ]
+  },
+  {
+    "index": "contrast-11",
+    "input": "ienikaerutokoro",
+    "kana_input": "いえにかえるところ",
+    "context_text": "",
+    "expected_output": [
+      "家に帰るところ"
+    ]
+  },
+  {
+    "index": "contrast-12",
+    "input": "komaxtutatokoroda",
+    "kana_input": "こまったところだ",
+    "context_text": "",
+    "expected_output": [
+      "困ったところだ"
+    ]
+  },
+  {
+    "index": "contrast-13",
+    "input": "tyoudoiitokoro",
+    "kana_input": "ちょうどいいところ",
+    "context_text": "",
+    "expected_output": [
+      "ちょうどいいところ",
+      "丁度いいところ",
+      "ちょうどいい所",
+      "丁度いい所"
+    ]
+  },
+  {
+    "index": "contrast-14",
+    "input": "kaeroutositatokoro",
+    "kana_input": "かえろうとしたところ",
+    "context_text": "",
+    "expected_output": [
+      "帰ろうとしたところ"
+    ]
+  },
+  {
+    "index": "contrast-15",
+    "input": "sotonideyoutokokoronikimeta",
+    "kana_input": "そとにでようとこころにきめた",
+    "context_text": "",
+    "expected_output": [
+      "外に出ようと心に決めた"
+    ]
+  },
+  {
+    "index": "contrast-16",
+    "input": "yaroutokokoroeteita",
+    "kana_input": "やろうとこころえていた",
+    "context_text": "",
+    "expected_output": [
+      "やろうと心得ていた"
+    ]
+  },
+  {
+    "index": "contrast-17",
+    "input": "hunetokoukuuki",
+    "kana_input": "ふねとこうくうき",
+    "context_text": "",
+    "expected_output": [
+      "船と航空機"
+    ]
+  },
+  {
+    "index": "contrast-18",
+    "input": "hahatokodokunituitehanasu",
+    "kana_input": "ははとこどくについてはなす",
+    "context_text": "",
+    "expected_output": [
+      "母と孤独について話す"
+    ]
+  },
+  {
+    "index": "contrast-19",
+    "input": "tititokokugowoben'kyousuru",
+    "kana_input": "ちちとこくごをべんきょうする",
+    "context_text": "",
+    "expected_output": [
+      "父と国語を勉強する"
+    ]
+  },
+  {
+    "index": "additional-0",
+    "input": "hahatomusume",
+    "kana_input": "ははとむすめ",
+    "context_text": "",
+    "expected_output": [
+      "母と娘"
+    ]
+  },
+  {
+    "index": "additional-1",
+    "input": "anitootouto",
+    "kana_input": "あにとおとうと",
+    "context_text": "",
+    "expected_output": [
+      "兄と弟"
+    ]
+  },
+  {
+    "index": "additional-2",
+    "input": "inutoneko",
+    "kana_input": "いぬとねこ",
+    "context_text": "",
+    "expected_output": [
+      "犬と猫"
+    ]
+  },
+  {
+    "index": "additional-3",
+    "input": "soratoumi",
+    "kana_input": "そらとうみ",
+    "context_text": "",
+    "expected_output": [
+      "空と海"
+    ]
+  },
+  {
+    "index": "additional-4",
+    "input": "yamatokawa",
+    "kana_input": "やまとかわ",
+    "context_text": "",
+    "expected_output": [
+      "山と川"
+    ]
+  },
+  {
+    "index": "additional-5",
+    "input": "toritomusi",
+    "kana_input": "とりとむし",
+    "context_text": "",
+    "expected_output": [
+      "鳥と虫"
+    ]
+  },
+  {
+    "index": "additional-6",
+    "input": "yumetokibou",
+    "kana_input": "ゆめときぼう",
+    "context_text": "",
+    "expected_output": [
+      "夢と希望"
+    ]
+  },
+  {
+    "index": "additional-7",
+    "input": "aitoyuuki",
+    "kana_input": "あいとゆうき",
+    "context_text": "",
+    "expected_output": [
+      "愛と勇気"
+    ]
+  },
+  {
+    "index": "additional-8",
+    "input": "saratohasi",
+    "kana_input": "さらとはし",
+    "context_text": "",
+    "expected_output": [
+      "皿と箸"
+    ]
+  },
+  {
+    "index": "additional-9",
+    "input": "tukuetoisu",
+    "kana_input": "つくえといす",
+    "context_text": "",
+    "expected_output": [
+      "机と椅子"
+    ]
+  },
+  {
+    "index": "additional-10",
+    "input": "titinokoe",
+    "kana_input": "ちちのこえ",
+    "context_text": "",
+    "expected_output": [
+      "父の声"
+    ]
+  },
+  {
+    "index": "additional-11",
+    "input": "hahanokoe",
+    "kana_input": "ははのこえ",
+    "context_text": "",
+    "expected_output": [
+      "母の声"
+    ]
+  },
+  {
+    "index": "additional-12",
+    "input": "inunokoe",
+    "kana_input": "いぬのこえ",
+    "context_text": "",
+    "expected_output": [
+      "犬の声"
+    ]
+  },
+  {
+    "index": "additional-13",
+    "input": "tititokita",
+    "kana_input": "ちちときた",
+    "context_text": "",
+    "expected_output": [
+      "父と来た"
+    ]
+  },
+  {
+    "index": "additional-14",
+    "input": "hahatoita",
+    "kana_input": "ははといた",
+    "context_text": "",
+    "expected_output": [
+      "母といた"
+    ]
+  },
+  {
+    "index": "additional-15",
+    "input": "tititokurasu",
+    "kana_input": "ちちとくらす",
+    "context_text": "",
+    "expected_output": [
+      "父と暮らす"
+    ]
+  },
+  {
+    "index": "additional-16",
+    "input": "tititokokoniiru",
+    "kana_input": "ちちとここにいる",
+    "context_text": "",
+    "expected_output": [
+      "父とここにいる"
+    ]
+  },
+  {
+    "index": "additional-17",
+    "input": "tititokonomitiwoaruku",
+    "kana_input": "ちちとこのみちをあるく",
+    "context_text": "",
+    "expected_output": [
+      "父とこの道を歩く"
+    ]
+  },
+  {
+    "index": "additional-18",
+    "input": "titigakurutoki",
+    "kana_input": "ちちがくるとき",
+    "context_text": "",
+    "expected_output": [
+      "父が来るとき"
+    ]
+  },
+  {
+    "index": "additional-19",
+    "input": "hahagaitatokiniha",
+    "kana_input": "ははがいたときには",
+    "context_text": "",
+    "expected_output": [
+      "母がいたときには"
+    ]
+  },
+  {
+    "index": "additional-20",
+    "input": "nekotokodomo",
+    "kana_input": "ねことこども",
+    "context_text": "",
+    "expected_output": [
+      "猫と子ども",
+      "猫と子供"
+    ]
+  },
+  {
+    "index": "additional-21",
+    "input": "hahatokowomamoru",
+    "kana_input": "ははとこをまもる",
+    "context_text": "",
+    "expected_output": [
+      "母と子を守る"
+    ]
+  },
+  {
+    "index": "additional-22",
+    "input": "titinokodomozidai",
+    "kana_input": "ちちのこどもじだい",
+    "context_text": "",
+    "expected_output": [
+      "父の子ども時代",
+      "父の子供時代"
+    ]
+  },
+  {
+    "index": "additional-23",
+    "input": "hitotokotoba",
+    "kana_input": "ひととことば",
+    "context_text": "",
+    "expected_output": [
+      "人と言葉"
+    ]
+  }
+]

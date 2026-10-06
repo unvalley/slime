@@ -231,6 +231,7 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "Comments", "Source revision: $SourceRevision\0"
+      VALUE "FileVersion", "$productVersion\0"
       VALUE "ProductName", "Slime\0"
       VALUE "ProductVersion", "$productVersion\0"
     END

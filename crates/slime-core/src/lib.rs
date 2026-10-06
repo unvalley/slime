@@ -504,7 +504,10 @@ pub struct SlimeEngine {
     model_rescore_dictionary: Option<Dictionary>,
     romaji: RomajiComposer,
     reading: String,
-    raw_input: String,
+    /// Keys typed for the whole reading. A deleted kana cannot be mapped back
+    /// to its keys, so a kana backspace makes this `None` until the
+    /// composition is empty again.
+    raw_input: Option<String>,
     candidates: Vec<String>,
     candidate_corrections: Vec<CandidateCorrection>,
     typo_correction_policy: TypoCorrectionPolicy,
@@ -538,7 +541,7 @@ impl SlimeEngine {
             model_rescore_dictionary: None,
             romaji: RomajiComposer::new(),
             reading: String::new(),
-            raw_input: String::new(),
+            raw_input: Some(String::new()),
             candidates: Vec::new(),
             candidate_corrections: Vec::new(),
             typo_correction_policy: TypoCorrectionPolicy::Disabled,
@@ -1986,7 +1989,9 @@ impl SlimeEngine {
             self.clear_candidates();
         }
 
-        self.raw_input.push(character);
+        if let Some(raw_input) = &mut self.raw_input {
+            raw_input.push(character);
+        }
 
         if character.is_ascii_alphabetic()
             || (character == '\'' && matches!(self.romaji.pending(), "n" | "t" | "d"))
@@ -2035,8 +2040,10 @@ impl SlimeEngine {
             return vec![SlimeAction::ForwardKey];
         }
 
-        let (candidates, corrections, rescore) =
-            self.conversion_candidates_with_corrections(&self.reading, &self.raw_input);
+        let (candidates, corrections, rescore) = self.conversion_candidates_with_corrections(
+            &self.reading,
+            self.complete_raw_input().unwrap_or_default(),
+        );
         self.candidates = candidates;
         self.candidate_corrections = corrections;
         self.candidate_rescore = rescore;
@@ -2566,8 +2573,11 @@ impl SlimeEngine {
 
         let had_candidates = self.candidate_kind.is_some();
         self.clear_candidates();
-        let raw = (!self.raw_input.is_empty()).then_some(self.raw_input.as_str());
-        self.transformed_surface = Some(transform_text(style, &self.reading, raw));
+        self.transformed_surface = Some(transform_text(
+            style,
+            &self.reading,
+            self.complete_raw_input(),
+        ));
         let mut actions = vec![SlimeAction::UpdatePreedit(self.preedit())];
         if had_candidates {
             actions.push(SlimeAction::HideCandidates);
@@ -2925,10 +2935,12 @@ impl SlimeEngine {
         }
 
         if self.romaji.backspace() {
-            self.raw_input.pop();
+            if let Some(raw_input) = &mut self.raw_input {
+                raw_input.pop();
+            }
         } else {
             self.reading.pop();
-            self.raw_input.clear();
+            self.raw_input = self.reading.is_empty().then(String::new);
         }
 
         let mut actions = self.refresh_composition_actions();
@@ -2939,6 +2951,13 @@ impl SlimeEngine {
             actions.push(SlimeAction::HideCandidates);
         }
         actions
+    }
+
+    /// Keys typed for the whole reading, or `None` once they no longer spell it.
+    fn complete_raw_input(&self) -> Option<&str> {
+        self.raw_input
+            .as_deref()
+            .filter(|raw_input| !raw_input.is_empty())
     }
 
     fn preedit(&self) -> String {
@@ -3031,7 +3050,7 @@ impl SlimeEngine {
     fn clear_composition(&mut self) {
         self.romaji.clear();
         self.reading.clear();
-        self.raw_input.clear();
+        self.raw_input.get_or_insert_default().clear();
         self.live_preview = None;
         self.live_preview_suppressed = false;
         self.segments.clear();
@@ -10602,6 +10621,45 @@ mod tests {
             engine
                 .handle(InputEvent::TransformFullAlphanumeric)
                 .contains(&SlimeAction::UpdatePreedit("Ｓｌｉｍｅ".to_owned()))
+        );
+    }
+
+    #[test]
+    fn raw_keys_after_a_kana_backspace_never_replace_the_whole_reading() {
+        // Keys typed after a deleted kana spell only the tail of the reading.
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "aiu");
+        engine.handle(InputEvent::Backspace);
+        type_text(&mut engine, "e");
+        assert!(
+            engine
+                .handle(InputEvent::TransformHalfAlphanumeric)
+                .contains(&SlimeAction::UpdatePreedit("aie".to_owned()))
+        );
+
+        let mut engine = SlimeEngine::bundled();
+        engine.set_typo_correction_enabled(true);
+        type_text(&mut engine, "wata");
+        engine.handle(InputEvent::Backspace);
+        type_text(&mut engine, "nihpn");
+        assert_eq!(engine.snapshot().preedit, "わにhpn");
+        let actions = engine.handle(InputEvent::Space);
+        assert!(
+            shown_candidate_details(&actions)
+                .iter()
+                .all(|detail| detail.annotation != CandidateAnnotation::Correction),
+            "a correction of the raw tail would drop わ"
+        );
+
+        // Deleting the whole reading makes the raw keys reliable again.
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "wa");
+        engine.handle(InputEvent::Backspace);
+        type_text(&mut engine, "sute");
+        assert!(
+            engine
+                .handle(InputEvent::TransformHalfAlphanumeric)
+                .contains(&SlimeAction::UpdatePreedit("sute".to_owned()))
         );
     }
 

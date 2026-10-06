@@ -283,8 +283,17 @@ pub fn validate_dictionary_pack(source: &str) -> Result<DictionaryPackInfo, Stri
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DictionaryPackStore {
     packs: Vec<DictionaryPack>,
-    context_rules: Vec<PackContextRule>,
+    context_rules: ContextRuleIndex,
     errors: Vec<DictionaryPackLoadError>,
+}
+
+/// Rules from every pack, sorted by reading, previous surface, priority, and
+/// surface. The longest previous surface bounds which suffixes of a left
+/// context can match at all, so lookups skip the rest of a long context.
+#[derive(Clone, Debug, Default)]
+struct ContextRuleIndex {
+    rules: Vec<PackContextRule>,
+    max_previous_surface_characters: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -358,7 +367,7 @@ impl DictionaryPackStore {
             Err(message) => {
                 return Self {
                     packs: Vec::new(),
-                    context_rules: Vec::new(),
+                    context_rules: ContextRuleIndex::default(),
                     errors: vec![DictionaryPackLoadError {
                         file: directory.display().to_string(),
                         message,
@@ -493,21 +502,23 @@ impl DictionaryPackStore {
         reading: &str,
         mut visitor: impl FnMut(&str) -> bool,
     ) {
-        let reading_start = self
-            .context_rules
-            .partition_point(|rule| rule.reading.as_str() < reading);
-        let reading_end = self
-            .context_rules
-            .partition_point(|rule| rule.reading.as_str() <= reading);
-        let rules = &self.context_rules[reading_start..reading_end];
+        let all_rules = &self.context_rules.rules;
+        let reading_start = all_rules.partition_point(|rule| rule.reading.as_str() < reading);
+        let reading_end = all_rules.partition_point(|rule| rule.reading.as_str() <= reading);
+        let rules = &all_rules[reading_start..reading_end];
         if rules.is_empty() {
             return;
         }
-        let character_count = previous_surface.chars().count();
-        for (character_index, (byte_index, _)) in previous_surface.char_indices().enumerate() {
-            if character_count - character_index > MAX_CONTEXT_SURFACE_CHARACTERS {
-                continue;
-            }
+        // Longest suffix first, so more specific contexts are visited first.
+        let searchable_characters = self
+            .context_rules
+            .max_previous_surface_characters
+            .min(MAX_CONTEXT_SURFACE_CHARACTERS);
+        let skipped_characters = previous_surface
+            .chars()
+            .count()
+            .saturating_sub(searchable_characters);
+        for (byte_index, _) in previous_surface.char_indices().skip(skipped_characters) {
             let suffix = &previous_surface[byte_index..];
             let start = rules.partition_point(|rule| rule.previous_surface.as_str() < suffix);
             let end = rules.partition_point(|rule| rule.previous_surface.as_str() <= suffix);
@@ -541,7 +552,7 @@ impl DictionaryPackStore {
     }
 }
 
-fn merge_context_rules(packs: &[DictionaryPack]) -> Vec<PackContextRule> {
+fn merge_context_rules(packs: &[DictionaryPack]) -> ContextRuleIndex {
     let mut rules: Vec<_> = packs
         .iter()
         .flat_map(|pack| pack.context_rules.iter().cloned())
@@ -579,7 +590,15 @@ fn merge_context_rules(packs: &[DictionaryPack]) -> Vec<PackContextRule> {
                 &right.surface,
             ))
     });
-    rules
+    let max_previous_surface_characters = rules
+        .iter()
+        .map(|rule| rule.previous_surface.chars().count())
+        .max()
+        .unwrap_or(0);
+    ContextRuleIndex {
+        rules,
+        max_previous_surface_characters,
+    }
 }
 
 fn pack_paths(directory: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1401,7 +1420,7 @@ mod tests {
         );
         let store = DictionaryPackStore {
             packs: vec![pack],
-            context_rules: Vec::new(),
+            context_rules: super::ContextRuleIndex::default(),
             errors: Vec::new(),
         };
         assert!(store.layers().is_empty());
@@ -1456,7 +1475,7 @@ mod tests {
         );
         let store = DictionaryPackStore {
             packs: vec![pack],
-            context_rules: Vec::new(),
+            context_rules: super::ContextRuleIndex::default(),
             errors: Vec::new(),
         };
         assert!(store.layers().is_empty());

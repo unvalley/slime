@@ -32,12 +32,16 @@ static void collect_action(void *context, const SlimeActionView *action) {
     assert(action->text.len < sizeof(collected->last_preedit));
     memcpy(collected->last_preedit, action->text.data, action->text.len);
     collected->last_preedit[action->text.len] = '\0';
+    /* This test never enters segmented conversion. */
+    assert(action->selected == SLIME_NO_SELECTION);
+    assert(action->selection_start == SLIME_NO_SELECTION);
     collected->preedit_count += 1;
     break;
   case SLIME_ACTION_SHOW_CANDIDATES:
     assert(action->candidates != NULL);
     assert(action->candidate_count > 0);
     assert(action->selected < action->candidate_count);
+    assert(action->selection_start == SLIME_NO_SELECTION);
     collected->candidate_count = action->candidate_count;
     collected->saw_show_candidates = true;
     break;

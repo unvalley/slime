@@ -22,6 +22,11 @@ typedef struct SlimeStringView {
   size_t len;
 } SlimeStringView;
 
+/* `selected` and `selection_start` hold SLIME_NO_SELECTION when an action has
+ * no candidate or segment selection. Swift imports size_t as Int, where the
+ * value reads as -1; compare it as UInt(bitPattern:) instead of Int.max. */
+#define SLIME_NO_SELECTION SIZE_MAX
+
 typedef struct SlimeActionView {
   uint32_t kind;
   SlimeStringView text;

@@ -39,6 +39,10 @@ pub const EVENT_PREVIOUS_SEGMENT: u32 = 15;
 pub const EVENT_EXPAND_SEGMENT: u32 = 16;
 pub const EVENT_SHRINK_SEGMENT: u32 = 17;
 
+/// `selected` and `selection_start` value for an action without a candidate
+/// or segment selection. Swift imports `size_t` as `Int`, where this is `-1`.
+pub const NO_SELECTION: usize = usize::MAX;
+
 pub const ACTION_UPDATE_PREEDIT: u32 = 0;
 pub const ACTION_SHOW_CANDIDATES: u32 = 1;
 pub const ACTION_HIDE_CANDIDATES: u32 = 2;
@@ -1723,8 +1727,8 @@ fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActio
             text: SlimeStringView::new(text),
             candidates: ptr::null(),
             candidate_count: 0,
-            selected: usize::MAX,
-            selection_start: usize::MAX,
+            selected: NO_SELECTION,
+            selection_start: NO_SELECTION,
             selection_length: 0,
         },
         SlimeAction::UpdateSegmentedPreedit {
@@ -1736,7 +1740,7 @@ fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActio
             text: SlimeStringView::new(text),
             candidates: ptr::null(),
             candidate_count: 0,
-            selected: usize::MAX,
+            selected: NO_SELECTION,
             selection_start: *selection_start,
             selection_length: *selection_length,
         },
@@ -1756,7 +1760,7 @@ fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActio
                 candidates: candidate_views.as_ptr(),
                 candidate_count: candidate_views.len(),
                 selected: *selected,
-                selection_start: usize::MAX,
+                selection_start: NO_SELECTION,
                 selection_length: 0,
             }
         }
@@ -1766,8 +1770,8 @@ fn visit_action(action: &SlimeAction, context: *mut c_void, callback: SlimeActio
             text: SlimeStringView::new(text),
             candidates: ptr::null(),
             candidate_count: 0,
-            selected: usize::MAX,
-            selection_start: usize::MAX,
+            selected: NO_SELECTION,
+            selection_start: NO_SELECTION,
             selection_length: 0,
         },
         SlimeAction::Clear => action_without_payload(ACTION_CLEAR),
@@ -1787,8 +1791,8 @@ fn visit_action_v2(action: &SlimeAction, context: *mut c_void, callback: SlimeAc
             text: SlimeStringView::new(text),
             candidates: ptr::null(),
             candidate_count: 0,
-            selected: usize::MAX,
-            selection_start: usize::MAX,
+            selected: NO_SELECTION,
+            selection_start: NO_SELECTION,
             selection_length: 0,
         },
         SlimeAction::UpdateSegmentedPreedit {
@@ -1800,7 +1804,7 @@ fn visit_action_v2(action: &SlimeAction, context: *mut c_void, callback: SlimeAc
             text: SlimeStringView::new(text),
             candidates: ptr::null(),
             candidate_count: 0,
-            selected: usize::MAX,
+            selected: NO_SELECTION,
             selection_start: *selection_start,
             selection_length: *selection_length,
         },
@@ -1827,7 +1831,7 @@ fn visit_action_v2(action: &SlimeAction, context: *mut c_void, callback: SlimeAc
                 candidates: candidate_views.as_ptr(),
                 candidate_count: candidate_views.len(),
                 selected: *selected,
-                selection_start: usize::MAX,
+                selection_start: NO_SELECTION,
                 selection_length: 0,
             }
         }
@@ -1837,8 +1841,8 @@ fn visit_action_v2(action: &SlimeAction, context: *mut c_void, callback: SlimeAc
             text: SlimeStringView::new(text),
             candidates: ptr::null(),
             candidate_count: 0,
-            selected: usize::MAX,
-            selection_start: usize::MAX,
+            selected: NO_SELECTION,
+            selection_start: NO_SELECTION,
             selection_length: 0,
         },
         SlimeAction::Clear => action_without_payload_v2(ACTION_CLEAR),
@@ -1856,8 +1860,8 @@ const fn action_without_payload(kind: u32) -> SlimeActionView {
         text: SlimeStringView::empty(),
         candidates: ptr::null(),
         candidate_count: 0,
-        selected: usize::MAX,
-        selection_start: usize::MAX,
+        selected: NO_SELECTION,
+        selection_start: NO_SELECTION,
         selection_length: 0,
     }
 }
@@ -1868,8 +1872,8 @@ const fn action_without_payload_v2(kind: u32) -> SlimeActionViewV2 {
         text: SlimeStringView::empty(),
         candidates: ptr::null(),
         candidate_count: 0,
-        selected: usize::MAX,
-        selection_start: usize::MAX,
+        selected: NO_SELECTION,
+        selection_start: NO_SELECTION,
         selection_length: 0,
     }
 }

@@ -360,7 +360,8 @@ private func collectTypedAction(
 
     switch action.kind {
     case UInt32(SLIME_ACTION_UPDATE_PREEDIT.rawValue):
-        let hasSelection = action.selection_start != .max
+        // size_t imports as Int, so SLIME_NO_SELECTION (SIZE_MAX) reads as -1.
+        let hasSelection = UInt(bitPattern: action.selection_start) != UInt.max
         collector.actions.append(
             RustEngine.Action(
                 type: "update_preedit",

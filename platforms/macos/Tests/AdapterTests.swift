@@ -143,6 +143,30 @@ enum AdapterTests {
             "commit actions should replace AppKit marked text with the selected candidate"
         )
 
+        // SLIME_NO_SELECTION is SIZE_MAX, which Swift's Int reads as -1.
+        let selectionEngine = try RustEngine(dataDirectory: testDirectory)
+        var plainPreedits: [RustEngine.Action] = []
+        for scalar in "watashihanihon".unicodeScalars {
+            plainPreedits += try selectionEngine.process(.character(scalar))
+                .filter { $0.type == "update_preedit" }
+        }
+        plainPreedits += try selectionEngine.process(.space)
+            .filter { $0.type == "update_preedit" }
+        try expect(
+            !plainPreedits.isEmpty
+                && plainPreedits.allSatisfy { $0.selectedStart == nil && $0.selectedLength == nil },
+            "plain and whole-phrase preedits must not report a segment selection"
+        )
+        let segmentedPreedit = try expectValue(
+            try selectionEngine.process(.nextSegment).first(where: { $0.type == "update_preedit" }),
+            "segment navigation should update the preedit"
+        )
+        try expect(
+            (segmentedPreedit.selectedStart ?? -1) > 0
+                && (segmentedPreedit.selectedLength ?? 0) > 0,
+            "segmented preedit should select the active segment in UTF-16 units"
+        )
+
         let typoEngine = try RustEngine(dataDirectory: testDirectory)
         _ = try typoEngine.setOptions(
             liveConversion: false,

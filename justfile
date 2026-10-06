@@ -43,6 +43,10 @@ test-dictionary-pack-verification-keys:
 test-dictionary-pack-version-floors:
     scripts/test-dictionary-pack-version-floors.sh
 
+# private辞書候補の生成・評価・no-clobberを架空データで検証する
+test-private-dictionary-candidate:
+    scripts/test-private-dictionary-candidate.sh
+
 # macOS release buildがcleanなGit revisionだけを受け入れることを検証する
 test-macos-release-source-policy:
     scripts/test-macos-release-source-policy.sh
@@ -56,12 +60,28 @@ test-macos-consumer-evidence-policy:
     scripts/test-macos-consumer-evidence-policy.sh
 
 # format、lint、Rustテスト、C ABI、商用境界・配布policyテストをまとめて実行する
-check: fmt-check lint test test-ffi test-commercial-boundary test-dictionary-pack-verification-keys test-dictionary-pack-version-floors test-macos-release-source-policy test-macos-package-binding-policy test-macos-consumer-evidence-policy
+check: fmt-check lint test test-ffi test-commercial-boundary test-dictionary-pack-verification-keys test-dictionary-pack-version-floors test-private-dictionary-candidate test-macos-release-source-policy test-macos-package-binding-policy test-macos-consumer-evidence-policy
     @echo "All checks passed."
 
 # 外部fixtureで入力ミス訂正の回収・誤訂正・遅延を集計する
 evaluate-typos positive negative *args:
     cargo run --release --quiet -p slime-tools --bin slime-typo-evaluate -- --positive "{{positive}}" --negative "{{negative}}" {{args}}
+
+# 端末内文脈学習と入力ミス訂正の改善・副作用を固定データで評価する
+evaluate-adaptation:
+    scripts/evaluate-adaptation.sh
+
+# 外部TSVの候補recallと、追加辞書による回収・回帰件数を分類する
+evaluate-recall input *args:
+    cargo run --release --quiet -p slime-tools --bin slime-recall -- --input "{{input}}" {{args}}
+
+# 非公開fixtureを出力せず、追加辞書・文脈ルールの品質差を集計する
+evaluate-context-pack data_dir input *args:
+    cargo run --release --quiet -p slime-tools --bin slime-context-pack-evaluate -- --data-dir "{{data_dir}}" --input "{{input}}" {{args}}
+
+# 辞書packを独立processで反復読込し、起動時間と最大RSSを集計する
+evaluate-pack-startup data_dir *args:
+    cargo run --release --quiet -p slime-tools --bin slime-pack-startup-evaluate -- --data-dir "{{data_dir}}" {{args}}
 
 # debugビルドする
 build:
@@ -226,3 +246,19 @@ select-macos:
 # Cargoの生成物を削除する
 clean:
     cargo clean
+
+# 署名・rollback下限・期待件数を語彙非出力で最終検証する
+verify-signed-dictionary-packs data_dir keys floors expected *args:
+    cargo run -q -p slime-tools --bin slime-dictionary-pack -- verify-signed --data-dir "{{data_dir}}" --verification-keys "{{keys}}" --version-floors "{{floors}}" --expected-packs "{{expected}}" {{args}}
+
+# 非公開の注釈corpusから保守的な左文脈ルールTSVを生成する
+generate-context-rules input output *args:
+    cargo run -q -p slime-tools --bin slime-context-rules -- --input "{{input}}" --output "{{output}}" {{args}}
+
+# 非公開の注釈corpusから生成欠落している固有語・複合語TSVを作る
+generate-term-dictionary input output *args:
+    cargo run -q -p slime-tools --bin slime-term-dictionary -- --input "{{input}}" --output "{{output}}" {{args}}
+
+# private語彙・文脈を生成し、複数splitのgateを通ったunsigned候補だけを公開する
+prepare-private-dictionary-candidate *args:
+    scripts/prepare-private-dictionary-candidate.sh {{args}}

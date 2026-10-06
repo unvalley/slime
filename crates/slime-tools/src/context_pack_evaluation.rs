@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use slime_core::{SlimeEngine, UserData};
 
 const MAX_CASES: usize = 100_000;
 const MAX_SURFACE_CHARACTERS: usize = 128;
+const MAX_AJIMEE_CHARACTERS: usize = 512;
 const MAX_TOP_K: usize = 1_000;
 
 fn main() -> ExitCode {
@@ -27,7 +28,7 @@ fn main() -> ExitCode {
 
 fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let options = Options::parse(arguments)?;
-    let cases = load_case_files(&options.input_paths)?;
+    let cases = load_case_files(options.input_format, &options.input_paths)?;
     let report = evaluate_from_directories(
         options.baseline_data_directory.as_deref(),
         &options.data_directory,
@@ -48,19 +49,37 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
 
 const fn usage() -> &'static str {
     "usage: slime-context-pack-evaluate --data-dir PATH [--baseline-data-dir PATH] --input PATH \
-     [--input PATH ...] [--top-k N] [--min-context-rules N] \
+     [--input PATH ...] [--format tsv|ajimee] [--top-k N] [--min-context-rules N] \
      [--min-added-context-rules N] \
      [--min-top1-improved N] [--max-top1-regressed N] \
      [--max-topk-regressed N] [--max-top1-changed N] \
      [--min-accuracy-delta N] [--min-mrr-delta N] \
      [--max-p95-ms N] [--max-pack-load-ms N] [--max-pack-bytes N] [--json]\n\
-     input format: previous_surface<TAB>reading<TAB>expected_surface"
+     tsv input: previous_surface<TAB>reading<TAB>expected_surface"
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InputFormat {
+    #[default]
+    Tsv,
+    Ajimee,
+}
+
+impl InputFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "tsv" => Ok(Self::Tsv),
+            "ajimee" => Ok(Self::Ajimee),
+            _ => Err("--format must be tsv or ajimee".to_owned()),
+        }
+    }
 }
 
 struct Options {
     data_directory: PathBuf,
     baseline_data_directory: Option<PathBuf>,
     input_paths: Vec<PathBuf>,
+    input_format: InputFormat,
     top_k: usize,
     min_context_rules: Option<usize>,
     min_added_context_rules: Option<usize>,
@@ -91,6 +110,7 @@ struct OptionBuilder {
     data_directory: Option<PathBuf>,
     baseline_data_directory: Option<PathBuf>,
     input_paths: Vec<PathBuf>,
+    input_format: Option<InputFormat>,
     top_k: Option<usize>,
     min_context_rules: Option<usize>,
     min_added_context_rules: Option<usize>,
@@ -123,6 +143,9 @@ impl OptionBuilder {
             "--input" => self
                 .input_paths
                 .push(PathBuf::from(next_value(argument, arguments)?)),
+            "--format" => {
+                self.input_format = Some(InputFormat::parse(&next_value(argument, arguments)?)?);
+            }
             "--top-k" => self.top_k = Some(parse_positive_usize(argument, arguments)?),
             "--min-context-rules" => {
                 self.min_context_rules = Some(parse_usize(argument, arguments)?);
@@ -173,6 +196,7 @@ impl OptionBuilder {
             data_directory,
             baseline_data_directory: self.baseline_data_directory,
             input_paths: self.input_paths,
+            input_format: self.input_format.unwrap_or_default(),
             top_k,
             min_context_rules: self.min_context_rules,
             min_added_context_rules: self.min_added_context_rules,
@@ -250,16 +274,29 @@ fn parse_non_negative(
 struct ContextCase {
     previous_surface: String,
     reading: String,
-    expected_surface: String,
+    expected_surfaces: Vec<String>,
 }
 
-fn load_case_files(paths: &[PathBuf]) -> Result<Vec<ContextCase>, String> {
+#[derive(Deserialize)]
+struct AjimeeCase {
+    #[serde(default)]
+    context_text: String,
+    input: String,
+    expected_output: Vec<String>,
+}
+
+fn load_case_files(format: InputFormat, paths: &[PathBuf]) -> Result<Vec<ContextCase>, String> {
     let mut cases = Vec::new();
     let mut seen = HashSet::new();
     for path in paths {
-        let file =
-            fs::File::open(path).map_err(|error| format!("failed to open input file: {error}"))?;
-        load_cases(BufReader::new(file), &mut cases, &mut seen)?;
+        match format {
+            InputFormat::Tsv => {
+                let file = fs::File::open(path)
+                    .map_err(|error| format!("failed to open input file: {error}"))?;
+                load_tsv_cases(BufReader::new(file), &mut cases, &mut seen)?;
+            }
+            InputFormat::Ajimee => load_ajimee_cases(path, &mut cases, &mut seen)?,
+        }
     }
     if cases.is_empty() {
         return Err("input files contain no cases".to_owned());
@@ -267,7 +304,7 @@ fn load_case_files(paths: &[PathBuf]) -> Result<Vec<ContextCase>, String> {
     Ok(cases)
 }
 
-fn load_cases(
+fn load_tsv_cases(
     reader: impl BufRead,
     cases: &mut Vec<ContextCase>,
     seen: &mut HashSet<(String, String)>,
@@ -300,10 +337,59 @@ fn load_cases(
         cases.push(ContextCase {
             previous_surface: previous_surface.to_owned(),
             reading: reading.to_owned(),
-            expected_surface: expected_surface.to_owned(),
+            expected_surfaces: vec![expected_surface.to_owned()],
         });
     }
     Ok(())
+}
+
+fn load_ajimee_cases(
+    path: &Path,
+    cases: &mut Vec<ContextCase>,
+    seen: &mut HashSet<(String, String)>,
+) -> Result<(), String> {
+    let source = fs::read(path).map_err(|error| format!("failed to read input file: {error}"))?;
+    let input: Vec<AjimeeCase> = serde_json::from_slice(&source)
+        .map_err(|error| format!("failed to parse AJIMEE input: {error}"))?;
+    for (index, item) in input.into_iter().enumerate() {
+        let line_number = index + 1;
+        if cases.len() == MAX_CASES {
+            return Err(format!("inputs exceed the {MAX_CASES} case limit"));
+        }
+        validate_ajimee_surface(&item.context_text, line_number)?;
+        let reading = katakana_to_hiragana(&item.input);
+        validate_ajimee_reading(&reading, line_number)?;
+        if item.expected_output.is_empty() {
+            return Err(format!("item {line_number} has no expected surfaces"));
+        }
+        for surface in &item.expected_output {
+            validate_ajimee_surface(surface, line_number)?;
+        }
+        let key = (item.context_text.clone(), reading.clone());
+        if !seen.insert(key) {
+            return Err(format!(
+                "item {line_number} duplicates a context and reading"
+            ));
+        }
+        cases.push(ContextCase {
+            previous_surface: item.context_text,
+            reading,
+            expected_surfaces: item.expected_output,
+        });
+    }
+    Ok(())
+}
+
+fn katakana_to_hiragana(input: &str) -> String {
+    input
+        .chars()
+        .map(|character| match character {
+            'ァ'..='ヶ' | 'ヽ' | 'ヾ' => {
+                char::from_u32(u32::from(character) - 0x60).expect("valid hiragana scalar")
+            }
+            _ => character,
+        })
+        .collect()
 }
 
 fn required_column(value: Option<&str>, line_number: usize) -> Result<&str, String> {
@@ -329,6 +415,25 @@ fn validate_reading(reading: &str, line_number: usize) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("line {line_number} reading must be hiragana"))
+    }
+}
+
+fn validate_ajimee_reading(reading: &str, item_number: usize) -> Result<(), String> {
+    if !reading.is_empty()
+        && reading.chars().count() <= MAX_AJIMEE_CHARACTERS
+        && !reading.chars().any(char::is_control)
+    {
+        Ok(())
+    } else {
+        Err(format!("item {item_number} has an invalid reading"))
+    }
+}
+
+fn validate_ajimee_surface(surface: &str, item_number: usize) -> Result<(), String> {
+    if surface.chars().count() <= MAX_AJIMEE_CHARACTERS && !surface.chars().any(char::is_control) {
+        Ok(())
+    } else {
+        Err(format!("item {item_number} has an invalid surface"))
     }
 }
 
@@ -518,7 +623,7 @@ fn evaluate_cases(
         scores.record(
             &baseline_candidates,
             &pack_candidates,
-            &case.expected_surface,
+            &case.expected_surfaces,
             top_k,
         );
     }
@@ -526,7 +631,7 @@ fn evaluate_cases(
 }
 
 impl ScoreAccumulator {
-    fn record(&mut self, baseline: &[String], pack: &[String], expected: &str, top_k: usize) {
+    fn record(&mut self, baseline: &[String], pack: &[String], expected: &[String], top_k: usize) {
         let baseline_rank = rank(baseline, expected, top_k);
         let pack_rank = rank(pack, expected, top_k);
         self.baseline_top1 += usize::from(baseline_rank == Some(0));
@@ -583,11 +688,11 @@ impl ScoreAccumulator {
     }
 }
 
-fn rank(candidates: &[String], expected: &str, top_k: usize) -> Option<usize> {
+fn rank(candidates: &[String], expected: &[String], top_k: usize) -> Option<usize> {
     candidates
         .iter()
         .take(top_k)
-        .position(|candidate| candidate == expected)
+        .position(|candidate| expected.contains(candidate))
 }
 
 fn reciprocal_rank(rank: Option<usize>) -> f64 {
@@ -733,7 +838,9 @@ fn print_report(report: &ContextPackReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextCase, evaluate_from_directories, load_cases};
+    use super::{
+        ContextCase, InputFormat, evaluate_from_directories, load_case_files, load_tsv_cases,
+    };
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::fmt::Write as _;
@@ -747,7 +854,7 @@ mod tests {
     fn parser_rejects_duplicates_without_echoing_vocabulary() {
         let mut cases = Vec::new();
         let mut seen = HashSet::new();
-        let error = load_cases(
+        let error = load_tsv_cases(
             Cursor::new("非公開前文\tかんじ\t漢字\n非公開前文\tかんじ\t感じ\n"),
             &mut cases,
             &mut seen,
@@ -756,6 +863,26 @@ mod tests {
         assert!(error.contains("duplicates"), "{error}");
         assert!(!error.contains("非公開前文"), "{error}");
         assert!(!error.contains("漢字"), "{error}");
+    }
+
+    #[test]
+    fn ajimee_parser_normalizes_reading_and_preserves_multiple_expected_surfaces() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("items.json");
+        fs::write(
+            &input,
+            r#"[{"context_text":"文章","input":"カンジ","expected_output":["漢字","感じ"]}]"#,
+        )
+        .unwrap();
+
+        let cases = load_case_files(InputFormat::Ajimee, &[input]).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].previous_surface, "文章");
+        assert_eq!(cases[0].reading, "かんじ");
+        assert_eq!(cases[0].expected_surfaces, ["漢字", "感じ"]);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -788,7 +915,7 @@ mod tests {
             &[ContextCase {
                 previous_surface: "文章".to_owned(),
                 reading: "かんじ".to_owned(),
-                expected_surface: "漢字".to_owned(),
+                expected_surfaces: vec!["漢字".to_owned()],
             }],
             10,
         )
@@ -833,7 +960,7 @@ mod tests {
             &[ContextCase {
                 previous_surface: "文章".to_owned(),
                 reading: "そうほう".to_owned(),
-                expected_surface: "蒼峰".to_owned(),
+                expected_surfaces: vec!["蒼峰".to_owned()],
             }],
             10,
         )

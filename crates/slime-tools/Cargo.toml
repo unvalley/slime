@@ -80,6 +80,10 @@ name = "slime-pack-startup-evaluate"
 path = "src/pack_startup_evaluation.rs"
 
 [[bin]]
+name = "slime-phrase-dictionary"
+path = "src/phrase_dictionary_generation.rs"
+
+[[bin]]
 name = "neural_prefix_probe"
 path = "src/bin/neural_prefix_probe.rs"
 required-features = ["neural"]

@@ -128,6 +128,9 @@ function Build-Forwarder(
     $arm64Definition = Join-Path $temporaryDirectory "$Library-arm64.def"
     $x64Import = Join-Path $temporaryDirectory "$Library-x64.lib"
     $arm64Import = Join-Path $temporaryDirectory "$Library-arm64.lib"
+    # link.exe writes an import library and export files beside the DLL
+    # unless told otherwise; the artifact must contain only the payload.
+    $forwarderImport = Join-Path $temporaryDirectory "$Library-forwarder.lib"
     Write-ForwarderDefinition $x64Definition $Library $X64Implementation $Exports
     Write-ForwarderDefinition $arm64Definition $Library $Arm64Implementation $Exports
     Invoke-NativeTool "link.exe" @(
@@ -140,7 +143,7 @@ function Build-Forwarder(
         "/dll", "/noentry", "/machine:arm64x",
         "/defArm64Native:$arm64Definition", "/def:$x64Definition",
         $Arm64Object, $Arm64EcObject, $Resource, "/out:$OutputFile",
-        $x64Import, $arm64Import
+        "/implib:$forwarderImport", $x64Import, $arm64Import
     ) | Out-Null
 }
 

@@ -109,6 +109,9 @@ foreach ($architecture in @(
 
 $makensisArguments = @(
     "-WX",
+    # The script is UTF-8 without a BOM; makensis otherwise reads it in the
+    # ANSI code page and installs mojibake Start Menu names.
+    "/INPUTCHARSET", "UTF8",
     "/DVERSION=$Version",
     "/DVERSION_QUAD=$Version.0",
     "/DSOURCE_REVISION=$sourceRevision",

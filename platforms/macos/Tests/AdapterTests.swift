@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 
 @main
 enum AdapterTests {
@@ -718,6 +719,13 @@ enum AdapterTests {
                     + "ぱふぉーまんす\tパフォーマンス\t200\n"
             ).utf8
         ).write(to: store.historyPreferencesURL, options: .atomic)
+        try Data(
+            (
+                "# slime-context-history-v1\n"
+                    + "ぶんしょう\t文章\tにほん\t日本\t2\t100\n"
+                    + "さいてきか\t最適化\tぱふぉーまんす\tパフォーマンス\t2\t200\n"
+            ).utf8
+        ).write(to: store.contextHistoryURL, options: .atomic)
         let history = try store.loadHistorySnapshot()
         let removed = try expectValue(
             history.entries.first(where: { $0.surface == "日本" }),
@@ -742,6 +750,14 @@ enum AdapterTests {
                 && remainingPreferences.contains("ぱふぉーまんす\tパフォーマンス\t"),
             "individual history deletion should remove only its confirmed preference"
         )
+        let remainingContext = try String(
+            contentsOf: store.contextHistoryURL,
+            encoding: .utf8
+        )
+        try expect(
+            !remainingContext.contains("日本") && remainingContext.contains("パフォーマンス"),
+            "individual history deletion should remove related context only"
+        )
 
         let compactFixture = Data(
             (
@@ -758,6 +774,17 @@ enum AdapterTests {
         try expect(
             compacted.map(\.surface) == ["日本"],
             "history compaction should remove only entries excluded by learning rules"
+        )
+
+        let beforeClear = try store.loadHistorySnapshot()
+        _ = try store.clearHistory(replacing: beforeClear.base)
+        let clearedContext = try String(
+            contentsOf: store.contextHistoryURL,
+            encoding: .utf8
+        )
+        try expect(
+            clearedContext == "# slime-context-history-v1\n",
+            "clearing history should also clear contextual learning"
         )
 
         let stale = try store.loadHistorySnapshot()
@@ -949,7 +976,11 @@ enum AdapterTests {
                     publishedAt: "2026-08-01",
                     provenance: "unvalley/context-packs/sample-pro",
                     entriesSHA256: "2e6e02b5291160ed2aa237f7163fad3c16afb55d3d89b471e5b9a272bb804b4c",
-                    entryCount: 1
+                    packSHA256: SHA256.hash(data: Data(packManifest.utf8))
+                        .map { String(format: "%02x", $0) }
+                        .joined(),
+                    entryCount: 1,
+                    contextRuleCount: 0
                 ),
             ] && catalog.errors.isEmpty,
             "installed dictionary metadata should cross the Swift/C/Rust boundary: \(catalog)"

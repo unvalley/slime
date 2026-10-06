@@ -161,7 +161,10 @@ struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
     let publishedAt: String?
     let provenance: String?
     let entriesSHA256: String?
+    let payloadSHA256: String?
+    let packSHA256: String?
     let entryCount: Int
+    let contextRuleCount: Int
 
     init(
         id: String,
@@ -174,7 +177,10 @@ struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
         publishedAt: String? = nil,
         provenance: String? = nil,
         entriesSHA256: String? = nil,
-        entryCount: Int
+        payloadSHA256: String? = nil,
+        packSHA256: String? = nil,
+        entryCount: Int,
+        contextRuleCount: Int = 0
     ) {
         self.id = id
         self.formatVersion = formatVersion
@@ -186,7 +192,10 @@ struct InstalledDictionaryPack: Decodable, Identifiable, Equatable {
         self.publishedAt = publishedAt
         self.provenance = provenance
         self.entriesSHA256 = entriesSHA256
+        self.payloadSHA256 = payloadSHA256
+        self.packSHA256 = packSHA256
         self.entryCount = entryCount
+        self.contextRuleCount = contextRuleCount
     }
 }
 
@@ -244,10 +253,12 @@ final class UserDataStore {
     let dictionaryURL: URL
     let historyURL: URL
     let historyPreferencesURL: URL
+    let contextHistoryURL: URL
 
     private let dictionaryHeader = "# slime-user-dictionary-v1\n"
     private let historyHeader = "# slime-history-v1\n"
     private let historyPreferencesHeader = "# slime-history-preferences-v1\n"
+    private let contextHistoryHeader = "# slime-context-history-v1\n"
 
     private convenience init(fileManager: FileManager = .default) {
         let applicationSupport = fileManager.urls(
@@ -265,6 +276,7 @@ final class UserDataStore {
         dictionaryURL = directoryURL.appendingPathComponent("user_dictionary.tsv")
         historyURL = directoryURL.appendingPathComponent("history.tsv")
         historyPreferencesURL = directoryURL.appendingPathComponent("history_preferences.tsv")
+        contextHistoryURL = directoryURL.appendingPathComponent("context_history.tsv")
     }
 
     func loadDictionary() throws -> (entries: [UserDictionaryEntry], base: Data?) {
@@ -375,12 +387,16 @@ final class UserDataStore {
         replacing base: Data?
     ) throws -> Data {
         let remaining = entries.filter { $0.id != removed.id }
-        return try saveHistory(remaining, replacing: base)
+        return try saveHistory(
+            remaining,
+            replacing: base,
+            contextRemoval: .pairs([removed.id])
+        )
     }
 
     @discardableResult
     func clearHistory(replacing base: Data?) throws -> Data {
-        try saveHistory([], replacing: base)
+        try saveHistory([], replacing: base, contextRemoval: .all)
     }
 
     @discardableResult
@@ -388,12 +404,25 @@ final class UserDataStore {
         _ entries: [InputHistoryEntry],
         replacing base: Data?
     ) throws -> Data {
-        try saveHistory(entries.filter { $0.isUsefulForCompletion }, replacing: base)
+        let retained = entries.filter { $0.isUsefulForCompletion }
+        let retainedIDs = Set(retained.map(\.id))
+        let removedIDs = Set(entries.lazy.map(\.id).filter { !retainedIDs.contains($0) })
+        return try saveHistory(
+            retained,
+            replacing: base,
+            contextRemoval: .pairs(removedIDs)
+        )
+    }
+
+    private enum ContextRemoval {
+        case pairs(Set<String>)
+        case all
     }
 
     private func saveHistory(
         _ entries: [InputHistoryEntry],
-        replacing base: Data?
+        replacing base: Data?,
+        contextRemoval: ContextRemoval
     ) throws -> Data {
         let current = try currentData(at: historyURL)
         guard current == base else {
@@ -410,7 +439,24 @@ final class UserDataStore {
             text += "\(UInt64(entry.lastUsed.timeIntervalSince1970))\n"
         }
         let data = Data(text.utf8)
-        try data.write(to: historyURL, options: .atomic)
+        let previousContext = try currentData(at: contextHistoryURL)
+        let context = try contextHistoryData(
+            removing: contextRemoval,
+            from: previousContext
+        )
+        if let context {
+            try context.write(to: contextHistoryURL, options: .atomic)
+        }
+        do {
+            try data.write(to: historyURL, options: .atomic)
+        } catch {
+            if let previousContext {
+                try? previousContext.write(to: contextHistoryURL, options: .atomic)
+            } else {
+                try? FileManager.default.removeItem(at: contextHistoryURL)
+            }
+            throw error
+        }
         if let preferencesUpdate,
            try currentData(at: historyPreferencesURL) == preferencesUpdate.base
         {
@@ -461,6 +507,52 @@ final class UserDataStore {
             }
         }
         return (data, Data(proposed.utf8))
+    }
+
+    private func contextHistoryData(
+        removing removal: ContextRemoval,
+        from current: Data?
+    ) throws -> Data? {
+        guard let current else { return nil }
+        if case .all = removal {
+            return Data(contextHistoryHeader.utf8)
+        }
+        guard case let .pairs(removedIDs) = removal, !removedIDs.isEmpty else {
+            return current
+        }
+        guard let text = String(data: current, encoding: .utf8) else {
+            throw UserDataStoreError.malformedFile(contextHistoryURL.lastPathComponent)
+        }
+
+        var retained: [String] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let value = String(line)
+            if value.isEmpty || value == contextHistoryHeader.trimmingCharacters(in: .newlines) {
+                continue
+            }
+            let columns = value.split(separator: "\t", omittingEmptySubsequences: false)
+            guard columns.count == 6,
+                  UInt32(columns[4]) != nil,
+                  UInt64(columns[5]) != nil,
+                  !columns[0].isEmpty,
+                  !columns[1].isEmpty,
+                  !columns[2].isEmpty,
+                  !columns[3].isEmpty
+            else {
+                throw UserDataStoreError.malformedFile(contextHistoryURL.lastPathComponent)
+            }
+            let previousID = "\(columns[0])\u{0}\(columns[1])"
+            let currentID = "\(columns[2])\u{0}\(columns[3])"
+            if !removedIDs.contains(previousID), !removedIDs.contains(currentID) {
+                retained.append(value)
+            }
+        }
+
+        var output = contextHistoryHeader
+        for line in retained {
+            output += "\(line)\n"
+        }
+        return Data(output.utf8)
     }
 
     func revealDictionary() {

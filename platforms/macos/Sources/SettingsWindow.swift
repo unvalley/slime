@@ -492,7 +492,7 @@ private struct InstalledDictionaryPackRow: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(pack.name)
-                Text("バージョン \(pack.version)・\(pack.entryCount)語")
+                Text(packSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if pack.candidateMode == "model-rescore-only" {
@@ -518,6 +518,16 @@ private struct InstalledDictionaryPackRow: View {
         .sheet(isPresented: $showsWords) {
             DomainDictionaryWordsView(title: pack.name, source: .installed(pack.id))
         }
+    }
+}
+
+private extension InstalledDictionaryPackRow {
+    var packSummary: String {
+        var components = ["バージョン \(pack.version)", "\(pack.entryCount)語"]
+        if pack.contextRuleCount > 0 {
+            components.append("文脈ルール\(pack.contextRuleCount)件")
+        }
+        return components.joined(separator: "・")
     }
 }
 

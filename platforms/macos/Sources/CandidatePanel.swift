@@ -51,6 +51,8 @@ final class CandidatePanel {
         rowHeight: CandidatePanel.rowHeight,
         pageSize: CandidatePanel.pageSize
     )
+    /// Size inputs of the visible frame; `nil` while hidden.
+    private var shownLayout: (visibleCount: Int, preferredWidth: CGFloat)?
 
     init() {
         panel = NSPanel(
@@ -68,30 +70,42 @@ final class CandidatePanel {
         panel.contentView = candidateView
     }
 
-    func show(candidates: [CandidatePanelItem], selected: Int, anchor: NSRect) {
+    /// Shows or updates the panel. `anchor` queries the text client, so it
+    /// runs only when the frame must change: on first show, or when the
+    /// visible row count or width differs from the shown frame.
+    func show(candidates: [CandidatePanelItem], selected: Int, anchor: () -> NSRect) {
         candidateView.update(candidates: candidates, selected: selected)
 
-        if panel.isVisible {
-            panel.contentView?.needsDisplay = true
+        let visibleCount = min(candidates.count, Self.pageSize)
+        let preferredWidth = candidateView.preferredWidth
+        if panel.isVisible,
+           let shownLayout,
+           shownLayout.visibleCount == visibleCount,
+           shownLayout.preferredWidth == preferredWidth
+        {
             return
         }
 
-        let visibleCount = min(candidates.count, Self.pageSize)
+        let anchor = anchor()
         let anchorPoint = NSPoint(x: anchor.midX, y: anchor.midY)
         let screen = NSScreen.screens.first(where: { $0.frame.contains(anchorPoint) }) ?? NSScreen.main
         let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 112, height: 252)
         let frame = candidatePanelFrame(
             anchor: anchor,
-            preferredWidth: candidateView.preferredWidth,
+            preferredWidth: preferredWidth,
             visibleCount: visibleCount,
             visibleFrame: visibleFrame
         )
 
         panel.setFrame(frame, display: true)
-        panel.orderFrontRegardless()
+        shownLayout = (visibleCount, preferredWidth)
+        if !panel.isVisible {
+            panel.orderFrontRegardless()
+        }
     }
 
     func hide() {
+        shownLayout = nil
         panel.orderOut(nil)
     }
 }
@@ -121,7 +135,10 @@ private final class CandidateListView: NSView {
 
     override var isFlipped: Bool { true }
 
-    var preferredWidth: CGFloat {
+    /// Measured once per candidate list; selection changes reuse it.
+    private(set) var preferredWidth: CGFloat = 112
+
+    private static func measuredWidth(of candidates: [CandidatePanelItem]) -> CGFloat {
         let valueAttributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 15)]
         let annotationAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 10),
@@ -140,6 +157,9 @@ private final class CandidateListView: NSView {
     }
 
     func update(candidates: [CandidatePanelItem], selected: Int) {
+        if candidates != self.candidates {
+            preferredWidth = Self.measuredWidth(of: candidates)
+        }
         self.candidates = candidates
         self.selected = candidates.indices.contains(selected) ? selected : 0
         pageStart = (self.selected / pageSize) * pageSize

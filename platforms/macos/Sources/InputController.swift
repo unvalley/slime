@@ -373,11 +373,9 @@ final class SlimeController: IMKInputController {
 
         candidateValues = items.map(\.value)
         selectedCandidateIndex = selected
-        candidatePanel.show(
-            candidates: items,
-            selected: selected,
-            anchor: candidateAnchorRect(client: inputClient)
-        )
+        candidatePanel.show(candidates: items, selected: selected) {
+            candidateAnchorRect(client: inputClient)
+        }
     }
 
     private func candidatePanelItems(

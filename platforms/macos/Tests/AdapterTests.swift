@@ -18,6 +18,228 @@ enum AdapterTests {
             in: testDirectory.appendingPathComponent("external-document-context")
         )
 
+        let verificationSuite = "slime-input-verification-tests-\(UUID().uuidString)"
+        let verificationDefaults = try expectValue(
+            UserDefaults(suiteName: verificationSuite),
+            "input verification should create isolated defaults"
+        )
+        defer {
+            verificationDefaults.removePersistentDomain(forName: verificationSuite)
+        }
+        let verificationToken = UUID().uuidString
+        verificationDefaults.set(verificationToken, forKey: InputVerification.defaultsKey)
+        let normalizedVerificationToken = try expectValue(
+            InputVerification.pendingToken(defaults: verificationDefaults),
+            "a canonical UUID should enable one input verification event"
+        )
+        try expect(
+            normalizedVerificationToken == verificationToken.lowercased(),
+            "input verification should normalize its non-sensitive correlation token"
+        )
+        try expect(
+            InputVerification.pendingRequest(defaults: verificationDefaults) == nil,
+            "input verification should reject a token that is not bound to one client process"
+        )
+        let verificationTargetProcess: Int32 = 1234
+        verificationDefaults.set(
+            Int(verificationTargetProcess),
+            forKey: InputVerification.targetProcessDefaultsKey
+        )
+        try expect(
+            InputVerification.pendingRequest(defaults: verificationDefaults)
+                == InputVerification.Request(
+                    token: normalizedVerificationToken,
+                    mode: .character,
+                    targetProcessIdentifier: verificationTargetProcess
+                ),
+            "a token without an explicit mode should preserve the character gate"
+        )
+        verificationDefaults.set(
+            InputVerification.Mode.candidateSelection.rawValue,
+            forKey: InputVerification.modeDefaultsKey
+        )
+        try expect(
+            InputVerification.pendingRequest(defaults: verificationDefaults)
+                == InputVerification.Request(
+                    token: normalizedVerificationToken,
+                    mode: .candidateSelection,
+                    targetProcessIdentifier: verificationTargetProcess
+                ),
+            "candidate verification should require an explicit supported mode"
+        )
+        for mode in [
+            InputVerification.Mode.candidateNumber,
+            InputVerification.Mode.candidateClick,
+            InputVerification.Mode.reconversion,
+            InputVerification.Mode.privacyPrivate,
+            InputVerification.Mode.privacySecure,
+            InputVerification.Mode.privacyResume,
+        ] {
+            verificationDefaults.set(mode.rawValue, forKey: InputVerification.modeDefaultsKey)
+            try expect(
+                InputVerification.pendingRequest(defaults: verificationDefaults)
+                    == InputVerification.Request(
+                        token: normalizedVerificationToken,
+                        mode: mode,
+                        targetProcessIdentifier: verificationTargetProcess
+                    ),
+                "each interaction gate should parse its explicit mode"
+            )
+        }
+        InputVerification.consume(
+            normalizedVerificationToken,
+            defaults: verificationDefaults
+        )
+        try expect(
+            InputVerification.pendingToken(defaults: verificationDefaults) == nil,
+            "input verification should remove a consumed token"
+        )
+        try expect(
+            verificationDefaults.string(forKey: InputVerification.modeDefaultsKey) == nil,
+            "input verification should remove a consumed mode"
+        )
+        try expect(
+            verificationDefaults.object(
+                forKey: InputVerification.targetProcessDefaultsKey
+            ) == nil,
+            "input verification should remove a consumed client-process binding"
+        )
+        verificationDefaults.set("not-a-token\nkey-data", forKey: InputVerification.defaultsKey)
+        try expect(
+            InputVerification.pendingToken(defaults: verificationDefaults) == nil,
+            "input verification should reject malformed or log-injectable tokens"
+        )
+        try expect(
+            InputVerification.isVerificationCharacter("a", hasDisallowedModifiers: false)
+                && InputVerification.isVerificationCharacter(
+                    "Z",
+                    hasDisallowedModifiers: false
+                ),
+            "input verification should accept one unmodified ASCII letter"
+        )
+        try expect(
+            !InputVerification.isVerificationCharacter(" ", hasDisallowedModifiers: false)
+                && !InputVerification.isVerificationCharacter(
+                    "ab",
+                    hasDisallowedModifiers: false
+                )
+                && !InputVerification.isVerificationCharacter(
+                    "a",
+                    hasDisallowedModifiers: true
+                ),
+            "input verification should ignore commands and non-letter events"
+        )
+        try expect(
+            InputVerification.isHardwareEventSource(1)
+                && !InputVerification.isHardwareEventSource(0)
+                && !InputVerification.isHardwareEventSource(-1)
+                && !InputVerification.isHardwareEventSource(nil),
+            "physical input evidence should accept only the HID system event source"
+        )
+        var candidateVerification = InputVerification.CandidateSelectionState()
+        try expect(
+            candidateVerification.record(.candidates(selected: 0)) == nil,
+            "candidate verification should not start from non-character activity"
+        )
+        try expect(
+            candidateVerification.record(.character) == .character
+                && candidateVerification.record(.character) == nil,
+            "candidate verification should record only the first character step"
+        )
+        try expect(
+            candidateVerification.record(.candidates(selected: 0)) == .candidateShown
+                && candidateVerification.record(.candidates(selected: 0)) == nil
+                && candidateVerification.record(.candidates(selected: 1)) == nil
+                && candidateVerification.record(.commit) == nil,
+            "candidate verification should require a recorded interaction before movement"
+        )
+        try expect(
+            candidateVerification.record(.selection(.arrow)) == .candidateArrow
+                && candidateVerification.record(.selection(.number)) == nil
+                && candidateVerification.record(.candidates(selected: 1)) == .candidateMoved
+                && candidateVerification.record(.commit) == nil
+                && candidateVerification.record(.accept) == nil
+                && candidateVerification.record(.commit) == .candidateCommitted
+                && candidateVerification.record(.candidates(selected: 2)) == nil,
+            "candidate verification should complete only after show, interaction, move, and commit"
+        )
+        for (method, expectedStep) in [
+            (
+                InputVerification.CandidateSelectionMethod.number,
+                InputVerification.CandidateStep.candidateNumber
+            ),
+            (
+                InputVerification.CandidateSelectionMethod.click,
+                InputVerification.CandidateStep.candidateClick
+            ),
+        ] {
+            var interaction = InputVerification.CandidateSelectionState()
+            _ = interaction.record(.character)
+            _ = interaction.record(.candidates(selected: 0))
+            try expect(
+                interaction.record(.selection(method)) == expectedStep
+                    && interaction.record(.candidates(selected: 1)) == .candidateMoved
+                    && interaction.record(.accept) == nil
+                    && interaction.record(.commit) == .candidateCommitted,
+                "number and click gates should require their specific interaction path"
+            )
+        }
+        var reconversionVerification = InputVerification.ReconversionState()
+        try expect(
+            reconversionVerification.record(.started) == nil
+                && reconversionVerification.record(.commit) == nil,
+            "reconversion verification should not start from internal actions"
+        )
+        try expect(
+            reconversionVerification.record(.requested) == .requested
+                && reconversionVerification.record(.requested) == nil
+                && reconversionVerification.record(.started) == .started
+                && reconversionVerification.record(.candidates) == .candidates
+                && reconversionVerification.record(.commit) == nil
+                && reconversionVerification.record(.accept) == nil
+                && reconversionVerification.record(.commit) == .committed
+                && reconversionVerification.record(.commit) == nil,
+            "reconversion verification should require request, start, candidates, and commit"
+        )
+        try expect(
+            InputVerification.Mode.privacyPrivate.matchesPrivacyState(
+                privateMode: true,
+                secureEventInput: false
+            )
+                && !InputVerification.Mode.privacyPrivate.matchesPrivacyState(
+                    privateMode: false,
+                    secureEventInput: false
+                )
+                && InputVerification.Mode.privacySecure.matchesPrivacyState(
+                    privateMode: false,
+                    secureEventInput: true
+                )
+                && InputVerification.Mode.privacyResume.matchesPrivacyState(
+                    privateMode: false,
+                    secureEventInput: false
+                )
+                && !InputVerification.Mode.privacyResume.matchesPrivacyState(
+                    privateMode: true,
+                    secureEventInput: false
+                ),
+            "privacy gates should match only their required runtime state"
+        )
+        var privacyVerification = InputVerification.PrivacyState()
+        try expect(
+            privacyVerification.record(.candidates) == nil
+                && privacyVerification.record(.commit) == nil
+                && privacyVerification.record(.character) == .character
+                && privacyVerification.record(.character) == nil
+                && privacyVerification.record(.candidates) == nil
+                && privacyVerification.record(.requestCandidates) == nil
+                && privacyVerification.record(.candidates) == .candidates
+                && privacyVerification.record(.commit) == nil
+                && privacyVerification.record(.accept) == nil
+                && privacyVerification.record(.commit) == .committed
+                && privacyVerification.record(.commit) == nil,
+            "privacy verification should require physical conversion and acceptance in order"
+        )
+
         let ordinaryInputOptions = InputRuntimeOptions(
             liveConversion: true,
             historyCompletion: true,

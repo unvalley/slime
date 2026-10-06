@@ -55,7 +55,7 @@ final class CandidatePanel {
     fileprivate static let rowHeight: CGFloat = 28
     private static let pageSize = 9
 
-    var onCandidateClicked: ((Int) -> Void)? {
+    var onCandidateClicked: ((Int, NSEvent) -> Void)? {
         get { candidateView.onCandidateClicked }
         set { candidateView.onCandidateClicked = newValue }
     }
@@ -125,7 +125,7 @@ final class CandidatePanel {
 }
 
 private final class CandidateListView: NSView {
-    var onCandidateClicked: ((Int) -> Void)?
+    var onCandidateClicked: ((Int, NSEvent) -> Void)?
 
     private let rowHeight: CGFloat
     private let pageSize: Int
@@ -248,6 +248,6 @@ private final class CandidateListView: NSView {
         let visibleRow = Int(point.y / rowHeight)
         let index = pageStart + visibleRow
         guard candidates.indices.contains(index) else { return }
-        onCandidateClicked?(index)
+        onCandidateClicked?(index, event)
     }
 }

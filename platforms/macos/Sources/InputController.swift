@@ -8,15 +8,26 @@ final class SlimeController: IMKInputController {
         subsystem: "com.unvalley.inputmethod.Slime",
         category: .pointsOfInterest
     )
+    private static let inputVerificationLog = OSLog(
+        subsystem: "com.unvalley.inputmethod.Slime",
+        category: "input-verification"
+    )
 
     private let engine: RustEngine
     private let candidatePanel: CandidatePanel
+    private let inputVerificationToken: String?
+    private let inputVerificationMode: InputVerification.Mode?
+    private let inputVerificationTargetProcessIdentifier: Int32?
     private var hasComposition = false
     private var isSegmentedConversion = false
     private var candidateValues: [String] = []
     private var selectedCandidateIndex = 0
     private var appliedOptions: InputRuntimeOptions?
     private var replacementRangeOnNextUpdate: NSRange?
+    private var didRecordInputVerification = false
+    private var candidateVerificationState = InputVerification.CandidateSelectionState()
+    private var reconversionVerificationState = InputVerification.ReconversionState()
+    private var privacyVerificationState = InputVerification.PrivacyState()
     private var inputContextBoundary = InputContextBoundary()
     private var needsExternalDocumentContext = true
 
@@ -26,10 +37,16 @@ final class SlimeController: IMKInputController {
         }
         self.engine = engine
         candidatePanel = CandidatePanel()
+        let inputVerificationRequest = InputVerification.pendingRequest()
+        inputVerificationToken = inputVerificationRequest?.token
+        inputVerificationMode = inputVerificationRequest?.mode
+        inputVerificationTargetProcessIdentifier =
+            inputVerificationRequest?.targetProcessIdentifier
         super.init(server: server, delegate: delegate, client: inputClient)
         _ = synchronizeOptions(force: true)
-        candidatePanel.onCandidateClicked = { [weak self] index in
-            self?.selectCandidate(at: index, commit: true)
+        candidatePanel.onCandidateClicked = { [weak self] index, event in
+            self?.recordCandidateSelectionMethod(.click, event: event)
+            self?.selectCandidate(at: index, commit: true, verificationEvent: event)
         }
         NotificationCenter.default.addObserver(
             self,
@@ -82,6 +99,7 @@ final class SlimeController: IMKInputController {
                 )
             }
         }
+        recordInputVerificationIfNeeded(event)
         let deleteSignpostID: OSSignpostID? = if event.keyCode == 51 || event.keyCode == 117 {
             OSSignpostID(log: Self.performanceLog)
         } else {
@@ -125,7 +143,8 @@ final class SlimeController: IMKInputController {
             candidateCount: candidateValues.count,
             pageStart: (selectedCandidateIndex / 9) * 9
         ) {
-            selectCandidate(at: index, commit: true)
+            recordCandidateSelectionMethod(.number, event: event)
+            selectCandidate(at: index, commit: true, verificationEvent: event)
             return true
         }
 
@@ -136,9 +155,22 @@ final class SlimeController: IMKInputController {
         ) {
             switch action {
             case let .engine(engineEvent):
+                if event.keyCode == 125 || event.keyCode == 126 {
+                    recordCandidateSelectionMethod(.arrow, event: event)
+                }
+                switch engineEvent {
+                case .space:
+                    recordPrivacyVerificationInput(.requestCandidates, event: event)
+                case .enter, .acceptCandidate:
+                    recordCandidateAcceptance(event)
+                    recordReconversionAcceptance(event)
+                    recordPrivacyVerificationInput(.accept, event: event)
+                default:
+                    break
+                }
                 return process(engineEvent, client: sender)
             case .reconvert:
-                return beginReconversion(client: sender)
+                return beginReconversion(client: sender, verificationEvent: event)
             }
         }
 
@@ -151,6 +183,7 @@ final class SlimeController: IMKInputController {
 
         guard let mappedEvent = characterEvent(from: event) else {
             if !candidateValues.isEmpty {
+                resetTransientContext()
                 return false
             }
             commitIfNeeded(client: sender)
@@ -159,6 +192,235 @@ final class SlimeController: IMKInputController {
         }
 
         return process(mappedEvent, client: sender)
+    }
+
+    private func recordInputVerificationIfNeeded(_ event: NSEvent) {
+        let disallowedModifiers = event.modifierFlags.intersection([
+            .command, .control, .option,
+        ])
+        guard !didRecordInputVerification,
+              let inputVerificationToken,
+              let inputVerificationMode,
+              isVerificationTargetActive(),
+              isHardwareInputEvent(event),
+              InputVerification.isVerificationCharacter(
+                  event.charactersIgnoringModifiers,
+                  hasDisallowedModifiers: !disallowedModifiers.isEmpty
+              )
+        else {
+            return
+        }
+        switch inputVerificationMode {
+        case .character:
+            didRecordInputVerification = true
+            os_log(
+                .default,
+                log: Self.inputVerificationLog,
+                "InputMethodCharacterEvent token=%{public}@",
+                inputVerificationToken as NSString
+            )
+            InputVerification.consume(inputVerificationToken)
+        case .candidateSelection, .candidateNumber, .candidateClick:
+            if let step = candidateVerificationState.record(.character) {
+                recordCandidateVerificationStep(step)
+            }
+        case .reconversion:
+            break
+        case .privacyPrivate, .privacySecure, .privacyResume:
+            guard privacyVerificationModeMatchesCurrentState() else { return }
+            if let step = privacyVerificationState.record(.character) {
+                recordPrivacyVerificationStep(step)
+            }
+        }
+    }
+
+    private func recordCandidateVerificationAction(_ action: RustEngine.Action) {
+        guard inputVerificationMode?.selectionMethod != nil,
+              !didRecordInputVerification,
+              isVerificationTargetActive()
+        else {
+            return
+        }
+        let step: InputVerification.CandidateStep? = switch action.type {
+        case "show_candidates" where !(action.candidates ?? []).isEmpty:
+            candidateVerificationState.record(.candidates(selected: action.selected ?? 0))
+        case "commit":
+            candidateVerificationState.record(.commit)
+        default:
+            nil
+        }
+        if let step {
+            recordCandidateVerificationStep(step)
+        }
+    }
+
+    private func recordReconversionVerificationAction(_ action: RustEngine.Action) {
+        guard inputVerificationMode == .reconversion,
+              !didRecordInputVerification,
+              isVerificationTargetActive()
+        else {
+            return
+        }
+        let event: InputVerification.ReconversionEvent? = switch action.type {
+        case "show_candidates" where !(action.candidates ?? []).isEmpty:
+            .candidates
+        case "commit":
+            .commit
+        default:
+            nil
+        }
+        if let event {
+            recordReconversionVerificationEvent(event)
+        }
+    }
+
+    private func recordPrivacyVerificationAction(_ action: RustEngine.Action) {
+        guard inputVerificationMode?.matchesPrivacyState(
+            privateMode: InputPrivacySession.isPrivate,
+            secureEventInput: secureEventInputIsEnabled()
+        ) == true,
+        !didRecordInputVerification,
+        isVerificationTargetActive()
+        else {
+            return
+        }
+        let event: InputVerification.PrivacyEvent? = switch action.type {
+        case "show_candidates" where !(action.candidates ?? []).isEmpty:
+            .candidates
+        case "commit":
+            .commit
+        default:
+            nil
+        }
+        if let event, let step = privacyVerificationState.record(event) {
+            recordPrivacyVerificationStep(step)
+        }
+    }
+
+    private func privacyVerificationModeMatchesCurrentState() -> Bool {
+        inputVerificationMode?.matchesPrivacyState(
+            privateMode: InputPrivacySession.isPrivate,
+            secureEventInput: secureEventInputIsEnabled()
+        ) == true
+    }
+
+    private func recordPrivacyVerificationStep(_ step: InputVerification.PrivacyStep) {
+        guard let inputVerificationToken, let inputVerificationMode else { return }
+        os_log(
+            .default,
+            log: Self.inputVerificationLog,
+            "InputMethodPrivacyEvent token=%{public}@ mode=%{public}@ step=%{public}@",
+            inputVerificationToken as NSString,
+            inputVerificationMode.rawValue as NSString,
+            step.rawValue as NSString
+        )
+        if step == .committed {
+            didRecordInputVerification = true
+            InputVerification.consume(inputVerificationToken)
+        }
+    }
+
+    private func recordReconversionVerificationEvent(
+        _ event: InputVerification.ReconversionEvent
+    ) {
+        guard inputVerificationMode == .reconversion,
+              !didRecordInputVerification,
+              isVerificationTargetActive(),
+              let inputVerificationToken,
+              let step = reconversionVerificationState.record(event)
+        else {
+            return
+        }
+        os_log(
+            .default,
+            log: Self.inputVerificationLog,
+            "InputMethodReconversionEvent token=%{public}@ step=%{public}@",
+            inputVerificationToken as NSString,
+            step.rawValue as NSString
+        )
+        if step == .committed {
+            didRecordInputVerification = true
+            InputVerification.consume(inputVerificationToken)
+        }
+    }
+
+    private func recordReconversionAcceptance(_ event: NSEvent) {
+        guard inputVerificationMode == .reconversion,
+              !didRecordInputVerification,
+              isVerificationTargetActive(),
+              isHardwareInputEvent(event)
+        else {
+            return
+        }
+        _ = reconversionVerificationState.record(.accept)
+    }
+
+    private func recordPrivacyVerificationInput(
+        _ input: InputVerification.PrivacyEvent,
+        event: NSEvent
+    ) {
+        guard privacyVerificationModeMatchesCurrentState(),
+              !didRecordInputVerification,
+              isVerificationTargetActive(),
+              isHardwareInputEvent(event)
+        else {
+            return
+        }
+        _ = privacyVerificationState.record(input)
+    }
+
+    private func recordCandidateSelectionMethod(
+        _ method: InputVerification.CandidateSelectionMethod,
+        event: NSEvent
+    ) {
+        guard inputVerificationMode?.selectionMethod == method,
+              !didRecordInputVerification,
+              isVerificationTargetActive(),
+              isHardwareInputEvent(event),
+              let step = candidateVerificationState.record(.selection(method))
+        else {
+            return
+        }
+        recordCandidateVerificationStep(step)
+    }
+
+    private func recordCandidateAcceptance(_ event: NSEvent) {
+        guard inputVerificationMode?.selectionMethod != nil,
+              !didRecordInputVerification,
+              isVerificationTargetActive(),
+              isHardwareInputEvent(event)
+        else {
+            return
+        }
+        _ = candidateVerificationState.record(.accept)
+    }
+
+    private func isHardwareInputEvent(_ event: NSEvent) -> Bool {
+        guard let cgEvent = event.cgEvent else { return false }
+        return InputVerification.isHardwareEventSource(
+            cgEvent.getIntegerValueField(.eventSourceStateID)
+        )
+    }
+
+    private func isVerificationTargetActive() -> Bool {
+        guard let inputVerificationTargetProcessIdentifier else { return false }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier
+            == inputVerificationTargetProcessIdentifier
+    }
+
+    private func recordCandidateVerificationStep(_ step: InputVerification.CandidateStep) {
+        guard let inputVerificationToken else { return }
+        os_log(
+            .default,
+            log: Self.inputVerificationLog,
+            "InputMethodCandidateEvent token=%{public}@ step=%{public}@",
+            inputVerificationToken as NSString,
+            step.rawValue as NSString
+        )
+        if step == .candidateCommitted {
+            didRecordInputVerification = true
+            InputVerification.consume(inputVerificationToken)
+        }
     }
 
     override func commitComposition(_ sender: Any!) {
@@ -245,6 +507,9 @@ final class SlimeController: IMKInputController {
         var forwarded = false
         let textClient = IMKTextMutationClient(base: inputClient)
         for action in actions {
+            recordCandidateVerificationAction(action)
+            recordReconversionVerificationAction(action)
+            recordPrivacyVerificationAction(action)
             if let compositionState = applyTextMutation(
                 action,
                 client: textClient,
@@ -328,7 +593,10 @@ final class SlimeController: IMKInputController {
         _ = process(.enter, client: sender)
     }
 
-    private func beginReconversion(client sender: Any!) -> Bool {
+    private func beginReconversion(client sender: Any!, verificationEvent: NSEvent) -> Bool {
+        if isVerificationTargetActive(), isHardwareInputEvent(verificationEvent) {
+            recordReconversionVerificationEvent(.requested)
+        }
         resetTransientContext()
         guard let inputClient = sender as? (any IMKTextInput & NSObjectProtocol) else {
             return false
@@ -344,6 +612,7 @@ final class SlimeController: IMKInputController {
         do {
             let actions = try engine.beginReconversion(surface: selected)
             guard !actions.isEmpty else { return false }
+            recordReconversionVerificationEvent(.started)
             replacementRangeOnNextUpdate = selectedRange
             _ = apply(actions, client: inputClient)
             return true
@@ -393,12 +662,21 @@ final class SlimeController: IMKInputController {
         selectedCandidateIndex = 0
     }
 
-    private func selectCandidate(at index: Int, commit: Bool) {
-        guard candidateValues.indices.contains(index), let inputClient = client() else {
+    private func selectCandidate(
+        at index: Int,
+        commit: Bool,
+        verificationEvent: NSEvent? = nil
+    ) {
+        guard candidateValues.indices.contains(index),
+              let inputClient = client()
+        else {
             return
         }
         _ = process(.selectCandidate(UInt32(index)), client: inputClient)
         if commit && !isSegmentedConversion {
+            if let verificationEvent {
+                recordCandidateAcceptance(verificationEvent)
+            }
             _ = process(.enter, client: inputClient)
         }
         inputContextBoundary.observe(

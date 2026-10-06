@@ -35,8 +35,28 @@ test-ffi:
 test-commercial-boundary:
     scripts/test-commercial-boundary.sh
 
-# format、lint、Rustテスト、C ABI、商用境界テストをまとめて実行する
-check: fmt-check lint test test-ffi test-commercial-boundary
+# 辞書パック公開鍵のbuild-time形式・重複・上限を検証する
+test-dictionary-pack-verification-keys:
+    scripts/test-dictionary-pack-verification-keys.sh
+
+# 署名済み辞書パックのrollback下限形式・重複・上限を検証する
+test-dictionary-pack-version-floors:
+    scripts/test-dictionary-pack-version-floors.sh
+
+# macOS release buildがcleanなGit revisionだけを受け入れることを検証する
+test-macos-release-source-policy:
+    scripts/test-macos-release-source-policy.sh
+
+# macOS release evidenceのcanonical artifact bindingを検証する
+test-macos-package-binding-policy:
+    scripts/test-macos-package-binding-policy.sh
+
+# macOS consumer sessionの全証拠が同一releaseへbindされることを検証する
+test-macos-consumer-evidence-policy:
+    scripts/test-macos-consumer-evidence-policy.sh
+
+# format、lint、Rustテスト、C ABI、商用境界・配布policyテストをまとめて実行する
+check: fmt-check lint test test-ffi test-commercial-boundary test-dictionary-pack-verification-keys test-dictionary-pack-version-floors test-macos-release-source-policy test-macos-package-binding-policy test-macos-consumer-evidence-policy
     @echo "All checks passed."
 
 # 外部fixtureで入力ミス訂正の回収・誤訂正・遅延を集計する
@@ -127,8 +147,49 @@ build-macos:
 verify-macos: build-macos
     scripts/verify-macos-bundle.sh
 
+# 未署名PKGでもpayload・version・lifecycle scriptの構造policyを回帰検証する
+test-macos-package-policy: build-macos
+    scripts/test-macos-package-policy.sh
+
+# TextEditの物理キーがInputMethodKitへ届いたことを内容非記録で確認する
+macos-textedit-input-gate command:
+    scripts/macos-textedit-input-gate.sh "{{command}}"
+
+# private/secure input中の履歴不変と解除後の学習再開を内容非記録で確認する
+macos-input-privacy-gate command:
+    scripts/macos-input-privacy-gate.sh "{{command}}"
+
+# 物理入力gateのshell構文を対話sessionなしで検証する
+test-macos-input-gate-syntax:
+    bash -n scripts/dictionary-pack-verification-keys.sh scripts/dictionary-pack-version-floors.sh scripts/macos-package-binding.sh scripts/macos-release-source.sh scripts/build-macos.sh scripts/verify-macos-bundle.sh scripts/verify-macos-release.sh scripts/test-macos-package-lifecycle.sh scripts/verify-macos-consumer-evidence.sh scripts/macos-console-state.sh scripts/macos-textedit-input-gate.sh scripts/macos-input-privacy-gate.sh scripts/test-macos-input-privacy-gate-policy.sh scripts/test-macos-textedit-input-gate-policy.sh scripts/test-macos-console-state-policy.sh scripts/test-macos-package-binding-policy.sh scripts/test-macos-consumer-evidence-policy.sh scripts/test-dictionary-pack-verification-keys.sh scripts/test-dictionary-pack-version-floors.sh scripts/test-macos-release-build-policy.sh scripts/test-macos-release-source-policy.sh
+    scripts/test-macos-console-state-policy.sh
+    scripts/test-macos-release-build-policy.sh
+    scripts/test-macos-input-privacy-gate-policy.sh
+    scripts/test-macos-textedit-input-gate-policy.sh
+
+# 署名状態に依存しないmacOS PKGの構造policyを検証する
+verify-macos-package package:
+    scripts/verify-macos-package-structure.sh "{{package}}"
+
+# Developer ID署名済みbundleからInstaller署名済みpkgを作る
+build-macos-release-pkg build:
+    SLIME_RELEASE_BUILD=1 SLIME_BUILD_NUMBER="{{build}}" scripts/build-macos.sh
+    scripts/build-macos-pkg.sh
+
+# 公証・staple済みpkgの商用配布gateを検証する
+verify-macos-release package:
+    scripts/verify-macos-release.sh "{{package}}"
+
+# 使い捨てmacOS VMで署名済みPKGのinstall/update/uninstallを検証する
+test-macos-package-lifecycle current previous="":
+    sudo -E scripts/test-macos-package-lifecycle.sh --current "{{current}}" {{ if previous != "" { "--previous '" + previous + "'" } else { "" } }}
+
+# システム領域のmacOS版を削除し、ユーザーデータは保持する
+uninstall-macos-system:
+    scripts/uninstall-macos-system.sh
+
 # macOS版をまとめて検証する
-check-macos: check test-macos verify-macos
+check-macos: check test-macos verify-macos test-macos-package-policy test-macos-input-gate-syntax
 
 # Windows TSFアダプターをx64/x86向けに型検査する
 check-windows:

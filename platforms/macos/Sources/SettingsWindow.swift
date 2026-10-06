@@ -266,6 +266,14 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    func uninstallSystemApp() {
+        do {
+            try SystemInstallation.startUninstaller()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     private func persistDictionary() -> Bool {
         do {
             dictionaryBase = try store.saveDictionary(dictionary, replacing: dictionaryBase)
@@ -300,6 +308,30 @@ enum SettingsTab: String {
     case history
 }
 
+private enum SystemInstallation {
+    static let bundlePath = "/Library/Input Methods/Slime.app"
+
+    static var canUninstall: Bool {
+        Bundle.main.bundleURL.standardizedFileURL.path == bundlePath
+            && FileManager.default.isExecutableFile(atPath: uninstallerURL.path)
+    }
+
+    static func startUninstaller() throws {
+        guard canUninstall else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [uninstallerURL.path]
+        try process.run()
+    }
+
+    private static var uninstallerURL: URL {
+        Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources/uninstall-macos-system.sh")
+    }
+}
+
 struct SettingsRootView: View {
     @StateObject private var model = SettingsModel()
     @State private var selection: SettingsTab
@@ -323,7 +355,7 @@ struct SettingsRootView: View {
         .padding(24)
         .frame(minWidth: 680, minHeight: 520)
         .alert(
-            "保存できませんでした",
+            "操作を完了できませんでした",
             isPresented: Binding(
                 get: { model.errorMessage != nil },
                 set: { if !$0 { model.errorMessage = nil } }
@@ -338,6 +370,7 @@ struct SettingsRootView: View {
 
 private struct GeneralSettingsView: View {
     @ObservedObject var model: SettingsModel
+    @State private var confirmsUninstall = false
 
     var body: some View {
         Form {
@@ -441,8 +474,35 @@ private struct GeneralSettingsView: View {
                     }
                 }
             }
+            if SystemInstallation.canUninstall {
+                Section("アプリ") {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("SlimeをこのMacから削除")
+                            Text("ユーザー辞書、設定、入力履歴は残します。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("アンインストール…", role: .destructive) {
+                            confirmsUninstall = true
+                        }
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
+        .confirmationDialog(
+            "Slimeをアンインストールしますか？",
+            isPresented: $confirmsUninstall
+        ) {
+            Button("アンインストール", role: .destructive) {
+                model.uninstallSystemApp()
+            }
+            Button("キャンセル", role: .cancel) {}
+        } message: {
+            Text("管理者の確認後に入力メソッド本体を削除します。ユーザー辞書、設定、入力履歴は残ります。入力メニューへ反映するには、サインアウトが必要な場合があります。")
+        }
     }
 }
 
@@ -519,10 +579,8 @@ private struct InstalledDictionaryPackRow: View {
             DomainDictionaryWordsView(title: pack.name, source: .installed(pack.id))
         }
     }
-}
 
-private extension InstalledDictionaryPackRow {
-    var packSummary: String {
+    private var packSummary: String {
         var components = ["バージョン \(pack.version)", "\(pack.entryCount)語"]
         if pack.contextRuleCount > 0 {
             components.append("文脈ルール\(pack.contextRuleCount)件")

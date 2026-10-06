@@ -66,12 +66,6 @@ final class SlimeController: IMKInputController {
         guard let inputClient = sender as? (any IMKTextInput & NSObjectProtocol) else {
             return false
         }
-        guard SlimeAccessController.shared.allowsInput else {
-            DispatchQueue.main.async {
-                SettingsWindowController.shared.present(initialTab: .license)
-            }
-            return true
-        }
         if !hasComposition,
            inputContextBoundary.shouldReset(
                client: inputClient,

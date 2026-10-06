@@ -31,8 +31,12 @@ test:
 test-ffi:
     scripts/test-c-ffi.sh
 
-# format、lint、Rustテスト、C ABIテストをまとめて実行する
-check: fmt-check lint test test-ffi
+# 公開入力経路へ商用認証・ネットワーク依存が戻っていないことを確認する
+test-commercial-boundary:
+    scripts/test-commercial-boundary.sh
+
+# format、lint、Rustテスト、C ABI、商用境界テストをまとめて実行する
+check: fmt-check lint test test-ffi test-commercial-boundary
     @echo "All checks passed."
 
 # 外部fixtureで入力ミス訂正の回収・誤訂正・遅延を集計する
@@ -134,7 +138,7 @@ check-windows:
 check-landing:
     cd landing && pnpm build && pnpm check
 
-# slime.unvalley.meへ静的Landingをdeployする（実Checkout URLが必須）
+# slime.unvalley.meへ静的Landingをdeployする
 deploy-landing:
     cd landing && pnpm run deploy
 

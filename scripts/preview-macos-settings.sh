@@ -12,8 +12,6 @@ swiftc \
   "$workspace_dir/platforms/macos/Sources/UserDataStore.swift" \
   "$workspace_dir/platforms/macos/Sources/DictionaryImporter.swift" \
   "$workspace_dir/platforms/macos/Sources/InputPrivacy.swift" \
-  "$workspace_dir/platforms/macos/Sources/Licensing.swift" \
-  "$workspace_dir/platforms/macos/Sources/LicenseSettingsView.swift" \
   "$workspace_dir/platforms/macos/Sources/SettingsWindow.swift" \
   "$workspace_dir/platforms/macos/Tests/SettingsPreview.swift" \
   -o "$preview_binary"

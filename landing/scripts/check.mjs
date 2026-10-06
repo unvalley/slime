@@ -7,21 +7,17 @@ const index = readFileSync(resolve(root, "dist/index.html"), "utf8");
 const styles = readFileSync(resolve(root, "dist/styles-20260807-15.css"), "utf8");
 const buttonScript = readFileSync(resolve(root, "dist/button-20260807-1.js"), "utf8");
 const wrangler = readFileSync(resolve(root, "wrangler.jsonc"), "utf8");
-const productionCheckoutURL =
-  "https://buy.polar.sh/polar_cl_asAsYJgLTkAhiius7JmEbgTIPRpEb4r4H8Unz2x9us2";
-
 const checks = [
-  [index.includes("14日間の無料トライアル"), "14-day trial copy"],
-  [index.includes("月額200円"), "monthly 200 JPY copy"],
-  [index.includes(`href="${productionCheckoutURL}"`) && !index.includes("__SLIME_POLAR_CHECKOUT_URL__"), "production checkout URL"],
+  [!index.includes("無料トライアル") && !index.includes("月額"), "commercial offer excluded"],
+  [!index.includes("checkout") && !index.includes("__SLIME_"), "checkout URL excluded"],
   [index.includes('rel="canonical" href="https://slime.unvalley.me/"'), "canonical URL"],
   [wrangler.includes('"pattern": "slime.unvalley.me"'), "Cloudflare custom domain"],
   [index.includes('class="skip-link" href="#main"'), "skip navigation link"],
   [index.includes("<h1>Macのための新しいIME</h1>") && !index.includes("考える速さで"), "single-line hero copy"],
-  [index.includes('<span class="action-label">ダウンロード</span>'), "download CTA copy"],
+  [index.includes('<span class="action-label">公開準備中</span>'), "release preparation copy"],
   [index.includes('<p class="lead">ライブ変換・履歴補完・ローカル完結。</p>'), "concise product copy"],
   [!index.includes("ライブ変換と履歴補完を備えた") && !index.includes("変換も学習も、このMacで完結します"), "old product copy removed"],
-  [!index.includes("macOS 13以降"), "platform requirement removed"],
+  [index.includes("macOS 13以降・Apple Silicon対応"), "platform requirement"],
   [!index.includes('class="site-header"') && index.includes('class="hero"') && !index.includes('class="feature-list"'), "minimal centered structure"],
   [!index.includes("<nav") && !index.includes("<details") && !index.includes("<article"), "nonessential sections removed"],
   [!index.includes("<img") && !index.includes("<figure") && !styles.includes(".writing-shot"), "image-free landing"],

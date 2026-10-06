@@ -39,9 +39,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         sharedServer = server
         SettingsStatusItem.shared.install()
-        Task {
-            await SlimeAccessController.shared.refreshStoredLicense()
-        }
         let registrationStatus = TISRegisterInputSource(bundle.bundleURL as CFURL)
         if registrationStatus != noErr {
             let message = "TISRegisterInputSource failed: \(registrationStatus)\n"

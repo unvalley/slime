@@ -25,6 +25,10 @@ Currently it's for me.
 設定は、メニューバーの歯車から「Slime設定…」を選びます。ユーザー辞書タブの「辞書を読み込む…」から既存IMEの書き出しファイルを移行できます。
 プライベートモードも同じメニューから切り替えられ、Slimeを終了すると解除されます。macOSのセキュア入力中は自動的に同じ保護を適用します。
 
+## Distribution boundary
+
+このリポジトリは、入力をローカルで処理するMITライセンスのコアと各OSアダプターを扱います。公式配布、更新サービス、有償辞書などの商用レイヤーは入力処理から分離し、契約状態によって基本入力が停止しない構成にします。詳しくは[商用配布境界](docs/commercial-distribution-boundary.md)を参照してください。
+
 ## License
 
 Slime IME is licensed under the MIT License.

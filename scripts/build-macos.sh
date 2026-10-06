@@ -12,9 +12,6 @@ codesign_identity="${SLIME_CODESIGN_IDENTITY:-}"
 neural_model="${SLIME_NEURAL_MODEL:-}"
 neural_model_license="${SLIME_NEURAL_MODEL_LICENSE:-}"
 neural_profile="${SLIME_NEURAL_PROFILE:-}"
-production_polar_organization_id="6a332eb2-129e-4a1b-92fe-8ec7777780df"
-production_polar_benefit_id="e014726e-23a8-4a99-a212-e44adc349c1e"
-production_polar_checkout_url="https://buy.polar.sh/polar_cl_asAsYJgLTkAhiius7JmEbgTIPRpEb4r4H8Unz2x9us2"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "macOS bundle can only be built on macOS" >&2
@@ -101,8 +98,6 @@ swiftc \
   "$workspace_dir/platforms/macos/Sources/KeyEventMapping.swift" \
   "$workspace_dir/platforms/macos/Sources/TextClientActions.swift" \
   "$workspace_dir/platforms/macos/Sources/CandidatePanel.swift" \
-  "$workspace_dir/platforms/macos/Sources/Licensing.swift" \
-  "$workspace_dir/platforms/macos/Sources/LicenseSettingsView.swift" \
   "$workspace_dir/platforms/macos/Sources/SettingsWindow.swift" \
   "$workspace_dir/platforms/macos/Sources/InputController.swift" \
   "$workspace_dir/platforms/macos/Sources/main.swift" \
@@ -110,35 +105,6 @@ swiftc \
 
 cp "$workspace_dir/target/release/libslime_ffi.dylib" "$frameworks_dir/"
 cp "$workspace_dir/platforms/macos/Resources/Info.plist" "$contents_dir/Info.plist"
-billing_environment="${SLIME_BILLING_ENVIRONMENT:-development}"
-/usr/libexec/PlistBuddy -c "Add :SlimeBillingEnvironment string $billing_environment" "$contents_dir/Info.plist"
-case "$billing_environment" in
-  development)
-    ;;
-  production)
-    billing_organization_id="${SLIME_POLAR_ORGANIZATION_ID:-$production_polar_organization_id}"
-    billing_benefit_id="${SLIME_POLAR_BENEFIT_ID:-$production_polar_benefit_id}"
-    billing_checkout_url="${SLIME_POLAR_CHECKOUT_URL:-$production_polar_checkout_url}"
-    ;;
-  sandbox)
-    billing_organization_id="${SLIME_POLAR_ORGANIZATION_ID:-}"
-    billing_benefit_id="${SLIME_POLAR_BENEFIT_ID:-}"
-    billing_checkout_url="${SLIME_POLAR_CHECKOUT_URL:-}"
-    ;;
-  *)
-    echo "Unsupported billing environment: $billing_environment" >&2
-    exit 1
-    ;;
-esac
-if [[ "$billing_environment" != "development" ]]; then
-  if [[ -z "$billing_organization_id" || -z "$billing_benefit_id" || -z "$billing_checkout_url" ]]; then
-    echo "Missing Polar configuration for $billing_environment billing" >&2
-    exit 1
-  fi
-  /usr/libexec/PlistBuddy -c "Add :SlimePolarOrganizationID string $billing_organization_id" "$contents_dir/Info.plist"
-  /usr/libexec/PlistBuddy -c "Add :SlimePolarBenefitID string $billing_benefit_id" "$contents_dir/Info.plist"
-  /usr/libexec/PlistBuddy -c "Add :SlimePolarCheckoutURL string $billing_checkout_url" "$contents_dir/Info.plist"
-fi
 if [[ "$neural_enabled" == true ]]; then
   /usr/libexec/PlistBuddy -c "Add :SlimeNeuralProfile string $neural_profile" "$contents_dir/Info.plist"
 fi

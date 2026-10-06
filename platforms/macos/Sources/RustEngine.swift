@@ -34,26 +34,27 @@ final class RustEngine {
         case shrinkSegment
 
         fileprivate var rawValue: UInt32 {
-            switch self {
-            case .character: 0
-            case .space: 1
-            case .enter: 2
-            case .escape: 3
-            case .backspace: 4
-            case .nextCandidate: 5
-            case .previousCandidate: 6
-            case .selectCandidate: 7
-            case .acceptCandidate: 8
-            case .transformHiragana: 9
-            case .transformFullKatakana: 10
-            case .transformHalfKatakana: 11
-            case .transformFullAlphanumeric: 12
-            case .transformHalfAlphanumeric: 13
-            case .nextSegment: 14
-            case .previousSegment: 15
-            case .expandSegment: 16
-            case .shrinkSegment: 17
+            let kind: SlimeEventKind = switch self {
+            case .character: SLIME_EVENT_CHARACTER
+            case .space: SLIME_EVENT_SPACE
+            case .enter: SLIME_EVENT_ENTER
+            case .escape: SLIME_EVENT_ESCAPE
+            case .backspace: SLIME_EVENT_BACKSPACE
+            case .nextCandidate: SLIME_EVENT_NEXT_CANDIDATE
+            case .previousCandidate: SLIME_EVENT_PREVIOUS_CANDIDATE
+            case .selectCandidate: SLIME_EVENT_SELECT_CANDIDATE
+            case .acceptCandidate: SLIME_EVENT_ACCEPT_CANDIDATE
+            case .transformHiragana: SLIME_EVENT_TRANSFORM_HIRAGANA
+            case .transformFullKatakana: SLIME_EVENT_TRANSFORM_FULL_KATAKANA
+            case .transformHalfKatakana: SLIME_EVENT_TRANSFORM_HALF_KATAKANA
+            case .transformFullAlphanumeric: SLIME_EVENT_TRANSFORM_FULL_ALPHANUMERIC
+            case .transformHalfAlphanumeric: SLIME_EVENT_TRANSFORM_HALF_ALPHANUMERIC
+            case .nextSegment: SLIME_EVENT_NEXT_SEGMENT
+            case .previousSegment: SLIME_EVENT_PREVIOUS_SEGMENT
+            case .expandSegment: SLIME_EVENT_EXPAND_SEGMENT
+            case .shrinkSegment: SLIME_EVENT_SHRINK_SEGMENT
             }
+            return kind.rawValue
         }
 
         fileprivate var scalar: UInt32 {

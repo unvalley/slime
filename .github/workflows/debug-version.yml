@@ -62,7 +62,7 @@ jobs:
             Set-Content -Path "$name.rc" -Value $text -Encoding ascii
             $flags = @($v.rcflags) + @("/I", "$include/um", "/I", "$include/shared", "/fo", "$name.res", "$name.rc")
             & $rc.FullName @flags | Out-Null
-            foreach ($kind in @("dll", "manifest")) {
+            foreach ($kind in @("dll")) {
               $out = "$name-$kind.dll"
               $linkFlags = @("/NOLOGO", "/DLL", "/NOENTRY", "/MACHINE:X64", "/OUT:$out", "$name.res")
               if ($kind -eq "manifest") { $linkFlags += @("/MANIFEST:EMBED") }

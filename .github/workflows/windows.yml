@@ -123,6 +123,8 @@ jobs:
       - name: Verify payload source revision metadata
         shell: pwsh
         run: |
+          # Check every payload before failing, so one run shows all of them.
+          $failures = @()
           foreach ($name in @(
             "SlimeIME.dll",
             "slime_ffi.dll",
@@ -130,14 +132,17 @@ jobs:
             "SlimeSettings.exe"
           )) {
             $path = "target/windows-${{ matrix.architecture }}/Release/$name"
-            $comments = (Get-Item -LiteralPath $path).VersionInfo.Comments
-            if ($comments -ne "Source revision: $env:SLIME_SOURCE_REVISION") {
-              throw "$name source revision metadata does not match the build: '$comments'"
+            $info = (Get-Item -LiteralPath $path).VersionInfo
+            if ($info.Comments -ne "Source revision: $env:SLIME_SOURCE_REVISION") {
+              $failures += "$name source revision is '$($info.Comments)'"
             }
-            $version = (Get-Item -LiteralPath $path).VersionInfo.ProductVersion
+            $version = $info.ProductVersion
             if (-not $version -or $version.Trim() -ne $env:SLIME_PRODUCT_VERSION) {
-              throw "$name product version metadata does not match the build: '$version'"
+              $failures += "$name product version is '$version' (file version '$($info.FileVersion)')"
             }
+          }
+          if ($failures.Count -ne 0) {
+            throw "payload metadata does not match the build:`n$($failures -join "`n")"
           }
       - name: Run native tests
         run: ctest --test-dir "target/windows-${{ matrix.architecture }}" -C Release --output-on-failure

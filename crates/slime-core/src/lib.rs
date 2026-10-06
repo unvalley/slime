@@ -2608,16 +2608,28 @@ impl SlimeEngine {
         if self.phase() != Phase::Converting {
             return vec![SlimeAction::ForwardKey];
         }
-        self.enter_segment_mode();
+        let entered = self.enter_segment_mode();
         if self.segments.is_empty() {
             return vec![SlimeAction::ForwardKey];
+        }
+        let can_resize = if expand {
+            self.active_segment + 1 < self.segments.len()
+        } else {
+            self.segments[self.active_segment]
+                .reading
+                .chars()
+                .nth(1)
+                .is_some()
+        };
+        if !can_resize {
+            if entered {
+                self.activate_segment_candidates();
+            }
+            return self.candidate_actions();
         }
 
         if expand {
             let next_index = self.active_segment + 1;
-            if next_index >= self.segments.len() {
-                return self.candidate_actions();
-            }
             let next_reading = self.segments[next_index].reading.clone();
             let character = next_reading.chars().next().expect("non-empty segment");
             self.segments[self.active_segment].reading.push(character);
@@ -2628,13 +2640,10 @@ impl SlimeEngine {
                 self.reset_segment_surface(next_index);
             }
         } else {
-            let Some(character) = self.segments[self.active_segment].reading.pop() else {
-                return self.candidate_actions();
-            };
-            if self.segments[self.active_segment].reading.is_empty() {
-                self.segments[self.active_segment].reading.push(character);
-                return self.candidate_actions();
-            }
+            let character = self.segments[self.active_segment]
+                .reading
+                .pop()
+                .expect("a resizable segment has two characters");
             let next_index = self.active_segment + 1;
             if next_index == self.segments.len() {
                 self.segments.push(EditableSegment {
@@ -2647,24 +2656,29 @@ impl SlimeEngine {
             }
             self.reset_segment_surface(next_index);
         }
-        self.reset_segment_surface(self.active_segment);
-        self.activate_segment_candidates();
+        self.reset_active_segment_candidates();
         self.candidate_actions()
     }
 
     /// Returns true when this call changed whole-phrase conversion into
-    /// segmented conversion.
+    /// segmented conversion. Callers show the active segment's candidates.
     fn enter_segment_mode(&mut self) -> bool {
         if self.candidate_kind == Some(CandidateKind::SegmentedConversion) {
             return false;
         }
         let selected_surface = self.selected_candidate().to_owned();
-        let conversion = self
-            .dictionary
-            .convert_n_best(&self.reading, 32)
-            .into_iter()
-            .find(|conversion| conversion.surface == selected_surface)
-            .or_else(|| self.dictionary.convert_best(&self.reading));
+        // Most selections are the 1-best surface. Reuse its segmentation and
+        // run the wide N-best search (milliseconds) only for another surface.
+        let best = self.dictionary.convert_best(&self.reading);
+        let conversion = match best {
+            Some(best) if best.surface == selected_surface => Some(best),
+            best => self
+                .dictionary
+                .convert_n_best(&self.reading, 32)
+                .into_iter()
+                .find(|conversion| conversion.surface == selected_surface)
+                .or(best),
+        };
         self.segments = conversion.map_or_else(
             || {
                 vec![EditableSegment {
@@ -2696,7 +2710,6 @@ impl SlimeEngine {
         }
         self.active_segment = 0;
         self.candidate_kind = Some(CandidateKind::SegmentedConversion);
-        self.activate_segment_candidates();
         true
     }
 
@@ -2716,6 +2729,21 @@ impl SlimeEngine {
             self.candidates.insert(0, surface);
             self.selected = 0;
         }
+    }
+
+    /// Resets the active segment to its best candidate and shows the same
+    /// candidate list, generating it once.
+    fn reset_active_segment_candidates(&mut self) {
+        let reading = self.segments[self.active_segment].reading.clone();
+        self.candidate_corrections.clear();
+        self.candidates = self.conversion_candidates_for_reading(&reading);
+        if self.candidates.is_empty() {
+            self.candidates.push(reading);
+        }
+        self.selected = 0;
+        let segment = &mut self.segments[self.active_segment];
+        segment.surface.clone_from(&self.candidates[0]);
+        segment.explicitly_selected = false;
     }
 
     fn reset_segment_surface(&mut self, index: usize) {
@@ -10700,6 +10728,79 @@ mod tests {
             .map(|segment| segment.reading.as_str())
             .collect::<String>();
         assert_eq!(expanded, "わたしはにほん");
+    }
+
+    #[test]
+    fn segment_operations_always_show_the_active_segment_candidates() {
+        fn assert_active_segment_is_shown(engine: &SlimeEngine, event: InputEvent) {
+            let segment = &engine.segments[engine.active_segment];
+            let expected = engine.conversion_candidates(&segment.reading);
+            assert_eq!(
+                engine.candidates[engine.selected], segment.surface,
+                "{event:?}: {:?}",
+                engine.segments
+            );
+            assert!(
+                engine
+                    .candidates
+                    .iter()
+                    .all(|candidate| expected.contains(candidate) || *candidate == segment.surface),
+                "{event:?}: {:?} for {}",
+                engine.candidates,
+                segment.reading
+            );
+        }
+
+        use InputEvent::{ExpandSegment, NextSegment, PreviousSegment, ShrinkSegment};
+        // Entering segment mode through every operation, including resizes
+        // that cannot apply to a one-segment phrase.
+        for (input, event) in [
+            ("watashihanihon", NextSegment),
+            ("watashihanihon", PreviousSegment),
+            ("watashihanihon", ExpandSegment),
+            ("watashihanihon", ShrinkSegment),
+            ("nihon", ExpandSegment),
+            ("ha", ShrinkSegment),
+            // A one-kana first segment of a longer phrase cannot shrink.
+            ("mewomiru", ShrinkSegment),
+        ] {
+            let mut engine = SlimeEngine::bundled();
+            type_text(&mut engine, input);
+            engine.handle(InputEvent::Space);
+            engine.handle(event);
+            assert_eq!(
+                engine.candidate_kind,
+                Some(CandidateKind::SegmentedConversion)
+            );
+            assert_active_segment_is_shown(&engine, event);
+        }
+
+        let mut engine = SlimeEngine::bundled();
+        type_text(&mut engine, "watashihanihon");
+        engine.handle(InputEvent::Space);
+        for event in [
+            ExpandSegment,
+            NextSegment,
+            ShrinkSegment,
+            ShrinkSegment,
+            ExpandSegment,
+            NextSegment,
+            NextSegment,
+            ExpandSegment,
+            PreviousSegment,
+            ShrinkSegment,
+        ] {
+            engine.handle(event);
+            assert_active_segment_is_shown(&engine, event);
+            assert_eq!(
+                engine
+                    .segments
+                    .iter()
+                    .map(|segment| segment.reading.as_str())
+                    .collect::<String>(),
+                "わたしはにほん"
+            );
+        }
     }
 
     #[test]

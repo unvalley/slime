@@ -132,11 +132,11 @@ jobs:
             $path = "target/windows-${{ matrix.architecture }}/Release/$name"
             $comments = (Get-Item -LiteralPath $path).VersionInfo.Comments
             if ($comments -ne "Source revision: $env:SLIME_SOURCE_REVISION") {
-              throw "$name source revision metadata does not match the build"
+              throw "$name source revision metadata does not match the build: '$comments'"
             }
             $version = (Get-Item -LiteralPath $path).VersionInfo.ProductVersion
             if (-not $version -or $version.Trim() -ne $env:SLIME_PRODUCT_VERSION) {
-              throw "$name product version metadata does not match the build"
+              throw "$name product version metadata does not match the build: '$version'"
             }
           }
       - name: Run native tests

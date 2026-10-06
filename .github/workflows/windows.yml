@@ -148,7 +148,18 @@ jobs:
               ForEach-Object { Write-Host "generated: $($_.FullName) $($_.Length) bytes" }
             Select-String -Path "$buildDirectory/SlimeIME.vcxproj" -Pattern 'ResourceCompile|SlimeVersion' |
               ForEach-Object { Write-Host "vcxproj: $($_.Line.Trim())" }
-            Get-Content "$buildDirectory/SlimeVersion.rc" | ForEach-Object { Write-Host "rc: $_" }
+            foreach ($name in @("SlimeIME.dll", "slime_ffi.dll", "SlimeSettings.exe")) {
+              $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path "$buildDirectory/Release/$name"))
+              $text = [System.Text.Encoding]::Unicode.GetString($bytes)
+              foreach ($needle in @("Source revision", "VS_VERSION_INFO", "StringFileInfo", "040904b0", "000004b0", "Translation")) {
+                Write-Host "embedded: $name contains '$needle' = $($text.Contains($needle))"
+              }
+              $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path "$buildDirectory/Release/$name"))
+              Write-Host "info: $name FileMajorPart=$($info.FileMajorPart) FileMinorPart=$($info.FileMinorPart) Language='$($info.Language)' ProductName='$($info.ProductName)' CompanyName='$($info.CompanyName)'"
+            }
+            Get-ChildItem "$buildDirectory" -Recurse -Include *.tlog -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match 'link\.(read|command)' } |
+              ForEach-Object { Get-Content $_.FullName | Select-String -Pattern '\.res' | ForEach-Object { Write-Host "link: $($_.Line.Trim())" } }
             throw "payload metadata does not match the build:`n$($failures -join "`n")"
           }
       - name: Run native tests

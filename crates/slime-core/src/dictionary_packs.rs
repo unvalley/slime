@@ -698,10 +698,9 @@ fn decode_lower_hex<const N: usize>(source: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in source.as_bytes().chunks_exact(2).enumerate() {
-        let high = decode_lower_hex_digit(pair[0])?;
-        let low = decode_lower_hex_digit(pair[1])?;
-        decoded[index] = high << 4 | low;
+    let (pairs, _) = source.as_bytes().as_chunks::<2>();
+    for (slot, &[high, low]) in decoded.iter_mut().zip(pairs) {
+        *slot = decode_lower_hex_digit(high)? << 4 | decode_lower_hex_digit(low)?;
     }
     Some(decoded)
 }

@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -186,10 +187,10 @@ impl UserData {
             .context_history
             .iter()
             .filter(|entry| {
-                entry.previous_surface.chars().count() >= 2
-                    && external_surface.ends_with(&entry.previous_surface)
-                    && entry.reading == reading
+                entry.reading == reading
                     && entry.count >= MIN_CONTEXT_USE_COUNT
+                    && external_surface.ends_with(&entry.previous_surface)
+                    && entry.previous_surface.chars().count() >= 2
                     && is_useful_context_anchor(&entry.previous_reading, &entry.previous_surface)
                     && is_useful_history(&entry.reading, &entry.surface)
             })
@@ -419,11 +420,12 @@ impl UserData {
             .history
             .iter()
             .filter(|entry| {
-                is_useful_history(&entry.reading, &entry.surface)
-                    && entry.count >= MIN_COMPLETION_USE_COUNT
+                // Cheap rejections first: this scans every entry per key.
+                entry.count >= MIN_COMPLETION_USE_COUNT
                     && entry.reading.starts_with(prefix)
                     && entry.reading.chars().count().saturating_sub(prefix_length)
                         >= MIN_COMPLETION_REMAINING_CHARS
+                    && is_useful_history(&entry.reading, &entry.surface)
             })
             .collect();
         sort_completions(&mut entries);
@@ -445,11 +447,11 @@ impl UserData {
             .history
             .iter()
             .filter(|entry| {
-                is_useful_history(&entry.reading, &entry.surface)
+                entry.surface == surface
                     && entry.count >= MIN_COMPLETION_USE_COUNT
                     && entry.reading.starts_with(prefix)
                     && entry.reading != prefix
-                    && entry.surface == surface
+                    && is_useful_history(&entry.reading, &entry.surface)
             })
             .collect();
         sort_completions(&mut entries);
@@ -488,12 +490,12 @@ impl UserData {
             return;
         }
 
+        // The written history already merges this record with any concurrent
+        // change, so there is nothing to read back.
         let path = directory.join(HISTORY_FILE);
-        let history_saved = write_history_optimistically(&path, reading, surface, now).is_ok();
-        if history_saved
-            && let Ok(Some(bytes)) = read_optional(&path)
-            && let Ok(history) = parse_history(&bytes)
-        {
+        let saved_history = write_history_optimistically(&path, reading, surface, now).ok();
+        let history_saved = saved_history.is_some();
+        if let Some(history) = saved_history {
             self.history = history;
         }
         if history_saved
@@ -501,10 +503,8 @@ impl UserData {
             && self.history_preferences_are_writable
         {
             let path = directory.join(HISTORY_PREFERENCES_FILE);
-            if write_history_preference_optimistically(&path, reading, &preferred_surface, now)
-                .is_ok()
-                && let Ok(Some(bytes)) = read_optional(&path)
-                && let Ok(preferences) = parse_history_preferences(&bytes)
+            if let Ok(preferences) =
+                write_history_preference_optimistically(&path, reading, &preferred_surface, now)
             {
                 self.history_preferences = preferences;
             }
@@ -579,10 +579,7 @@ impl UserData {
         }
 
         let path = directory.join(CONTEXT_HISTORY_FILE);
-        if write_context_history_optimistically(&path, &contexts, wall_clock).is_ok()
-            && let Ok(Some(bytes)) = read_optional(&path)
-            && let Ok(history) = parse_context_history(&bytes)
-        {
+        if let Ok(history) = write_context_history_optimistically(&path, &contexts, wall_clock) {
             self.context_history = history;
         }
     }
@@ -782,37 +779,31 @@ fn next_context_last_used(history: &[ContextHistoryEntry], wall_clock: u64) -> u
         })
 }
 
+/// Keeps useful, then recent entries. Keys are computed once per entry:
+/// `is_useful_history` walks both strings, which dominated a comparator-based
+/// sort of a full history on every commit.
 fn trim_history(history: &mut Vec<HistoryEntry>) {
-    history.sort_unstable_by(|left, right| {
-        is_useful_history(&right.reading, &right.surface)
-            .cmp(&is_useful_history(&left.reading, &left.surface))
-            .then_with(|| {
-                right
-                    .last_used
-                    .cmp(&left.last_used)
-                    .then_with(|| right.count.cmp(&left.count))
-            })
+    history.sort_by_cached_key(|entry| {
+        (
+            Reverse(is_useful_history(&entry.reading, &entry.surface)),
+            Reverse(entry.last_used),
+            Reverse(entry.count),
+        )
     });
     history.truncate(MAX_HISTORY_ENTRIES);
 }
 
 fn trim_context_history(history: &mut Vec<ContextHistoryEntry>) {
-    history.sort_unstable_by(|left, right| {
-        is_useful_context_anchor(&right.previous_reading, &right.previous_surface)
-            .cmp(&is_useful_context_anchor(
-                &left.previous_reading,
-                &left.previous_surface,
-            ))
-            .then_with(|| {
-                is_useful_history(&right.reading, &right.surface)
-                    .cmp(&is_useful_history(&left.reading, &left.surface))
-            })
-            .then_with(|| {
-                right
-                    .last_used
-                    .cmp(&left.last_used)
-                    .then_with(|| right.count.cmp(&left.count))
-            })
+    history.sort_by_cached_key(|entry| {
+        (
+            Reverse(is_useful_context_anchor(
+                &entry.previous_reading,
+                &entry.previous_surface,
+            )),
+            Reverse(is_useful_history(&entry.reading, &entry.surface)),
+            Reverse(entry.last_used),
+            Reverse(entry.count),
+        )
     });
     history.truncate(MAX_CONTEXT_HISTORY_ENTRIES);
 }
@@ -1001,12 +992,14 @@ fn serialize_context_history(history: &[ContextHistoryEntry]) -> Vec<u8> {
     output.into_bytes()
 }
 
+/// Merges one record into the file's current history and returns what was
+/// written.
 fn write_history_optimistically(
     path: &Path,
     reading: &str,
     surface: &str,
     last_used: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<HistoryEntry>> {
     for _ in 0..3 {
         let base = read_optional(path)?;
         let mut history = match base.as_deref() {
@@ -1019,7 +1012,7 @@ fn write_history_optimistically(
         trim_history(&mut history);
         let proposed = serialize_history(&history);
         if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
-            return Ok(());
+            return Ok(history);
         }
     }
     Err(io::Error::new(
@@ -1033,7 +1026,7 @@ fn write_history_preference_optimistically(
     reading: &str,
     surface: &str,
     last_used: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<HistoryPreferenceEntry>> {
     for _ in 0..3 {
         let base = read_optional(path)?;
         let mut preferences = match base.as_deref() {
@@ -1051,7 +1044,7 @@ fn write_history_preference_optimistically(
         trim_history_preferences(&mut preferences);
         let proposed = serialize_history_preferences(&preferences);
         if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
-            return Ok(());
+            return Ok(preferences);
         }
     }
     Err(io::Error::new(
@@ -1064,7 +1057,7 @@ fn write_context_history_optimistically(
     path: &Path,
     contexts: &[(String, String, String, String)],
     last_used: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<ContextHistoryEntry>> {
     for _ in 0..3 {
         let base = read_optional(path)?;
         let mut history = match base.as_deref() {
@@ -1087,7 +1080,7 @@ fn write_context_history_optimistically(
         trim_context_history(&mut history);
         let proposed = serialize_context_history(&history);
         if atomic_replace_if_unchanged(path, base.as_deref(), &proposed)? {
-            return Ok(());
+            return Ok(history);
         }
     }
     Err(io::Error::new(

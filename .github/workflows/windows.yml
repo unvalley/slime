@@ -142,6 +142,13 @@ jobs:
             }
           }
           if ($failures.Count -ne 0) {
+            # TEMPORARY DIAGNOSTICS: remove once the version resource is fixed.
+            $buildDirectory = "target/windows-${{ matrix.architecture }}"
+            Get-ChildItem $buildDirectory -Recurse -Include SlimeVersion.rc,*.res |
+              ForEach-Object { Write-Host "generated: $($_.FullName) $($_.Length) bytes" }
+            Select-String -Path "$buildDirectory/SlimeIME.vcxproj" -Pattern 'ResourceCompile|SlimeVersion' |
+              ForEach-Object { Write-Host "vcxproj: $($_.Line.Trim())" }
+            Get-Content "$buildDirectory/SlimeVersion.rc" | ForEach-Object { Write-Host "rc: $_" }
             throw "payload metadata does not match the build:`n$($failures -join "`n")"
           }
       - name: Run native tests

@@ -1,5 +1,8 @@
 #include <winver.h>
 
+// Language-neutral strings without explicit terminators, the same layout as
+// the Rust engine's resource: .NET's FileVersionInfo read no strings from a
+// US English block whose values ended in "\0".
 1 VERSIONINFO
 FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
 PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
@@ -11,16 +14,16 @@ FILESUBTYPE VFT2_UNKNOWN
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
-    BLOCK "040904b0"
+    BLOCK "000004b0"
     BEGIN
-      VALUE "Comments", "Source revision: @SLIME_SOURCE_REVISION@\0"
-      VALUE "CompanyName", "unvalley\0"
-      VALUE "ProductName", "Slime\0"
-      VALUE "ProductVersion", "@PROJECT_VERSION@\0"
+      VALUE "Comments", "Source revision: @SLIME_SOURCE_REVISION@"
+      VALUE "CompanyName", "unvalley"
+      VALUE "ProductName", "Slime"
+      VALUE "ProductVersion", "@PROJECT_VERSION@"
     END
   END
   BLOCK "VarFileInfo"
   BEGIN
-    VALUE "Translation", 0x0409, 1200
+    VALUE "Translation", 0x0, 1200
   END
 END
